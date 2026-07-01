@@ -23,6 +23,12 @@ defmodule Compux.Binary do
   @command "compux"
   @release_base "https://github.com/tezra-io/compux/releases/download"
 
+  # Bound the release download so a hung/slow fetch can't block the caller forever
+  # (e.g. a setup-page "installing…" spinner that never resolves). The artifact is
+  # small; these are generous.
+  @connect_timeout_ms 15_000
+  @download_timeout_ms 120_000
+
   @checksum_file Path.expand(Path.join([__DIR__, "..", "..", "checksum-compux.exs"]))
   @external_resource @checksum_file
   @checksums (case File.read(@checksum_file) do
@@ -199,7 +205,9 @@ defmodule Compux.Binary do
 
     http_opts = [
       ssl: [verify: :verify_peer, cacerts: :public_key.cacerts_get()],
-      autoredirect: true
+      autoredirect: true,
+      connect_timeout: @connect_timeout_ms,
+      timeout: @download_timeout_ms
     ]
 
     request = {String.to_charlist(url), []}
