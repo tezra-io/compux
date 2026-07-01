@@ -78,6 +78,26 @@ defmodule Compux.Binary do
     end
   end
 
+  @doc """
+  Resolve the sidecar path WITHOUT downloading: the `COMPUX_BUILD` dev build if
+  set, else the cached download if already present, else `{:error, :not_cached}`.
+
+  Use this for a side-effect-free "is it installed?" check on a hot path (a status
+  read must never trigger a network fetch); use `path/1` when a download-if-absent
+  is acceptable (e.g. at spawn time, after readiness is already gated).
+  """
+  @spec cached_path(keyword()) :: {:ok, String.t()} | {:error, term()}
+  def cached_path(opts \\ []) do
+    if dev_build?() do
+      dev_build_path()
+    else
+      with {:ok, target} <- target() do
+        cache = cache_path(opts, target)
+        if File.regular?(cache), do: {:ok, cache}, else: {:error, :not_cached}
+      end
+    end
+  end
+
   @doc "The local `cargo build --release` output path (the dev loop target)."
   @spec dev_build_path() :: {:ok, String.t()} | {:error, term()}
   def dev_build_path do

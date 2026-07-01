@@ -82,6 +82,33 @@ defmodule Compux.BinaryTest do
     end
   end
 
+  describe "cached_path/1 (no download)" do
+    setup do
+      System.delete_env("COMPUX_BUILD")
+      tmp = Path.join(System.tmp_dir!(), "compux-cache-#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(tmp) end)
+      %{tmp: tmp}
+    end
+
+    test "returns {:error, :not_cached} when nothing is cached", %{tmp: tmp} do
+      assert {:error, :not_cached} = Binary.cached_path(cache_dir: tmp)
+    end
+
+    test "returns the cached path once present, without fetching", %{tmp: tmp} do
+      {:ok, target} = Binary.target()
+      {tarball, sha} = fake_tarball("cached-bytes")
+
+      {:ok, cached} =
+        Binary.path(
+          cache_dir: tmp,
+          checksums: %{target => sha},
+          fetcher: fn _ -> {:ok, tarball} end
+        )
+
+      assert {:ok, ^cached} = Binary.cached_path(cache_dir: tmp)
+    end
+  end
+
   defp fake_tarball(contents) do
     tar = Path.join(System.tmp_dir!(), "compux-src-#{System.unique_integer([:positive])}.tar.gz")
     :ok = :erl_tar.create(String.to_charlist(tar), [{~c"compux", contents}], [:compressed])
