@@ -659,8 +659,9 @@ fn wait(req: &Value) -> Result<Value, String> {
 // --- v2 actions: wait_for_change / paste / elements -------------------------
 
 /// Block until the region's pixels change (or `timeout_ms` elapses), then return
-/// the resulting screenshot plus a `changed` flag. Diffs a downsampled hash so a
-/// big frame is cheap to poll; the budget is bounded by the caller's protocol.
+/// the resulting screenshot plus a `changed` flag. Each poll captures the frame
+/// (xcap has no sub-region capture) and diffs an AVERAGED thumbnail hash of the
+/// region; the poll budget is bounded by the caller's protocol.
 fn wait_for_change(req: &Value) -> Result<Value, String> {
     let display = target_display(req)?;
     let region = region_or_full(&display.geom, parse_region(req)?);
@@ -690,7 +691,10 @@ fn wait_for_change(req: &Value) -> Result<Value, String> {
     }
 }
 
-/// A cheap change-detector: capture the region, hash a small thumbnail of it.
+/// A change-detector: capture the region and hash an AVERAGED thumbnail of it.
+/// Triangle (not Nearest) folds every source pixel into a cell, so a small change
+/// still perturbs the hash instead of landing between sample points and being
+/// missed — a miss would block `wait_for_change` to its full timeout.
 fn region_hash(display: &Display, region: &Region) -> Result<u64, String> {
     let geom = &display.geom;
     let crop = crop_rect(geom, region);
@@ -706,7 +710,7 @@ fn region_hash(display: &Display, region: &Region) -> Result<u64, String> {
         crop.h_phys.round().max(1.0) as u32,
     )
     .to_image();
-    let thumb = image::imageops::resize(&cropped, 128, 128, image::imageops::FilterType::Nearest);
+    let thumb = image::imageops::resize(&cropped, 256, 256, image::imageops::FilterType::Triangle);
     let mut hasher = DefaultHasher::new();
     thumb.as_raw().hash(&mut hasher);
     Ok(hasher.finish())
@@ -720,6 +724,9 @@ fn paste(req: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .ok_or("missing text")?;
     let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("clipboard: {e}"))?;
+    // Best-effort save of the user's clipboard TEXT so paste doesn't silently destroy
+    // it (a non-text clipboard — image/files — can't be preserved here).
+    let prior = clipboard.get_text().ok();
     clipboard
         .set_text(text)
         .map_err(|e| format!("clipboard set: {e}"))?;
@@ -734,6 +741,13 @@ fn paste(req: &Value) -> Result<Value, String> {
         .map_err(|e| format!("paste key: {e}"))?;
     e.key(modifier, Direction::Release)
         .map_err(|e| format!("paste modifier: {e}"))?;
+
+    // Restore the prior clipboard once the target has consumed the paste (a small
+    // delay avoids racing the paste read).
+    if let Some(previous) = prior {
+        thread::sleep(Duration::from_millis(80));
+        let _ = clipboard.set_text(previous);
+    }
 
     post(req, &target_display(req)?)
 }
@@ -845,6 +859,8 @@ mod ax {
     extern "C" {
         fn CFArrayGetCount(array: CFTypeRef) -> isize;
         fn CFArrayGetValueAtIndex(array: CFTypeRef, index: isize) -> CFTypeRef;
+        fn CFGetTypeID(cf: CFTypeRef) -> usize;
+        fn CFArrayGetTypeID() -> usize;
     }
 
     // The AX attribute-name constants (`kAXRoleAttribute`, …) are header `extern
@@ -863,9 +879,12 @@ mod ax {
     const AXVALUE_CGPOINT: u32 = 1;
     const AXVALUE_CGSIZE: u32 = 2;
 
-    // Bound the tree walk so a deep/huge hierarchy can't stall the request.
+    // Bound the tree walk so a deep/huge hierarchy can't stall the request:
+    // MAX_NODES caps elements COLLECTED, MAX_VISITED caps nodes TRAVERSED (a large
+    // sparse subtree has few interactive nodes but many to walk), MAX_DEPTH the depth.
     const MAX_DEPTH: usize = 14;
     const MAX_NODES: usize = 250;
+    const MAX_VISITED: usize = 3000;
 
     // Roles worth surfacing as clickable targets (set-of-marks).
     const INTERACTIVE: &[&str] = &[
@@ -974,20 +993,22 @@ mod ax {
             let system = CFType::wrap_under_create_rule(system_ref);
             let root = copy_element_attr(&system, FOCUSED_APP).unwrap_or(system);
             let mut out = Vec::new();
-            walk(&root, 0, &mut out);
+            let mut visited = 0;
+            walk(&root, 0, &mut visited, &mut out);
             out
         }
     }
 
-    unsafe fn walk(element: &CFType, depth: usize, out: &mut Vec<Node>) {
-        if depth > MAX_DEPTH || out.len() >= MAX_NODES {
+    unsafe fn walk(element: &CFType, depth: usize, visited: &mut usize, out: &mut Vec<Node>) {
+        if depth > MAX_DEPTH || out.len() >= MAX_NODES || *visited >= MAX_VISITED {
             return;
         }
+        *visited += 1;
         if let Some(node) = interactive_node(element) {
             out.push(node);
         }
         for child in copy_children(element) {
-            walk(&child, depth + 1, out);
+            walk(&child, depth + 1, visited, out);
         }
     }
 
@@ -1014,6 +1035,12 @@ mod ax {
             return Vec::new();
         };
         let array = children.as_CFTypeRef();
+        // AXChildren SHOULD be a CFArray, but an app with a custom/broken AX impl can
+        // return another CFType; the CFArray getters would then type-confuse and read
+        // garbage. Verify the concrete type before treating it as an array.
+        if CFGetTypeID(array) != CFArrayGetTypeID() {
+            return Vec::new();
+        }
         let count = CFArrayGetCount(array);
         let mut out = Vec::new();
         let mut index = 0;
