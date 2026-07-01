@@ -1,0 +1,153 @@
+name: release
+
+# Tag `vX.Y.Z` (matching mix.exs + Cargo.toml) and push it. Per target this:
+# cross-builds the crate, (macOS) Developer-ID codesigns + notarizes it, packs a
+# tarball, sha256s it, and cosign-signs the tarball (keyless/OIDC). The publish job
+# attaches everything to a GitHub Release and prints the checksum map to paste into
+# `checksum-compux.exs` via `mix compux.checksum`.
+#
+# Required repo secrets for the macOS signing/notarization steps:
+#   MACOS_CERT_P12_BASE64   base64 of the "Developer ID Application" .p12
+#   MACOS_CERT_PASSWORD     its export password
+#   MACOS_KEYCHAIN_PASSWORD an ephemeral CI keychain password
+#   MACOS_DEVELOPER_ID      e.g. "Developer ID Application: Tezra (TEAMID)"
+#   APPLE_ID                Apple ID email for notarytool
+#   APPLE_TEAM_ID           the 10-char team id
+#   APPLE_APP_PASSWORD      an app-specific password for notarytool
+# cosign is keyless (Sigstore OIDC) and needs no secret, only id-token: write.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-aarch64
+            os: macos-14
+          - target: linux-x86_64
+            os: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (release, locked)
+        working-directory: native/compux
+        run: cargo build --release --locked
+
+      - name: macOS — import Developer ID certificate
+        if: matrix.target == 'macos-aarch64'
+        env:
+          CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$CERT_P12_BASE64" | base64 --decode > cert.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security import cert.p12 -k build.keychain -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm -f cert.p12
+
+      - name: macOS — codesign (hardened runtime) + notarize
+        if: matrix.target == 'macos-aarch64'
+        working-directory: native/compux/target/release
+        env:
+          DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          codesign --force --timestamp --options runtime --sign "$DEVELOPER_ID" compux
+          codesign --verify --strict --verbose=2 compux
+          # A bare Mach-O CLI cannot be stapled; notarize a zip of it so the ticket
+          # is registered against the binary's cdhash (Gatekeeper checks online).
+          ditto -c -k compux compux-notarize.zip
+          xcrun notarytool submit compux-notarize.zip \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          rm -f compux-notarize.zip
+
+      - name: Package tarball + sha256
+        env:
+          BIN_DIR: native/compux/target/release
+        run: |
+          set -euo pipefail
+          VERSION="${REF_NAME#v}"
+          OUT="compux-${VERSION}-${TARGET}.tar.gz"
+          tar -czf "$OUT" -C "$BIN_DIR" compux
+          shasum -a 256 "$OUT" | awk '{print $1}' > "$OUT.sha256"
+          echo "artifact=$OUT" >> "$GITHUB_ENV"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: cosign sign-blob (keyless)
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --output-signature "${artifact}.sig" \
+            --output-certificate "${artifact}.pem" \
+            "${artifact}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            compux-*.tar.gz
+            compux-*.tar.gz.sha256
+            compux-*.tar.gz.sig
+            compux-*.tar.gz.pem
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Print checksum map (paste into checksum-compux.exs)
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          echo "%{"
+          for f in compux-*.tar.gz; do
+            target="$(echo "$f" | sed -E 's/^compux-[0-9.]+-(.+)\.tar\.gz$/\1/')"
+            printf '  "%s" => "%s",\n' "$target" "$(cat "$f.sha256")"
+          done
+          echo "}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          gh release create "$REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$REF_NAME" \
+            --generate-notes \
+            compux-*.tar.gz compux-*.tar.gz.sha256 compux-*.tar.gz.sig compux-*.tar.gz.pem

@@ -1,0 +1,12 @@
+/_build/
+/cover/
+/deps/
+/doc/
+/.elixir_ls/
+erl_crash.dump
+*.ez
+compux-*.tar
+.DS_Store
+
+# Rust build output (the crate is built by CI / a local COMPUX_BUILD loop).
+/native/compux/target/

@@ -1,0 +1,81 @@
+# compux
+
+Native **computer use** (screen capture + mouse/keyboard input) for Elixir, backed
+by a crash-isolated Rust sidecar spawned over a Port — **not** a NIF.
+
+```elixir
+{:ok, cu}   = Compux.start()
+{:ok, shot} = Compux.screenshot(cu, region: {0, 0, 800, 600})
+:ok         = Compux.click(cu, {120, 80}, button: :left, modifiers: [:cmd])
+{:ok, el}   = Compux.inspect(cu, {120, 80})   # accessibility element under a point (macOS)
+:ok         = Compux.stop(cu)
+```
+
+## Why a Port, not a NIF
+
+A GUI driver segfaults for real reasons — a denied macOS TCC permission, an
+`xcap`/`enigo` quirk, a raw Accessibility FFI call. As a **NIF** that crash takes
+down the whole BEAM node; as a **separate process** behind a Port it is a
+recoverable `:exit_status`. Capture + PNG encode is also tens of ms of blocking
+work that has no business on a scheduler thread. So the Rust backend is a spawned
+executable, and Elixir owns it over stdin/stdout with a line-framed JSON protocol.
+
+The split:
+
+- **`compux` (the library)** owns the *mechanism* — the wire protocol
+  (`Compux.Protocol`), the Port plumbing (`Compux.PortDriver`), the coordinate math
+  (Retina physical-vs-logical, region zoom), and the ergonomic API (`Compux`).
+- **The caller** owns the *policy* — when an action is allowed, confirmation, and
+  telemetry. `compux` makes no such decisions; it returns `{:ok, _} | {:error, _}`.
+
+## Actions
+
+`screenshot`, `left_click` / `right_click` / `double_click`, `mouse_move`,
+`left_click_drag`, `scroll`, `type`, `key` (chords like `"cmd+shift+4"`), `wait`,
+and `inspect` (the accessibility element under a point). Every coordinate is in the
+screenshot's pixel space; a `:region` zooms capture *and* the click mapping through
+one shared crop, so clicks can't land offset.
+
+## The version handshake
+
+`Compux.start/1` performs a `hello` handshake and refuses a sidecar whose
+`protocol_version` differs from `Compux.Protocol.protocol_version/0`, returning
+`{:error, {:protocol_mismatch, _}}`. Because the encoder is compiled in but the
+binary is installed separately, this is what keeps them from silently drifting.
+
+## Installation
+
+```elixir
+def deps do
+  [{:compux, "~> 0.1"}]
+end
+```
+
+`Compux.Binary.path!/0` resolves the sidecar for the host: a checksum-verified
+per-target binary downloaded once from the GitHub release and cached, or — with
+`COMPUX_BUILD=1` — the local `cargo build --release` output (the dev loop). An
+embedder that manages its own signed install passes an explicit `:binary_path` to
+`Compux.start/1` instead.
+
+## Supported platforms
+
+macOS-first. **Apple-Silicon macOS** is the primary, fully-featured target
+(capture, input, accessibility `inspect`, non-prompting permission probe).
+**Linux/X11** supports capture + input (no `inspect`). **Wayland**, **Linux
+accessibility**, and **Windows** are not supported yet.
+
+macOS requires the user to grant **Screen Recording** (capture) and **Accessibility**
+(input) in System Settings → Privacy & Security. Without Accessibility, synthetic
+input is silently dropped while screenshots still work — `Compux.probe/1` reports
+both grants without prompting so you can tell the user exactly what's missing.
+
+## Status
+
+Alpha (`0.x`). The coordinate math is unit-tested (including the Retina
+physical-vs-logical regression); the wire protocol, handshake, and capture paths are
+verified on-device. Input-injection landing and `inspect` roles need per-machine
+verification with the grants in place.
+
+## License
+
+MIT.

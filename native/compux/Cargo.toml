@@ -1,0 +1,44 @@
+# compux OS-driver sidecar — the native screen-capture + input-injection helper.
+#
+# A standalone binary (NOT a Rustler NIF) that `Compux.PortDriver` spawns as an OS
+# Port. It speaks the line-framed JSON protocol defined in lib/compux/protocol.ex:
+# one request line in on stdin, one response line out on stdout. Kept a separate
+# process on purpose — a GUI driver can segfault on a TCC denial or an xcap/enigo
+# quirk, and a Port crash is recoverable where a NIF crash would down the BEAM.
+#
+# Build (dev loop):  cargo build --release  ->  target/release/compux
+# Release builds are cross-compiled per target + signed/notarized by CI.
+
+[package]
+name = "compux"
+version = "0.1.0"
+edition = "2021"
+description = "Native screen-capture + input-injection helper for the compux Elixir library"
+license = "MIT"
+repository = "https://github.com/tezra-io/compux"
+
+[[bin]]
+name = "compux"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Cross-platform synthetic input (macOS CGEvent, Linux XTEST/uinput).
+enigo = "0.3"
+# Cross-platform screen capture (macOS ScreenCaptureKit/CG, Linux X11).
+xcap = "0.4"
+# PNG encoding + downscale of the captured frame.
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
+
+# macOS Accessibility query (`inspect`) + the non-prompting permission probe.
+# core-foundation handles CFString/CFType memory safety for the AX FFI. Already in
+# the tree transitively via xcap, so this adds no new compilation.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
