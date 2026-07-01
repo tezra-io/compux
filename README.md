@@ -31,10 +31,13 @@ The split:
 ## Actions
 
 `screenshot`, `left_click` / `right_click` / `double_click`, `mouse_move`,
-`left_click_drag`, `scroll`, `type`, `key` (chords like `"cmd+shift+4"`), `wait`,
-and `inspect` (the accessibility element under a point). Every coordinate is in the
-screenshot's pixel space; a `:region` zooms capture *and* the click mapping through
-one shared crop, so clicks can't land offset.
+`left_click_drag`, `scroll`, `type`, `paste` (clipboard-based — fast and
+unicode-safe for long text), `key` (chords like `"cmd+shift+4"`, incl. `f1`–`f12`),
+`wait`, `wait_for_change` (block until the screen changes, then return the new
+frame), `inspect` (the accessibility element under a point), and `elements` (the
+interactive accessibility elements with a click point each — target by element, not
+raw pixels). Every coordinate is in the screenshot's pixel space; a `:region` zooms
+capture *and* the click mapping through one shared crop, so clicks can't land offset.
 
 ## The version handshake
 

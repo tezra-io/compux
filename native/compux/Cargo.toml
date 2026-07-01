@@ -11,7 +11,7 @@
 
 [package]
 name = "compux"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Native screen-capture + input-injection helper for the compux Elixir library"
 license = "MIT"
@@ -31,6 +31,8 @@ xcap = "0.4"
 # PNG encoding + downscale of the captured frame.
 image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"
+# Clipboard access for the `paste` action (macOS NSPasteboard, Linux X11/Wayland).
+arboard = "3"
 
 # macOS Accessibility query (`inspect`) + the non-prompting permission probe.
 # core-foundation handles CFString/CFType memory safety for the AX FFI. Already in

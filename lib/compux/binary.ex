@@ -94,13 +94,13 @@ defmodule Compux.Binary do
   """
   @spec cached_path(keyword()) :: {:ok, String.t()} | {:error, term()}
   def cached_path(opts \\ []) do
-    if dev_build?() do
-      dev_build_path()
-    else
-      with {:ok, target} <- target() do
-        cache = cache_path(opts, target)
-        if File.regular?(cache), do: {:ok, cache}, else: {:error, :not_cached}
-      end
+    if dev_build?(), do: dev_build_path(), else: cached_download(opts)
+  end
+
+  defp cached_download(opts) do
+    with {:ok, target} <- target() do
+      cache = cache_path(opts, target)
+      if File.regular?(cache), do: {:ok, cache}, else: {:error, :not_cached}
     end
   end
 

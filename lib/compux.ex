@@ -160,6 +160,37 @@ defmodule Compux do
   end
 
   @doc """
+  Block until the screen (or `:region`) changes, or `:timeout_ms` elapses; returns
+  the resulting screenshot. Read-only. `:poll_ms` sets the check interval.
+  """
+  @spec wait_for_change(t(), keyword()) :: response()
+  def wait_for_change(%__MODULE__{} = cu, opts \\ []) do
+    params =
+      %{"action" => "wait_for_change"}
+      |> put_display(opts)
+      |> put_region(opts)
+      |> maybe_put("timeout_ms", Keyword.get(opts, :timeout_ms))
+      |> maybe_put("poll_ms", Keyword.get(opts, :poll_ms))
+
+    run(cu, params, opts)
+  end
+
+  @doc """
+  Enumerate the accessibility elements (role, label, bounds) under the focused
+  window or a `:region`, so the caller can target by element rather than raw
+  pixels. Read-only; macOS only.
+  """
+  @spec elements(t(), keyword()) :: response()
+  def elements(%__MODULE__{} = cu, opts \\ []) do
+    run(cu, put_region(put_display(%{"action" => "elements"}, opts), opts), opts)
+  end
+
+  @doc "Paste `text` via the clipboard — fast and unicode-safe for long strings."
+  @spec paste(t(), String.t(), keyword()) :: response()
+  def paste(%__MODULE__{} = cu, text, opts \\ []) when is_binary(text),
+    do: run(cu, %{"action" => "paste", "text" => text}, opts)
+
+  @doc """
   Non-prompting OS-permission probe: whether screen capture and input control are
   actually available, plus the platform and display server. Not a model action.
   """

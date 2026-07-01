@@ -16,14 +16,19 @@ defmodule Compux.Protocol do
   compiled-in encoder and the installed sidecar can never silently drift.
   """
 
-  @protocol_version 1
+  @protocol_version 2
 
-  @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect)
-  @read_only ~w(screenshot mouse_move wait inspect)
+  @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements)
+  @read_only ~w(screenshot mouse_move wait inspect wait_for_change elements)
   @modifiers ~w(cmd ctrl alt shift)
   @scroll_directions ~w(up down left right)
   @max_type_bytes 10_000
   @max_wait_ms 10_000
+  # `wait_for_change` must finish inside the caller's per-action deadline (30s in
+  # Fermix), so its poll budget is capped well under that.
+  @max_wait_for_change_ms 25_000
+  @min_poll_ms 50
+  @max_poll_ms 5_000
 
   @doc "The wire-compatibility version this build speaks (see the moduledoc)."
   @spec protocol_version() :: pos_integer()
@@ -113,6 +118,48 @@ defmodule Compux.Protocol do
          {:ok, region} <- opt_region(params) do
       request = put_display(%{"action" => "inspect", "x" => x, "y" => y}, display)
       {:ok, put_region(request, region)}
+    end
+  end
+
+  # Block until the screen (or `region`) differs from a baseline, or `timeout_ms`
+  # elapses; returns the resulting screenshot. Read-only.
+  defp validate_action("wait_for_change", params) do
+    with {:ok, display} <- opt_display(params),
+         {:ok, region} <- opt_region(params),
+         {:ok, timeout_ms} <- opt_bounded(params, "timeout_ms", 1, @max_wait_for_change_ms),
+         {:ok, poll_ms} <- opt_bounded(params, "poll_ms", @min_poll_ms, @max_poll_ms) do
+      request =
+        %{"action" => "wait_for_change"}
+        |> put_display(display)
+        |> put_region(region)
+        |> maybe_put("timeout_ms", timeout_ms)
+        |> maybe_put("poll_ms", poll_ms)
+
+      {:ok, request}
+    end
+  end
+
+  # Enumerate the accessibility elements (role/label/bounds) under a window or
+  # `region` so the caller can target by element, not raw pixels. Read-only.
+  defp validate_action("elements", params) do
+    with {:ok, display} <- opt_display(params),
+         {:ok, region} <- opt_region(params) do
+      {:ok, put_region(put_display(%{"action" => "elements"}, display), region)}
+    end
+  end
+
+  # Like `type`, but sets the clipboard and issues a paste — fast + unicode-safe
+  # for long text (char-by-char typing can exceed the action deadline).
+  defp validate_action("paste", params) do
+    case Map.get(params, "text") do
+      text when is_binary(text) and byte_size(text) > 0 and byte_size(text) <= @max_type_bytes ->
+        {:ok, %{"action" => "paste", "text" => text}}
+
+      text when is_binary(text) ->
+        {:error, "paste.text must be 1..#{@max_type_bytes} bytes"}
+
+      _other ->
+        {:error, "paste requires a non-empty string text"}
     end
   end
 
@@ -231,6 +278,19 @@ defmodule Compux.Protocol do
 
   defp put_display(request, nil), do: request
   defp put_display(request, display), do: Map.put(request, "display", display)
+
+  # An optional integer bounded to `min..max`; absent → `{:ok, nil}` (the sidecar
+  # fills a default), present-and-in-range → `{:ok, int}`, otherwise a loud error.
+  defp opt_bounded(params, key, min, max) do
+    case Map.get(params, key) do
+      nil -> {:ok, nil}
+      value when is_integer(value) and value >= min and value <= max -> {:ok, value}
+      _other -> {:error, "#{key} must be an integer in #{min}..#{max}"}
+    end
+  end
+
+  defp maybe_put(request, _key, nil), do: request
+  defp maybe_put(request, key, value), do: Map.put(request, key, value)
 
   # A zoom rectangle in the full-screenshot pixel space — the coordinates the model
   # reads off a normal screenshot. Passing the same `region` on a `screenshot` and the

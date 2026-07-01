@@ -19,13 +19,16 @@ defmodule Compux.ProtocolTest do
       end
     end
 
-    test "the read-only set is screenshot/mouse_move/wait/inspect" do
+    test "the read-only set includes screenshot/mouse_move/wait/inspect/wait_for_change/elements" do
       assert Protocol.read_only?("screenshot")
       assert Protocol.read_only?("inspect")
       assert Protocol.read_only?("mouse_move")
       assert Protocol.read_only?("wait")
+      assert Protocol.read_only?("wait_for_change")
+      assert Protocol.read_only?("elements")
       refute Protocol.read_only?("left_click")
       refute Protocol.read_only?("type")
+      refute Protocol.read_only?("paste")
     end
   end
 
@@ -160,6 +163,49 @@ defmodule Compux.ProtocolTest do
     test "invalid JSON fails loud" do
       assert {:error, "invalid JSON from sidecar: " <> _} =
                Protocol.decode_response("{not json")
+    end
+  end
+
+  describe "validate/1 — v2 actions" do
+    test "wait_for_change: bare, and with region + bounded timeout/poll" do
+      assert {:ok, %{"action" => "wait_for_change"}} =
+               Protocol.validate(%{"action" => "wait_for_change"})
+
+      params = %{
+        "action" => "wait_for_change",
+        "region" => %{"x" => 0, "y" => 0, "w" => 10, "h" => 10},
+        "timeout_ms" => 5000,
+        "poll_ms" => 200
+      }
+
+      assert {:ok, req} = Protocol.validate(params)
+      assert req["timeout_ms"] == 5000
+      assert req["poll_ms"] == 200
+      assert req["region"]["w"] == 10
+    end
+
+    test "wait_for_change rejects an out-of-range timeout or poll" do
+      assert {:error, _} =
+               Protocol.validate(%{"action" => "wait_for_change", "timeout_ms" => 999_999})
+
+      assert {:error, _} = Protocol.validate(%{"action" => "wait_for_change", "poll_ms" => 1})
+    end
+
+    test "elements: bare and with region" do
+      assert {:ok, %{"action" => "elements"}} = Protocol.validate(%{"action" => "elements"})
+
+      assert {:ok, %{"region" => %{"w" => 50}}} =
+               Protocol.validate(%{
+                 "action" => "elements",
+                 "region" => %{"x" => 0, "y" => 0, "w" => 50, "h" => 50}
+               })
+    end
+
+    test "paste needs a non-empty string" do
+      assert {:error, _} = Protocol.validate(%{"action" => "paste", "text" => ""})
+
+      assert {:ok, %{"action" => "paste", "text" => "hi"}} =
+               Protocol.validate(%{"action" => "paste", "text" => "hi"})
     end
   end
 end

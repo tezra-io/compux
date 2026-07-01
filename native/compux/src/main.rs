@@ -19,9 +19,11 @@
 //! (Screen Recording and Accessibility). It never panics the request loop — every
 //! action answers with `{"ok": true, ...}` or `{"ok": false, "error": "..."}`.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
@@ -37,7 +39,7 @@ const MAX_EDGE: u32 = 1366;
 /// Wire-compatibility version. MUST match `Compux.Protocol.protocol_version/0`.
 /// Bumped ONLY on a wire-incompatible change; reported in the `hello` handshake so
 /// a consumer can refuse a mismatched sidecar (the two-pin drift guard).
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 
 fn main() {
     let stdin = io::stdin();
@@ -81,6 +83,9 @@ fn handle(req: &Value) -> Value {
         "key" => key_chord(req),
         "wait" => wait(req),
         "inspect" => inspect(req),
+        "wait_for_change" => wait_for_change(req),
+        "paste" => paste(req),
+        "elements" => elements(req),
         other => Err(format!("unknown action: {other}")),
     };
 
@@ -107,7 +112,8 @@ fn hello() -> Result<Value, String> {
         "compux_version": env!("CARGO_PKG_VERSION"),
         "actions": [
             "screenshot", "left_click", "right_click", "double_click", "mouse_move",
-            "left_click_drag", "scroll", "type", "key", "wait", "inspect"
+            "left_click_drag", "scroll", "type", "key", "wait", "inspect",
+            "wait_for_change", "paste", "elements"
         ],
     }))
 }
@@ -423,6 +429,23 @@ fn to_logical(geom: &Geometry, region: &Region, x: f64, y: f64) -> (i32, i32) {
     (lx.round() as i32, ly.round() as i32)
 }
 
+/// Inverse of `to_logical`: a global LOGICAL point → the sent-image coordinate for
+/// `region`, or None when it falls outside the sent image. Used by `elements` to
+/// place accessibility frames back onto the coordinates the model reads.
+fn to_sent(geom: &Geometry, region: &Region, lx: f64, ly: f64) -> Option<(i64, i64)> {
+    let crop = crop_rect(geom, region);
+    let kz = crop.sent_scale();
+    let sf = geom.scale_factor;
+    let sx = ((lx as f32 - geom.origin_x) * sf - crop.left_phys) * kz;
+    let sy = ((ly as f32 - geom.origin_y) * sf - crop.top_phys) * kz;
+    let (sw, sh) = crop.sent_dims();
+    if sx < 0.0 || sy < 0.0 || sx > sw as f32 || sy > sh as f32 {
+        None
+    } else {
+        Some((sx.round() as i64, sy.round() as i64))
+    }
+}
+
 // --- screenshot -------------------------------------------------------------
 
 fn screenshot(req: &Value) -> Result<Value, String> {
@@ -633,6 +656,124 @@ fn wait(req: &Value) -> Result<Value, String> {
     Ok(json!({ "ok": true }))
 }
 
+// --- v2 actions: wait_for_change / paste / elements -------------------------
+
+/// Block until the region's pixels change (or `timeout_ms` elapses), then return
+/// the resulting screenshot plus a `changed` flag. Diffs a downsampled hash so a
+/// big frame is cheap to poll; the budget is bounded by the caller's protocol.
+fn wait_for_change(req: &Value) -> Result<Value, String> {
+    let display = target_display(req)?;
+    let region = region_or_full(&display.geom, parse_region(req)?);
+    let timeout_ms = req
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(10_000);
+    let poll_ms = req
+        .get("poll_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(250)
+        .max(1);
+
+    let baseline = region_hash(&display, &region)?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+    loop {
+        thread::sleep(Duration::from_millis(poll_ms));
+        let changed = region_hash(&display, &region)? != baseline;
+        if changed || Instant::now() >= deadline {
+            let mut payload = capture_payload(&display, Some(region))?;
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("changed".to_string(), json!(changed));
+            }
+            return Ok(payload);
+        }
+    }
+}
+
+/// A cheap change-detector: capture the region, hash a small thumbnail of it.
+fn region_hash(display: &Display, region: &Region) -> Result<u64, String> {
+    let geom = &display.geom;
+    let crop = crop_rect(geom, region);
+    let image = display
+        .monitor
+        .capture_image()
+        .map_err(|e| format!("capture: {e}"))?;
+    let cropped = image::imageops::crop_imm(
+        &image,
+        crop.left_phys.round() as u32,
+        crop.top_phys.round() as u32,
+        crop.w_phys.round().max(1.0) as u32,
+        crop.h_phys.round().max(1.0) as u32,
+    )
+    .to_image();
+    let thumb = image::imageops::resize(&cropped, 128, 128, image::imageops::FilterType::Nearest);
+    let mut hasher = DefaultHasher::new();
+    thumb.as_raw().hash(&mut hasher);
+    Ok(hasher.finish())
+}
+
+/// Paste `text` via the clipboard + the platform paste chord — fast and
+/// unicode-safe for long strings that char-by-char typing would stall on.
+fn paste(req: &Value) -> Result<Value, String> {
+    let text = req
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or("missing text")?;
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("clipboard: {e}"))?;
+    clipboard
+        .set_text(text)
+        .map_err(|e| format!("clipboard set: {e}"))?;
+    // Let the pasteboard write settle before the paste keystroke.
+    thread::sleep(Duration::from_millis(50));
+
+    let mut e = enigo()?;
+    let modifier = paste_modifier();
+    e.key(modifier, Direction::Press)
+        .map_err(|e| format!("paste modifier: {e}"))?;
+    e.key(Key::Unicode('v'), Direction::Click)
+        .map_err(|e| format!("paste key: {e}"))?;
+    e.key(modifier, Direction::Release)
+        .map_err(|e| format!("paste modifier: {e}"))?;
+
+    post(req, &target_display(req)?)
+}
+
+#[cfg(target_os = "macos")]
+fn paste_modifier() -> Key {
+    Key::Meta
+}
+
+#[cfg(not(target_os = "macos"))]
+fn paste_modifier() -> Key {
+    Key::Control
+}
+
+/// Enumerate interactive accessibility elements (role + label + a click point in
+/// screenshot coordinates) so the model can target by element, not raw pixels.
+fn elements(req: &Value) -> Result<Value, String> {
+    let display = target_display(req)?;
+    let region = region_or_full(&display.geom, parse_region(req)?);
+    elements_for(&display.geom, &region)
+}
+
+#[cfg(target_os = "macos")]
+fn elements_for(geom: &Geometry, region: &Region) -> Result<Value, String> {
+    let mut items = Vec::new();
+    for node in ax::interactive_elements() {
+        let center_x = node.x + node.w / 2.0;
+        let center_y = node.y + node.h / 2.0;
+        if let Some((x, y)) = to_sent(geom, region, center_x, center_y) {
+            items.push(json!({ "role": node.role, "title": node.title, "x": x, "y": y }));
+        }
+    }
+    Ok(json!({ "ok": true, "elements": items }))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn elements_for(_geom: &Geometry, _region: &Region) -> Result<Value, String> {
+    Err("element enumeration is only supported on macOS".to_string())
+}
+
 // --- accessibility (inspect) ------------------------------------------------
 
 /// Report the accessibility element under a (screenshot-space) point: its role and
@@ -676,6 +817,7 @@ fn inspect_at(_x: f32, _y: f32) -> Result<Value, String> {
 mod ax {
     use core_foundation::base::{CFType, CFTypeRef, TCFType};
     use core_foundation::string::{CFString, CFStringRef};
+    use std::ffi::c_void;
 
     type AXUIElementRef = CFTypeRef;
 
@@ -694,6 +836,15 @@ mod ax {
             attribute: CFStringRef,
             value: *mut CFTypeRef,
         ) -> i32;
+        // Extract the concrete value (CGPoint/CGSize) an AXValue wraps; false if the
+        // requested type doesn't match.
+        fn AXValueGetValue(value: CFTypeRef, the_type: u32, out: *mut c_void) -> bool;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFArrayGetCount(array: CFTypeRef) -> isize;
+        fn CFArrayGetValueAtIndex(array: CFTypeRef, index: isize) -> CFTypeRef;
     }
 
     // The AX attribute-name constants (`kAXRoleAttribute`, …) are header `extern
@@ -703,6 +854,48 @@ mod ax {
     const TITLE: &str = "AXTitle";
     const DESCRIPTION: &str = "AXDescription";
     const VALUE: &str = "AXValue";
+    const CHILDREN: &str = "AXChildren";
+    const FOCUSED_APP: &str = "AXFocusedApplication";
+    const POSITION: &str = "AXPosition";
+    const SIZE: &str = "AXSize";
+
+    // AXValueType tags for AXValueGetValue.
+    const AXVALUE_CGPOINT: u32 = 1;
+    const AXVALUE_CGSIZE: u32 = 2;
+
+    // Bound the tree walk so a deep/huge hierarchy can't stall the request.
+    const MAX_DEPTH: usize = 14;
+    const MAX_NODES: usize = 250;
+
+    // Roles worth surfacing as clickable targets (set-of-marks).
+    const INTERACTIVE: &[&str] = &[
+        "AXButton",
+        "AXMenuItem",
+        "AXMenuButton",
+        "AXPopUpButton",
+        "AXCheckBox",
+        "AXRadioButton",
+        "AXTextField",
+        "AXTextArea",
+        "AXComboBox",
+        "AXLink",
+        "AXTabButton",
+        "AXSlider",
+        "AXDisclosureTriangle",
+        "AXCell",
+    ];
+
+    #[repr(C)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+
+    #[repr(C)]
+    struct CGSize {
+        width: f64,
+        height: f64,
+    }
 
     pub struct Element {
         pub role: Option<String>,
@@ -736,9 +929,8 @@ mod ax {
         }
     }
 
-    // Read a string-valued AX attribute. Non-string values (e.g. a slider's number)
-    // downcast to None — we only surface text labels.
-    unsafe fn copy_string_attr(element: &CFType, attribute: &str) -> Option<String> {
+    // Read any CFType-valued AX attribute (a +1 Copy-rule ref, released on drop).
+    unsafe fn copy_element_attr(element: &CFType, attribute: &str) -> Option<CFType> {
         let attr = CFString::new(attribute);
         let mut value_ref: CFTypeRef = std::ptr::null();
         let err = AXUIElementCopyAttributeValue(
@@ -749,8 +941,115 @@ mod ax {
         if err != 0 || value_ref.is_null() {
             return None;
         }
-        let value = CFType::wrap_under_create_rule(value_ref);
-        value.downcast::<CFString>().map(|s| s.to_string())
+        Some(CFType::wrap_under_create_rule(value_ref))
+    }
+
+    // Read a string-valued AX attribute. Non-string values (e.g. a slider's number)
+    // downcast to None — we only surface text labels.
+    unsafe fn copy_string_attr(element: &CFType, attribute: &str) -> Option<String> {
+        copy_element_attr(element, attribute)?
+            .downcast::<CFString>()
+            .map(|s| s.to_string())
+    }
+
+    /// An interactive element with its global-logical frame.
+    pub struct Node {
+        pub role: Option<String>,
+        pub title: Option<String>,
+        pub x: f64,
+        pub y: f64,
+        pub w: f64,
+        pub h: f64,
+    }
+
+    /// Walk the focused application's accessibility tree and collect interactive
+    /// elements (bounded depth + count) with global-logical frames. NON-PROMPTING,
+    /// read-only; runtime behavior needs a real Mac with the Accessibility grant.
+    pub fn interactive_elements() -> Vec<Node> {
+        unsafe {
+            let system_ref = AXUIElementCreateSystemWide();
+            if system_ref.is_null() {
+                return Vec::new();
+            }
+            let system = CFType::wrap_under_create_rule(system_ref);
+            let root = copy_element_attr(&system, FOCUSED_APP).unwrap_or(system);
+            let mut out = Vec::new();
+            walk(&root, 0, &mut out);
+            out
+        }
+    }
+
+    unsafe fn walk(element: &CFType, depth: usize, out: &mut Vec<Node>) {
+        if depth > MAX_DEPTH || out.len() >= MAX_NODES {
+            return;
+        }
+        if let Some(node) = interactive_node(element) {
+            out.push(node);
+        }
+        for child in copy_children(element) {
+            walk(&child, depth + 1, out);
+        }
+    }
+
+    unsafe fn interactive_node(element: &CFType) -> Option<Node> {
+        let role = copy_string_attr(element, ROLE)?;
+        if !INTERACTIVE.contains(&role.as_str()) {
+            return None;
+        }
+        let (x, y, w, h) = element_frame(element)?;
+        Some(Node {
+            title: copy_string_attr(element, TITLE)
+                .or_else(|| copy_string_attr(element, DESCRIPTION))
+                .or_else(|| copy_string_attr(element, VALUE)),
+            role: Some(role),
+            x,
+            y,
+            w,
+            h,
+        })
+    }
+
+    unsafe fn copy_children(element: &CFType) -> Vec<CFType> {
+        let Some(children) = copy_element_attr(element, CHILDREN) else {
+            return Vec::new();
+        };
+        let array = children.as_CFTypeRef();
+        let count = CFArrayGetCount(array);
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index < count && out.len() < MAX_NODES {
+            let child_ref = CFArrayGetValueAtIndex(array, index);
+            if !child_ref.is_null() {
+                out.push(CFType::wrap_under_get_rule(child_ref));
+            }
+            index += 1;
+        }
+        out
+    }
+
+    unsafe fn element_frame(element: &CFType) -> Option<(f64, f64, f64, f64)> {
+        let position = copy_element_attr(element, POSITION)?;
+        let size = copy_element_attr(element, SIZE)?;
+        let mut point = CGPoint { x: 0.0, y: 0.0 };
+        let mut dims = CGSize {
+            width: 0.0,
+            height: 0.0,
+        };
+        let got_point = AXValueGetValue(
+            position.as_CFTypeRef(),
+            AXVALUE_CGPOINT,
+            &mut point as *mut _ as *mut c_void,
+        );
+        let got_size = AXValueGetValue(
+            size.as_CFTypeRef(),
+            AXVALUE_CGSIZE,
+            &mut dims as *mut _ as *mut c_void,
+        );
+        if got_point && got_size && dims.width > 0.0 && dims.height > 0.0 {
+            Some((point.x, point.y, dims.width, dims.height))
+        } else {
+            None
+        }
     }
 }
 
@@ -813,6 +1112,18 @@ fn named_key(name: &str) -> Option<Key> {
         "end" => Some(Key::End),
         "pageup" => Some(Key::PageUp),
         "pagedown" => Some(Key::PageDown),
+        "f1" => Some(Key::F1),
+        "f2" => Some(Key::F2),
+        "f3" => Some(Key::F3),
+        "f4" => Some(Key::F4),
+        "f5" => Some(Key::F5),
+        "f6" => Some(Key::F6),
+        "f7" => Some(Key::F7),
+        "f8" => Some(Key::F8),
+        "f9" => Some(Key::F9),
+        "f10" => Some(Key::F10),
+        "f11" => Some(Key::F11),
+        "f12" => Some(Key::F12),
         _ => {
             let mut chars = name.chars();
             match (chars.next(), chars.next()) {

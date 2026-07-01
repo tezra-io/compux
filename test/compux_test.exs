@@ -106,6 +106,24 @@ defmodule CompuxTest do
       assert_received {:executed, %{"action" => "inspect", "x" => 7, "y" => 8}}
     end
 
+    test "wait_for_change / elements / paste build the right request", %{cu: cu} do
+      Compux.wait_for_change(cu, region: {0, 0, 10, 10}, timeout_ms: 3000, poll_ms: 100)
+
+      assert_received {:executed,
+                       %{
+                         "action" => "wait_for_change",
+                         "timeout_ms" => 3000,
+                         "poll_ms" => 100,
+                         "region" => %{"w" => 10}
+                       }}
+
+      Compux.elements(cu)
+      assert_received {:executed, %{"action" => "elements"}}
+
+      Compux.paste(cu, "long text")
+      assert_received {:executed, %{"action" => "paste", "text" => "long text"}}
+    end
+
     test "invalid params fail loud before hitting the driver", %{cu: cu} do
       assert {:error, _reason} = Compux.click(cu, {-1, 2})
       refute_received {:executed, %{"action" => "left_click"}}

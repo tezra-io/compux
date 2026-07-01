@@ -12,7 +12,7 @@ defmodule Compux.StubDriver do
   def start(opts) do
     {:ok,
      %{
-       protocol_version: Keyword.get(opts, :protocol_version, 1),
+       protocol_version: Keyword.get(opts, :protocol_version, Compux.Protocol.protocol_version()),
        compux_version: Keyword.get(opts, :compux_version, "0.0.0-stub"),
        log: Keyword.get(opts, :log),
        responses: Keyword.get(opts, :responses, %{}),
