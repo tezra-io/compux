@@ -454,7 +454,36 @@ fn screenshot(req: &Value) -> Result<Value, String> {
     capture_payload(&display, region)
 }
 
+/// Fail FAST when the target display is asleep instead of engaging a capture.
+/// ScreenCaptureKit delivers no frame from a sleeping display until an internal
+/// ~30s give-up — long enough to bust a caller's action deadline, and a client
+/// stuck in that wait wedges SCK for every later capture system-wide (observed
+/// live, 2026-07-01). The typed error lets the caller say what is actually wrong.
+#[cfg(target_os = "macos")]
+fn ensure_display_awake(display: &Display) -> Result<(), String> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        // boolean_t CGDisplayIsAsleep(CGDirectDisplayID display)
+        fn CGDisplayIsAsleep(display: u32) -> u32;
+    }
+
+    let id = display
+        .monitor
+        .id()
+        .map_err(|e| format!("display id: {e}"))?;
+    if unsafe { CGDisplayIsAsleep(id) } != 0 {
+        return Err("display_asleep".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_display_awake(_display: &Display) -> Result<(), String> {
+    Ok(())
+}
+
 fn capture_payload(display: &Display, requested: Option<Region>) -> Result<Value, String> {
+    ensure_display_awake(display)?;
     let geom = &display.geom;
     let region = region_or_full(geom, requested);
     let crop = crop_rect(geom, &region);
@@ -717,6 +746,7 @@ fn wait_for_change(req: &Value) -> Result<Value, String> {
 /// still perturbs the hash instead of landing between sample points and being
 /// missed — a miss would block `wait_for_change` to its full timeout.
 fn region_hash(display: &Display, region: &Region) -> Result<u64, String> {
+    ensure_display_awake(display)?;
     let geom = &display.geom;
     let crop = crop_rect(geom, region);
     let image = display

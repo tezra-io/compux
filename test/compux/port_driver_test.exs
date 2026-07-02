@@ -53,5 +53,36 @@ defmodule Compux.PortDriverTest do
       assert :ok = PortDriver.stop(state)
       assert :ok = PortDriver.stop(state)
     end
+
+    test "kills a sidecar that is blocked in an action and ignoring stdin EOF" do
+      # The leak class from live 2026-07-01: a sidecar stuck inside a native
+      # capture never reads stdin, so Port.close alone leaks the OS process (and
+      # a leaked stuck ScreenCaptureKit client wedges capture system-wide). The
+      # fixture's "hang" (a 10s sleep, not reading) stands in for that state:
+      # after stop/1 the OS process must be GONE promptly, not sleeping it off.
+      {:ok, state} = PortDriver.start(binary_path: @fake, timeout: 50)
+      {:os_pid, os_pid} = Port.info(state.port, :os_pid)
+
+      assert {:error, {:timeout, 50}} = PortDriver.execute(state, %{"action" => "hang"})
+      assert :ok = PortDriver.stop(state)
+
+      assert os_process_exits_within?(os_pid, 2_000),
+             "sidecar os process #{os_pid} still alive after stop/1"
+    end
   end
+
+  # Bounded poll (max ~2s) for the child's exit; `ps -p` is a read-only check on
+  # a process this test itself spawned.
+  defp os_process_exits_within?(os_pid, budget_ms) when budget_ms > 0 do
+    case System.cmd("ps", ["-p", Integer.to_string(os_pid)], stderr_to_stdout: true) do
+      {_out, 0} ->
+        Process.sleep(100)
+        os_process_exits_within?(os_pid, budget_ms - 100)
+
+      {_out, _nonzero} ->
+        true
+    end
+  end
+
+  defp os_process_exits_within?(_os_pid, _budget_ms), do: false
 end

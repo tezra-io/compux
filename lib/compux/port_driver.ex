@@ -49,10 +49,31 @@ defmodule Compux.PortDriver do
 
   @impl true
   def stop(%{port: port}) do
+    os_pid = port_os_pid(port)
     if Port.info(port), do: Port.close(port)
+    # Port.close only closes the pipes — it never ends the OS process. A sidecar
+    # blocked inside a native capture (ScreenCaptureKit on a sleeping display)
+    # doesn't notice stdin EOF, and a leaked stuck client wedges SCK for every
+    # later capture SYSTEM-WIDE (observed live, 2026-07-01: 7 leaked sidecars →
+    # every capture ~30s until they were killed). We own the process: end it
+    # definitively. SIGKILL is safe — the sidecar holds no state to flush — and
+    # killing an already-exited pid is a harmless no-op.
+    if os_pid, do: kill_os_process(os_pid)
     :ok
   rescue
     ArgumentError -> :ok
+  end
+
+  defp port_os_pid(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, os_pid} -> os_pid
+      nil -> nil
+    end
+  end
+
+  defp kill_os_process(os_pid) do
+    System.cmd("kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    :ok
   end
 
   defp port_options(opts) do
