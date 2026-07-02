@@ -16,19 +16,32 @@ defmodule Compux.BinaryTest do
   end
 
   describe "dev build (COMPUX_BUILD)" do
-    test "dev_build_path/0 points at the local cargo release output" do
-      assert {:ok, path} = Binary.dev_build_path()
-      assert String.ends_with?(path, "native/compux/target/release/compux")
-      # P1 built it in this repo.
-      assert File.regular?(path)
+    # Hermetic: whether a local `cargo build --release` output EXISTS is host
+    # state (present on a dev machine, absent on the Elixir CI runner), so these
+    # assert the path RESOLUTION — the unit under test — and accept both the
+    # built and not-built host, never requiring the cargo artifact.
+    test "dev_build_path/0 resolves the local cargo release output path" do
+      case Binary.dev_build_path() do
+        {:ok, path} ->
+          assert String.ends_with?(path, "native/compux/target/release/compux")
+          assert File.regular?(path)
+
+        {:error, {:dev_build_missing, path}} ->
+          assert String.ends_with?(path, "native/compux/target/release/compux")
+      end
     end
 
-    test "path/1 uses the dev build when COMPUX_BUILD is set" do
+    test "path/1 resolves via the dev build when COMPUX_BUILD is set" do
       System.put_env("COMPUX_BUILD", "1")
       on_exit(fn -> System.delete_env("COMPUX_BUILD") end)
 
-      assert {:ok, path} = Binary.path()
-      assert String.ends_with?(path, "native/compux/target/release/compux")
+      case Binary.path() do
+        {:ok, path} ->
+          assert String.ends_with?(path, "native/compux/target/release/compux")
+
+        {:error, {:dev_build_missing, path}} ->
+          assert String.ends_with?(path, "native/compux/target/release/compux")
+      end
     end
   end
 
