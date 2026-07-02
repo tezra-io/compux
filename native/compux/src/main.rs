@@ -495,7 +495,7 @@ fn capture_payload(display: &Display, requested: Option<Region>) -> Result<Value
 
     let data = base64::engine::general_purpose::STANDARD.encode(&png);
 
-    Ok(json!({
+    let mut payload = json!({
         "ok": true,
         "mime": "image/png",
         "width": sent_w,
@@ -510,7 +510,20 @@ fn capture_payload(display: &Display, requested: Option<Region>) -> Result<Value
             "h": region.h.round() as i64
         },
         "data": data
-    }))
+    });
+
+    // The cursor's position in this image's coordinates, when it falls inside the
+    // captured region — useful for drag/hover reasoning. Absent if off-region.
+    if let (Some((cursor_x, cursor_y)), Some(object)) =
+        (cursor_point(geom, &region), payload.as_object_mut())
+    {
+        object.insert(
+            "cursor".to_string(),
+            json!({ "x": cursor_x, "y": cursor_y }),
+        );
+    }
+
+    Ok(payload)
 }
 
 // --- input ------------------------------------------------------------------
@@ -523,6 +536,14 @@ struct Point {
 
 fn enigo() -> Result<Enigo, String> {
     Enigo::new(&Settings::default()).map_err(|e| format!("init input: {e}"))
+}
+
+// Best-effort cursor position in sent-image coords (None if input can't be read or
+// the cursor lies outside the region) — a screenshot never fails on the cursor read.
+fn cursor_point(geom: &Geometry, region: &Region) -> Option<(i64, i64)> {
+    let input = enigo().ok()?;
+    let (lx, ly) = input.location().ok()?;
+    to_sent(geom, region, lx as f64, ly as f64)
 }
 
 fn coords(req: &Value) -> Result<(f64, f64), String> {
@@ -1229,6 +1250,74 @@ mod tests {
         let (lx, ly) = to_logical(&g, &region, sw as f64, sh as f64);
         assert!((lx - 1440).abs() <= 2, "lx={lx}");
         assert!((ly - 900).abs() <= 2, "ly={ly}");
+    }
+
+    // `elements` maps AX frames back through `to_sent`, so a click point is only as
+    // accurate as `to_sent` inverting `to_logical`. Round-trip a grid of sent points:
+    // sent -> logical -> sent must return the origin (within double-rounding slack).
+    #[test]
+    fn to_sent_inverts_to_logical_full_screen() {
+        let g = retina_geom();
+        let region = Region::full(&g);
+        for (sx, sy) in [(0.0_f64, 0.0_f64), (683.0, 450.0), (1200.0, 700.0)] {
+            let (lx, ly) = to_logical(&g, &region, sx, sy);
+            let (rx, ry) = to_sent(&g, &region, lx as f64, ly as f64).expect("in bounds");
+            assert!((rx - sx as i64).abs() <= 2, "x: sent={sx} back={rx}");
+            assert!((ry - sy as i64).abs() <= 2, "y: sent={sy} back={ry}");
+        }
+    }
+
+    #[test]
+    fn to_sent_inverts_to_logical_in_a_zoomed_region() {
+        let g = retina_geom();
+        let k = sent_scale(&g);
+        let region = Region {
+            x: (720.0 * k) as f64,
+            y: (450.0 * k) as f64,
+            w: (720.0 * k) as f64,
+            h: (450.0 * k) as f64,
+        };
+        let crop = crop_rect(&g, &region);
+        let (sw, sh) = crop.sent_dims();
+        for (sx, sy) in [(0.0_f64, 0.0_f64), ((sw / 2) as f64, (sh / 2) as f64)] {
+            let (lx, ly) = to_logical(&g, &region, sx, sy);
+            let (rx, ry) = to_sent(&g, &region, lx as f64, ly as f64).expect("in region");
+            // Zoom magnifies, so a logical i32 rounding is worth >1 sent px — allow 3.
+            assert!((rx - sx as i64).abs() <= 3, "x: sent={sx} back={rx}");
+            assert!((ry - sy as i64).abs() <= 3, "y: sent={sy} back={ry}");
+        }
+    }
+
+    #[test]
+    fn to_sent_round_trips_with_nonzero_origin_and_physical_mismatch() {
+        let mut g = macbook_air_geom();
+        g.origin_x = 1440.0;
+        g.origin_y = 100.0;
+        let region = Region::full(&g);
+        let crop = crop_rect(&g, &region);
+        let (sw, sh) = crop.sent_dims();
+        let (sx, sy) = ((sw as f64) / 3.0, (sh as f64) / 3.0);
+        let (lx, ly) = to_logical(&g, &region, sx, sy);
+        let (rx, ry) = to_sent(&g, &region, lx as f64, ly as f64).expect("in bounds");
+        assert!((rx - sx as i64).abs() <= 2, "x: sent={sx} back={rx}");
+        assert!((ry - sy as i64).abs() <= 2, "y: sent={sy} back={ry}");
+    }
+
+    #[test]
+    fn to_sent_is_none_outside_the_sent_image() {
+        let g = retina_geom();
+        let region = Region::full(&g);
+        // Left of / above the display origin, and past the far edge.
+        assert_eq!(to_sent(&g, &region, -100.0, 10.0), None);
+        assert_eq!(
+            to_sent(
+                &g,
+                &region,
+                g.logical_w as f64 + 100.0,
+                g.logical_h as f64 + 100.0
+            ),
+            None
+        );
     }
 
     // 13" Retina: 2560x1600 physical, 2x -> 1280x800 logical. logical_long (1280) <=
