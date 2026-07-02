@@ -22,6 +22,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -238,6 +240,9 @@ struct Geometry {
 struct Display {
     monitor: Monitor,
     geom: Geometry,
+    /// The request's display index — bounded capture re-resolves the monitor by
+    /// this on its worker thread (same selection semantics as `target_display`).
+    index: usize,
 }
 
 /// A zoom rectangle in full-display SENT-image pixel space — the coordinates the
@@ -341,7 +346,11 @@ fn target_display(req: &Value) -> Result<Display, String> {
         phys_h,
     };
 
-    Ok(Display { monitor, geom })
+    Ok(Display {
+        monitor,
+        geom,
+        index,
+    })
 }
 
 /// The full-display "sent scale" `k`: sent pixels per LOGICAL point for a full
@@ -482,6 +491,59 @@ fn ensure_display_awake(_display: &Display) -> Result<(), String> {
     Ok(())
 }
 
+// --- bounded capture (the anti-stall watchdog) -------------------------------
+
+/// Hard budget for one physical frame grab. A real capture takes ~0.2–0.5s; one
+/// that exceeds this is stalled inside the OS capture service (the 2026-07-01
+/// wedge: CGWindowListCreateImage's ScreenCaptureKit proxy waited out a ~30s XPC
+/// semaphore PER CALL), and waiting would burn the caller's whole action
+/// deadline. Fail fast with the typed `capture_stalled` instead.
+const CAPTURE_STALL_MS: u64 = 5_000;
+
+/// True while an abandoned capture worker is still stuck inside the OS call.
+/// While set, new captures fail fast rather than piling up more stuck threads.
+static CAPTURE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+struct InFlightGuard;
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        CAPTURE_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Grab the display's physical frame on a worker thread, bounded by
+/// `CAPTURE_STALL_MS`. The worker re-enumerates monitors by `index` (an xcap
+/// `Monitor` handle stays on the thread that made it); enumeration is cheap and
+/// stays inside the bound too. The request loop is single-threaded, so the
+/// in-flight flag only ever guards ABANDONED workers, never concurrent callers.
+fn capture_display_image(index: usize) -> Result<image::RgbaImage, String> {
+    if CAPTURE_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("capture_stalled".to_string());
+    }
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        // Clears the flag on every exit path, including a worker panic.
+        let _guard = InFlightGuard;
+        let _ = tx.send(capture_by_index(index));
+    });
+
+    match rx.recv_timeout(Duration::from_millis(CAPTURE_STALL_MS)) {
+        Ok(result) => result,
+        Err(_timeout_or_worker_death) => Err("capture_stalled".to_string()),
+    }
+}
+
+fn capture_by_index(index: usize) -> Result<image::RgbaImage, String> {
+    let monitors = Monitor::all().map_err(|e| format!("enumerate displays: {e}"))?;
+    let monitor = select_monitor(monitors, index)?;
+    monitor.capture_image().map_err(|e| format!("capture: {e}"))
+}
+
 fn capture_payload(display: &Display, requested: Option<Region>) -> Result<Value, String> {
     ensure_display_awake(display)?;
     let geom = &display.geom;
@@ -489,10 +551,7 @@ fn capture_payload(display: &Display, requested: Option<Region>) -> Result<Value
     let crop = crop_rect(geom, &region);
     let (sent_w, sent_h) = crop.sent_dims();
 
-    let image = display
-        .monitor
-        .capture_image()
-        .map_err(|e| format!("capture: {e}"))?;
+    let image = capture_display_image(display.index)?;
 
     // Crop to the region's physical rect, then downscale to the sent size. The
     // model's coordinates live in this (sent) space; `to_logical` inverts it.
@@ -749,10 +808,7 @@ fn region_hash(display: &Display, region: &Region) -> Result<u64, String> {
     ensure_display_awake(display)?;
     let geom = &display.geom;
     let crop = crop_rect(geom, region);
-    let image = display
-        .monitor
-        .capture_image()
-        .map_err(|e| format!("capture: {e}"))?;
+    let image = capture_display_image(display.index)?;
     let cropped = image::imageops::crop_imm(
         &image,
         crop.left_phys.round() as u32,

@@ -40,6 +40,12 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       REF_NAME: ${{ github.ref_name }}
+      # Signing is CONDITIONAL on the Apple secrets being configured: without
+      # them the release ships an UNSIGNED (ad-hoc) macOS binary — functional
+      # for the sha256-verified download path, but its TCC identity changes per
+      # release (users re-grant Screen Recording/Accessibility after an
+      # upgrade). Add the 7 secrets above and re-run for a signed build.
+      HAS_APPLE_SIGNING: ${{ secrets.MACOS_CERT_P12_BASE64 != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -49,8 +55,13 @@ jobs:
         working-directory: native/compux
         run: cargo build --release --locked
 
+      - name: macOS — warn when shipping unsigned
+        if: matrix.target == 'macos-aarch64' && env.HAS_APPLE_SIGNING != 'true'
+        run: |
+          echo "::warning title=UNSIGNED macOS binary::Apple signing secrets are not configured — this macOS binary is unsigned (TCC identity changes per release). Configure the MACOS_*/APPLE_* secrets and re-run for a signed+notarized build."
+
       - name: macOS — import Developer ID certificate
-        if: matrix.target == 'macos-aarch64'
+        if: matrix.target == 'macos-aarch64' && env.HAS_APPLE_SIGNING == 'true'
         env:
           CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
           CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -66,7 +77,7 @@ jobs:
           rm -f cert.p12
 
       - name: macOS — codesign (hardened runtime) + notarize
-        if: matrix.target == 'macos-aarch64'
+        if: matrix.target == 'macos-aarch64' && env.HAS_APPLE_SIGNING == 'true'
         working-directory: native/compux/target/release
         env:
           DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
