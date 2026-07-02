@@ -87,6 +87,9 @@ physical-vs-logical regression); the wire protocol, handshake, and capture paths
 verified on-device. Input-injection landing and `inspect` roles need per-machine
 verification with the grants in place.
 
+Where it's headed — set-of-marks + OCR grounding, action batching, and eventual
+continuous-video capture — is in [ROADMAP.md](ROADMAP.md).
+
 ## License
 
 MIT.
