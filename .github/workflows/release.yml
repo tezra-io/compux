@@ -1,12 +1,20 @@
 name: release
 
 # Tag `vX.Y.Z` (matching mix.exs + Cargo.toml) and push it. Per target this:
-# cross-builds the crate, (macOS) Developer-ID codesigns + notarizes it, packs a
-# tarball, sha256s it, and cosign-signs the tarball (keyless/OIDC). The publish job
-# attaches everything to a GitHub Release and prints the checksum map to paste into
-# `checksum-compux.exs` via `mix compux.checksum`.
+# cross-builds the crate, packs a tarball, sha256s it, and cosign-signs the
+# tarball (keyless/OIDC). The publish job attaches everything to a GitHub Release
+# and prints the checksum map to paste into `checksum-compux.exs`.
 #
-# Required repo secrets for the macOS signing/notarization steps:
+# macOS Developer-ID codesign + notarization is CONDITIONAL: it runs only when the
+# signing secrets are configured (detected via HAS_APPLE_SIGNING). Without them
+# the macOS binary ships UNSIGNED (ad-hoc) — functional for the sha256-verified
+# download path, but its TCC identity changes per release, so users re-grant
+# Screen Recording / Accessibility after an upgrade. The build warns loudly in
+# that case. cosign is keyless (Sigstore OIDC) and needs no secret.
+#
+# To ship a signed+notarized macOS binary, configure ALL of these repo secrets
+# (a partial set fails the early "validate signing secrets" guard, loud, rather
+# than mid-job):
 #   MACOS_CERT_P12_BASE64   base64 of the "Developer ID Application" .p12
 #   MACOS_CERT_PASSWORD     its export password
 #   MACOS_KEYCHAIN_PASSWORD an ephemeral CI keychain password
@@ -14,7 +22,6 @@ name: release
 #   APPLE_ID                Apple ID email for notarytool
 #   APPLE_TEAM_ID           the 10-char team id
 #   APPLE_APP_PASSWORD      an app-specific password for notarytool
-# cosign is keyless (Sigstore OIDC) and needs no secret, only id-token: write.
 
 on:
   push:
@@ -40,17 +47,60 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       REF_NAME: ${{ github.ref_name }}
+      # Signing is CONDITIONAL on the Apple secrets being configured: without
+      # them the release ships an UNSIGNED (ad-hoc) macOS binary — functional
+      # for the sha256-verified download path, but its TCC identity changes per
+      # release (users re-grant Screen Recording/Accessibility after an
+      # upgrade). Add the 7 secrets above and re-run for a signed build.
+      HAS_APPLE_SIGNING: ${{ secrets.MACOS_CERT_P12_BASE64 != '' }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Linux — install system libs (xcap/enigo/arboard link deps)
+        if: matrix.target == 'linux-x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libdbus-1-dev libxdo-dev
+
       - name: Build (release, locked)
         working-directory: native/compux
         run: cargo build --release --locked
 
+      - name: macOS — warn when shipping unsigned
+        if: matrix.target == 'macos-aarch64' && env.HAS_APPLE_SIGNING != 'true'
+        run: |
+          echo "::warning title=UNSIGNED macOS binary::Apple signing secrets are not configured — this macOS binary is unsigned (TCC identity changes per release). Configure the MACOS_*/APPLE_* secrets and re-run for a signed+notarized build."
+
+      - name: macOS — validate signing secrets are COMPLETE
+        # HAS_APPLE_SIGNING keys off one secret; guard here that ALL seven are set,
+        # so a partial config fails loud EARLY rather than midway through signing.
+        if: matrix.target == 'macos-aarch64' && env.HAS_APPLE_SIGNING == 'true'
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          MACOS_DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for v in MACOS_CERT_P12_BASE64 MACOS_CERT_PASSWORD MACOS_KEYCHAIN_PASSWORD \
+                   MACOS_DEVELOPER_ID APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error title=Incomplete signing config::MACOS_CERT_P12_BASE64 is set but these are missing:$missing. Set all seven or clear MACOS_CERT_P12_BASE64 to ship unsigned."
+            exit 1
+          fi
+
       - name: macOS — import Developer ID certificate
-        if: matrix.target == 'macos-aarch64'
+        if: matrix.target == 'macos-aarch64' && env.HAS_APPLE_SIGNING == 'true'
         env:
           CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
           CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -66,7 +116,7 @@ jobs:
           rm -f cert.p12
 
       - name: macOS — codesign (hardened runtime) + notarize
-        if: matrix.target == 'macos-aarch64'
+        if: matrix.target == 'macos-aarch64' && env.HAS_APPLE_SIGNING == 'true'
         working-directory: native/compux/target/release
         env:
           DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}

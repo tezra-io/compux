@@ -22,6 +22,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -64,6 +66,14 @@ fn main() {
             break;
         }
         let _ = stdout.flush();
+
+        // A capture wedged the OS backend and leaked a stuck worker we can't
+        // reclaim — the reply is now flushed, so exit and let the parent respawn
+        // a clean sidecar (EX_TEMPFAIL). Do this AFTER flush so the caller got
+        // its `capture_stalled` answer first.
+        if CAPTURE_WEDGED.load(Ordering::SeqCst) {
+            std::process::exit(75);
+        }
     }
 }
 
@@ -236,8 +246,13 @@ struct Geometry {
 }
 
 struct Display {
-    monitor: Monitor,
     geom: Geometry,
+    /// The monitor's stable id (CGDirectDisplayID on macOS). Capture and the
+    /// asleep check both re-resolve the monitor by THIS (never by list index),
+    /// so a mid-action display change fails typed instead of rebinding to a
+    /// different physical monitor. The xcap `Monitor` handle isn't `Send` and
+    /// isn't held past geometry read — the id is all a later capture needs.
+    id: u32,
 }
 
 /// A zoom rectangle in full-display SENT-image pixel space — the coordinates the
@@ -330,6 +345,7 @@ fn target_display(req: &Value) -> Result<Display, String> {
         .map_err(|e| format!("display height: {e}"))?;
     let origin_x = monitor.x().map_err(|e| format!("display origin x: {e}"))?;
     let origin_y = monitor.y().map_err(|e| format!("display origin y: {e}"))?;
+    let id = monitor.id().map_err(|e| format!("display id: {e}"))?;
 
     let geom = Geometry {
         logical_w: phys_w as f32 / scale_factor,
@@ -341,7 +357,7 @@ fn target_display(req: &Value) -> Result<Display, String> {
         phys_h,
     };
 
-    Ok(Display { monitor, geom })
+    Ok(Display { geom, id })
 }
 
 /// The full-display "sent scale" `k`: sent pixels per LOGICAL point for a full
@@ -467,11 +483,7 @@ fn ensure_display_awake(display: &Display) -> Result<(), String> {
         fn CGDisplayIsAsleep(display: u32) -> u32;
     }
 
-    let id = display
-        .monitor
-        .id()
-        .map_err(|e| format!("display id: {e}"))?;
-    if unsafe { CGDisplayIsAsleep(id) } != 0 {
+    if unsafe { CGDisplayIsAsleep(display.id) } != 0 {
         return Err("display_asleep".to_string());
     }
     Ok(())
@@ -482,6 +494,76 @@ fn ensure_display_awake(_display: &Display) -> Result<(), String> {
     Ok(())
 }
 
+// --- bounded capture (the anti-stall watchdog) -------------------------------
+
+/// Hard budget for one physical frame grab. A real capture takes ~0.2–0.5s; one
+/// that exceeds this is stalled inside the OS capture service (the 2026-07-01
+/// wedge: CGWindowListCreateImage's ScreenCaptureKit proxy waited out a ~30s XPC
+/// semaphore PER CALL), and waiting would burn the caller's whole action
+/// deadline. Fail fast with the typed `capture_stalled` instead.
+const CAPTURE_STALL_MS: u64 = 5_000;
+
+/// Set when a capture blew its budget: the OS capture backend is wedged and a
+/// leaked worker thread is still stuck inside the syscall. There is no in-process
+/// recovery (the stuck thread can't be cancelled), so after replying we EXIT and
+/// let the owning parent (`Compux.PortDriver`) respawn a fresh sidecar with a
+/// clean capture-service connection. Checked in `main` AFTER the response flush,
+/// so the `capture_stalled` reply always reaches the caller first.
+static CAPTURE_WEDGED: AtomicBool = AtomicBool::new(false);
+
+/// Grab a display's physical frame on a worker thread, bounded by
+/// `CAPTURE_STALL_MS`. Bounding (not moving to a different capture API) is the
+/// fix: the newest xcap still captures via `CGWindowListCreateImage`, so ANY
+/// backend can wedge — only a hard deadline is robust.
+///
+/// The worker re-resolves the monitor by its stable id (an xcap `Monitor` is not
+/// `Send`; the id is a plain `u32`). Re-resolving by ID — not by list index —
+/// means a display unplugged mid-action fails typed (`display_disconnected`)
+/// instead of silently rebinding to whatever now occupies that index. On a hard
+/// stall we set `CAPTURE_WEDGED` (→ process exit + respawn) so a leaked worker
+/// can never pile up or wedge the process forever.
+fn capture_display_image(monitor_id: u32) -> Result<image::RgbaImage, String> {
+    let (tx, rx) = mpsc::channel();
+
+    let spawned = thread::Builder::new()
+        .name("compux-capture".to_string())
+        .spawn(move || {
+            let _ = tx.send(capture_by_id(monitor_id));
+        });
+
+    if spawned.is_err() {
+        return Err("capture failed: could not spawn capture worker".to_string());
+    }
+
+    match rx.recv_timeout(Duration::from_millis(CAPTURE_STALL_MS)) {
+        Ok(result) => result,
+
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The worker is still stuck in the OS call; it holds a capture-service
+            // resource this process can't reclaim. Flag for exit-after-reply.
+            CAPTURE_WEDGED.store(true, Ordering::SeqCst);
+            Err("capture_stalled".to_string())
+        }
+
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            // Worker died without sending (a panic inside xcap). It leaked no stuck
+            // resource, so keep serving — a retry may well succeed.
+            Err("capture failed: capture worker exited without a result".to_string())
+        }
+    }
+}
+
+fn capture_by_id(monitor_id: u32) -> Result<image::RgbaImage, String> {
+    let monitors = Monitor::all().map_err(|e| format!("enumerate displays: {e}"))?;
+
+    let monitor = monitors
+        .into_iter()
+        .find(|m| m.id().map(|id| id == monitor_id).unwrap_or(false))
+        .ok_or_else(|| "display_disconnected".to_string())?;
+
+    monitor.capture_image().map_err(|e| format!("capture: {e}"))
+}
+
 fn capture_payload(display: &Display, requested: Option<Region>) -> Result<Value, String> {
     ensure_display_awake(display)?;
     let geom = &display.geom;
@@ -489,10 +571,7 @@ fn capture_payload(display: &Display, requested: Option<Region>) -> Result<Value
     let crop = crop_rect(geom, &region);
     let (sent_w, sent_h) = crop.sent_dims();
 
-    let image = display
-        .monitor
-        .capture_image()
-        .map_err(|e| format!("capture: {e}"))?;
+    let image = capture_display_image(display.id)?;
 
     // Crop to the region's physical rect, then downscale to the sent size. The
     // model's coordinates live in this (sent) space; `to_logical` inverts it.
@@ -749,10 +828,7 @@ fn region_hash(display: &Display, region: &Region) -> Result<u64, String> {
     ensure_display_awake(display)?;
     let geom = &display.geom;
     let crop = crop_rect(geom, region);
-    let image = display
-        .monitor
-        .capture_image()
-        .map_err(|e| format!("capture: {e}"))?;
+    let image = capture_display_image(display.id)?;
     let cropped = image::imageops::crop_imm(
         &image,
         crop.left_phys.round() as u32,

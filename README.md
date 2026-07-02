@@ -63,9 +63,17 @@ embedder that manages its own signed install passes an explicit `:binary_path` t
 ## Supported platforms
 
 macOS-first. **Apple-Silicon macOS** is the primary, fully-featured target
-(capture, input, accessibility `inspect`, non-prompting permission probe).
-**Linux/X11** supports capture + input (no `inspect`). **Wayland**, **Linux
-accessibility**, and **Windows** are not supported yet.
+(capture, input, accessibility `inspect` + `elements`, non-prompting permission
+probe). **Linux/X11** supports capture + input + `wait_for_change` + `paste`
+(the accessibility actions — `inspect` and `elements` — are macOS-only and
+return a typed error on Linux; the paste chord is Ctrl+V). The permission
+`probe` works on both (on Linux it reports X11-vs-Wayland capability).
+**Wayland**, **Linux accessibility**, and **Windows** are not supported yet.
+
+Building the Linux target needs the X11/input system headers the crates link
+via pkg-config: `libxcb1-dev libxcb-render0-dev libxcb-shape0-dev
+libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev`
+(mirrored in `ci.yml`'s `rust-linux` job and the release workflow).
 
 macOS requires the user to grant **Screen Recording** (capture) and **Accessibility**
 (input) in System Settings → Privacy & Security. Without Accessibility, synthetic
