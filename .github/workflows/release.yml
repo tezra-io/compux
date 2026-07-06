@@ -130,9 +130,34 @@ jobs:
           # A bare Mach-O CLI cannot be stapled; notarize a zip of it so the ticket
           # is registered against the binary's cdhash (Gatekeeper checks online).
           ditto -c -k compux compux-notarize.zip
-          xcrun notarytool submit compux-notarize.zip \
-            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          # Submit WITHOUT --wait, then poll `notarytool info` on the submission id.
+          # `submit --wait` holds one HTTP poll loop open for the whole scan (an hour+
+          # on a team's first submission) and dies on any transient runner network
+          # blip — v0.3.0's first run lost a 75-minute wait to a 1-second blip.
+          # Bounded: 48 polls x 150s = 2h ceiling, then fail loud.
+          sub_id=$(xcrun notarytool submit compux-notarize.zip \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" \
+            --output-format json | jq -r '.id')
           rm -f compux-notarize.zip
+          echo "notarization submission: $sub_id"
+          state="In Progress"
+          for attempt in $(seq 1 48); do
+            state=$(xcrun notarytool info "$sub_id" \
+              --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" \
+              --output-format json 2>/dev/null | jq -r '.status' || echo "network-error")
+            echo "notarization status ($attempt/48): $state"
+            case "$state" in
+              "Accepted") break ;;
+              "Invalid"|"Rejected") break ;;
+              *) sleep 150 ;;
+            esac
+          done
+          if [ "$state" != "Accepted" ]; then
+            echo "::error title=Notarization did not complete::status=$state (submission $sub_id)"
+            xcrun notarytool log "$sub_id" \
+              --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" || true
+            exit 1
+          fi
 
       - name: Package tarball + sha256
         env:
