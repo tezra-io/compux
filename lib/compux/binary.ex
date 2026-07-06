@@ -203,8 +203,18 @@ defmodule Compux.Binary do
     {:ok, _} = Application.ensure_all_started(:inets)
     {:ok, _} = Application.ensure_all_started(:ssl)
 
+    # customize_hostname_check is required for wildcard certs: GitHub serves
+    # release assets from release-assets.githubusercontent.com behind a
+    # *.githubusercontent.com cert, and Erlang's default DNS-ID matching
+    # rejects wildcards unless the HTTPS match function is supplied.
     http_opts = [
-      ssl: [verify: :verify_peer, cacerts: :public_key.cacerts_get()],
+      ssl: [
+        verify: :verify_peer,
+        cacerts: :public_key.cacerts_get(),
+        customize_hostname_check: [
+          match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
+        ]
+      ],
       autoredirect: true,
       connect_timeout: @connect_timeout_ms,
       timeout: @download_timeout_ms
