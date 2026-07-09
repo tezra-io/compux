@@ -1,20 +1,21 @@
 name: release
 
-# Tag `vX.Y.Z` (matching mix.exs + Cargo.toml) and push it. Per target this:
-# cross-builds the crate, packs a tarball, sha256s it, and cosign-signs the
-# tarball (keyless/OIDC). The publish job attaches everything to a GitHub Release
-# and prints the checksum map to paste into `checksum-compux.exs`.
+# Tag `vX.Y.Z` (matching mix.exs + Cargo.toml) and push it. Per target this
+# cross-builds the crate, packs the release artifact, sha256s it, and cosign-signs
+# it (keyless/OIDC). The publish job attaches everything to a GitHub Release and
+# prints the checksum map to paste into `checksum-compux.exs`.
 #
-# macOS Developer-ID codesign + notarization is CONDITIONAL: it runs only when the
-# signing secrets are configured (detected via HAS_APPLE_SIGNING). Without them
-# the macOS binary ships UNSIGNED (ad-hoc) — functional for the sha256-verified
-# download path, but its TCC identity changes per release, so users re-grant
-# Screen Recording / Accessibility after an upgrade. The build warns loudly in
-# that case. cosign is keyless (Sigstore OIDC) and needs no secret.
+# Per-target artifact shape (Compux.Binary.artifact_name/2):
+#   * macOS  — a Developer-ID-signed, notarized, STAPLED `Fermix.app` zipped with
+#     ditto: `compux-<ver>-macos-aarch64.zip`. The bundle gives the sidecar a stable
+#     TCC identity (io.tezra.fermix.computer-use) so Screen-Recording / Accessibility
+#     grants persist across upgrades. Signing is MANDATORY — the build fails loud if
+#     the Apple secrets are absent (never ships an ad-hoc bundle, whose per-build
+#     identity would re-prompt every upgrade).
+#   * Linux  — a bare `compux` binary tarball: `compux-<ver>-linux-x86_64.tar.gz`
+#     (no TCC on X11; nothing to sign).
 #
-# To ship a signed+notarized macOS binary, configure ALL of these repo secrets
-# (a partial set fails the early "validate signing secrets" guard, loud, rather
-# than mid-job):
+# Required macOS repo secrets (a partial set fails the early validate guard, loud):
 #   MACOS_CERT_P12_BASE64   base64 of the "Developer ID Application" .p12
 #   MACOS_CERT_PASSWORD     its export password
 #   MACOS_KEYCHAIN_PASSWORD an ephemeral CI keychain password
@@ -22,6 +23,7 @@ name: release
 #   APPLE_ID                Apple ID email for notarytool
 #   APPLE_TEAM_ID           the 10-char team id
 #   APPLE_APP_PASSWORD      an app-specific password for notarytool
+# cosign is keyless (Sigstore OIDC) and needs no secret.
 
 on:
   push:
@@ -47,12 +49,6 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       REF_NAME: ${{ github.ref_name }}
-      # Signing is CONDITIONAL on the Apple secrets being configured: without
-      # them the release ships an UNSIGNED (ad-hoc) macOS binary — functional
-      # for the sha256-verified download path, but its TCC identity changes per
-      # release (users re-grant Screen Recording/Accessibility after an
-      # upgrade). Add the 7 secrets above and re-run for a signed build.
-      HAS_APPLE_SIGNING: ${{ secrets.MACOS_CERT_P12_BASE64 != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -70,15 +66,10 @@ jobs:
         working-directory: native/compux
         run: cargo build --release --locked
 
-      - name: macOS — warn when shipping unsigned
-        if: matrix.target == 'macos-aarch64' && env.HAS_APPLE_SIGNING != 'true'
-        run: |
-          echo "::warning title=UNSIGNED macOS binary::Apple signing secrets are not configured — this macOS binary is unsigned (TCC identity changes per release). Configure the MACOS_*/APPLE_* secrets and re-run for a signed+notarized build."
-
-      - name: macOS — validate signing secrets are COMPLETE
-        # HAS_APPLE_SIGNING keys off one secret; guard here that ALL seven are set,
-        # so a partial config fails loud EARLY rather than midway through signing.
-        if: matrix.target == 'macos-aarch64' && env.HAS_APPLE_SIGNING == 'true'
+      - name: macOS — validate signing secrets are complete
+        # Signing is MANDATORY on macOS: fail loud + early if ANY of the seven is
+        # missing, rather than shipping an ad-hoc bundle or dying mid-notarization.
+        if: matrix.target == 'macos-aarch64'
         env:
           MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -95,12 +86,12 @@ jobs:
             [ -n "${!v}" ] || missing="$missing $v"
           done
           if [ -n "$missing" ]; then
-            echo "::error title=Incomplete signing config::MACOS_CERT_P12_BASE64 is set but these are missing:$missing. Set all seven or clear MACOS_CERT_P12_BASE64 to ship unsigned."
+            echo "::error title=Missing signing secrets::macOS signing is mandatory but these secrets are unset:$missing. Configure all seven on the compux repo and re-run."
             exit 1
           fi
 
       - name: macOS — import Developer ID certificate
-        if: matrix.target == 'macos-aarch64' && env.HAS_APPLE_SIGNING == 'true'
+        if: matrix.target == 'macos-aarch64'
         env:
           CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
           CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -115,9 +106,8 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
           rm -f cert.p12
 
-      - name: macOS — codesign (hardened runtime) + notarize
-        if: matrix.target == 'macos-aarch64' && env.HAS_APPLE_SIGNING == 'true'
-        working-directory: native/compux/target/release
+      - name: macOS — build, sign, notarize + staple Fermix.app
+        if: matrix.target == 'macos-aarch64'
         env:
           DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -125,20 +115,20 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           set -euo pipefail
-          codesign --force --timestamp --options runtime --sign "$DEVELOPER_ID" compux
-          codesign --verify --strict --verbose=2 compux
-          # A bare Mach-O CLI cannot be stapled; notarize a zip of it so the ticket
-          # is registered against the binary's cdhash (Gatekeeper checks online).
-          ditto -c -k compux compux-notarize.zip
-          # Submit WITHOUT --wait, then poll `notarytool info` on the submission id.
-          # `submit --wait` holds one HTTP poll loop open for the whole scan (an hour+
-          # on a team's first submission) and dies on any transient runner network
-          # blip — v0.3.0's first run lost a 75-minute wait to a 1-second blip.
-          # Bounded: 48 polls x 150s = 2h ceiling, then fail loud.
-          sub_id=$(xcrun notarytool submit compux-notarize.zip \
+          VERSION="${REF_NAME#v}"
+
+          # Wrap the signed binary in the Fermix.app bundle (hardened runtime).
+          scripts/build_app.sh native/compux/target/release/compux Fermix.app "$VERSION" "$DEVELOPER_ID"
+
+          # Notarize the bundle (submit a zip; the ticket is stapled to the .app so
+          # Gatekeeper works offline). Submit WITHOUT --wait, then poll: `--wait` holds
+          # one HTTP loop open for the whole scan (an hour+ on a first submission) and
+          # dies on any transient runner blip. Bounded: 48 polls x 150s = 2h ceiling.
+          ditto -c -k --keepParent Fermix.app notarize.zip
+          sub_id=$(xcrun notarytool submit notarize.zip \
             --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" \
             --output-format json | jq -r '.id')
-          rm -f compux-notarize.zip
+          rm -f notarize.zip
           echo "notarization submission: $sub_id"
           state="In Progress"
           for attempt in $(seq 1 48); do
@@ -158,15 +148,23 @@ jobs:
               --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" || true
             exit 1
           fi
+          xcrun stapler staple Fermix.app
+          codesign --verify --deep --strict --verbose=2 Fermix.app
 
-      - name: Package tarball + sha256
+      - name: Package artifact + sha256
         env:
           BIN_DIR: native/compux/target/release
         run: |
           set -euo pipefail
           VERSION="${REF_NAME#v}"
-          OUT="compux-${VERSION}-${TARGET}.tar.gz"
-          tar -czf "$OUT" -C "$BIN_DIR" compux
+          if [ "$TARGET" = "macos-aarch64" ]; then
+            # ditto-zip the stapled bundle (preserves _CodeSignature/xattrs).
+            OUT="compux-${VERSION}-${TARGET}.zip"
+            ditto -c -k --keepParent Fermix.app "$OUT"
+          else
+            OUT="compux-${VERSION}-${TARGET}.tar.gz"
+            tar -czf "$OUT" -C "$BIN_DIR" compux
+          fi
           shasum -a 256 "$OUT" | awk '{print $1}' > "$OUT.sha256"
           echo "artifact=$OUT" >> "$GITHUB_ENV"
 
@@ -190,6 +188,10 @@ jobs:
             compux-*.tar.gz.sha256
             compux-*.tar.gz.sig
             compux-*.tar.gz.pem
+            compux-*.zip
+            compux-*.zip.sha256
+            compux-*.zip.sig
+            compux-*.zip.pem
           if-no-files-found: error
 
   publish:
@@ -208,8 +210,9 @@ jobs:
         run: |
           set -euo pipefail
           echo "%{"
-          for f in compux-*.tar.gz; do
-            target="$(echo "$f" | sed -E 's/^compux-[0-9.]+-(.+)\.tar\.gz$/\1/')"
+          for f in compux-*.tar.gz compux-*.zip; do
+            [ -e "$f" ] || continue
+            target="$(echo "$f" | sed -E 's/^compux-[0-9.]+-(.+)\.(tar\.gz|zip)$/\1/')"
             printf '  "%s" => "%s",\n' "$target" "$(cat "$f.sha256")"
           done
           echo "}"
@@ -225,4 +228,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "$REF_NAME" \
             --generate-notes \
-            compux-*.tar.gz compux-*.tar.gz.sha256 compux-*.tar.gz.sig compux-*.tar.gz.pem
+            compux-*.tar.gz compux-*.tar.gz.sha256 compux-*.tar.gz.sig compux-*.tar.gz.pem \
+            compux-*.zip compux-*.zip.sha256 compux-*.zip.sig compux-*.zip.pem

@@ -11,7 +11,7 @@
 
 [package]
 name = "compux"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Native screen-capture + input-injection helper for the compux Elixir library"
 license = "MIT"
@@ -34,11 +34,15 @@ base64 = "0.22"
 # Clipboard access for the `paste` action (macOS NSPasteboard, Linux X11/Wayland).
 arboard = "3"
 
-# macOS Accessibility query (`inspect`) + the non-prompting permission probe.
-# core-foundation handles CFString/CFType memory safety for the AX FFI. Already in
-# the tree transitively via xcap, so this adds no new compilation.
+# macOS Accessibility query (`inspect`) + the non-prompting permission probe +
+# the Accessibility grant PROMPT (`request_permissions`). core-foundation handles
+# CFString/CFType/CFDictionary memory safety for the AX FFI. Already in the tree
+# transitively via xcap, so this adds no new compilation.
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
+# posix_spawn + dlsym for the TCC responsibility self-disclaim re-exec (see
+# `disclaim` in src/main.rs) — makes compux its own TCC responsible process.
+libc = "0.2"
 
 [profile.release]
 strip = true
