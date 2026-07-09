@@ -43,7 +43,129 @@ const MAX_EDGE: u32 = 1366;
 /// a consumer can refuse a mismatched sidecar (the two-pin drift guard).
 const PROTOCOL_VERSION: u32 = 2;
 
+// --- macOS TCC responsibility disclaim ---------------------------------------
+
+/// Make this process its OWN TCC "responsible process".
+///
+/// `Compux.PortDriver` spawns us via `posix_spawn` (the Elixir Port). A child that
+/// does not disclaim inherits its PARENT's TCC identity, so macOS would attribute our
+/// Screen-Recording (`kTCCServiceScreenCapture`) and Accessibility
+/// (`kTCCServiceAccessibility`) requests to the ad-hoc, version-keyed BEAM/daemon
+/// ancestor — an identity whose grant never persists (re-prompt every action, a new
+/// System-Settings row per version). Disclaiming attaches the grant to compux's OWN
+/// stable Developer-ID bundle identity instead.
+///
+/// The disclaim flag must be set on the spawn attributes BEFORE the spawn — which the
+/// Port cannot do, and a running process cannot do to itself — so we re-exec ONCE via
+/// `POSIX_SPAWN_SETEXEC` (replaces this image in place; the pid and the stdin/stdout
+/// Port fds are preserved, so the wire protocol is untouched). A `COMPUX_DISCLAIMED`
+/// sentinel bounds it to a single re-exec. The API is private/header-less (resolved
+/// via `dlsym`), so we FAIL LOUD (non-zero exit) if it is absent or errors, rather
+/// than silently running un-disclaimed and resurrecting the mis-attribution bug.
+#[cfg(target_os = "macos")]
+mod disclaim {
+    use std::env;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::ptr;
+
+    type SetDisclaimFn =
+        unsafe extern "C" fn(*mut libc::posix_spawnattr_t, libc::c_int) -> libc::c_int;
+
+    pub fn become_responsible() {
+        if env::var_os("COMPUX_DISCLAIMED").is_some() {
+            return; // already the re-exec'd, disclaimed image
+        }
+
+        let set_disclaim = resolve_set_disclaim();
+        let exe = env::current_exe().unwrap_or_else(|e| fatal(73, &format!("current_exe: {e}")));
+        let exe_c = cstr(exe.as_os_str().as_bytes());
+
+        let argv = CArray::new(env::args_os().map(|a| cstr(a.as_bytes())).collect());
+        let mut env_strings: Vec<CString> = env::vars_os()
+            .map(|(k, v)| {
+                let mut kv = k.as_bytes().to_vec();
+                kv.push(b'=');
+                kv.extend_from_slice(v.as_bytes());
+                cstr(&kv)
+            })
+            .collect();
+        env_strings.push(cstr(b"COMPUX_DISCLAIMED=1"));
+        let envp = CArray::new(env_strings);
+
+        unsafe {
+            let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
+            if libc::posix_spawnattr_init(&mut attr) != 0 {
+                fatal(74, "posix_spawnattr_init failed");
+            }
+            if set_disclaim(&mut attr, 1) != 0 {
+                fatal(71, "responsibility_spawnattrs_setdisclaim returned nonzero");
+            }
+            if libc::posix_spawnattr_setflags(&mut attr, libc::POSIX_SPAWN_SETEXEC as libc::c_short)
+                != 0
+            {
+                fatal(75, "posix_spawnattr_setflags failed");
+            }
+            // SETEXEC replaces this image; posix_spawn returns ONLY on failure.
+            libc::posix_spawn(
+                ptr::null_mut(),
+                exe_c.as_ptr(),
+                ptr::null(),
+                &attr,
+                argv.ptrs.as_ptr(),
+                envp.ptrs.as_ptr(),
+            );
+            fatal(72, "POSIX_SPAWN_SETEXEC re-exec failed");
+        }
+    }
+
+    fn resolve_set_disclaim() -> SetDisclaimFn {
+        // dlsym's RTLD_DEFAULT pseudo-handle on macOS is (void *)-2.
+        let rtld_default = (-2isize) as *mut libc::c_void;
+        let name = cstr(b"responsibility_spawnattrs_setdisclaim");
+        let sym = unsafe { libc::dlsym(rtld_default, name.as_ptr()) };
+        if sym.is_null() {
+            fatal(70, "responsibility_spawnattrs_setdisclaim unavailable");
+        }
+        unsafe { std::mem::transmute::<*mut libc::c_void, SetDisclaimFn>(sym) }
+    }
+
+    fn cstr(bytes: &[u8]) -> CString {
+        CString::new(bytes).unwrap_or_else(|_| fatal(76, "unexpected NUL in argv/env"))
+    }
+
+    // Owns the CString backing store so the null-terminated pointer vector stays valid.
+    struct CArray {
+        ptrs: Vec<*mut libc::c_char>,
+        _owned: Vec<CString>,
+    }
+
+    impl CArray {
+        fn new(owned: Vec<CString>) -> CArray {
+            let mut ptrs: Vec<*mut libc::c_char> =
+                owned.iter().map(|s| s.as_ptr() as *mut _).collect();
+            ptrs.push(ptr::null_mut());
+            CArray {
+                ptrs,
+                _owned: owned,
+            }
+        }
+    }
+
+    fn fatal(code: i32, msg: &str) -> ! {
+        eprintln!("compux: FATAL disclaim: {msg}");
+        std::process::exit(code);
+    }
+}
+
 fn main() {
+    // macOS: become our OWN TCC responsible process before any capture/input call,
+    // so Screen-Recording + Accessibility grants attribute to compux's stable code
+    // identity rather than the ad-hoc BEAM ancestor that Port-spawned us. One-shot
+    // self-re-exec (see the `disclaim` module); a no-op on the second entry.
+    #[cfg(target_os = "macos")]
+    disclaim::become_responsible();
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -82,6 +204,7 @@ fn handle(req: &Value) -> Value {
     let result = match action {
         "hello" => hello(),
         "probe" => probe(),
+        "request_permissions" => request_permissions(req),
         "screenshot" => screenshot(req),
         "mouse_move" => mouse_move(req),
         "left_click" => click(req, Button::Left, 1),
@@ -146,6 +269,46 @@ fn probe() -> Result<Value, String> {
     }))
 }
 
+// --- request_permissions (operational grant PROMPT, NOT a model action) -------
+
+/// Actively PROMPT for the macOS grants and report the resulting state. Operational,
+/// like `probe` — excluded from `hello`'s model-facing verbs. The consumer's setup /
+/// doctor flow calls this at enable time so the OS dialogs (Screen Recording +
+/// Accessibility) appear up front instead of on the first screenshot, and the app
+/// registers in System Settings. Unlike `probe`'s non-prompting preflight, these
+/// variants RAISE the system dialog. The prompts are async, so the returned booleans
+/// are the pre-response snapshot (typically `false` on first call) — the consumer
+/// re-runs `probe` after the user approves. No-op on Linux (no TCC).
+fn request_permissions(_req: &Value) -> Result<Value, String> {
+    Ok(json!({
+        "ok": true,
+        "platform": std::env::consts::OS,
+        "screen_capture": request_screen_capture_ok(),
+        "input_control": request_input_control_ok(),
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn request_screen_capture_ok() -> bool {
+    permissions::request_screen_capture()
+}
+
+#[cfg(target_os = "macos")]
+fn request_input_control_ok() -> bool {
+    permissions::request_input_control()
+}
+
+// No TCC off macOS: report the same reality `probe` does (there is nothing to prompt).
+#[cfg(not(target_os = "macos"))]
+fn request_screen_capture_ok() -> bool {
+    screen_capture_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn request_input_control_ok() -> bool {
+    input_control_ok()
+}
+
 #[cfg(target_os = "macos")]
 mod permissions {
     //! macOS TCC grant state, queried without prompting.
@@ -155,14 +318,26 @@ mod permissions {
     //! click returns ok yet nothing moves). `CGPreflightScreenCaptureAccess`
     //! (CoreGraphics, 10.15+): is screen capture permitted — without it capture
     //! returns wallpaper-only. Both are preflight checks; neither prompts.
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+    use core_foundation::string::CFString;
+
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn AXIsProcessTrusted() -> u8;
+        // Same trust check, but with `kAXTrustedCheckOptionPrompt` it RAISES the
+        // Accessibility prompt (directs the user to System Settings). Returns the
+        // current (pre-grant) trust state.
+        fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> u8;
     }
 
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGPreflightScreenCaptureAccess() -> bool;
+        // Prompts if the grant is undetermined and registers the app in System
+        // Settings ▸ Screen Recording. Returns whether access is already granted.
+        fn CGRequestScreenCaptureAccess() -> bool;
     }
 
     pub fn input_control() -> bool {
@@ -171,6 +346,24 @@ mod permissions {
 
     pub fn screen_capture() -> bool {
         unsafe { CGPreflightScreenCaptureAccess() }
+    }
+
+    // --- prompting variants (used by `request_permissions`) ---
+
+    pub fn request_screen_capture() -> bool {
+        unsafe { CGRequestScreenCaptureAccess() }
+    }
+
+    pub fn request_input_control() -> bool {
+        // The exported `kAXTrustedCheckOptionPrompt` constant does not link as a
+        // symbol (same as the AX attribute-name constants elsewhere here), so we
+        // build the CFString from its documented value.
+        let key = CFString::new("AXTrustedCheckOptionPrompt");
+        let options = CFDictionary::from_CFType_pairs(&[(
+            key.as_CFType(),
+            CFBoolean::true_value().as_CFType(),
+        )]);
+        unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) != 0 }
     }
 }
 

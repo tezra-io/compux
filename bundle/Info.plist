@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TCC identity for the compux macOS sidecar.
+
+  The screen-capture + input-injection process is what macOS grants Screen Recording
+  and Accessibility to, so it needs a STABLE, path-independent code identity: a real
+  bundle id (TCC client_type 0) that survives the version-keyed install path. Wrapping
+  the single Mach-O in this .app supplies that identity AND a name + icon for the
+  System Settings row.
+
+  This is the Fermix-branded FIRST-PARTY distribution of compux (the reusable library
+  is brand-neutral; the shipped bundle is branded because Fermix signs + distributes
+  it). CFBundleIdentifier is a PERMANENT TCC key — never change it across versions.
+  __VERSION__ is substituted by scripts/build_app.sh.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>io.tezra.fermix.computer-use</string>
+  <key>CFBundleName</key><string>Fermix</string>
+  <key>CFBundleDisplayName</key><string>Fermix</string>
+  <key>CFBundleExecutable</key><string>compux</string>
+  <key>CFBundleIconFile</key><string>Fermix</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleShortVersionString</key><string>__VERSION__</string>
+  <key>CFBundleVersion</key><string>__VERSION__</string>
+  <key>LSUIElement</key><true/>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>NSScreenCaptureUsageDescription</key><string>Fermix captures the screen to carry out the computer-use actions you ask it to perform.</string>
+</dict>
+</plist>
