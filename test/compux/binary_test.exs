@@ -17,8 +17,8 @@ defmodule Compux.BinaryTest do
 
   describe "artifact_name/2" do
     test "a zipped .app on macOS, a bare-binary tarball elsewhere" do
-      assert Binary.artifact_name("0.4.0", "macos-aarch64") == "compux-0.4.0-macos-aarch64.zip"
-      assert Binary.artifact_name("0.4.0", "linux-x86_64") == "compux-0.4.0-linux-x86_64.tar.gz"
+      assert Binary.artifact_name("0.5.0", "macos-aarch64") == "compux-0.5.0-macos-aarch64.zip"
+      assert Binary.artifact_name("0.5.0", "linux-x86_64") == "compux-0.5.0-linux-x86_64.tar.gz"
     end
   end
 

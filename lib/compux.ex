@@ -202,6 +202,42 @@ defmodule Compux do
     end
   end
 
+  @doc """
+  Milliseconds since the last input event the OS saw — a coexistence signal that
+  lets a policy layer yield the seat to a present human. Operational (not a model
+  action), macOS only.
+
+  It counts ANY input the OS saw, INCLUDING synthetic events this library posts, so
+  a caller that also drives input must disambiguate "the human vs my own last action"
+  itself — compux only reports the raw number.
+  """
+  @spec idle_ms(t()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def idle_ms(%__MODULE__{driver: driver, state: state}) do
+    case driver.execute(state, %{"action" => "idle_ms"}) do
+      {:ok, %{"idle_ms" => ms}} when is_integer(ms) and ms >= 0 -> {:ok, ms}
+      {:ok, other} -> {:error, {:malformed_idle_response, other}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Block in the sidecar until the human has been idle for `:idle_ms` (default 1000),
+  bounded by `:timeout_ms` (default 3000). Returns `{:ok, %{"idle" => boolean,
+  "idle_ms" => n}}` — `idle: true` if the quiet window was reached, `false` if it
+  timed out with the human still active. Operational, macOS only; the coexistence
+  micro-defer primitive.
+  """
+  @spec wait_for_idle(t(), keyword()) :: response()
+  def wait_for_idle(%__MODULE__{driver: driver, state: state}, opts \\ []) do
+    request =
+      %{"action" => "wait_for_idle"}
+      |> maybe_put("idle_ms", Keyword.get(opts, :idle_ms))
+      |> maybe_put("timeout_ms", Keyword.get(opts, :timeout_ms))
+      |> maybe_put("poll_ms", Keyword.get(opts, :poll_ms))
+
+    driver.execute(state, request)
+  end
+
   # --- internals ------------------------------------------------------------
 
   defp run(%__MODULE__{driver: driver, state: state}, params, opts) do

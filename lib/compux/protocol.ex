@@ -16,7 +16,11 @@ defmodule Compux.Protocol do
   compiled-in encoder and the installed sidecar can never silently drift.
   """
 
-  @protocol_version 2
+  # v3 added the operational idle-detection actions `idle_ms` + `wait_for_idle`
+  # (coexistence — let a policy layer yield the seat to a present human). They are
+  # NOT model verbs (excluded from `@actions`, like `probe`), but the wire changed,
+  # so the version bumps and a mismatched sidecar is refused at the handshake.
+  @protocol_version 3
 
   @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements)
   @read_only ~w(screenshot mouse_move wait inspect wait_for_change elements)

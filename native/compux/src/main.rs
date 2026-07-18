@@ -41,7 +41,10 @@ const MAX_EDGE: u32 = 1366;
 /// Wire-compatibility version. MUST match `Compux.Protocol.protocol_version/0`.
 /// Bumped ONLY on a wire-incompatible change; reported in the `hello` handshake so
 /// a consumer can refuse a mismatched sidecar (the two-pin drift guard).
-const PROTOCOL_VERSION: u32 = 2;
+///
+/// v3: added the operational idle-detection actions `idle_ms` + `wait_for_idle`
+/// (coexistence — let a policy layer yield the seat to a present human).
+const PROTOCOL_VERSION: u32 = 3;
 
 // --- macOS TCC responsibility disclaim ---------------------------------------
 
@@ -204,6 +207,8 @@ fn handle(req: &Value) -> Value {
     let result = match action {
         "hello" => hello(),
         "probe" => probe(),
+        "idle_ms" => idle_ms(),
+        "wait_for_idle" => wait_for_idle(req),
         "request_permissions" => request_permissions(req),
         "screenshot" => screenshot(req),
         "mouse_move" => mouse_move(req),
@@ -1036,6 +1041,90 @@ fn region_hash(display: &Display, region: &Region) -> Result<u64, String> {
     Ok(hasher.finish())
 }
 
+// --- idle detection (coexistence: yield the seat to a present human) --------
+
+/// Upper bound on a `wait_for_idle` block, so a caller can never hang the sidecar
+/// past its per-action deadline (30s in Fermix). Matches `wait_for_change`'s ceiling.
+const MAX_WAIT_FOR_IDLE_MS: u64 = 25_000;
+
+/// Milliseconds since the last input event the OS saw, via CoreGraphics' session
+/// idle clock. NOTE: this counts ANY input, INCLUDING this sidecar's own synthetic
+/// events (`enigo` posts through the HID tap) — so a caller that also drives input
+/// must disambiguate "the human vs my own last action" itself (that is policy, and
+/// lives in the consumer; compux only reports the raw number). macOS only; mirrors
+/// the `CGDisplayIsAsleep` FFI shape.
+#[cfg(target_os = "macos")]
+fn human_idle_ms() -> Result<u64, String> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        // CFTimeInterval CGEventSourceSecondsSinceLastEventType(
+        //     CGEventSourceStateID stateID, CGEventType eventType)
+        fn CGEventSourceSecondsSinceLastEventType(state_id: u32, event_type: u32) -> f64;
+    }
+
+    // kCGEventSourceStateHIDSystemState = 1; kCGAnyInputEventType = 0xFFFF_FFFF.
+    const HID_SYSTEM_STATE: u32 = 1;
+    const ANY_INPUT_EVENT: u32 = 0xFFFF_FFFF;
+
+    let seconds =
+        unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, ANY_INPUT_EVENT) };
+
+    if seconds.is_finite() && seconds >= 0.0 {
+        Ok((seconds * 1000.0).round() as u64)
+    } else {
+        Err("idle query returned an invalid interval".to_string())
+    }
+}
+
+/// Report ms since the last input event. Operational (a policy-support probe), NOT a
+/// model action — excluded from `hello`'s advertised verbs like `probe`.
+#[cfg(target_os = "macos")]
+fn idle_ms() -> Result<Value, String> {
+    Ok(json!({ "ok": true, "idle_ms": human_idle_ms()? }))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn idle_ms() -> Result<Value, String> {
+    Err("idle detection is only supported on macOS".to_string())
+}
+
+/// Block until the human has been idle for `idle_ms` (default 1000), bounded by
+/// `timeout_ms` (default 3000, capped at `MAX_WAIT_FOR_IDLE_MS`). Returns
+/// `idle: true` if the quiet window was reached, `idle: false` if it timed out with
+/// the human still active. Reuses the `wait_for_change` bounded-poll idiom so a
+/// consumer can schedule input into a human-idle gap.
+#[cfg(target_os = "macos")]
+fn wait_for_idle(req: &Value) -> Result<Value, String> {
+    let idle_target = req.get("idle_ms").and_then(Value::as_u64).unwrap_or(1_000);
+    let timeout_ms = req
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(3_000)
+        .min(MAX_WAIT_FOR_IDLE_MS);
+    let poll_ms = req
+        .get("poll_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(100)
+        .max(1);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+    loop {
+        let idle = human_idle_ms()?;
+        if idle >= idle_target {
+            return Ok(json!({ "ok": true, "idle": true, "idle_ms": idle }));
+        }
+        if Instant::now() >= deadline {
+            return Ok(json!({ "ok": true, "idle": false, "idle_ms": idle }));
+        }
+        thread::sleep(Duration::from_millis(poll_ms));
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn wait_for_idle(_req: &Value) -> Result<Value, String> {
+    Err("idle detection is only supported on macOS".to_string())
+}
+
 /// Paste `text` via the clipboard + the platform paste chord — fast and
 /// unicode-safe for long strings that char-by-char typing would stall on.
 fn paste(req: &Value) -> Result<Value, String> {
@@ -1685,5 +1774,59 @@ mod tests {
             .unwrap()
             .iter()
             .any(|a| a == "screenshot"));
+    }
+
+    // idle_ms / wait_for_idle are OPERATIONAL (policy-support), never advertised as
+    // model verbs — same posture as `probe`. Lock that so they aren't offered to a model.
+    #[test]
+    fn idle_verbs_are_not_advertised_model_actions() {
+        let actions = hello().unwrap()["actions"].as_array().unwrap().clone();
+        assert!(!actions.iter().any(|a| a == "idle_ms"));
+        assert!(!actions.iter().any(|a| a == "wait_for_idle"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn idle_ms_reports_a_nonnegative_value() {
+        let v = idle_ms().unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert!(v["idle_ms"].as_u64().is_some());
+    }
+
+    // idle_ms:0 means "idle for >= 0ms", which is always true, so the poll returns
+    // immediately with idle:true — a deterministic check of the loop's success path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wait_for_idle_zero_target_returns_immediately_idle() {
+        let v = wait_for_idle(&json!({"idle_ms": 0, "timeout_ms": 500})).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["idle"], json!(true));
+    }
+
+    // An unreachable idle target (hours) with a tiny timeout must time out cleanly
+    // as idle:false rather than block — the step-aside path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wait_for_idle_times_out_when_target_unreachable() {
+        let v =
+            wait_for_idle(&json!({"idle_ms": 3_600_000, "timeout_ms": 50, "poll_ms": 10})).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["idle"], json!(false));
+    }
+
+    // The dispatch table wires the operational verbs through `handle`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn handle_dispatches_idle_ms() {
+        let v = handle(&json!({"action": "idle_ms"}));
+        assert_eq!(v["ok"], json!(true));
+        assert!(v["idle_ms"].as_u64().is_some());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn idle_detection_is_macos_only_off_macos() {
+        assert!(idle_ms().is_err());
+        assert!(wait_for_idle(&json!({})).is_err());
     }
 }
