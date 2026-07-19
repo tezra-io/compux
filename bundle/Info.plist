@@ -13,12 +13,18 @@
   is brand-neutral; the shipped bundle is branded because Fermix signs + distributes
   it). CFBundleIdentifier is a PERMANENT TCC key — never change it across versions.
   __VERSION__ is substituted by scripts/build_app.sh.
+
+  The display name is "Fermix Computer Use", deliberately DISTINCT from the FermixPet
+  companion (bundle id io.tezra.FermixPet), which also displays as "Fermix". Both being
+  named plain "Fermix" made them indistinguishable in System Settings privacy panes
+  (same name, same icon) — do NOT rename this back to "Fermix". The icon is shared on
+  purpose so both still read as part of Fermix; only the name disambiguates.
 -->
 <plist version="1.0">
 <dict>
   <key>CFBundleIdentifier</key><string>io.tezra.fermix.computer-use</string>
-  <key>CFBundleName</key><string>Fermix</string>
-  <key>CFBundleDisplayName</key><string>Fermix</string>
+  <key>CFBundleName</key><string>Fermix Computer Use</string>
+  <key>CFBundleDisplayName</key><string>Fermix Computer Use</string>
   <key>CFBundleExecutable</key><string>compux</string>
   <key>CFBundleIconFile</key><string>Fermix</string>
   <key>CFBundlePackageType</key><string>APPL</string>
