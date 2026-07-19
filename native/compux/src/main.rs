@@ -1045,6 +1045,9 @@ fn region_hash(display: &Display, region: &Region) -> Result<u64, String> {
 
 /// Upper bound on a `wait_for_idle` block, so a caller can never hang the sidecar
 /// past its per-action deadline (30s in Fermix). Matches `wait_for_change`'s ceiling.
+/// macOS-only: `wait_for_idle` (the sole user) is macOS-gated, so on other targets
+/// this would be dead code under clippy's `-D warnings`.
+#[cfg(target_os = "macos")]
 const MAX_WAIT_FOR_IDLE_MS: u64 = 25_000;
 
 /// Milliseconds since the last input event the OS saw, via CoreGraphics' session
