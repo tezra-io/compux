@@ -206,7 +206,7 @@ defmodule Compux.BinaryTest do
     <plist version="1.0"><dict>
     <key>CFBundleIdentifier</key><string>io.tezra.fermix.computer-use</string>
     <key>CFBundleExecutable</key><string>compux</string>
-    <key>CFBundleName</key><string>Fermix</string>
+    <key>CFBundleName</key><string>Fermix Computer Use</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     </dict></plist>
     """
