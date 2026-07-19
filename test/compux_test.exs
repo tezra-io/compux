@@ -139,6 +139,55 @@ defmodule CompuxTest do
     end
   end
 
+  describe "idle_ms/1 (operational)" do
+    test "returns the reported millisecond count" do
+      cu = start!(responses: %{"idle_ms" => {:ok, %{"ok" => true, "idle_ms" => 1234}}})
+      assert {:ok, 1234} = Compux.idle_ms(cu)
+      assert_received {:executed, %{"action" => "idle_ms"}}
+    end
+
+    test "fails loud on a malformed response" do
+      cu = start!(responses: %{"idle_ms" => {:ok, %{"ok" => true}}})
+      assert {:error, {:malformed_idle_response, _}} = Compux.idle_ms(cu)
+    end
+
+    test "propagates a driver error" do
+      cu =
+        start!(responses: %{"idle_ms" => {:error, "idle detection is only supported on macOS"}})
+
+      assert {:error, "idle detection is only supported on macOS"} = Compux.idle_ms(cu)
+    end
+  end
+
+  describe "wait_for_idle/2 (operational)" do
+    test "builds the request with the given bounds and returns the result" do
+      cu =
+        start!(
+          responses: %{
+            "wait_for_idle" => {:ok, %{"ok" => true, "idle" => true, "idle_ms" => 1500}}
+          }
+        )
+
+      assert {:ok, %{"idle" => true, "idle_ms" => 1500}} =
+               Compux.wait_for_idle(cu, idle_ms: 1000, timeout_ms: 3000, poll_ms: 100)
+
+      assert_received {:executed,
+                       %{
+                         "action" => "wait_for_idle",
+                         "idle_ms" => 1000,
+                         "timeout_ms" => 3000,
+                         "poll_ms" => 100
+                       }}
+    end
+
+    test "omits absent bounds (sidecar fills defaults)" do
+      cu = start!(responses: %{"wait_for_idle" => {:ok, %{"ok" => true, "idle" => false}}})
+      assert {:ok, %{"idle" => false}} = Compux.wait_for_idle(cu)
+      assert_received {:executed, %{"action" => "wait_for_idle"} = request}
+      assert request == %{"action" => "wait_for_idle"}
+    end
+  end
+
   describe "stop/1" do
     test "delegates to the driver" do
       cu = start!()

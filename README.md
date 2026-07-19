@@ -64,11 +64,16 @@ embedder that manages its own signed install passes an explicit `:binary_path` t
 
 macOS-first. **Apple-Silicon macOS** is the primary, fully-featured target
 (capture, input, accessibility `inspect` + `elements`, non-prompting permission
-probe). **Linux/X11** supports capture + input + `wait_for_change` + `paste`
-(the accessibility actions — `inspect` and `elements` — are macOS-only and
+probe, idle detection). **Linux/X11** supports capture + input + `wait_for_change`
++ `paste` (the accessibility actions — `inspect` and `elements` — are macOS-only and
 return a typed error on Linux; the paste chord is Ctrl+V). The permission
 `probe` works on both (on Linux it reports X11-vs-Wayland capability).
 **Wayland**, **Linux accessibility**, and **Windows** are not supported yet.
+
+`idle_ms` / `wait_for_idle` (operational, not model actions) report how long the
+human has been idle — a coexistence signal so a policy layer can yield the seat to
+a present human. macOS only (typed error elsewhere). They count synthetic input too,
+so a caller that also drives input disambiguates its own actions.
 
 Building the Linux target needs the X11/input system headers the crates link
 via pkg-config: `libxcb1-dev libxcb-render0-dev libxcb-shape0-dev
