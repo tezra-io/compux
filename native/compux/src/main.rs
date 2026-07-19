@@ -1806,13 +1806,17 @@ mod tests {
         assert_eq!(v["idle"], json!(true));
     }
 
-    // An unreachable idle target (hours) with a tiny timeout must time out cleanly
-    // as idle:false rather than block — the step-aside path.
+    // A target longer than any machine uptime is unreachable, so the poll must time
+    // out cleanly as idle:false rather than block — the step-aside path. The target
+    // must exceed real idle even on a CI runner that has been idle for hours (an
+    // hours-scale target is NOT safe — it can be satisfied immediately there).
     #[cfg(target_os = "macos")]
     #[test]
     fn wait_for_idle_times_out_when_target_unreachable() {
-        let v =
-            wait_for_idle(&json!({"idle_ms": 3_600_000, "timeout_ms": 50, "poll_ms": 10})).unwrap();
+        let v = wait_for_idle(
+            &json!({"idle_ms": 9_000_000_000_000u64, "timeout_ms": 50, "poll_ms": 10}),
+        )
+        .unwrap();
         assert_eq!(v["ok"], json!(true));
         assert_eq!(v["idle"], json!(false));
     }
