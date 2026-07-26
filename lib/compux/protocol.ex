@@ -20,10 +20,17 @@ defmodule Compux.Protocol do
   # (coexistence — let a policy layer yield the seat to a present human). They are
   # NOT model verbs (excluded from `@actions`, like `probe`), but the wire changed,
   # so the version bumps and a mismatched sidecar is refused at the handshake.
-  @protocol_version 3
+  #
+  # v4 added `windows` — a read-only listing of a display's on-screen windows whose
+  # bounds come back as ready-to-use `region`s. It exists for PRECISION: a full
+  # screenshot is downscaled to fit `MAX_EDGE`, so on a large or ultrawide display
+  # the app the caller cares about arrives tiny, while a region crop is rescaled to
+  # that budget on its own. Returning regions rather than raw geometry keeps every
+  # coordinate in the one transform the sidecar already proves.
+  @protocol_version 4
 
-  @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements)
-  @read_only ~w(screenshot mouse_move wait inspect wait_for_change elements)
+  @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows)
+  @read_only ~w(screenshot mouse_move wait inspect wait_for_change elements windows)
   @modifiers ~w(cmd ctrl alt shift)
   @scroll_directions ~w(up down left right)
   @max_type_bytes 10_000
@@ -96,9 +103,10 @@ defmodule Compux.Protocol do
 
   defp validate_action("screenshot", params) do
     with {:ok, display} <- opt_display(params),
-         {:ok, region} <- opt_region(params) do
+         {:ok, region} <- opt_region(params),
+         {:ok, quality} <- opt_jpeg_quality(params) do
       request = put_display(%{"action" => "screenshot"}, display)
-      {:ok, put_region(request, region)}
+      {:ok, request |> put_region(region) |> maybe_put("jpeg_quality", quality)}
     end
   end
 
@@ -149,6 +157,16 @@ defmodule Compux.Protocol do
     with {:ok, display} <- opt_display(params),
          {:ok, region} <- opt_region(params) do
       {:ok, put_region(put_display(%{"action" => "elements"}, display), region)}
+    end
+  end
+
+  # List the on-screen windows of a display, each with its bounds already expressed
+  # as a `region` in that display's screenshot space — so a caller can crop to the
+  # window it cares about instead of reading it out of a downscaled full screen.
+  # Read-only, and takes no region itself (it is what PRODUCES regions).
+  defp validate_action("windows", params) do
+    with {:ok, display} <- opt_display(params) do
+      {:ok, put_display(%{"action" => "windows"}, display)}
     end
   end
 
@@ -299,6 +317,19 @@ defmodule Compux.Protocol do
   # A zoom rectangle in the full-screenshot pixel space — the coordinates the model
   # reads off a normal screenshot. Passing the same `region` on a `screenshot` and the
   # follow-up click maps the click back through the crop.
+  # Opt into JPEG for this capture. Absent = PNG, the lossless default for reading
+  # fine UI text; a BULK periodic caller (a continuous screen feed) sets it, because
+  # a full-desktop PNG is an order of magnitude larger and saturates the uplink at
+  # any real cadence. It changes only the encoding — never the sent dimensions, on
+  # which every coordinate depends.
+  defp opt_jpeg_quality(params) do
+    case Map.get(params, "jpeg_quality") do
+      nil -> {:ok, nil}
+      q when is_integer(q) and q >= 1 and q <= 100 -> {:ok, q}
+      _other -> {:error, "jpeg_quality must be an integer 1-100"}
+    end
+  end
+
   defp opt_region(params) do
     case Map.get(params, "region") do
       nil -> {:ok, nil}

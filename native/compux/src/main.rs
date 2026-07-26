@@ -44,7 +44,7 @@ const MAX_EDGE: u32 = 1366;
 ///
 /// v3: added the operational idle-detection actions `idle_ms` + `wait_for_idle`
 /// (coexistence — let a policy layer yield the seat to a present human).
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 
 // --- macOS TCC responsibility disclaim ---------------------------------------
 
@@ -224,6 +224,7 @@ fn handle(req: &Value) -> Value {
         "wait_for_change" => wait_for_change(req),
         "paste" => paste(req),
         "elements" => elements(req),
+        "windows" => windows(req),
         other => Err(format!("unknown action: {other}")),
     };
 
@@ -251,7 +252,7 @@ fn hello() -> Result<Value, String> {
         "actions": [
             "screenshot", "left_click", "right_click", "double_click", "mouse_move",
             "left_click_drag", "scroll", "type", "key", "wait", "inspect",
-            "wait_for_change", "paste", "elements"
+            "wait_for_change", "paste", "elements", "windows"
         ],
     }))
 }
@@ -665,7 +666,19 @@ fn to_sent(geom: &Geometry, region: &Region, lx: f64, ly: f64) -> Option<(i64, i
 fn screenshot(req: &Value) -> Result<Value, String> {
     let display = target_display(req)?;
     let region = parse_region(req)?;
-    capture_payload(&display, region)
+    capture_payload_encoded(&display, region, parse_jpeg_quality(req)?)
+}
+
+/// Opt into JPEG for this capture (1-100). Absent = PNG, the lossless default a
+/// caller reading fine UI text wants.
+fn parse_jpeg_quality(req: &Value) -> Result<Option<u8>, String> {
+    match req.get("jpeg_quality") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => match value.as_u64() {
+            Some(q) if (1..=100).contains(&q) => Ok(Some(q as u8)),
+            _ => Err("jpeg_quality must be an integer 1-100".to_string()),
+        },
+    }
 }
 
 /// Fail FAST when the target display is asleep instead of engaging a capture.
@@ -762,7 +775,52 @@ fn capture_by_id(monitor_id: u32) -> Result<image::RgbaImage, String> {
     monitor.capture_image().map_err(|e| format!("capture: {e}"))
 }
 
+/// Encode the sent image. PNG by default — lossless, which is what a caller reading
+/// fine UI text wants. `jpeg_quality` opts into JPEG for a BULK, periodic caller
+/// (a continuous screen feed): a full-desktop PNG runs to hundreds of KB, and at a
+/// frame every couple of seconds that saturates the consumer's uplink; the same
+/// frame as JPEG is roughly an order of magnitude smaller.
+///
+/// Deliberately NOT paired with a dimension cap. The sent width/height feed
+/// `sent_scale`, which is the inverse used to map a click back to the desktop, so
+/// shrinking them here would silently move every coordinate. Compression is the one
+/// axis that shrinks the payload while leaving the coordinate space identical.
+fn encode_image(
+    image: &image::RgbaImage,
+    w: u32,
+    h: u32,
+    jpeg_quality: Option<u8>,
+) -> Result<(Vec<u8>, &'static str), String> {
+    let mut out: Vec<u8> = Vec::new();
+
+    match jpeg_quality {
+        Some(quality) => {
+            // The JPEG encoder takes no alpha channel; the capture is opaque, so
+            // dropping it costs nothing.
+            let rgb = image::DynamicImage::ImageRgba8(image.clone()).into_rgb8();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+                .write_image(rgb.as_raw(), w, h, image::ExtendedColorType::Rgb8)
+                .map_err(|e| format!("encode jpeg: {e}"))?;
+            Ok((out, "image/jpeg"))
+        }
+        None => {
+            image::codecs::png::PngEncoder::new(&mut out)
+                .write_image(image.as_raw(), w, h, image::ExtendedColorType::Rgba8)
+                .map_err(|e| format!("encode png: {e}"))?;
+            Ok((out, "image/png"))
+        }
+    }
+}
+
 fn capture_payload(display: &Display, requested: Option<Region>) -> Result<Value, String> {
+    capture_payload_encoded(display, requested, None)
+}
+
+fn capture_payload_encoded(
+    display: &Display,
+    requested: Option<Region>,
+    jpeg_quality: Option<u8>,
+) -> Result<Value, String> {
     ensure_display_awake(display)?;
     let geom = &display.geom;
     let region = region_or_full(geom, requested);
@@ -789,21 +847,12 @@ fn capture_payload(display: &Display, requested: Option<Region>) -> Result<Value
         image::imageops::FilterType::Triangle,
     );
 
-    let mut png: Vec<u8> = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(
-            resized.as_raw(),
-            sent_w,
-            sent_h,
-            image::ExtendedColorType::Rgba8,
-        )
-        .map_err(|e| format!("encode png: {e}"))?;
-
-    let data = base64::engine::general_purpose::STANDARD.encode(&png);
+    let (encoded, mime) = encode_image(&resized, sent_w, sent_h, jpeg_quality)?;
+    let data = base64::engine::general_purpose::STANDARD.encode(&encoded);
 
     let mut payload = json!({
         "ok": true,
-        "mime": "image/png",
+        "mime": mime,
         "width": sent_w,
         "height": sent_h,
         "scale": geom.scale_factor,
@@ -1172,6 +1221,112 @@ fn paste_modifier() -> Key {
 #[cfg(not(target_os = "macos"))]
 fn paste_modifier() -> Key {
     Key::Control
+}
+
+// --- windows ----------------------------------------------------------------
+
+/// Hard cap on the reported window list. A desktop can carry a hundred windows
+/// (helpers, panels, offscreen shells); an unbounded list would bloat the reply and
+/// bury the two or three that matter. Front-most first, so the cap drops the least
+/// relevant.
+const MAX_WINDOWS: usize = 40;
+
+/// Enumerate the on-screen windows of a display, each with its bounds ALREADY
+/// EXPRESSED AS A `region` in that display's screenshot space.
+///
+/// This is the precision lever on a large or ultrawide display. A full-screen
+/// capture is downscaled to fit `MAX_EDGE`, so the app the caller cares about
+/// arrives at a fraction of its real size; a `region` crop is rescaled to that same
+/// budget on its own, so cropping to one window recovers most of the lost
+/// resolution (on a 3840x1080 display, ~2.4x for a typical browser window).
+///
+/// Returning a ready-made `region` — rather than raw window geometry — is the whole
+/// point: the caller pastes it straight into `screenshot`/click and rides the
+/// EXISTING, proven region transform. No second coordinate system is introduced, so
+/// this cannot reintroduce the region-offset class of bug.
+///
+/// READ-ONLY: pure metadata — no capture, no input.
+fn windows(req: &Value) -> Result<Value, String> {
+    let display = target_display(req)?;
+    let full = Region::full(&display.geom);
+    let mut listed = window_entries(&display.geom, &full)?;
+    listed.truncate(MAX_WINDOWS);
+    Ok(json!({ "ok": true, "windows": listed }))
+}
+
+fn window_entries(geom: &Geometry, full: &Region) -> Result<Vec<Value>, String> {
+    let mut windows = xcap::Window::all().map_err(|e| format!("enumerate windows: {e}"))?;
+
+    // Front-most first: xcap's `z` grows toward the front, so the caller reads the
+    // window it most likely means at the top of the list.
+    windows.sort_by_key(|w| std::cmp::Reverse(w.z().unwrap_or(0)));
+
+    let mut entries = Vec::new();
+    for window in windows {
+        if window.is_minimized().unwrap_or(false) {
+            continue;
+        }
+        if let Some(region) = window_region(geom, full, &window) {
+            entries.push(json!({
+                "id": window.id().unwrap_or_default(),
+                "app": window.app_name().unwrap_or_default(),
+                "title": window.title().unwrap_or_default(),
+                "focused": window.is_focused().unwrap_or(false),
+                "region": {
+                    "x": region.x.round() as i64,
+                    "y": region.y.round() as i64,
+                    "w": region.w.round() as i64,
+                    "h": region.h.round() as i64
+                }
+            }));
+        }
+    }
+    Ok(entries)
+}
+
+/// A window's LOGICAL bounds (`kCGWindowBounds` on macOS — the same unit `Geometry`
+/// uses) converted into this display's sent-image space. Thin effectful shell; the
+/// arithmetic is `logical_bounds_to_region` so it can be tested without a desktop.
+fn window_region(geom: &Geometry, full: &Region, window: &xcap::Window) -> Option<Region> {
+    let (x, y) = (window.x().ok()? as f64, window.y().ok()? as f64);
+    let (w, h) = (window.width().ok()? as f64, window.height().ok()? as f64);
+    logical_bounds_to_region(geom, full, x, y, w, h)
+}
+
+/// Convert logical bounds to a sent-space `region`, clipped to the display's own
+/// sent image. `None` for a degenerate window, or one that does not overlap this
+/// display, so the listing never offers a region that cannot be captured.
+fn logical_bounds_to_region(
+    geom: &Geometry,
+    full: &Region,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) -> Option<Region> {
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+
+    let k = sent_scale(geom) as f64;
+    let left = (x - geom.origin_x as f64) * k;
+    let top = (y - geom.origin_y as f64) * k;
+
+    let x0 = left.max(full.x);
+    let y0 = top.max(full.y);
+    let x1 = (left + w * k).min(full.x + full.w);
+    let y1 = (top + h * k).min(full.y + full.h);
+
+    if x1 - x0 < 1.0 || y1 - y0 < 1.0 {
+        return None;
+    }
+
+    Some(Region {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    })
 }
 
 /// Enumerate interactive accessibility elements (role + label + a click point in
@@ -1723,6 +1878,120 @@ mod tests {
             origin_y: 0.0,
             scale_factor: 2.0,
         }
+    }
+
+    /// The display the window listing exists for: 3840x1080 at 1x, where a full
+    /// capture is squeezed to 1366x384 and a window crop wins most of it back.
+    fn ultrawide_geom() -> Geometry {
+        Geometry {
+            phys_w: 3840,
+            phys_h: 1080,
+            logical_w: 3840.0,
+            logical_h: 1080.0,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            scale_factor: 1.0,
+        }
+    }
+
+    #[test]
+    fn window_bounds_become_a_region_in_sent_space() {
+        let g = ultrawide_geom();
+        let full = Region::full(&g);
+        // A 1600x1000 window at logical (400,60): k = 1366/3840 = 0.3557.
+        let r =
+            logical_bounds_to_region(&g, &full, 400.0, 60.0, 1600.0, 1000.0).expect("on screen");
+
+        let k = sent_scale(&g) as f64;
+        assert!((r.x - 400.0 * k).abs() < 1.0, "x: {}", r.x);
+        assert!((r.y - 60.0 * k).abs() < 1.0, "y: {}", r.y);
+        assert!((r.w - 1600.0 * k).abs() < 1.0, "w: {}", r.w);
+        assert!((r.h - 1000.0 * k).abs() < 1.0, "h: {}", r.h);
+    }
+
+    /// The whole point of the action: cropping to the window recovers resolution a
+    /// full capture spends on empty desktop.
+    #[test]
+    fn a_window_crop_is_sharper_than_the_full_screen() {
+        let g = ultrawide_geom();
+        let full = Region::full(&g);
+        let r =
+            logical_bounds_to_region(&g, &full, 400.0, 60.0, 1600.0, 1000.0).expect("on screen");
+
+        let full_k = sent_scale(&g) as f64;
+        let crop = crop_rect(&g, &r);
+        let (sent_w, _) = crop.sent_dims();
+        let window_k = sent_w as f64 / 1600.0;
+
+        assert!(
+            window_k > full_k * 2.0,
+            "a window crop must be at least 2x sharper: full={full_k} window={window_k}"
+        );
+    }
+
+    #[test]
+    fn a_window_is_clipped_to_the_display_it_overlaps() {
+        let g = ultrawide_geom();
+        let full = Region::full(&g);
+        // Straddles the left edge: half of it lies off this display.
+        let r = logical_bounds_to_region(&g, &full, -500.0, 0.0, 1000.0, 400.0).expect("overlaps");
+
+        assert!(r.x >= full.x, "clipped left edge: {}", r.x);
+        assert!(r.x + r.w <= full.x + full.w + 1.0, "within the sent image");
+        assert!(
+            (r.w - 500.0 * sent_scale(&g) as f64).abs() < 1.0,
+            "w: {}",
+            r.w
+        );
+    }
+
+    #[test]
+    fn an_offscreen_or_degenerate_window_is_not_listed() {
+        let g = ultrawide_geom();
+        let full = Region::full(&g);
+
+        assert!(
+            logical_bounds_to_region(&g, &full, 0.0, 0.0, 0.0, 500.0).is_none(),
+            "zero-width window"
+        );
+        assert!(
+            logical_bounds_to_region(&g, &full, 9000.0, 0.0, 800.0, 600.0).is_none(),
+            "entirely to the right of this display"
+        );
+    }
+
+    /// Regression guard for the region-offset class of bug: a window's region must
+    /// survive the round trip through the very transform clicks use.
+    #[test]
+    fn a_window_region_round_trips_through_the_click_transform() {
+        let g = ultrawide_geom();
+        let full = Region::full(&g);
+        let r =
+            logical_bounds_to_region(&g, &full, 400.0, 60.0, 1600.0, 1000.0).expect("on screen");
+
+        // The window's own top-left, read as the origin of the magnified crop.
+        let (lx, ly) = to_logical(&g, &r, 0.0, 0.0);
+        assert!((lx - 400).abs() <= 2, "logical x: {lx}");
+        assert!((ly - 60).abs() <= 2, "logical y: {ly}");
+    }
+
+    // The DISPATCH is what this pins; whether a display is attached is the host's
+    // business (CI has none, and a locked Mac reports `no_active_display`). So a
+    // window list OR a typed display error both pass — "unknown action" never does.
+    #[test]
+    fn handle_dispatches_windows() {
+        let response = handle(&json!({ "action": "windows" }));
+
+        let unknown = response["error"]
+            .as_str()
+            .map(|e| e.contains("unknown action"))
+            .unwrap_or(false);
+
+        assert!(!unknown, "windows must reach its handler: {response}");
+        assert!(
+            response["windows"].is_array() || response["ok"] == json!(false),
+            "expected a window list or a typed error: {response}"
+        );
     }
 
     #[test]
