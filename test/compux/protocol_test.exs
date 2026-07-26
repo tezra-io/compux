@@ -207,5 +207,41 @@ defmodule Compux.ProtocolTest do
       assert {:ok, %{"action" => "paste", "text" => "hi"}} =
                Protocol.validate(%{"action" => "paste", "text" => "hi"})
     end
+
+    test "windows: bare defaults to the sidecar's display, or names one" do
+      assert {:ok, request} = Protocol.validate(%{"action" => "windows"})
+      assert request == %{"action" => "windows"}
+
+      assert {:ok, %{"action" => "windows", "display" => 2}} =
+               Protocol.validate(%{"action" => "windows", "display" => 2})
+    end
+
+    test "windows takes no region — it is what PRODUCES regions" do
+      assert {:ok, request} =
+               Protocol.validate(%{
+                 "action" => "windows",
+                 "region" => %{"x" => 0, "y" => 0, "w" => 50, "h" => 50}
+               })
+
+      refute Map.has_key?(request, "region")
+    end
+
+    test "windows is read-only: it captures nothing and moves nothing" do
+      assert Protocol.read_only?("windows")
+    end
+
+    test "screenshot: jpeg_quality is optional, bounded, and defaults to PNG" do
+      assert {:ok, request} = Protocol.validate(%{"action" => "screenshot"})
+      refute Map.has_key?(request, "jpeg_quality"), "PNG stays the default"
+
+      assert {:ok, %{"jpeg_quality" => 60}} =
+               Protocol.validate(%{"action" => "screenshot", "jpeg_quality" => 60})
+
+      for bad <- [0, 101, "high", 60.5] do
+        assert {:error, _} =
+                 Protocol.validate(%{"action" => "screenshot", "jpeg_quality" => bad}),
+               "jpeg_quality #{inspect(bad)} must be refused"
+      end
+    end
   end
 end

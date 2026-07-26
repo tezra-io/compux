@@ -81,7 +81,15 @@ defmodule Compux do
   def execute(%__MODULE__{} = cu, params, opts \\ []) when is_map(params),
     do: run(cu, params, opts)
 
-  @doc "Capture the target display (optionally a `:region` and `:display`)."
+  @doc """
+  Capture the target display (optionally a `:region` and `:display`).
+
+  Returns lossless PNG by default. `:jpeg_quality` (1-100) switches to JPEG, which a
+  BULK periodic caller wants: a full-desktop PNG runs to hundreds of KB and
+  saturates an uplink at any real frame cadence, while the same frame at quality 60
+  is roughly an order of magnitude smaller. It changes only the encoding — the sent
+  dimensions, and therefore every coordinate, are identical either way.
+  """
   @spec screenshot(t(), keyword()) :: response()
   def screenshot(%__MODULE__{} = cu, opts \\ []),
     do: run(cu, put_opts(%{"action" => "screenshot"}, opts), opts)
@@ -183,6 +191,26 @@ defmodule Compux do
   @spec elements(t(), keyword()) :: response()
   def elements(%__MODULE__{} = cu, opts \\ []) do
     run(cu, put_region(put_display(%{"action" => "elements"}, opts), opts), opts)
+  end
+
+  @doc """
+  List a display's on-screen windows — app, title, focus, and each window's bounds
+  ALREADY EXPRESSED AS A `region` in that display's screenshot space.
+
+  Use it for precision. A full screenshot is downscaled so its long edge fits the
+  sidecar's size budget, so on a large or ultrawide display the window you care
+  about arrives at a fraction of its real size; a `region` crop is rescaled to that
+  same budget on its own, so cropping to one window recovers most of it. Take a
+  window's `region` from here and pass it both to `screenshot/2` and to the click
+  that follows — the coordinates you read are then in the magnified crop.
+
+  Read-only. Needs the same screen-capture permission as `screenshot/2`: window
+  titles are withheld from an unpermitted process, so an empty list on a desktop
+  that plainly has windows means the grant is missing, not that nothing is open.
+  """
+  @spec windows(t(), keyword()) :: response()
+  def windows(%__MODULE__{} = cu, opts \\ []) do
+    run(cu, put_display(%{"action" => "windows"}, opts), opts)
   end
 
   @doc "Paste `text` via the clipboard — fast and unicode-safe for long strings."
@@ -290,7 +318,11 @@ defmodule Compux do
     end
   end
 
-  defp put_opts(params, opts), do: params |> put_display(opts) |> put_region(opts)
+  defp put_opts(params, opts),
+    do: params |> put_display(opts) |> put_region(opts) |> put_jpeg_quality(opts)
+
+  defp put_jpeg_quality(params, opts),
+    do: maybe_put(params, "jpeg_quality", Keyword.get(opts, :jpeg_quality))
 
   defp put_display(params, opts), do: maybe_put(params, "display", Keyword.get(opts, :display))
 

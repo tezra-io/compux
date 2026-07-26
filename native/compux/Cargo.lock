@@ -121,7 +121,7 @@ checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
 
 [[package]]
 name = "compux"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "arboard",
  "base64",
@@ -367,6 +367,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
