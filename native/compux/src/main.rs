@@ -373,6 +373,67 @@ mod permissions {
     }
 }
 
+/// Make the pointer BE at the requested point before any button/scroll event is
+/// posted, so the event's own destination is the point the caller asked for.
+///
+/// Why this exists (observed live 2026-07-26: 4 of 7 clicks landed on the PREVIOUS
+/// click's point, every one reporting success): enigo's macOS `button()` opens with
+/// `let (current_x, current_y) = self.location()?` — `NSEvent::mouseLocation()` — and
+/// builds `dest` for BOTH the mouse-down and the mouse-up from that live read. Our
+/// preceding `move_mouse` only POSTS a CGEvent, which the window server applies
+/// asynchronously, so `mouseLocation()` can still report the old position when
+/// `button()` reads it. The click then goes to — and warps the cursor to — wherever
+/// the pointer still was. `scroll` has the same exposure: a CGEvent scroll carries no
+/// destination and lands wherever the pointer actually is.
+///
+/// `CGWarpMouseCursorPosition` is SYNCHRONOUS: it moves the cursor in the window
+/// server before returning, so the subsequent `location()` read is the truth. It is
+/// deliberately called AFTER `move_mouse`, not instead of it — `move_mouse` is what
+/// emits the MouseMoved/Dragged event (hover states, drag tracking) with real deltas,
+/// and warping first would zero those deltas.
+///
+/// Takes the same top-left global point space `move_mouse(_, _, Coordinate::Abs)`
+/// does, which is what `to_logical` already produces. Note macOS suppresses local
+/// HID mouse events for a short interval after a warp; compux already yields the
+/// cursor to a present human through the caller's courtesy arbiter, so a brief
+/// suppression during an agent action is the intended trade.
+#[cfg(target_os = "macos")]
+mod pointer {
+    #[repr(C)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGWarpMouseCursorPosition(newCursorPosition: CGPoint) -> i32;
+    }
+
+    /// `Err` on a non-zero CGError: a pointer we could not place is a click we must
+    /// not post, since it would land somewhere the caller never asked for.
+    pub fn settle(x: i32, y: i32) -> Result<(), String> {
+        let point = CGPoint {
+            x: f64::from(x),
+            y: f64::from(y),
+        };
+
+        match unsafe { CGWarpMouseCursorPosition(point) } {
+            0 => Ok(()),
+            error => Err(format!("warp pointer to ({x},{y}): CGError {error}")),
+        }
+    }
+}
+
+/// X11 injects motion synchronously (`XTestFakeMotionEvent` + flush) and
+/// `XTestFakeButtonEvent` carries no coordinate, so there is nothing to settle.
+#[cfg(not(target_os = "macos"))]
+mod pointer {
+    pub fn settle(_x: i32, _y: i32) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn display_server() -> &'static str {
     "quartz"
@@ -926,6 +987,10 @@ fn mouse_move(req: &Value) -> Result<Value, String> {
     let mut e = enigo()?;
     e.move_mouse(lx, ly, Coordinate::Abs)
         .map_err(|e| format!("move: {e}"))?;
+    // Same settle as the acting verbs: this action's entire promise is "the pointer
+    // is now here", and a posted move alone leaves that pending (hover would land on
+    // whatever the pointer had not left yet).
+    pointer::settle(lx, ly)?;
     // read-only: no post-action screenshot
     Ok(json!({ "ok": true }))
 }
@@ -940,6 +1005,7 @@ fn click(req: &Value, button: Button, count: u32) -> Result<Value, String> {
     let mut e = enigo()?;
     e.move_mouse(lx, ly, Coordinate::Abs)
         .map_err(|e| format!("move: {e}"))?;
+    pointer::settle(lx, ly)?;
     hold(&mut e, &mods, Direction::Press)?;
     for _ in 0..count {
         e.button(button, Direction::Click)
@@ -961,10 +1027,12 @@ fn drag(req: &Value) -> Result<Value, String> {
     let mut e = enigo()?;
     e.move_mouse(fx, fy, Coordinate::Abs)
         .map_err(|e| format!("move: {e}"))?;
+    pointer::settle(fx, fy)?;
     e.button(Button::Left, Direction::Press)
         .map_err(|e| format!("press: {e}"))?;
     e.move_mouse(tx, ty, Coordinate::Abs)
         .map_err(|e| format!("drag: {e}"))?;
+    pointer::settle(tx, ty)?;
     e.button(Button::Left, Direction::Release)
         .map_err(|e| format!("release: {e}"))?;
 
@@ -988,6 +1056,7 @@ fn scroll(req: &Value) -> Result<Value, String> {
     let mut e = enigo()?;
     e.move_mouse(lx, ly, Coordinate::Abs)
         .map_err(|e| format!("move: {e}"))?;
+    pointer::settle(lx, ly)?;
     e.scroll(length, axis).map_err(|e| format!("scroll: {e}"))?;
 
     post(req, &display)
