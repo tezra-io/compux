@@ -399,15 +399,36 @@ mod permissions {
 /// suppression during an agent action is the intended trade.
 #[cfg(target_os = "macos")]
 mod pointer {
+    use std::ffi::c_void;
+    use std::ptr;
+
     #[repr(C)]
     struct CGPoint {
         x: f64,
         y: f64,
     }
 
+    /// `CGEventType::kCGEventLeftMouseDragged` / `kCGHIDEventTap` /
+    /// `kCGMouseButtonLeft` — numeric values from CGEventTypes.h, stable ABI.
+    const LEFT_MOUSE_DRAGGED: u32 = 6;
+    const HID_EVENT_TAP: u32 = 0;
+    const MOUSE_BUTTON_LEFT: u32 = 0;
+
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGWarpMouseCursorPosition(newCursorPosition: CGPoint) -> i32;
+        fn CGEventCreateMouseEvent(
+            source: *const c_void,
+            event_type: u32,
+            point: CGPoint,
+            button: u32,
+        ) -> *mut c_void;
+        fn CGEventPost(tap: u32, event: *mut c_void);
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRelease(cf: *const c_void);
     }
 
     /// `Err` on a non-zero CGError: a pointer we could not place is a click we must
@@ -422,6 +443,35 @@ mod pointer {
             0 => Ok(()),
             error => Err(format!("warp pointer to ({x},{y}): CGError {error}")),
         }
+    }
+
+    /// One intermediate point of a drag, posted as an EXPLICIT `LeftMouseDragged`
+    /// event. enigo's `move_mouse` picks its event type from a live
+    /// `pressedMouseButtons()` read, which races the just-posted mouse-down — the
+    /// intermediate move then goes out as `MouseMoved` (a hover, not a drag) and
+    /// no drag handler ever arms. Building the event by hand removes the state
+    /// read entirely. The warp afterwards keeps the visible cursor and the next
+    /// `location()` read (the release's destination) at the same point.
+    pub fn drag_step(x: i32, y: i32) -> Result<(), String> {
+        let point = CGPoint {
+            x: f64::from(x),
+            y: f64::from(y),
+        };
+
+        let event = unsafe {
+            CGEventCreateMouseEvent(ptr::null(), LEFT_MOUSE_DRAGGED, point, MOUSE_BUTTON_LEFT)
+        };
+
+        if event.is_null() {
+            return Err(format!("create drag event at ({x},{y})"));
+        }
+
+        unsafe {
+            CGEventPost(HID_EVENT_TAP, event);
+            CFRelease(event);
+        }
+
+        settle(x, y)
     }
 }
 
@@ -951,7 +1001,16 @@ struct Point {
 }
 
 fn enigo() -> Result<Enigo, String> {
-    Enigo::new(&Settings::default()).map_err(|e| format!("init input: {e}"))
+    // Never let library INIT raise the macOS Accessibility dialog mid-action:
+    // prompting is an operator flow that belongs exclusively to the
+    // `request_permissions` action (the setup card's button). Without the grant,
+    // actions fail/no-op and the consumer's probe reports the state loudly.
+    let settings = Settings {
+        open_prompt_to_get_permissions: false,
+        ..Settings::default()
+    };
+
+    Enigo::new(&settings).map_err(|e| format!("init input: {e}"))
 }
 
 // Best-effort cursor position in sent-image coords (None if input can't be read or
@@ -1016,6 +1075,16 @@ fn click(req: &Value, button: Button, count: u32) -> Result<Value, String> {
     post(req, &display)
 }
 
+/// Drag pacing. A zero-dwell teleport drag lands inside one render frame, which
+/// rAF-gated drag handlers (chessground boards, HTML5 drag-and-drop, sliders,
+/// maps) never observe as a drag at all — they demote it to a click. Every
+/// mature driver interpolates with dwell (Playwright `mouse.move(steps)`,
+/// pyautogui `dragTo(duration)`); these are that, as internal constants.
+const DRAG_STEPS: u32 = 10;
+const DRAG_STEP_MS: u64 = 20;
+const DRAG_GRAB_MS: u64 = 60;
+const DRAG_DROP_MS: u64 = 50;
+
 fn drag(req: &Value) -> Result<Value, String> {
     let display = target_display(req)?;
     let region = region_or_full(&display.geom, parse_region(req)?);
@@ -1030,13 +1099,57 @@ fn drag(req: &Value) -> Result<Value, String> {
     pointer::settle(fx, fy)?;
     e.button(Button::Left, Direction::Press)
         .map_err(|e| format!("press: {e}"))?;
-    e.move_mouse(tx, ty, Coordinate::Abs)
-        .map_err(|e| format!("drag: {e}"))?;
+    // Let the press register (and the target arm its drag) before moving.
+    thread::sleep(Duration::from_millis(DRAG_GRAB_MS));
+    drag_through(&mut e, &drag_path(fx, fy, tx, ty, DRAG_STEPS))?;
     pointer::settle(tx, ty)?;
+    // Dwell at the destination so the drop is observed where it happens.
+    thread::sleep(Duration::from_millis(DRAG_DROP_MS));
     e.button(Button::Left, Direction::Release)
         .map_err(|e| format!("release: {e}"))?;
 
     post(req, &display)
+}
+
+/// The interpolated pointer path from start to end: `steps` evenly spaced
+/// points, endpoints exact (the last point IS the destination), each axis
+/// monotonic. Pure, so the geometry is unit-testable without posting events.
+fn drag_path(fx: i32, fy: i32, tx: i32, ty: i32, steps: u32) -> Vec<(i32, i32)> {
+    (1..=steps)
+        .map(|i| {
+            let t = i as f32 / steps as f32;
+            (
+                (fx as f32 + (tx - fx) as f32 * t).round() as i32,
+                (fy as f32 + (ty - fy) as f32 * t).round() as i32,
+            )
+        })
+        .collect()
+}
+
+/// macOS posts each step as an EXPLICIT `LeftMouseDragged` (enigo's `move_mouse`
+/// derives its event type from a live `pressedMouseButtons()` read that races
+/// the just-posted mouse-down and then emits `MouseMoved` — a hover mid-press).
+#[cfg(target_os = "macos")]
+fn drag_through(_e: &mut Enigo, path: &[(i32, i32)]) -> Result<(), String> {
+    for &(x, y) in path {
+        pointer::drag_step(x, y)?;
+        thread::sleep(Duration::from_millis(DRAG_STEP_MS));
+    }
+
+    Ok(())
+}
+
+/// X11 motion while the button is pressed IS the drag — no distinct event type —
+/// so enigo's own motion injection is correct here.
+#[cfg(not(target_os = "macos"))]
+fn drag_through(e: &mut Enigo, path: &[(i32, i32)]) -> Result<(), String> {
+    for &(x, y) in path {
+        e.move_mouse(x, y, Coordinate::Abs)
+            .map_err(|e| format!("drag: {e}"))?;
+        thread::sleep(Duration::from_millis(DRAG_STEP_MS));
+    }
+
+    Ok(())
 }
 
 fn scroll(req: &Value) -> Result<Value, String> {
@@ -1096,7 +1209,13 @@ fn key_chord(req: &Value) -> Result<Value, String> {
 }
 
 fn wait(req: &Value) -> Result<Value, String> {
-    let ms = req.get("ms").and_then(Value::as_u64).unwrap_or(0);
+    // Clamped like every other blocking verb: the wire is one-request-one-response,
+    // so an unbounded sleep would hold the whole session hostage to one argument.
+    let ms = req
+        .get("ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(MAX_WAIT_FOR_IDLE_MS);
     thread::sleep(Duration::from_millis(ms));
     Ok(json!({ "ok": true }))
 }
@@ -1113,7 +1232,8 @@ fn wait_for_change(req: &Value) -> Result<Value, String> {
     let timeout_ms = req
         .get("timeout_ms")
         .and_then(Value::as_u64)
-        .unwrap_or(10_000);
+        .unwrap_or(10_000)
+        .min(MAX_WAIT_FOR_IDLE_MS);
     let poll_ms = req
         .get("poll_ms")
         .and_then(Value::as_u64)
@@ -1161,11 +1281,10 @@ fn region_hash(display: &Display, region: &Region) -> Result<u64, String> {
 
 // --- idle detection (coexistence: yield the seat to a present human) --------
 
-/// Upper bound on a `wait_for_idle` block, so a caller can never hang the sidecar
-/// past its per-action deadline (30s in Fermix). Matches `wait_for_change`'s ceiling.
-/// macOS-only: `wait_for_idle` (the sole user) is macOS-gated, so on other targets
-/// this would be dead code under clippy's `-D warnings`.
-#[cfg(target_os = "macos")]
+/// Upper bound on ANY blocking verb (`wait`, `wait_for_change`, `wait_for_idle`),
+/// so one argument can never hang the sidecar past its per-action deadline (30s
+/// in Fermix). Cross-platform since the `wait`/`wait_for_change` clamps adopted
+/// it — no longer macOS-gated.
 const MAX_WAIT_FOR_IDLE_MS: u64 = 25_000;
 
 /// Milliseconds since the last input event the OS saw, via CoreGraphics' session
@@ -1800,6 +1919,35 @@ fn named_key(name: &str) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The drag path's geometry is what makes an interpolated drag land exactly:
+    // the LAST point must BE the destination (a rounded near-miss would drop the
+    // piece a pixel off), the step count fixed, and each axis monotonic so the
+    // pointer never doubles back mid-drag.
+    #[test]
+    fn drag_path_ends_exactly_at_the_destination() {
+        let path = drag_path(10, 20, 313, 207, DRAG_STEPS);
+        assert_eq!(path.len(), DRAG_STEPS as usize);
+        assert_eq!(*path.last().unwrap(), (313, 207));
+    }
+
+    #[test]
+    fn drag_path_is_monotonic_on_both_axes() {
+        let path = drag_path(300, 400, 20, 40, DRAG_STEPS);
+        let mut prev = (300, 400);
+        for &(x, y) in &path {
+            assert!(x <= prev.0, "x doubled back: {x} after {}", prev.0);
+            assert!(y <= prev.1, "y doubled back: {y} after {}", prev.1);
+            prev = (x, y);
+        }
+        assert_eq!(prev, (20, 40));
+    }
+
+    #[test]
+    fn drag_path_handles_a_zero_length_drag() {
+        let path = drag_path(50, 60, 50, 60, DRAG_STEPS);
+        assert!(path.iter().all(|&p| p == (50, 60)));
+    }
 
     // An empty monitor list (locked / asleep / no GUI session) maps to the typed
     // `no_active_display` for ANY requested index — never the bad-index message,
