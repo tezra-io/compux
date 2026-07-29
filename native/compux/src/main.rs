@@ -38,13 +38,37 @@ use xcap::Monitor;
 /// Anthropic and ground worse).
 const MAX_EDGE: u32 = 1366;
 
+/// Pixel-area budget for a sent screenshot (M28 B5). The long-edge cap alone
+/// punishes extreme aspect ratios: a 3840x1080 super-ultrawide got the same
+/// budget as 16:9 but only 384px tall — unreadable, which forced the model to
+/// live in magnified crops (and grid-switch errors). A sent image may use
+/// whichever budget grants MORE pixels, never upscaled: 16:9 keeps exactly
+/// 1366x768, 32:9 recovers ~1931x543, and any capture that fits the long edge
+/// today still ships at native resolution.
+const MAX_AREA: u32 = MAX_EDGE * 768;
+
+/// The sent-image downscale `kz <= 1` fitting `w x h` physical pixels into the
+/// budgets: the looser of the long-edge and area rules, capped at native. One
+/// formula for full captures and crops, so the two can never diverge.
+fn budget_scale(w: f32, h: f32) -> f32 {
+    let long = w.max(h).max(1.0);
+    let edge = (MAX_EDGE as f32 / long).min(1.0);
+    let area = (MAX_AREA as f32 / (w * h).max(1.0)).sqrt();
+    edge.max(area).min(1.0)
+}
+
 /// Wire-compatibility version. MUST match `Compux.Protocol.protocol_version/0`.
 /// Bumped ONLY on a wire-incompatible change; reported in the `hello` handshake so
 /// a consumer can refuse a mismatched sidecar (the two-pin drift guard).
 ///
 /// v3: added the operational idle-detection actions `idle_ms` + `wait_for_idle`
 /// (coexistence — let a policy layer yield the seat to a present human).
-const PROTOCOL_VERSION: u32 = 4;
+///
+/// v5: `screenshot` gained the optional grounding-integrity fields `rulers`,
+/// `annotate_point`, and `marks` (M28) — additive, but a consumer advertising
+/// them against an older sidecar would get silently un-annotated images, so the
+/// version bumps and the handshake refuses the pairing loudly.
+const PROTOCOL_VERSION: u32 = 5;
 
 // --- macOS TCC responsibility disclaim ---------------------------------------
 
@@ -197,9 +221,18 @@ fn main() {
         // a clean sidecar (EX_TEMPFAIL). Do this AFTER flush so the caller got
         // its `capture_stalled` answer first.
         if CAPTURE_WEDGED.load(Ordering::SeqCst) {
+            #[cfg(target_os = "macos")]
+            ax::clear_activations();
             std::process::exit(75);
         }
     }
+
+    // stdin EOF: the owning Port closed — the session is over. Switch OFF any
+    // accessibility attribute this process switched on (B4), so one enumeration
+    // never leaves the user's browser in an altered AX mode. Best-effort: a
+    // SIGKILLed sidecar skips this, and the next activation is idempotent.
+    #[cfg(target_os = "macos")]
+    ax::clear_activations();
 }
 
 fn handle(req: &Value) -> Value {
@@ -599,15 +632,11 @@ struct CropRect {
 }
 
 impl CropRect {
-    /// Downscale so the long edge fits MAX_EDGE; never upscale (`kz <= 1`). A small
-    /// crop is therefore sent at native physical resolution — that is the zoom.
+    /// Downscale to fit the sent budgets (`budget_scale`); never upscale
+    /// (`kz <= 1`). A small crop is therefore sent at native physical
+    /// resolution — that is the zoom.
     fn sent_scale(&self) -> f32 {
-        let long = self.w_phys.max(self.h_phys);
-        if long <= MAX_EDGE as f32 {
-            1.0
-        } else {
-            MAX_EDGE as f32 / long
-        }
+        budget_scale(self.w_phys, self.h_phys)
     }
 
     fn sent_dims(&self) -> (u32, u32) {
@@ -671,21 +700,15 @@ fn target_display(req: &Value) -> Result<Display, String> {
 }
 
 /// The full-display "sent scale" `k`: sent pixels per LOGICAL point for a full
-/// screenshot. The full image is the PHYSICAL display downscaled so its physical long
-/// edge fits MAX_EDGE (`kz_full`), so `k = sent_dim / logical_dim = kz_full *
+/// screenshot. The full image is the PHYSICAL display downscaled to fit the sent
+/// budgets (`budget_scale` → `kz_full`), so `k = sent_dim / logical_dim = kz_full *
 /// scale_factor`. Region coordinates are read off that sent image, so `crop_rect` /
 /// `Region::full` MUST use this physical-derived `k`. A logical-derived `k` diverges
-/// whenever the logical long edge already fits MAX_EDGE but the physical one does not
-/// (e.g. a 13" Retina at 2560x1600@2x → 1280x800 logical) and mislocates region zooms
-/// — the #1 offset bug.
+/// whenever the logical long edge already fits the budget but the physical one does
+/// not (e.g. a 13" Retina at 2560x1600@2x → 1280x800 logical) and mislocates region
+/// zooms — the #1 offset bug.
 fn sent_scale(geom: &Geometry) -> f32 {
-    let phys_long = geom.phys_w.max(geom.phys_h) as f32;
-    let kz_full = if phys_long <= MAX_EDGE as f32 {
-        1.0
-    } else {
-        MAX_EDGE as f32 / phys_long
-    };
-    kz_full * geom.scale_factor
+    budget_scale(geom.phys_w as f32, geom.phys_h as f32) * geom.scale_factor
 }
 
 fn parse_region(req: &Value) -> Result<Option<Region>, String> {
@@ -772,12 +795,236 @@ fn to_sent(geom: &Geometry, region: &Region, lx: f64, ly: f64) -> Option<(i64, i
     }
 }
 
+// --- overlay drawing (M28 B1/B2/B3) ------------------------------------------
+
+/// Marker / ruler / badge drawing on the SENT image, hand-rolled on the raw
+/// buffer. Deliberately no imageproc/font dependency: the sidecar ships
+/// size-optimized (`opt-level="z"`, lto, strip) and the only text needed is
+/// digits plus three symbols, covered by a 5x7 bitmap atlas.
+///
+/// Everything draws in SENT-image pixel space — the space the model reads and
+/// answers in — and every write is bounds-checked, so a marker near an edge
+/// clips instead of panicking.
+mod overlay {
+    use image::RgbaImage;
+
+    const BLACK: [u8; 4] = [0, 0, 0, 255];
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+    const RED: [u8; 4] = [230, 40, 40, 255];
+
+    /// 5x7 glyphs, one row per byte (5 low bits, MSB = leftmost pixel).
+    const GLYPH_W: i32 = 5;
+    const GLYPH_H: i32 = 7;
+
+    fn glyph(c: char) -> Option<[u8; 7]> {
+        match c {
+            '0' => Some([0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E]),
+            '1' => Some([0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E]),
+            '2' => Some([0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F]),
+            '3' => Some([0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E]),
+            '4' => Some([0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02]),
+            '5' => Some([0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E]),
+            '6' => Some([0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E]),
+            '7' => Some([0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08]),
+            '8' => Some([0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E]),
+            '9' => Some([0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C]),
+            '(' => Some([0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02]),
+            ')' => Some([0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08]),
+            ',' => Some([0x00, 0x00, 0x00, 0x00, 0x0C, 0x04, 0x08]),
+            _ => None,
+        }
+    }
+
+    /// Rendered width of a label in pixels (glyphs + 1px spacing).
+    fn text_width(text: &str) -> i32 {
+        let n = text.chars().count() as i32;
+        if n == 0 {
+            0
+        } else {
+            n * (GLYPH_W + 1) - 1
+        }
+    }
+
+    fn put(img: &mut RgbaImage, x: i32, y: i32, color: [u8; 4]) {
+        if x >= 0 && y >= 0 && (x as u32) < img.width() && (y as u32) < img.height() {
+            img.put_pixel(x as u32, y as u32, image::Rgba(color));
+        }
+    }
+
+    fn fill_rect(img: &mut RgbaImage, x0: i32, y0: i32, w: i32, h: i32, color: [u8; 4]) {
+        for y in y0..y0 + h {
+            for x in x0..x0 + w {
+                put(img, x, y, color);
+            }
+        }
+    }
+
+    /// Black text on a white plate (1px padding) — readable on any background.
+    fn draw_label(img: &mut RgbaImage, x0: i32, y0: i32, text: &str) {
+        fill_rect(
+            img,
+            x0 - 1,
+            y0 - 1,
+            text_width(text) + 2,
+            GLYPH_H + 2,
+            WHITE,
+        );
+        let mut x = x0;
+        for c in text.chars() {
+            if let Some(rows) = glyph(c) {
+                for (dy, row) in rows.iter().enumerate() {
+                    for dx in 0..GLYPH_W {
+                        if row & (0x10 >> dx) != 0 {
+                            put(img, x + dx, y0 + dy as i32, BLACK);
+                        }
+                    }
+                }
+            }
+            x += GLYPH_W + 1;
+        }
+    }
+
+    /// Keep a `w`-wide element fully inside `0..limit` (labels/plates near edges).
+    fn clamp_span(start: i32, w: i32, limit: i32) -> i32 {
+        start.min(limit - w).max(0)
+    }
+
+    fn ring(img: &mut RgbaImage, cx: i32, cy: i32, r: i32, thickness: i32, color: [u8; 4]) {
+        let (r_out, r_in) = (r + thickness, r);
+        for dy in -r_out..=r_out {
+            for dx in -r_out..=r_out {
+                let d2 = dx * dx + dy * dy;
+                if d2 <= r_out * r_out && d2 > r_in * r_in {
+                    put(img, cx + dx, cy + dy, color);
+                }
+            }
+        }
+    }
+
+    /// B1: mark the EXECUTED point in the check image — ring + cross + the
+    /// coordinate as text — so the model SEES where its click landed relative to
+    /// the target instead of only reading its own number echoed back.
+    pub fn executed_point(img: &mut RgbaImage, x: i32, y: i32) {
+        ring(img, x, y, 8, 2, WHITE);
+        ring(img, x, y, 6, 2, RED);
+        for d in 3..=14 {
+            for (px, py) in [(x + d, y), (x - d, y), (x, y + d), (x, y - d)] {
+                put(img, px, py, WHITE);
+            }
+        }
+        for d in 3..=13 {
+            for (px, py) in [(x + d, y), (x - d, y), (x, y + d), (x, y - d)] {
+                if d % 2 == 0 {
+                    put(img, px, py, BLACK);
+                }
+            }
+        }
+
+        let label = format!("({x},{y})");
+        let lx = clamp_span(x + 12, text_width(&label), img.width() as i32);
+        let ly = clamp_span(y + 10, GLYPH_H, img.height() as i32);
+        draw_label(img, lx, ly, &label);
+    }
+
+    /// B2: edge rulers in THIS image's own pixel space — ticks every 100px,
+    /// labels every 200px — so the answer grid is visible in the image itself
+    /// and a wrong-grid answer stops being label-compatible with what the model
+    /// is looking at.
+    const TICK_EVERY: i32 = 100;
+    const LABEL_EVERY: i32 = 200;
+    const TICK_LEN: i32 = 7;
+
+    pub fn rulers(img: &mut RgbaImage) {
+        let (w, h) = (img.width() as i32, img.height() as i32);
+
+        let mut x = TICK_EVERY;
+        while x < w {
+            for y in 0..TICK_LEN {
+                put(img, x, y, BLACK);
+                put(img, x + 1, y, WHITE);
+            }
+            if x % LABEL_EVERY == 0 {
+                let text = x.to_string();
+                draw_label(img, clamp_span(x + 3, text_width(&text), w), 9, &text);
+            }
+            x += TICK_EVERY;
+        }
+
+        let mut y = TICK_EVERY;
+        while y < h {
+            for x in 0..TICK_LEN {
+                put(img, x, y, BLACK);
+                put(img, x, y + 1, WHITE);
+            }
+            if y % LABEL_EVERY == 0 {
+                let text = y.to_string();
+                draw_label(img, 9, clamp_span(y + 3, GLYPH_H, h), &text);
+            }
+            y += TICK_EVERY;
+        }
+    }
+
+    /// B3: a numbered set-of-marks badge at an element's click point. The model
+    /// answers with the NUMBER; the caller resolves it to the exact point — no
+    /// pixel estimation at all.
+    pub fn badge(img: &mut RgbaImage, x: i32, y: i32, n: usize) {
+        let text = n.to_string();
+        let half_w = (text_width(&text) / 2 + 4).max(8);
+
+        fill_rect(img, x - half_w - 1, y - 7, 2 * half_w + 2, 14, BLACK);
+        fill_rect(img, x - half_w, y - 6, 2 * half_w, 12, RED);
+        draw_label(img, x - text_width(&text) / 2, y - 3, &text);
+    }
+}
+
 // --- screenshot -------------------------------------------------------------
 
 fn screenshot(req: &Value) -> Result<Value, String> {
     let display = target_display(req)?;
     let region = parse_region(req)?;
-    capture_payload_encoded(&display, region, parse_jpeg_quality(req)?)
+    capture_payload_encoded(
+        &display,
+        region,
+        parse_jpeg_quality(req)?,
+        parse_overlays(req)?,
+    )
+}
+
+/// Grounding-integrity overlays for one capture (M28), all drawn on the SENT
+/// image in its own pixel space: `rulers` (B2) makes the answer grid visible,
+/// `annotate_point` (B1) marks an executed click in a check image, `marks` (B3)
+/// badges accessibility click points and returns their id table.
+#[derive(Default, Clone, Copy)]
+struct Overlays {
+    rulers: bool,
+    marks: bool,
+    annotate: Option<(i32, i32)>,
+}
+
+fn parse_overlays(req: &Value) -> Result<Overlays, String> {
+    let rulers = req.get("rulers").and_then(Value::as_bool).unwrap_or(false);
+    let marks = req.get("marks").and_then(Value::as_bool).unwrap_or(false);
+
+    let annotate = match req.get("annotate_point") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let x = value
+                .get("x")
+                .and_then(Value::as_f64)
+                .ok_or("annotate_point.x is missing or not a number")?;
+            let y = value
+                .get("y")
+                .and_then(Value::as_f64)
+                .ok_or("annotate_point.y is missing or not a number")?;
+            Some((x.round() as i32, y.round() as i32))
+        }
+    };
+
+    Ok(Overlays {
+        rulers,
+        marks,
+        annotate,
+    })
 }
 
 /// Opt into JPEG for this capture (1-100). Absent = PNG, the lossless default a
@@ -923,14 +1170,11 @@ fn encode_image(
     }
 }
 
-fn capture_payload(display: &Display, requested: Option<Region>) -> Result<Value, String> {
-    capture_payload_encoded(display, requested, None)
-}
-
 fn capture_payload_encoded(
     display: &Display,
     requested: Option<Region>,
     jpeg_quality: Option<u8>,
+    overlays: Overlays,
 ) -> Result<Value, String> {
     ensure_display_awake(display)?;
     let geom = &display.geom;
@@ -951,12 +1195,26 @@ fn capture_payload_encoded(
     )
     .to_image();
 
-    let resized = image::imageops::resize(
+    let mut resized = image::imageops::resize(
         &cropped,
         sent_w,
         sent_h,
         image::imageops::FilterType::Triangle,
     );
+
+    // Overlays draw on the sent image, bottom to top: grid, badges, then the
+    // executed-point marker so it is never covered.
+    if overlays.rulers {
+        overlay::rulers(&mut resized);
+    }
+    let marks = if overlays.marks {
+        Some(collect_marks(geom, &region, &mut resized))
+    } else {
+        None
+    };
+    if let Some((ax, ay)) = overlays.annotate {
+        overlay::executed_point(&mut resized, ax, ay);
+    }
 
     let (encoded, mime) = encode_image(&resized, sent_w, sent_h, jpeg_quality)?;
     let data = base64::engine::general_purpose::STANDARD.encode(&encoded);
@@ -989,7 +1247,58 @@ fn capture_payload_encoded(
         );
     }
 
+    // B3: the mark table, present (possibly empty) whenever marks were requested,
+    // so the caller can tell "zero accessibility marks" from "none asked for".
+    if let (Some(info), Some(object)) = (marks, payload.as_object_mut()) {
+        object.insert("marks".to_string(), Value::Array(info.entries));
+        if let Some(note) = info.ax_activation {
+            object.insert("ax_activation".to_string(), json!(note));
+        }
+        if info.truncated > 0 {
+            object.insert("marks_truncated".to_string(), json!(info.truncated));
+        }
+    }
+
     Ok(payload)
+}
+
+/// The badge cap keeps a marked image readable — a dense tree can expose
+/// hundreds of interactive nodes, and a badge soup grounds worse than pixels.
+/// Tree-walk order is roughly top-down, so the cap drops the least prominent.
+const MAX_MARKS: usize = 60;
+
+struct MarksInfo {
+    entries: Vec<Value>,
+    ax_activation: Option<String>,
+    truncated: usize,
+}
+
+#[cfg(target_os = "macos")]
+fn collect_marks(geom: &Geometry, region: &Region, img: &mut image::RgbaImage) -> MarksInfo {
+    let (nodes, ax_activation) = interactive_in_view(geom, region);
+    let truncated = nodes.len().saturating_sub(MAX_MARKS);
+
+    let mut entries = Vec::new();
+    for (index, (node, (sx, sy))) in nodes.into_iter().take(MAX_MARKS).enumerate() {
+        let id = index + 1;
+        overlay::badge(img, sx as i32, sy as i32, id);
+        entries.push(json!({ "id": id, "role": node.role, "title": node.title, "x": sx, "y": sy }));
+    }
+
+    MarksInfo {
+        entries,
+        ax_activation,
+        truncated,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn collect_marks(_geom: &Geometry, _region: &Region, _img: &mut image::RgbaImage) -> MarksInfo {
+    MarksInfo {
+        entries: Vec::new(),
+        ax_activation: Some("marks are only supported on macOS".to_string()),
+        truncated: 0,
+    }
 }
 
 // --- input ------------------------------------------------------------------
@@ -1247,7 +1556,14 @@ fn wait_for_change(req: &Value) -> Result<Value, String> {
         thread::sleep(Duration::from_millis(poll_ms));
         let changed = region_hash(&display, &region)? != baseline;
         if changed || Instant::now() >= deadline {
-            let mut payload = capture_payload(&display, Some(region))?;
+            // The returned frame becomes the caller's coordinate view, so it
+            // carries the same `rulers` grid an explicit screenshot would.
+            let overlays = Overlays {
+                rulers: req.get("rulers").and_then(Value::as_bool).unwrap_or(false),
+                marks: false,
+                annotate: None,
+            };
+            let mut payload = capture_payload_encoded(&display, Some(region), None, overlays)?;
             if let Some(object) = payload.as_object_mut() {
                 object.insert("changed".to_string(), json!(changed));
             }
@@ -1423,10 +1739,11 @@ const MAX_WINDOWS: usize = 40;
 /// EXPRESSED AS A `region` in that display's screenshot space.
 ///
 /// This is the precision lever on a large or ultrawide display. A full-screen
-/// capture is downscaled to fit `MAX_EDGE`, so the app the caller cares about
+/// capture is downscaled to fit the sent budget, so the app the caller cares about
 /// arrives at a fraction of its real size; a `region` crop is rescaled to that same
-/// budget on its own, so cropping to one window recovers most of the lost
-/// resolution (on a 3840x1080 display, ~2.4x for a typical browser window).
+/// budget on its own, so cropping to one window recovers the lost resolution
+/// (up to native 1:1 — on a 3840x1080 display, ~1.7x over the full view for a
+/// typical browser window).
 ///
 /// Returning a ready-made `region` — rather than raw window geometry — is the whole
 /// point: the caller pastes it straight into `screenshot`/click and rides the
@@ -1527,15 +1844,67 @@ fn elements(req: &Value) -> Result<Value, String> {
 
 #[cfg(target_os = "macos")]
 fn elements_for(geom: &Geometry, region: &Region) -> Result<Value, String> {
-    let mut items = Vec::new();
-    for node in ax::interactive_elements() {
-        let center_x = node.x + node.w / 2.0;
-        let center_y = node.y + node.h / 2.0;
-        if let Some((x, y)) = to_sent(geom, region, center_x, center_y) {
-            items.push(json!({ "role": node.role, "title": node.title, "x": x, "y": y }));
-        }
+    let (nodes, ax_activation) = interactive_in_view(geom, region);
+
+    let items: Vec<Value> = nodes
+        .iter()
+        .map(|(node, (x, y))| json!({ "role": node.role, "title": node.title, "x": x, "y": y }))
+        .collect();
+
+    let mut payload = json!({ "ok": true, "elements": items });
+    if let (Some(note), Some(object)) = (ax_activation, payload.as_object_mut()) {
+        object.insert("ax_activation".to_string(), json!(note));
     }
-    Ok(json!({ "ok": true, "elements": items }))
+    Ok(payload)
+}
+
+/// An interactive AX node paired with its click point in sent-image space.
+#[cfg(target_os = "macos")]
+type ViewNode = (ax::Node, (i64, i64));
+
+/// Interactive AX elements whose centers fall inside this view, as sent-space
+/// points. Shared by `elements` and the `marks` overlay so the two can never
+/// disagree about what is clickable.
+#[cfg(target_os = "macos")]
+fn in_view_nodes(geom: &Geometry, region: &Region) -> Vec<ViewNode> {
+    ax::interactive_elements()
+        .into_iter()
+        .filter_map(|node| {
+            let center_x = node.x + node.w / 2.0;
+            let center_y = node.y + node.h / 2.0;
+            to_sent(geom, region, center_x, center_y).map(|point| (node, point))
+        })
+        .collect()
+}
+
+/// How long a freshly AX-activated app gets to build its accessibility tree
+/// before the one retry. Chromium constructs the tree lazily on activation;
+/// an immediate re-walk still sees nothing.
+#[cfg(target_os = "macos")]
+const AX_ACTIVATION_SETTLE_MS: u64 = 400;
+
+/// B4: enumerate, and on an EMPTY tree try accessibility activation once, then
+/// re-enumerate. Chromium/Electron-family apps expose their AX tree only to
+/// detected assistive clients (`AXManualAccessibility`); on any other app the
+/// set is a harmless typed error — which is why the retry is unconditional and
+/// needs no app-family sniffing. The note reports exactly what happened so an
+/// empty result is never silent again.
+#[cfg(target_os = "macos")]
+fn interactive_in_view(geom: &Geometry, region: &Region) -> (Vec<ViewNode>, Option<String>) {
+    let found = in_view_nodes(geom, region);
+    if !found.is_empty() {
+        return (found, None);
+    }
+
+    match ax::activate_accessibility() {
+        Ok(attribute) => {
+            thread::sleep(Duration::from_millis(AX_ACTIVATION_SETTLE_MS));
+            let after = in_view_nodes(geom, region);
+            let note = format!("{attribute} activated; {} element(s) after", after.len());
+            (after, Some(note))
+        }
+        Err(reason) => (found, Some(format!("AX activation failed: {reason}"))),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1585,8 +1954,10 @@ fn inspect_at(_x: f32, _y: f32) -> Result<Value, String> {
 #[cfg(target_os = "macos")]
 mod ax {
     use core_foundation::base::{CFType, CFTypeRef, TCFType};
+    use core_foundation::boolean::CFBoolean;
     use core_foundation::string::{CFString, CFStringRef};
     use std::ffi::c_void;
+    use std::sync::Mutex;
 
     type AXUIElementRef = CFTypeRef;
 
@@ -1608,6 +1979,15 @@ mod ax {
         // Extract the concrete value (CGPoint/CGSize) an AXValue wraps; false if the
         // requested type doesn't match.
         fn AXValueGetValue(value: CFTypeRef, the_type: u32, out: *mut c_void) -> bool;
+        // B4 activation: set an attribute on an app element / resolve its pid /
+        // re-create an app element from a pid at teardown time.
+        fn AXUIElementSetAttributeValue(
+            element: AXUIElementRef,
+            attribute: CFStringRef,
+            value: CFTypeRef,
+        ) -> i32;
+        fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> i32;
+        fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -1736,6 +2116,100 @@ mod ax {
         pub h: f64,
     }
 
+    // --- accessibility activation (M28 B4) -----------------------------------
+
+    /// Chromium/Electron's opt-in switch: the family builds its AX tree only for
+    /// detected assistive clients, and this per-app attribute is the documented
+    /// de-facto way to request it manually.
+    const MANUAL_ACCESSIBILITY: &str = "AXManualAccessibility";
+    /// Second choice ONLY on a typed attribute-unsupported error: it also flips
+    /// apps into an enhanced-UI mode window managers react to (layout side
+    /// effects), which is why it is never tried first.
+    const ENHANCED_UI: &str = "AXEnhancedUserInterface";
+    /// AXError `kAXErrorAttributeUnsupported` — the one deterministic criterion
+    /// for falling through to `ENHANCED_UI`.
+    const ATTRIBUTE_UNSUPPORTED: i32 = -25205;
+
+    /// `(pid, attribute)` pairs this process switched ON — cleared on the exit
+    /// paths so one enumeration never leaves an app in an altered AX mode.
+    static ACTIVATED: Mutex<Vec<(i32, &'static str)>> = Mutex::new(Vec::new());
+
+    /// Ask the FOCUSED application to expose its accessibility tree. Returns the
+    /// attribute that activated, or a typed reason. Setting the attribute on an
+    /// app that does not gate its tree is a harmless error — callers retry
+    /// unconditionally on an empty enumeration, no app-family sniffing.
+    pub fn activate_accessibility() -> Result<&'static str, String> {
+        unsafe {
+            let system_ref = AXUIElementCreateSystemWide();
+            if system_ref.is_null() {
+                return Err("no system-wide AX element".to_string());
+            }
+            let system = CFType::wrap_under_create_rule(system_ref);
+            let app = copy_element_attr(&system, FOCUSED_APP).ok_or("no focused application")?;
+
+            let mut pid: i32 = 0;
+            if AXUIElementGetPid(app.as_CFTypeRef(), &mut pid) != 0 || pid <= 0 {
+                return Err("focused application has no pid".to_string());
+            }
+
+            match set_bool_attr(&app, MANUAL_ACCESSIBILITY, true) {
+                0 => {
+                    record(pid, MANUAL_ACCESSIBILITY);
+                    Ok(MANUAL_ACCESSIBILITY)
+                }
+                ATTRIBUTE_UNSUPPORTED => match set_bool_attr(&app, ENHANCED_UI, true) {
+                    0 => {
+                        record(pid, ENHANCED_UI);
+                        Ok(ENHANCED_UI)
+                    }
+                    code => Err(format!("AXError {code}")),
+                },
+                code => Err(format!("AXError {code}")),
+            }
+        }
+    }
+
+    /// Best-effort teardown: switch OFF every attribute this process switched on.
+    pub fn clear_activations() {
+        let entries: Vec<(i32, &'static str)> = match ACTIVATED.lock() {
+            Ok(mut list) => list.drain(..).collect(),
+            Err(_poisoned) => return,
+        };
+
+        for (pid, attribute) in entries {
+            unsafe {
+                let app_ref = AXUIElementCreateApplication(pid);
+                if app_ref.is_null() {
+                    continue;
+                }
+                let app = CFType::wrap_under_create_rule(app_ref);
+                let _ = set_bool_attr(&app, attribute, false);
+            }
+        }
+    }
+
+    fn record(pid: i32, attribute: &'static str) {
+        if let Ok(mut list) = ACTIVATED.lock() {
+            if !list.contains(&(pid, attribute)) {
+                list.push((pid, attribute));
+            }
+        }
+    }
+
+    unsafe fn set_bool_attr(element: &CFType, attribute: &str, value: bool) -> i32 {
+        let attr = CFString::new(attribute);
+        let flag = if value {
+            CFBoolean::true_value()
+        } else {
+            CFBoolean::false_value()
+        };
+        AXUIElementSetAttributeValue(
+            element.as_CFTypeRef(),
+            attr.as_concrete_TypeRef(),
+            flag.as_CFTypeRef(),
+        )
+    }
+
     /// Walk the focused application's accessibility tree and collect interactive
     /// elements (bounded depth + count) with global-logical frames. NON-PROMPTING,
     /// read-only; runtime behavior needs a real Mac with the Accessibility grant.
@@ -1841,16 +2315,38 @@ mod ax {
 /// asked for it (`screenshot_after`). Always the FULL display (region: None) so the
 /// model sees the broader result of a zoomed action; it can re-zoom with an explicit
 /// `screenshot` if it needs detail.
+///
+/// B1: the check draws the EXECUTED point (the action's own coordinates — the drag
+/// destination for drags) into the image, so the caller SEES where the click landed
+/// relative to its target instead of only reading its own number echoed back. An
+/// unregioned action's coordinates are full-screen sent space — the same space this
+/// full-display check captures in. `rulers` is honored from the action request.
 fn post(req: &Value, display: &Display) -> Result<Value, String> {
     if req
         .get("screenshot_after")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        capture_payload(display, None)
+        let overlays = Overlays {
+            rulers: req.get("rulers").and_then(Value::as_bool).unwrap_or(false),
+            marks: false,
+            annotate: executed_point_of(req),
+        };
+        capture_payload_encoded(display, None, None, overlays)
     } else {
         Ok(json!({ "ok": true }))
     }
+}
+
+/// The point a pointer action executed at, from its own request: `to` for drags,
+/// top-level x/y otherwise; None for keyboard/uncoordinated actions.
+fn executed_point_of(req: &Value) -> Option<(i32, i32)> {
+    let (x, y) = if let Some(to) = req.get("to") {
+        (to.get("x")?.as_f64()?, to.get("y")?.as_f64()?)
+    } else {
+        (req.get("x")?.as_f64()?, req.get("y")?.as_f64()?)
+    };
+    Some((x.round() as i32, y.round() as i32))
 }
 
 fn hold(e: &mut Enigo, mods: &[Key], dir: Direction) -> Result<(), String> {
@@ -2127,7 +2623,9 @@ mod tests {
     }
 
     /// The whole point of the action: cropping to the window recovers resolution a
-    /// full capture spends on empty desktop.
+    /// full capture spends on empty desktop. The margin is 1.5x (not the old 2x):
+    /// the area budget already recovered part of the gap for the FULL view on this
+    /// display (0.356 → 0.503), which narrows the crop's relative win.
     #[test]
     fn a_window_crop_is_sharper_than_the_full_screen() {
         let g = ultrawide_geom();
@@ -2141,9 +2639,77 @@ mod tests {
         let window_k = sent_w as f64 / 1600.0;
 
         assert!(
-            window_k > full_k * 2.0,
-            "a window crop must be at least 2x sharper: full={full_k} window={window_k}"
+            window_k > full_k * 1.5,
+            "a window crop must be clearly sharper: full={full_k} window={window_k}"
         );
+    }
+
+    // --- M28 B5: the area budget ---------------------------------------------
+
+    /// The incident display: a pure long-edge cap sent 1366x384 (unreadable);
+    /// the area budget recovers ~1931x543 — same pixel count as 1366x768.
+    #[test]
+    fn ultrawide_full_view_uses_the_area_budget() {
+        let g = ultrawide_geom();
+        let region = Region::full(&g);
+        let crop = crop_rect(&g, &region);
+        let (sw, sh) = crop.sent_dims();
+
+        assert_eq!((sw, sh), (1931, 543), "sent dims");
+        assert!(
+            sw > MAX_EDGE,
+            "the long edge may exceed MAX_EDGE under the area rule"
+        );
+        assert!(
+            sw * sh <= MAX_AREA + sw,
+            "within the area budget (rounding slack)"
+        );
+
+        // The center of the sent image still maps to the display center.
+        let (lx, ly) = to_logical(&g, &region, (sw as f64) / 2.0, (sh as f64) / 2.0);
+        assert!((lx - 1920).abs() <= 2, "lx={lx}");
+        assert!((ly - 540).abs() <= 2, "ly={ly}");
+    }
+
+    /// A 16:9 display is the budget's fixed point: 1366x768 exactly, as before.
+    #[test]
+    fn sixteen_nine_full_view_is_unchanged_by_the_area_budget() {
+        let g = Geometry {
+            phys_w: 1920,
+            phys_h: 1080,
+            logical_w: 1920.0,
+            logical_h: 1080.0,
+            origin_x: 0.0,
+            origin_y: 0.0,
+            scale_factor: 1.0,
+        };
+        let crop = crop_rect(&g, &Region::full(&g));
+        assert_eq!(crop.sent_dims(), (1366, 768));
+    }
+
+    /// A crop that fits the long edge ships native — the incident's 1355x959
+    /// region crop (1.30MP) must NOT be shrunk by the area rule; the looser
+    /// budget wins. This is the regression a pure-area budget would introduce.
+    #[test]
+    fn a_crop_that_fits_the_long_edge_stays_native() {
+        let crop = CropRect {
+            left_phys: 64.7,
+            top_phys: 30.9,
+            w_phys: 1355.0,
+            h_phys: 959.0,
+        };
+        assert!((crop.sent_scale() - 1.0).abs() < f32::EPSILON);
+        assert_eq!(crop.sent_dims(), (1355, 959));
+    }
+
+    /// Retina 16:10 (2880x1800): the edge rule (0.474) beats the area rule
+    /// (0.450) — behavior identical to the pure long-edge cap.
+    #[test]
+    fn retina_full_view_keeps_the_long_edge_budget() {
+        let g = retina_geom();
+        let crop = crop_rect(&g, &Region::full(&g));
+        let (sw, _sh) = crop.sent_dims();
+        assert_eq!(sw, MAX_EDGE);
     }
 
     #[test]
@@ -2244,6 +2810,64 @@ mod tests {
         g.origin_x = 1440.0;
         let region = Region::full(&g);
         assert_eq!(to_logical(&g, &region, 0.0, 0.0).0, 1440);
+    }
+
+    // --- M28 B1/B2/B3: overlay placement ------------------------------------
+
+    fn blank(w: u32, h: u32) -> image::RgbaImage {
+        image::RgbaImage::from_pixel(w, h, image::Rgba([20, 20, 20, 255]))
+    }
+
+    fn changed_pixels(img: &image::RgbaImage) -> usize {
+        img.pixels().filter(|p| p.0 != [20, 20, 20, 255]).count()
+    }
+
+    /// The executed-point marker must draw AT the point (ring pixels near it),
+    /// clip safely at edges, and leave a blank image otherwise untouched.
+    #[test]
+    fn executed_point_marker_draws_at_the_point_and_clips_at_edges() {
+        let mut img = blank(200, 120);
+        overlay::executed_point(&mut img, 60, 40);
+        assert!(changed_pixels(&img) > 50, "marker must be visible");
+        // A ring pixel at radius ~7 on the horizontal axis.
+        assert_ne!(img.get_pixel(67, 40).0, [20, 20, 20, 255]);
+
+        // Clipping: a marker at the corner must not panic and still draws.
+        let mut corner = blank(40, 30);
+        overlay::executed_point(&mut corner, 0, 0);
+        assert!(changed_pixels(&corner) > 0);
+    }
+
+    /// Rulers tick every 100px on the top and left edges; a small image gets no
+    /// ticks at all (nothing at or past its size).
+    #[test]
+    fn rulers_tick_every_100_pixels() {
+        let mut img = blank(350, 250);
+        overlay::rulers(&mut img);
+        // Vertical ticks at x=100/200/300 on the top edge; horizontal at y=100/200.
+        for x in [100u32, 200, 300] {
+            assert_eq!(img.get_pixel(x, 0).0, [0, 0, 0, 255], "tick at x={x}");
+        }
+        for y in [100u32, 200] {
+            assert_eq!(img.get_pixel(0, y).0, [0, 0, 0, 255], "tick at y={y}");
+        }
+
+        let mut small = blank(90, 60);
+        overlay::rulers(&mut small);
+        assert_eq!(
+            changed_pixels(&small),
+            0,
+            "no tick fits an image under 100px"
+        );
+    }
+
+    /// A badge paints its red disc/pill centered on the mark point.
+    #[test]
+    fn badge_is_centered_on_the_mark_point() {
+        let mut img = blank(120, 80);
+        overlay::badge(&mut img, 60, 40, 7);
+        assert_eq!(img.get_pixel(52, 40).0, [230, 40, 40, 255], "red pill body");
+        assert!(changed_pixels(&img) > 80, "badge must be prominent");
     }
 
     #[test]

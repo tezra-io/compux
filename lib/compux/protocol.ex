@@ -27,7 +27,17 @@ defmodule Compux.Protocol do
   # the app the caller cares about arrives tiny, while a region crop is rescaled to
   # that budget on its own. Returning regions rather than raw geometry keeps every
   # coordinate in the one transform the sidecar already proves.
-  @protocol_version 4
+  #
+  # v5 (M28 grounding integrity): `screenshot` gained three OPTIONAL fields —
+  # `rulers` (draw the image's own coordinate grid on it), `marks` (badge the
+  # accessibility click points and return their id table), and `annotate_point`
+  # (mark an executed click in a check image). Additive at the JSON layer, but a
+  # consumer advertising `marks` against an older sidecar would get silently
+  # un-annotated images and no table, so the version bumps and the handshake
+  # refuses the pairing loudly. The sidecar also replaced the pure long-edge sent
+  # budget with the looser of long-edge and pixel-area rules (never upscaling),
+  # so extreme aspect ratios stop arriving unreadably small.
+  @protocol_version 5
 
   @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows)
   @read_only ~w(screenshot mouse_move wait inspect wait_for_change elements windows)
@@ -104,9 +114,19 @@ defmodule Compux.Protocol do
   defp validate_action("screenshot", params) do
     with {:ok, display} <- opt_display(params),
          {:ok, region} <- opt_region(params),
-         {:ok, quality} <- opt_jpeg_quality(params) do
+         {:ok, quality} <- opt_jpeg_quality(params),
+         {:ok, rulers} <- opt_bool(params, "rulers"),
+         {:ok, marks} <- opt_bool(params, "marks"),
+         {:ok, annotate} <- opt_annotate_point(params) do
       request = put_display(%{"action" => "screenshot"}, display)
-      {:ok, request |> put_region(region) |> maybe_put("jpeg_quality", quality)}
+
+      {:ok,
+       request
+       |> put_region(region)
+       |> maybe_put("jpeg_quality", quality)
+       |> maybe_put("rulers", rulers)
+       |> maybe_put("marks", marks)
+       |> maybe_put("annotate_point", annotate)}
     end
   end
 
@@ -295,6 +315,32 @@ defmodule Compux.Protocol do
       nil -> {:ok, nil}
       display when is_integer(display) and display >= 0 -> {:ok, display}
       _other -> {:error, "display must be a non-negative integer"}
+    end
+  end
+
+  # Optional boolean flags (v5: `rulers`/`marks`). Only a literal `true` is
+  # carried; false and absent are equivalent, so the wire stays minimal.
+  defp opt_bool(params, key) do
+    case Map.get(params, key) do
+      nil -> {:ok, nil}
+      true -> {:ok, true}
+      false -> {:ok, nil}
+      _other -> {:error, "#{key} must be a boolean"}
+    end
+  end
+
+  # v5: mark an executed click in a check image — a point in THIS capture's own
+  # sent pixel space.
+  defp opt_annotate_point(params) do
+    case Map.get(params, "annotate_point") do
+      nil ->
+        {:ok, nil}
+
+      %{"x" => x, "y" => y} when is_integer(x) and is_integer(y) and x >= 0 and y >= 0 ->
+        {:ok, %{"x" => x, "y" => y}}
+
+      _other ->
+        {:error, "annotate_point must be an object with non-negative integer x and y"}
     end
   end
 
