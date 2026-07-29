@@ -966,7 +966,9 @@ mod overlay {
 
     /// B3: a numbered set-of-marks badge at an element's click point. The model
     /// answers with the NUMBER; the caller resolves it to the exact point — no
-    /// pixel estimation at all.
+    /// pixel estimation at all. Badges are only ever drawn from the macOS AX
+    /// mark collection, so the fn is scoped with it.
+    #[cfg(target_os = "macos")]
     pub fn badge(img: &mut RgbaImage, x: i32, y: i32, n: usize) {
         let text = n.to_string();
         let half_w = (text_width(&text) / 2 + 4).max(8);
@@ -1265,6 +1267,7 @@ fn capture_payload_encoded(
 /// The badge cap keeps a marked image readable — a dense tree can expose
 /// hundreds of interactive nodes, and a badge soup grounds worse than pixels.
 /// Tree-walk order is roughly top-down, so the cap drops the least prominent.
+#[cfg(target_os = "macos")]
 const MAX_MARKS: usize = 60;
 
 struct MarksInfo {
@@ -2862,6 +2865,7 @@ mod tests {
     }
 
     /// A badge paints its red disc/pill centered on the mark point.
+    #[cfg(target_os = "macos")]
     #[test]
     fn badge_is_centered_on_the_mark_point() {
         let mut img = blank(120, 80);
