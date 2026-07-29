@@ -67,6 +67,44 @@ defmodule Compux.ProtocolTest do
       params = %{"action" => "screenshot", "region" => %{"x" => 0, "y" => 0, "w" => 0, "h" => 50}}
       assert {:error, _} = Protocol.validate(params)
     end
+
+    # v5 grounding-integrity fields: carried only when meaningfully set, so the
+    # wire stays minimal and a request without them is byte-identical to v4's.
+    test "carries rulers/marks only when literally true" do
+      assert {:ok, request} =
+               Protocol.validate(%{"action" => "screenshot", "rulers" => true, "marks" => true})
+
+      assert request["rulers"] == true
+      assert request["marks"] == true
+
+      assert {:ok, request} =
+               Protocol.validate(%{"action" => "screenshot", "rulers" => false, "marks" => false})
+
+      refute Map.has_key?(request, "rulers")
+      refute Map.has_key?(request, "marks")
+    end
+
+    test "rejects non-boolean rulers/marks" do
+      assert {:error, _} = Protocol.validate(%{"action" => "screenshot", "rulers" => "yes"})
+      assert {:error, _} = Protocol.validate(%{"action" => "screenshot", "marks" => 1})
+    end
+
+    test "carries a valid annotate_point and rejects malformed ones" do
+      assert {:ok, %{"annotate_point" => %{"x" => 12, "y" => 34}}} =
+               Protocol.validate(%{
+                 "action" => "screenshot",
+                 "annotate_point" => %{"x" => 12, "y" => 34}
+               })
+
+      assert {:error, _} =
+               Protocol.validate(%{"action" => "screenshot", "annotate_point" => %{"x" => 12}})
+
+      assert {:error, _} =
+               Protocol.validate(%{
+                 "action" => "screenshot",
+                 "annotate_point" => %{"x" => -1, "y" => 2}
+               })
+    end
   end
 
   describe "validate/1 — clicks and inspect" do
