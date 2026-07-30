@@ -1,7 +1,7 @@
 defmodule Compux.MixProject do
   use Mix.Project
 
-  @version "0.7.0"
+  @version "0.7.1"
   @source_url "https://github.com/tezra-io/compux"
 
   def project do
