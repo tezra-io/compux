@@ -1767,12 +1767,22 @@ fn window_entries(geom: &Geometry, full: &Region) -> Result<Vec<Value>, String> 
 
     // Front-most first: xcap's `z` grows toward the front, so the caller reads the
     // window it most likely means at the top of the list.
-    windows.sort_by_key(|w| std::cmp::Reverse(w.z().unwrap_or(0)));
+    windows.sort_by_cached_key(|w| std::cmp::Reverse(w.z().unwrap_or(0)));
+
+    // Shell-layer windows (the Dock, the menu bar, floating overlays) are not
+    // windows a caller can work IN — listing them invites zooming into a
+    // phantom region (observed live: "Dock — region {0,0,1931,543}").
+    let normal = shell_window_filter()?;
 
     let mut entries = Vec::new();
     for window in windows {
         if window.is_minimized().unwrap_or(false) {
             continue;
+        }
+        if let (Some(normal), Ok(id)) = (&normal, window.id()) {
+            if !normal.contains(&id) {
+                continue;
+            }
         }
         if let Some(region) = window_region(geom, full, &window) {
             entries.push(json!({
@@ -1906,26 +1916,121 @@ struct TargetApp {
     app: String,
 }
 
+/// The CGWindowIDs of NORMAL-layer windows (kCGWindowLayer == 0) on screen.
+/// The Dock, menu bar, Control Center, and floating shell panels live on
+/// non-zero layers while reporting large bounds at high z — observed live
+/// 2026-07-30: the Dock's full-screen window (layer 20) won target selection
+/// for BOTH a full-screen and a browser-window region, so `marks`/`elements`
+/// activated accessibility on the Dock and walked an empty tree. Layer 0 is
+/// the OS's own definition of "an app window a user works in", so filtering by
+/// it kills the class instead of chasing shell apps by name. (Measured here:
+/// Dock 20, menu bar 24, Control Center 25, floating companion panels 3.)
+#[cfg(target_os = "macos")]
+mod window_layer {
+    use core_foundation::base::{CFType, CFTypeRef, TCFType};
+    use core_foundation::string::CFString;
+    use std::collections::HashSet;
+    use std::ffi::c_void;
+
+    /// kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements.
+    const ON_SCREEN_ONLY: u32 = 1 << 0;
+    const EXCLUDE_DESKTOP: u32 = 1 << 4;
+    /// kCFNumberSInt64Type.
+    const SINT64: isize = 4;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFTypeRef;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFArrayGetCount(array: CFTypeRef) -> isize;
+        fn CFArrayGetValueAtIndex(array: CFTypeRef, index: isize) -> CFTypeRef;
+        fn CFDictionaryGetValue(dict: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
+        fn CFNumberGetValue(number: CFTypeRef, the_type: isize, out: *mut c_void) -> bool;
+    }
+
+    /// `Err` when the OS refuses the listing — the same underlying call the
+    /// window enumeration rides, so the two fail together and loudly.
+    pub fn normal_window_ids() -> Result<HashSet<u32>, String> {
+        unsafe {
+            let list_ref = CGWindowListCopyWindowInfo(ON_SCREEN_ONLY | EXCLUDE_DESKTOP, 0);
+            if list_ref.is_null() {
+                return Err("window layer listing failed".to_string());
+            }
+            let list = CFType::wrap_under_create_rule(list_ref);
+            let layer_key = CFString::new("kCGWindowLayer");
+            let number_key = CFString::new("kCGWindowNumber");
+
+            let mut ids = HashSet::new();
+            for index in 0..CFArrayGetCount(list.as_CFTypeRef()) {
+                let dict = CFArrayGetValueAtIndex(list.as_CFTypeRef(), index);
+                if dict.is_null() {
+                    continue;
+                }
+                if let (Some(0), Some(id)) =
+                    (read_i64(dict, &layer_key), read_i64(dict, &number_key))
+                {
+                    ids.insert(id as u32);
+                }
+            }
+            Ok(ids)
+        }
+    }
+
+    // CFDictionaryGetValue returns a borrowed (Get-rule) ref — no release here.
+    unsafe fn read_i64(dict: CFTypeRef, key: &CFString) -> Option<i64> {
+        let value = CFDictionaryGetValue(dict, key.as_CFTypeRef());
+        if value.is_null() {
+            return None;
+        }
+        let mut out: i64 = 0;
+        if CFNumberGetValue(value, SINT64, &mut out as *mut _ as *mut c_void) {
+            Some(out)
+        } else {
+            None
+        }
+    }
+}
+
+/// The normal-layer window-id set on macOS; `None` where layers do not exist
+/// (X11 has no shell-overlay class to exclude).
+#[cfg(target_os = "macos")]
+fn shell_window_filter() -> Result<Option<std::collections::HashSet<u32>>, String> {
+    window_layer::normal_window_ids().map(Some)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn shell_window_filter() -> Result<Option<std::collections::HashSet<u32>>, String> {
+    Ok(None)
+}
+
 /// The window list as selection candidates, FRONT TO BACK: minimized windows,
-/// the window server's own windows (the menu bar — never an accessibility
-/// target), off-display windows, and windows with no readable pid are out. An
-/// enumeration failure is a typed error, not an empty list — the two mean
-/// different things to the caller.
+/// shell-layer windows (`window_layer` — the Dock/menu-bar/overlay class that
+/// reports huge bounds at high z and shadowed real targets), off-display
+/// windows, and windows with no readable pid are out. An enumeration failure
+/// is a typed error, not an empty list — the two mean different things to the
+/// caller.
 #[cfg(target_os = "macos")]
 fn window_candidates(geom: &Geometry) -> Result<Vec<(Region, TargetApp)>, String> {
     let full = Region::full(geom);
     let mut windows = xcap::Window::all().map_err(|e| format!("window enumeration failed: {e}"))?;
     windows.sort_by_cached_key(|w| std::cmp::Reverse(w.z().unwrap_or(0)));
 
+    let normal = shell_window_filter()?;
+
     let mut candidates = Vec::new();
     for window in windows {
         if window.is_minimized().unwrap_or(false) {
             continue;
         }
-        let app = window.app_name().unwrap_or_default();
-        if app == "Window Server" {
-            continue;
+        if let (Some(normal), Ok(id)) = (&normal, window.id()) {
+            if !normal.contains(&id) {
+                continue;
+            }
         }
+        let app = window.app_name().unwrap_or_default();
         let Some(bounds) = window_region(geom, &full, &window) else {
             continue;
         };
