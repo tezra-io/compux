@@ -1865,48 +1865,215 @@ fn elements_for(geom: &Geometry, region: &Region) -> Result<Value, String> {
 #[cfg(target_os = "macos")]
 type ViewNode = (ax::Node, (i64, i64));
 
-/// Interactive AX elements whose centers fall inside this view, as sent-space
-/// points. Shared by `elements` and the `marks` overlay so the two can never
-/// disagree about what is clickable.
+/// Interactive AX elements of ONE application: the ones whose centers fall
+/// inside this view (as sent-space points) plus the TOTAL interactive count the
+/// walk saw before the view filter. The total is what distinguishes "the app's
+/// tree is gated/empty" (activation territory) from "the app has elements, just
+/// none inside this region" (nothing to activate). Shared by `elements` and the
+/// `marks` overlay so the two can never disagree about what is clickable.
 #[cfg(target_os = "macos")]
-fn in_view_nodes(geom: &Geometry, region: &Region) -> Vec<ViewNode> {
-    ax::interactive_elements()
+fn in_view_nodes(pid: i32, geom: &Geometry, region: &Region) -> (Vec<ViewNode>, usize) {
+    let nodes = ax::interactive_elements_of(pid);
+    let total = nodes.len();
+
+    let in_view = nodes
         .into_iter()
         .filter_map(|node| {
             let center_x = node.x + node.w / 2.0;
             let center_y = node.y + node.h / 2.0;
             to_sent(geom, region, center_x, center_y).map(|point| (node, point))
         })
-        .collect()
+        .collect();
+
+    (in_view, total)
 }
 
-/// How long a freshly AX-activated app gets to build its accessibility tree
-/// before the one retry. Chromium constructs the tree lazily on activation;
-/// an immediate re-walk still sees nothing.
+/// The application to read accessibility from: the one OWNING the window the
+/// caller is looking at, resolved from the window list. Deliberately NOT
+/// `AXFocusedApplication`: that query proved flaky from this spawned process
+/// (observed live 2026-07-29: "no focused application" three seconds after
+/// `windows` listed Chrome focused), and during a voice call it can resolve to
+/// the floating voice companion instead of the app on screen — which is how an
+/// activation attempt hit a non-Chromium app and died with AXError -25208
+/// while Chrome sat frontmost. Known limitation, accepted: an app with no
+/// named on-screen window (a menu-bar app with an open popover) cannot be
+/// resolved this way — the old query never reached those reliably either, and
+/// the typed no-window note says what happened.
 #[cfg(target_os = "macos")]
-const AX_ACTIVATION_SETTLE_MS: u64 = 400;
+#[derive(Debug, Clone, PartialEq)]
+struct TargetApp {
+    pid: i32,
+    app: String,
+}
 
-/// B4: enumerate, and on an EMPTY tree try accessibility activation once, then
-/// re-enumerate. Chromium/Electron-family apps expose their AX tree only to
-/// detected assistive clients (`AXManualAccessibility`); on any other app the
-/// set is a harmless typed error — which is why the retry is unconditional and
-/// needs no app-family sniffing. The note reports exactly what happened so an
-/// empty result is never silent again.
+/// The window list as selection candidates, FRONT TO BACK: minimized windows,
+/// the window server's own windows (the menu bar — never an accessibility
+/// target), off-display windows, and windows with no readable pid are out. An
+/// enumeration failure is a typed error, not an empty list — the two mean
+/// different things to the caller.
+#[cfg(target_os = "macos")]
+fn window_candidates(geom: &Geometry) -> Result<Vec<(Region, TargetApp)>, String> {
+    let full = Region::full(geom);
+    let mut windows = xcap::Window::all().map_err(|e| format!("window enumeration failed: {e}"))?;
+    windows.sort_by_cached_key(|w| std::cmp::Reverse(w.z().unwrap_or(0)));
+
+    let mut candidates = Vec::new();
+    for window in windows {
+        if window.is_minimized().unwrap_or(false) {
+            continue;
+        }
+        let app = window.app_name().unwrap_or_default();
+        if app == "Window Server" {
+            continue;
+        }
+        let Some(bounds) = window_region(geom, &full, &window) else {
+            continue;
+        };
+        let Ok(pid) = window.pid() else {
+            continue;
+        };
+        candidates.push((
+            bounds,
+            TargetApp {
+                pid: pid as i32,
+                app,
+            },
+        ));
+    }
+    Ok(candidates)
+}
+
+/// Substantial-overlap floor: the fraction of the REQUEST region a window must
+/// cover to win on stacking order alone. High enough that a small always-on-top
+/// panel (the voice companion, ~1-3% of a window region) can never shadow the
+/// window being read; low enough that a normal app window over a larger
+/// background one clears it easily.
+#[cfg(target_os = "macos")]
+const AX_TARGET_MIN_OVERLAP: f64 = 0.10;
+
+/// Pick the app the view is ABOUT from front-to-back candidates: the frontmost
+/// window with SUBSTANTIAL overlap of the request region wins — stacking order
+/// is the tiebreak the screen actually shows, so a maximized background window
+/// can never beat the smaller window in front of it. Only when nothing is
+/// substantial (a sparse desktop of small windows) does raw maximum overlap
+/// decide. Pure, so the selection semantics are unit-tested.
+#[cfg(target_os = "macos")]
+fn select_target(candidates: Vec<(Region, TargetApp)>, region: &Region) -> Option<TargetApp> {
+    let region_area = (region.w * region.h).max(1.0);
+
+    let mut best: Option<(f64, TargetApp)> = None;
+    for (bounds, target) in candidates {
+        let area = overlap_area(&bounds, region);
+        if area <= 0.0 {
+            continue;
+        }
+        if area >= AX_TARGET_MIN_OVERLAP * region_area {
+            return Some(target);
+        }
+        let better = best.as_ref().map(|(b, _)| area > *b).unwrap_or(true);
+        if better {
+            best = Some((area, target));
+        }
+    }
+    best.map(|(_, target)| target)
+}
+
+/// Overlap area of two sent-space rectangles; 0 when disjoint.
+#[cfg(target_os = "macos")]
+fn overlap_area(a: &Region, b: &Region) -> f64 {
+    let w = (a.x + a.w).min(b.x + b.w) - a.x.max(b.x);
+    let h = (a.y + a.h).min(b.y + b.h) - a.y.max(b.y);
+    if w <= 0.0 || h <= 0.0 {
+        0.0
+    } else {
+        w * h
+    }
+}
+
+/// Bounded settle for a lazily-built accessibility tree: Chromium switches web
+/// accessibility on when an AX client starts querying it, then needs a moment
+/// to build the tree — so an empty first walk re-queries on a short cadence
+/// instead of concluding emptiness from one look.
+#[cfg(target_os = "macos")]
+const AX_SETTLE_POLL_MS: u64 = 300;
+#[cfg(target_os = "macos")]
+const AX_SETTLE_POLLS: u32 = 5;
+
+/// B4, revised on live evidence: enumerate the TARGET app's tree rooted at its
+/// own application element. Activation (one typed attempt —
+/// `AXManualAccessibility`, then `AXEnhancedUserInterface` on an
+/// attribute-unsupported / not-implemented answer — current Chrome refuses
+/// BOTH yet serves its full tree to a querying client anyway) plus the bounded
+/// settle poll fire ONLY when the app's tree walked to zero interactive nodes
+/// overall: an app whose elements merely fall outside the view has nothing
+/// gated, and flipping enhanced-UI mode on it would be a pure side effect.
+/// Every outcome lands in the note — which app was read, what activation did,
+/// how long the tree took — so no result is silent about its cause.
 #[cfg(target_os = "macos")]
 fn interactive_in_view(geom: &Geometry, region: &Region) -> (Vec<ViewNode>, Option<String>) {
-    let found = in_view_nodes(geom, region);
+    let candidates = match window_candidates(geom) {
+        Ok(candidates) => candidates,
+        Err(reason) => return (Vec::new(), Some(reason)),
+    };
+    let Some(target) = select_target(candidates, region) else {
+        return (
+            Vec::new(),
+            Some("no application window to target for accessibility".to_string()),
+        );
+    };
+
+    let (found, total) = in_view_nodes(target.pid, geom, region);
     if !found.is_empty() {
-        return (found, None);
+        return (found, Some(format!("read {}", target.app)));
+    }
+    if total > 0 {
+        let note = format!(
+            "{}: {total} interactive element(s) in the app, none inside this view",
+            target.app
+        );
+        return (Vec::new(), Some(note));
     }
 
-    match ax::activate_accessibility() {
-        Ok(attribute) => {
-            thread::sleep(Duration::from_millis(AX_ACTIVATION_SETTLE_MS));
-            let after = in_view_nodes(geom, region);
-            let note = format!("{attribute} activated; {} element(s) after", after.len());
-            (after, Some(note))
+    let attempt = ax::activate_accessibility(target.pid);
+    for poll in 1..=AX_SETTLE_POLLS {
+        thread::sleep(Duration::from_millis(AX_SETTLE_POLL_MS));
+        let (again, again_total) = in_view_nodes(target.pid, geom, region);
+        let waited = u64::from(poll) * AX_SETTLE_POLL_MS;
+        if !again.is_empty() {
+            let note = format!(
+                "{}: tree appeared after {waited}ms ({})",
+                target.app,
+                attempt_note(&attempt)
+            );
+            return (again, Some(note));
         }
-        Err(reason) => (found, Some(format!("AX activation failed: {reason}"))),
+        if again_total > 0 {
+            // The tree came alive; this view just contains none of it — more
+            // polling cannot change that.
+            let note = format!(
+                "{}: tree appeared after {waited}ms ({}), but its {again_total} element(s) \
+                 are outside this view",
+                target.app,
+                attempt_note(&attempt)
+            );
+            return (Vec::new(), Some(note));
+        }
+    }
+
+    let waited = u64::from(AX_SETTLE_POLLS) * AX_SETTLE_POLL_MS;
+    let note = format!(
+        "{}: no accessibility elements — {}; tree still empty after {waited}ms",
+        target.app,
+        attempt_note(&attempt)
+    );
+    (Vec::new(), Some(note))
+}
+
+#[cfg(target_os = "macos")]
+fn attempt_note(attempt: &Result<&'static str, String>) -> String {
+    match attempt {
+        Ok(attribute) => format!("{attribute} activated"),
+        Err(reason) => format!("activation refused: {reason}"),
     }
 }
 
@@ -1982,14 +2149,13 @@ mod ax {
         // Extract the concrete value (CGPoint/CGSize) an AXValue wraps; false if the
         // requested type doesn't match.
         fn AXValueGetValue(value: CFTypeRef, the_type: u32, out: *mut c_void) -> bool;
-        // B4 activation: set an attribute on an app element / resolve its pid /
-        // re-create an app element from a pid at teardown time.
+        // B4 activation: set an attribute on an application element, created
+        // from the pid the caller resolved off the window list.
         fn AXUIElementSetAttributeValue(
             element: AXUIElementRef,
             attribute: CFStringRef,
             value: CFTypeRef,
         ) -> i32;
-        fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> i32;
         fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
     }
 
@@ -2009,7 +2175,6 @@ mod ax {
     const DESCRIPTION: &str = "AXDescription";
     const VALUE: &str = "AXValue";
     const CHILDREN: &str = "AXChildren";
-    const FOCUSED_APP: &str = "AXFocusedApplication";
     const POSITION: &str = "AXPosition";
     const SIZE: &str = "AXSize";
 
@@ -2123,44 +2288,49 @@ mod ax {
 
     /// Chromium/Electron's opt-in switch: the family builds its AX tree only for
     /// detected assistive clients, and this per-app attribute is the documented
-    /// de-facto way to request it manually.
+    /// way to request it manually. Current Chrome refuses it (and serves its
+    /// tree to a querying client regardless); Electron-family builds honor it.
     const MANUAL_ACCESSIBILITY: &str = "AXManualAccessibility";
-    /// Second choice ONLY on a typed attribute-unsupported error: it also flips
-    /// apps into an enhanced-UI mode window managers react to (layout side
-    /// effects), which is why it is never tried first.
+    /// Second choice ONLY on a typed rejection: it also flips apps into an
+    /// enhanced-UI mode window managers react to (layout side effects), which
+    /// is why it is never tried first.
     const ENHANCED_UI: &str = "AXEnhancedUserInterface";
-    /// AXError `kAXErrorAttributeUnsupported` — the one deterministic criterion
-    /// for falling through to `ENHANCED_UI`.
+    /// AXError `kAXErrorAttributeUnsupported`.
     const ATTRIBUTE_UNSUPPORTED: i32 = -25205;
+    /// AXError `kAXErrorNotImplemented` — what a process that does not
+    /// implement the attribute's setter answers (observed live from Chrome and
+    /// from non-Chromium apps).
+    const NOT_IMPLEMENTED: i32 = -25208;
+
+    /// The typed rejections that mean "this attribute is not a thing here" —
+    /// the deterministic criterion for trying the second attribute.
+    pub fn attribute_rejected(code: i32) -> bool {
+        code == ATTRIBUTE_UNSUPPORTED || code == NOT_IMPLEMENTED
+    }
 
     /// `(pid, attribute)` pairs this process switched ON — cleared on the exit
     /// paths so one enumeration never leaves an app in an altered AX mode.
     static ACTIVATED: Mutex<Vec<(i32, &'static str)>> = Mutex::new(Vec::new());
 
-    /// Ask the FOCUSED application to expose its accessibility tree. Returns the
-    /// attribute that activated, or a typed reason. Setting the attribute on an
-    /// app that does not gate its tree is a harmless error — callers retry
-    /// unconditionally on an empty enumeration, no app-family sniffing.
-    pub fn activate_accessibility() -> Result<&'static str, String> {
+    /// Ask ONE application — the pid the caller resolved off the window list —
+    /// to expose its accessibility tree. Returns the attribute that activated,
+    /// or a typed reason. Setting the attribute on an app that does not gate
+    /// its tree is a harmless typed error — callers attempt unconditionally on
+    /// an empty enumeration, no app-family sniffing.
+    pub fn activate_accessibility(pid: i32) -> Result<&'static str, String> {
         unsafe {
-            let system_ref = AXUIElementCreateSystemWide();
-            if system_ref.is_null() {
-                return Err("no system-wide AX element".to_string());
+            let app_ref = AXUIElementCreateApplication(pid);
+            if app_ref.is_null() {
+                return Err(format!("no accessibility connection to pid {pid}"));
             }
-            let system = CFType::wrap_under_create_rule(system_ref);
-            let app = copy_element_attr(&system, FOCUSED_APP).ok_or("no focused application")?;
-
-            let mut pid: i32 = 0;
-            if AXUIElementGetPid(app.as_CFTypeRef(), &mut pid) != 0 || pid <= 0 {
-                return Err("focused application has no pid".to_string());
-            }
+            let app = CFType::wrap_under_create_rule(app_ref);
 
             match set_bool_attr(&app, MANUAL_ACCESSIBILITY, true) {
                 0 => {
                     record(pid, MANUAL_ACCESSIBILITY);
                     Ok(MANUAL_ACCESSIBILITY)
                 }
-                ATTRIBUTE_UNSUPPORTED => match set_bool_attr(&app, ENHANCED_UI, true) {
+                code if attribute_rejected(code) => match set_bool_attr(&app, ENHANCED_UI, true) {
                     0 => {
                         record(pid, ENHANCED_UI);
                         Ok(ENHANCED_UI)
@@ -2213,17 +2383,20 @@ mod ax {
         )
     }
 
-    /// Walk the focused application's accessibility tree and collect interactive
-    /// elements (bounded depth + count) with global-logical frames. NON-PROMPTING,
-    /// read-only; runtime behavior needs a real Mac with the Accessibility grant.
-    pub fn interactive_elements() -> Vec<Node> {
+    /// Walk ONE application's accessibility tree — rooted at its own
+    /// application element, never at `AXFocusedApplication` (a query that
+    /// proved flaky from this spawned process and, during a voice call, can
+    /// name the floating companion instead of the app on screen) — and collect
+    /// interactive elements (bounded depth + count) with global-logical frames.
+    /// NON-PROMPTING, read-only; runtime behavior needs a real Mac with the
+    /// Accessibility grant.
+    pub fn interactive_elements_of(pid: i32) -> Vec<Node> {
         unsafe {
-            let system_ref = AXUIElementCreateSystemWide();
-            if system_ref.is_null() {
+            let app_ref = AXUIElementCreateApplication(pid);
+            if app_ref.is_null() {
                 return Vec::new();
             }
-            let system = CFType::wrap_under_create_rule(system_ref);
-            let root = copy_element_attr(&system, FOCUSED_APP).unwrap_or(system);
+            let root = CFType::wrap_under_create_rule(app_ref);
             let mut out = Vec::new();
             let mut visited = 0;
             walk(&root, 0, &mut visited, &mut out);
@@ -2645,6 +2818,149 @@ mod tests {
             window_k > full_k * 1.5,
             "a window crop must be clearly sharper: full={full_k} window={window_k}"
         );
+    }
+
+    // --- M28 B4 rev: AX target selection + activation codes ------------------
+
+    #[cfg(target_os = "macos")]
+    fn candidate(x: f64, y: f64, w: f64, h: f64, pid: i32, app: &str) -> (Region, TargetApp) {
+        (
+            Region { x, y, w, h },
+            TargetApp {
+                pid,
+                app: app.to_string(),
+            },
+        )
+    }
+
+    /// The frontmost SUBSTANTIAL window wins on stacking order — a maximized
+    /// background window must never beat the smaller window in front of it
+    /// (occlusion-blind max-overlap was the reviewed-out bug), and a small
+    /// always-on-top panel is never substantial, so it can never shadow the
+    /// window being read.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn select_target_prefers_the_frontmost_substantial_window() {
+        let full = Region {
+            x: 0.0,
+            y: 0.0,
+            w: 1931.0,
+            h: 543.0,
+        };
+        // Front to back: tiny voice panel, focused Chrome, maximized Slack.
+        let candidates = vec![
+            candidate(1700.0, 400.0, 120.0, 90.0, 10, "FermixPet"),
+            candidate(0.0, 16.0, 823.0, 481.0, 20, "Google Chrome"),
+            candidate(0.0, 0.0, 1931.0, 543.0, 30, "Slack"),
+        ];
+
+        let chosen = select_target(candidates, &full).expect("a target");
+        assert_eq!(chosen.app, "Google Chrome");
+    }
+
+    /// A region call scoped to a window picks that window even when the panel
+    /// floats ABOVE it inside the region.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn select_target_ignores_a_small_panel_over_the_region() {
+        let request = Region {
+            x: 0.0,
+            y: 16.0,
+            w: 823.0,
+            h: 481.0,
+        };
+        let candidates = vec![
+            candidate(600.0, 300.0, 120.0, 90.0, 10, "FermixPet"),
+            candidate(0.0, 16.0, 823.0, 481.0, 20, "Google Chrome"),
+        ];
+
+        let chosen = select_target(candidates, &request).expect("a target");
+        assert_eq!(chosen.app, "Google Chrome");
+    }
+
+    /// With nothing substantial, raw maximum overlap decides — and a LATER,
+    /// larger-overlap candidate beats an earlier smaller one (kills a
+    /// first-hit-wins regression), while an exact tie keeps the frontmost.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn select_target_falls_to_max_overlap_below_the_floor() {
+        let full = Region {
+            x: 0.0,
+            y: 0.0,
+            w: 1931.0,
+            h: 543.0,
+        };
+        let candidates = vec![
+            candidate(100.0, 100.0, 80.0, 60.0, 10, "Tiny"),
+            candidate(400.0, 200.0, 300.0, 150.0, 20, "MiniPlayer"),
+        ];
+        let chosen = select_target(candidates, &full).expect("a target");
+        assert_eq!(chosen.app, "MiniPlayer");
+
+        let tied = vec![
+            candidate(0.0, 0.0, 100.0, 100.0, 1, "Front"),
+            candidate(500.0, 0.0, 100.0, 100.0, 2, "Back"),
+        ];
+        let chosen = select_target(tied, &full).expect("a target");
+        assert_eq!(chosen.app, "Front", "an exact tie keeps the frontmost");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn select_target_is_none_without_overlap() {
+        let request = Region {
+            x: 0.0,
+            y: 0.0,
+            w: 400.0,
+            h: 300.0,
+        };
+        let candidates = vec![candidate(1500.0, 400.0, 200.0, 100.0, 10, "Elsewhere")];
+        assert_eq!(select_target(candidates, &request), None);
+        assert_eq!(select_target(Vec::new(), &request), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn overlap_area_geometry() {
+        let a = Region {
+            x: 0.0,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+        };
+        let inside = Region {
+            x: 2.0,
+            y: 2.0,
+            w: 4.0,
+            h: 4.0,
+        };
+        let disjoint = Region {
+            x: 20.0,
+            y: 0.0,
+            w: 5.0,
+            h: 5.0,
+        };
+        let partial = Region {
+            x: 5.0,
+            y: 5.0,
+            w: 10.0,
+            h: 10.0,
+        };
+
+        assert_eq!(overlap_area(&a, &inside), 16.0);
+        assert_eq!(overlap_area(&a, &disjoint), 0.0);
+        assert_eq!(overlap_area(&a, &partial), 25.0);
+    }
+
+    /// The two typed rejections fall through to the second attribute; every
+    /// other AXError is terminal.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attribute_rejection_codes() {
+        assert!(ax::attribute_rejected(-25205));
+        assert!(ax::attribute_rejected(-25208));
+        assert!(!ax::attribute_rejected(-25204));
+        assert!(!ax::attribute_rejected(0));
     }
 
     // --- M28 B5: the area budget ---------------------------------------------
