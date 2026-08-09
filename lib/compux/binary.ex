@@ -230,12 +230,36 @@ defmodule Compux.Binary do
 
   # Atomically move the VERIFIED bundle from staging into the cache dir (same
   # filesystem → a rename, so a resolve never sees a half-written bundle).
+  #
+  # Replacing an EXISTING installed bundle deletes a registered, signed .app —
+  # the operation macOS App Management (kTCCServiceSystemPolicyAppBundles)
+  # guards. If the embedding process lacks that grant the delete/rename comes
+  # back :eperm/:eacces; surface it as a typed error naming the gate instead of
+  # raising a bare File.Error that reads like a disk fault.
   defp publish_app(app, dest_dir) do
     File.mkdir_p!(dest_dir)
     final = Path.join(dest_dir, "Fermix.app")
-    File.rm_rf!(final)
-    File.rename!(app, final)
-    :ok
+
+    case replace_bundle(app, final) do
+      :ok ->
+        :ok
+
+      {:error, posix} when posix in [:eperm, :eacces] ->
+        {:error, {:app_management_denied, final, posix}}
+
+      {:error, reason} ->
+        {:error, {:publish_failed, final, reason}}
+    end
+  end
+
+  defp replace_bundle(app, final) do
+    with {:ok, _removed} <- File.rm_rf(final),
+         :ok <- File.rename(app, final) do
+      :ok
+    else
+      {:error, reason, _file} -> {:error, reason}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   # The installed executable: inside the `.app` on macOS, a bare binary elsewhere.

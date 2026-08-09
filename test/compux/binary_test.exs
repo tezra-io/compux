@@ -103,6 +103,42 @@ defmodule Compux.BinaryTest do
                Binary.path(cache_dir: tmp, checksums: %{}, fetcher: fn _url -> {:ok, ""} end)
     end
 
+    # Replacing an EXISTING installed bundle deletes a registered, signed .app —
+    # the one write macOS App Management (kTCCServiceSystemPolicyAppBundles) can
+    # deny the embedding process. A denial must surface as a typed error naming
+    # the gate, never a raised File.Error that reads like a disk fault and kills
+    # the embedder's install task. Simulated here with the same :eacces class a
+    # TCC denial returns (write-denied bundle parent).
+    test "a denied bundle replacement is a typed app_management_denied error (macOS)",
+         %{tmp: tmp} do
+      case Binary.target() do
+        {:ok, "macos-" <> _ = target} ->
+          {artifact, sha} = fake_app_zip()
+
+          opts = [
+            cache_dir: tmp,
+            checksums: %{target => sha},
+            fetcher: fn _url -> {:ok, artifact} end
+          ]
+
+          assert {:ok, cached} = Binary.path(opts)
+
+          # Force a re-extract over the still-present bundle: drop the inner
+          # executable (cache miss) and deny writes on the bundle's parent dir.
+          bundle = cached |> Path.dirname() |> Path.dirname() |> Path.dirname()
+          root = Path.dirname(bundle)
+          File.rm!(cached)
+          File.chmod!(root, 0o500)
+          on_exit(fn -> File.chmod(root, 0o700) end)
+
+          assert {:error, {:app_management_denied, ^bundle, posix}} = Binary.path(opts)
+          assert posix in [:eperm, :eacces]
+
+        _linux ->
+          :ok
+      end
+    end
+
     # macOS second integrity gate: even with a matching sha256, an unsigned/tampered
     # bundle must fail codesign verify AND leave nothing behind for a later resolve.
     test "fails loud on an unsigned .app and caches nothing (macOS)", %{tmp: tmp} do
