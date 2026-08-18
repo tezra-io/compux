@@ -37,7 +37,15 @@ defmodule Compux.Protocol do
   # refuses the pairing loudly. The sidecar also replaced the pure long-edge sent
   # budget with the looser of long-edge and pixel-area rules (never upscaling),
   # so extreme aspect ratios stop arriving unreadably small.
-  @protocol_version 5
+  #
+  # v6 (MILESTONE_32 capture mode): the sidecar gained the control actions
+  # `observe_start` / `observe_stop` and an UNSOLICITED push wire —
+  # `{"type":"event"|"ack", …}` frames streamed after `observe_start` is acked.
+  # Like `probe`/`idle_ms` these are operational, NOT model verbs (excluded from
+  # `@actions`), but the wire is no longer strictly one-response-per-request, so a
+  # pre-v6 sidecar cannot speak it and the handshake refuses the pairing. The
+  # consuming Fermix `Capturer` owns the Port and demuxes the discriminated frames.
+  @protocol_version 6
 
   @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows)
   @read_only ~w(screenshot mouse_move wait inspect wait_for_change elements windows)
