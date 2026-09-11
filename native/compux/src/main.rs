@@ -2450,11 +2450,11 @@ mod ax {
     /// detected assistive clients, and this per-app attribute is the documented
     /// way to request it manually. Current Chrome refuses it (and serves its
     /// tree to a querying client regardless); Electron-family builds honor it.
-    const MANUAL_ACCESSIBILITY: &str = "AXManualAccessibility";
+    pub const MANUAL_ACCESSIBILITY: &str = "AXManualAccessibility";
     /// Second choice ONLY on a typed rejection: it also flips apps into an
     /// enhanced-UI mode window managers react to (layout side effects), which
     /// is why it is never tried first.
-    const ENHANCED_UI: &str = "AXEnhancedUserInterface";
+    pub const ENHANCED_UI: &str = "AXEnhancedUserInterface";
     /// AXError `kAXErrorAttributeUnsupported`.
     const ATTRIBUTE_UNSUPPORTED: i32 = -25205;
     /// AXError `kAXErrorNotImplemented` — what a process that does not
@@ -2519,6 +2519,56 @@ mod ax {
                 let _ = set_bool_attr(&app, attribute, false);
             }
         }
+    }
+
+    /// Record an activation the CAPTURE engine performed. Capture drives its own
+    /// set (it reads the prior value first and sequences two attributes), but the
+    /// teardown ledger is shared: one list, so the process-exit `clear_activations`
+    /// also undoes capture's switches on a path that never reaches its detach (a
+    /// panicked observer thread, a failed join).
+    pub fn record_activation(pid: i32, attribute: &'static str) {
+        record(pid, attribute);
+    }
+
+    /// Switch OFF every attribute this process turned on for ONE app (capture's
+    /// detach). Returns one message per attribute that could NOT be cleared, so the
+    /// caller logs the failure rather than hiding it; an app with nothing recorded
+    /// makes no AX call at all.
+    pub fn clear_activation(pid: i32) -> Vec<String> {
+        let mut failures = Vec::new();
+        for attribute in take_recorded(pid) {
+            unsafe {
+                let app_ref = AXUIElementCreateApplication(pid);
+                if app_ref.is_null() {
+                    failures.push(format!(
+                        "no accessibility connection to pid {pid} to clear {attribute}"
+                    ));
+                    continue;
+                }
+                let app = CFType::wrap_under_create_rule(app_ref);
+                let code = set_bool_attr(&app, attribute, false);
+                if code != 0 {
+                    failures.push(format!("could not clear {attribute} (AXError {code})"));
+                }
+            }
+        }
+        failures
+    }
+
+    /// Remove and return the attributes recorded for one pid, leaving every other
+    /// app's records in place.
+    fn take_recorded(pid: i32) -> Vec<&'static str> {
+        let mut mine = Vec::new();
+        if let Ok(mut list) = ACTIVATED.lock() {
+            list.retain(|(recorded_pid, attribute)| {
+                if *recorded_pid == pid {
+                    mine.push(*attribute);
+                    return false;
+                }
+                true
+            });
+        }
+        mine
     }
 
     fn record(pid: i32, attribute: &'static str) {
@@ -2641,6 +2691,41 @@ mod ax {
             Some((point.x, point.y, dims.width, dims.height))
         } else {
             None
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // The teardown ledger is shared with the capture engine (one list, so a
+        // panicked observer thread still has its switches undone at process exit).
+        // Clearing ONE app must therefore drain that app's records and nobody else's.
+        // Pure bookkeeping only — no AX call is made for an app with no records.
+        #[test]
+        fn take_recorded_drains_only_the_requested_app() {
+            let (app_a, app_b) = (0x7f00_0001, 0x7f00_0002);
+            record(app_a, MANUAL_ACCESSIBILITY);
+            record(app_a, ENHANCED_UI);
+            record(app_b, MANUAL_ACCESSIBILITY);
+
+            assert!(
+                take_recorded(0x7f00_0003).is_empty(),
+                "an app with nothing recorded yields nothing to clear"
+            );
+
+            let mut drained = take_recorded(app_a);
+            drained.sort_unstable();
+            assert_eq!(drained, vec![ENHANCED_UI, MANUAL_ACCESSIBILITY]);
+            assert!(
+                take_recorded(app_a).is_empty(),
+                "a drained app is not cleared twice"
+            );
+            assert_eq!(
+                take_recorded(app_b),
+                vec![MANUAL_ACCESSIBILITY],
+                "another app's record survived"
+            );
         }
     }
 }
