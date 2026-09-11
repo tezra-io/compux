@@ -21,7 +21,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -33,6 +33,10 @@ use image::ImageEncoder as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use xcap::Monitor;
+
+/// Capture mode (MILESTONE_32 §8.4a): the AXObserver/CFRunLoop event-push engine +
+/// the serialized `Emitter`. Isolated from the request/response core here.
+mod capture;
 
 /// Long-edge cap for a sent screenshot (design §5: oversized captures 400 on
 /// Anthropic and ground worse).
@@ -68,7 +72,13 @@ fn budget_scale(w: f32, h: f32) -> f32 {
 /// `annotate_point`, and `marks` (M28) — additive, but a consumer advertising
 /// them against an older sidecar would get silently un-annotated images, so the
 /// version bumps and the handshake refuses the pairing loudly.
-const PROTOCOL_VERSION: u32 = 5;
+///
+/// v6: CAPTURE MODE (MILESTONE_32 §8.4a) — the control actions `observe_start` /
+/// `observe_stop` (excluded from `hello`'s model verbs) and an unsolicited
+/// `{"type":"event"|"ack",…}` push wire. The push channel is wire-incompatible
+/// with the strictly-positional request/response core, so the version bumps and
+/// the handshake refuses an older pairing. See `mod capture`.
+const PROTOCOL_VERSION: u32 = 6;
 
 // --- macOS TCC responsibility disclaim ---------------------------------------
 
@@ -193,8 +203,12 @@ fn main() {
     #[cfg(target_os = "macos")]
     disclaim::become_responsible();
 
+    // One serialized writer shared by the request loop and the capture observer
+    // thread (§8.4a): every response, ack, and event frame goes through `emitter`
+    // so a multi-write screenshot line and an unsolicited event can never split
+    // each other.
+    let emitter = capture::Emitter::new();
     let stdin = io::stdin();
-    let mut stdout = io::stdout();
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -206,36 +220,38 @@ fn main() {
         }
 
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(req) => handle(&req),
+            Ok(req) => handle(&req, &emitter),
             Err(e) => err(format!("invalid request JSON: {e}")),
         };
 
         // One JSON line per response. A write failure means the parent is gone.
-        if writeln!(stdout, "{response}").is_err() {
+        if emitter.emit_line(&response.to_string()).is_err() {
             break;
         }
-        let _ = stdout.flush();
 
         // A capture wedged the OS backend and leaked a stuck worker we can't
         // reclaim — the reply is now flushed, so exit and let the parent respawn
         // a clean sidecar (EX_TEMPFAIL). Do this AFTER flush so the caller got
         // its `capture_stalled` answer first.
         if CAPTURE_WEDGED.load(Ordering::SeqCst) {
+            capture::stop();
             #[cfg(target_os = "macos")]
             ax::clear_activations();
             std::process::exit(75);
         }
     }
 
-    // stdin EOF: the owning Port closed — the session is over. Switch OFF any
-    // accessibility attribute this process switched on (B4), so one enumeration
-    // never leaves the user's browser in an altered AX mode. Best-effort: a
-    // SIGKILLed sidecar skips this, and the next activation is idempotent.
+    // stdin EOF: the owning Port closed — the session is over. Tear down any live
+    // capture observer, then switch OFF any accessibility attribute this process
+    // switched on (B4), so one enumeration never leaves the user's browser in an
+    // altered AX mode. Best-effort: a SIGKILLed sidecar skips this, and the next
+    // activation is idempotent.
+    capture::stop();
     #[cfg(target_os = "macos")]
     ax::clear_activations();
 }
 
-fn handle(req: &Value) -> Value {
+fn handle(req: &Value, emitter: &capture::Emitter) -> Value {
     let action = req.get("action").and_then(Value::as_str).unwrap_or("");
     let result = match action {
         "hello" => hello(),
@@ -243,6 +259,13 @@ fn handle(req: &Value) -> Value {
         "idle_ms" => idle_ms(),
         "wait_for_idle" => wait_for_idle(req),
         "request_permissions" => request_permissions(req),
+        // Capture control verbs (MILESTONE_32 §8.4a) — NOT model actions, excluded
+        // from `hello`. They return a type-discriminated `ack` frame (even on
+        // refusal), never the generic `{ok:false,error}` shape, so the consumer's
+        // handshake reads `ok`/`protocol_version` rather than degrading on a
+        // missing frame type.
+        "observe_start" => Ok(observe_start(req, emitter)),
+        "observe_stop" => Ok(observe_stop()),
         "screenshot" => screenshot(req),
         "mouse_move" => mouse_move(req),
         "left_click" => click(req, Button::Left, 1),
@@ -265,6 +288,38 @@ fn handle(req: &Value) -> Value {
         Ok(value) => value,
         Err(message) => err(message),
     }
+}
+
+// --- capture control (MILESTONE_32 §8.4a, NOT model actions) -----------------
+
+/// Start the capture observer and reply with the `observe_start` ack. On a refusal
+/// (no Accessibility grant, already running, non-macOS) the ack carries `ok:false`
+/// plus a diagnostic `error` (which the consumer ignores). The consumer degrades to
+/// observe_start_refused on the `ok:false`, so it MUST be an `ack`, never `err()`.
+fn observe_start(req: &Value, emitter: &capture::Emitter) -> Value {
+    match capture::start(req, emitter.clone()) {
+        Ok(()) => observe_ack("observe_start", true, None),
+        Err(reason) => observe_ack("observe_start", false, Some(reason)),
+    }
+}
+
+/// Tear down the observer and ack. `observe_stop` is best-effort and always `ok`.
+fn observe_stop() -> Value {
+    capture::stop();
+    observe_ack("observe_stop", true, None)
+}
+
+fn observe_ack(action: &str, ok: bool, error: Option<String>) -> Value {
+    let mut ack = json!({
+        "type": "ack",
+        "action": action,
+        "ok": ok,
+        "protocol_version": PROTOCOL_VERSION,
+    });
+    if let Some(error) = error {
+        ack["error"] = json!(error);
+    }
+    ack
 }
 
 fn err(message: String) -> Value {
@@ -2395,11 +2450,11 @@ mod ax {
     /// detected assistive clients, and this per-app attribute is the documented
     /// way to request it manually. Current Chrome refuses it (and serves its
     /// tree to a querying client regardless); Electron-family builds honor it.
-    const MANUAL_ACCESSIBILITY: &str = "AXManualAccessibility";
+    pub const MANUAL_ACCESSIBILITY: &str = "AXManualAccessibility";
     /// Second choice ONLY on a typed rejection: it also flips apps into an
     /// enhanced-UI mode window managers react to (layout side effects), which
     /// is why it is never tried first.
-    const ENHANCED_UI: &str = "AXEnhancedUserInterface";
+    pub const ENHANCED_UI: &str = "AXEnhancedUserInterface";
     /// AXError `kAXErrorAttributeUnsupported`.
     const ATTRIBUTE_UNSUPPORTED: i32 = -25205;
     /// AXError `kAXErrorNotImplemented` — what a process that does not
@@ -2464,6 +2519,56 @@ mod ax {
                 let _ = set_bool_attr(&app, attribute, false);
             }
         }
+    }
+
+    /// Record an activation the CAPTURE engine performed. Capture drives its own
+    /// set (it reads the prior value first and sequences two attributes), but the
+    /// teardown ledger is shared: one list, so the process-exit `clear_activations`
+    /// also undoes capture's switches on a path that never reaches its detach (a
+    /// panicked observer thread, a failed join).
+    pub fn record_activation(pid: i32, attribute: &'static str) {
+        record(pid, attribute);
+    }
+
+    /// Switch OFF every attribute this process turned on for ONE app (capture's
+    /// detach). Returns one message per attribute that could NOT be cleared, so the
+    /// caller logs the failure rather than hiding it; an app with nothing recorded
+    /// makes no AX call at all.
+    pub fn clear_activation(pid: i32) -> Vec<String> {
+        let mut failures = Vec::new();
+        for attribute in take_recorded(pid) {
+            unsafe {
+                let app_ref = AXUIElementCreateApplication(pid);
+                if app_ref.is_null() {
+                    failures.push(format!(
+                        "no accessibility connection to pid {pid} to clear {attribute}"
+                    ));
+                    continue;
+                }
+                let app = CFType::wrap_under_create_rule(app_ref);
+                let code = set_bool_attr(&app, attribute, false);
+                if code != 0 {
+                    failures.push(format!("could not clear {attribute} (AXError {code})"));
+                }
+            }
+        }
+        failures
+    }
+
+    /// Remove and return the attributes recorded for one pid, leaving every other
+    /// app's records in place.
+    fn take_recorded(pid: i32) -> Vec<&'static str> {
+        let mut mine = Vec::new();
+        if let Ok(mut list) = ACTIVATED.lock() {
+            list.retain(|(recorded_pid, attribute)| {
+                if *recorded_pid == pid {
+                    mine.push(*attribute);
+                    return false;
+                }
+                true
+            });
+        }
+        mine
     }
 
     fn record(pid: i32, attribute: &'static str) {
@@ -2586,6 +2691,41 @@ mod ax {
             Some((point.x, point.y, dims.width, dims.height))
         } else {
             None
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // The teardown ledger is shared with the capture engine (one list, so a
+        // panicked observer thread still has its switches undone at process exit).
+        // Clearing ONE app must therefore drain that app's records and nobody else's.
+        // Pure bookkeeping only — no AX call is made for an app with no records.
+        #[test]
+        fn take_recorded_drains_only_the_requested_app() {
+            let (app_a, app_b) = (0x7f00_0001, 0x7f00_0002);
+            record(app_a, MANUAL_ACCESSIBILITY);
+            record(app_a, ENHANCED_UI);
+            record(app_b, MANUAL_ACCESSIBILITY);
+
+            assert!(
+                take_recorded(0x7f00_0003).is_empty(),
+                "an app with nothing recorded yields nothing to clear"
+            );
+
+            let mut drained = take_recorded(app_a);
+            drained.sort_unstable();
+            assert_eq!(drained, vec![ENHANCED_UI, MANUAL_ACCESSIBILITY]);
+            assert!(
+                take_recorded(app_a).is_empty(),
+                "a drained app is not cleared twice"
+            );
+            assert_eq!(
+                take_recorded(app_b),
+                vec![MANUAL_ACCESSIBILITY],
+                "another app's record survived"
+            );
         }
     }
 }
@@ -3187,7 +3327,7 @@ mod tests {
     // window list OR a typed display error both pass — "unknown action" never does.
     #[test]
     fn handle_dispatches_windows() {
-        let response = handle(&json!({ "action": "windows" }));
+        let response = handle(&json!({ "action": "windows" }), &capture::Emitter::new());
 
         let unknown = response["error"]
             .as_str()
@@ -3323,6 +3463,26 @@ mod tests {
         assert!(!actions.iter().any(|a| a == "wait_for_idle"));
     }
 
+    // The capture control verbs are operational (policy-driven), NOT model verbs —
+    // no model tool call must reach observe_start/observe_stop (MILESTONE_32 §8.4a).
+    #[test]
+    fn observe_verbs_are_not_advertised_model_actions() {
+        let actions = hello().unwrap()["actions"].as_array().unwrap().clone();
+        assert!(!actions.iter().any(|a| a == "observe_start"));
+        assert!(!actions.iter().any(|a| a == "observe_stop"));
+    }
+
+    // observe_start/observe_stop reply with a type-discriminated ack carrying
+    // protocol_version — the frame the consumer's handshake reads (never err()).
+    #[test]
+    fn observe_stop_returns_an_ack_frame() {
+        let ack = handle(&json!({"action": "observe_stop"}), &capture::Emitter::new());
+        assert_eq!(ack["type"], json!("ack"));
+        assert_eq!(ack["action"], json!("observe_stop"));
+        assert_eq!(ack["ok"], json!(true));
+        assert_eq!(ack["protocol_version"], json!(PROTOCOL_VERSION));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn idle_ms_reports_a_nonnegative_value() {
@@ -3360,7 +3520,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn handle_dispatches_idle_ms() {
-        let v = handle(&json!({"action": "idle_ms"}));
+        let v = handle(&json!({"action": "idle_ms"}), &capture::Emitter::new());
         assert_eq!(v["ok"], json!(true));
         assert!(v["idle_ms"].as_u64().is_some());
     }
