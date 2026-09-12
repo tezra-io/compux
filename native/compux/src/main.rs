@@ -78,6 +78,11 @@ fn budget_scale(w: f32, h: f32) -> f32 {
 /// `{"type":"event"|"ack",…}` push wire. The push channel is wire-incompatible
 /// with the strictly-positional request/response core, so the version bumps and
 /// the handshake refuses an older pairing. See `mod capture`.
+///
+/// 0.9.0 stays on v6: the `browser.navigated` observation kind and the browser
+/// context on `field.value` are ADDITIVE fields on that same push wire, and the
+/// retired `sites` key of `observe_start` is accepted and ignored — no control
+/// action changed, so neither side needs a new minimum.
 const PROTOCOL_VERSION: u32 = 6;
 
 // --- macOS TCC responsibility disclaim ---------------------------------------

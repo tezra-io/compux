@@ -85,6 +85,24 @@ macOS requires the user to grant **Screen Recording** (capture) and **Accessibil
 input is silently dropped while screenshots still work — `Compux.probe/1` reports
 both grants without prompting so you can tell the user exactly what's missing.
 
+## Capture mode
+
+Besides the request/response actions, the sidecar has an observe rail the embedder
+starts with `observe_start` and stops with `observe_stop`: it attaches the macOS
+Accessibility observer to the frontmost app **in the caller's allowlist** and streams
+window, focus and field events back as unsolicited JSON frames. For an allowlisted
+browser it also reports the page the owner is on — the URL reduced to scheme, host and
+path (the query string and fragment are dropped in the sidecar, never sent), the page
+title, and the window/tab it belongs to.
+
+Typed text is sent only for a window the sidecar can positively tell is **not** a
+private-browsing window, and a private window's URL is never sent at all; anything else
+arrives as volume-only metadata, so a caller can always tell withheld content from
+content that never existed. A private window needs no explanation — it is working as
+designed — so only a browser whose private-browsing state the sidecar cannot read at all
+also reports a named gap, once per session, naming that browser. Secure text fields are
+never read.
+
 ## Status
 
 Alpha (`0.x`). The coordinate math is unit-tested (including the Retina

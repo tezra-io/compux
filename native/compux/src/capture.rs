@@ -188,9 +188,9 @@ pub fn event_frame(
 /// epoch-ms).
 ///
 /// `app` says whose coverage the gap is about: a per-app COVERAGE gap (`title_only`,
-/// `ax_refused:…`) carries the app object so the decoder attributes it through the
-/// same `bundle_id` path every other event uses; a SYSTEM gap (`grant_revoked`,
-/// `secure_input`, `private_unknown`) is app-less because it is not a property of one
+/// `ax_refused:…`, `private_unknown`) carries the app object so the decoder attributes
+/// it through the same `bundle_id` path every other event uses; a SYSTEM gap
+/// (`grant_revoked`, `secure_input`) is app-less because it is not a property of one
 /// app.
 pub fn gap_frame(
     boot_id: &str,
@@ -214,6 +214,11 @@ pub fn gap_frame(
 pub enum GapReason {
     SecureInput,
     GrantRevoked,
+    /// A browser family with NO pinned private-window marker, so the posture of its
+    /// windows can never be read and its typed text is always withheld (inv. 26). A
+    /// standing property of ONE app, so it carries the app and is announced once per app
+    /// per session, like `title_only`. A PINNED family never owes this gap: a title its
+    /// window did not answer withholds that one value and says nothing about the app.
     PrivateUnknown,
     /// The app's accessibility tree could not be switched on, so only window
     /// titles are observable for it — never a `field.value` (§8.2).
@@ -277,10 +282,26 @@ pub fn truncate_text(text: &str) -> (String, bool) {
     (text[..end].to_string(), true)
 }
 
-/// The bundle-id set treated as a web browser. A browser's field/selection content
-/// cannot be site-correlated in v1 (no tab/window ref, no private-window signal),
-/// so its content is WITHHELD before it crosses the Port (§13.2) — never sent for
-/// Fermix to filter later. `browser.navigated` + full correlation is v1.1.
+/// Number of CHARACTERS in a value — the volume a `field.value` reports even when its
+/// content is withheld or clipped, so a gap is never a silent loss.
+pub fn char_len(s: &str) -> i64 {
+    s.chars().count() as i64
+}
+
+/// Insert a string field only when there is one: an absent value is an ABSENT key on
+/// the wire, never a `null` the decoder would have to special-case.
+pub fn insert_str(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
+    if let Some(v) = value {
+        map.insert(key.to_string(), json!(v));
+    }
+}
+
+/// The bundle-id set treated as a web browser. A browser's content events are
+/// site-correlated (`browser_id`/`window_ref`/`tab_ref`/`host`) and gated on the
+/// window's private-browsing posture: typed text leaves the sidecar only for a window
+/// KNOWN not to be private, and a private window's URL never leaves it at all
+/// (inv. 26, §13.2 — withheld before it crosses the Port, never sent for Fermix to
+/// filter later).
 pub fn is_browser(bundle_id: &str) -> bool {
     matches!(
         bundle_id,
@@ -288,14 +309,342 @@ pub fn is_browser(bundle_id: &str) -> bool {
             | "com.apple.SafariTechnologyPreview"
             | "com.google.Chrome"
             | "com.google.Chrome.canary"
+            | "com.google.Chrome.beta"
+            | "com.google.Chrome.dev"
+            | "org.chromium.Chromium"
             | "com.microsoft.edgemac"
+            | "com.microsoft.edgemac.Beta"
+            | "com.microsoft.edgemac.Dev"
+            | "com.microsoft.edgemac.Canary"
             | "com.brave.Browser"
             | "org.mozilla.firefox"
+            | "org.mozilla.nightly"
+            | "org.mozilla.firefoxdeveloperedition"
             | "com.operasoftware.Opera"
             | "company.thebrowser.Browser"
             | "com.vivaldi.Vivaldi"
             | "com.arc.Arc"
     )
+}
+
+// --- browser privacy, URLs and navigation (portable, unit-tested) ------------
+
+/// A browser window's private-browsing posture — the ONLY gate left on browser data,
+/// so it is a four-valued answer rather than a boolean guess (§2.2 of the v1.1
+/// design). Three of the four withhold typed text; what separates the last two is
+/// whether the sidecar learned anything worth SAYING about the app:
+///
+/// * `Unknown` — this browser family has no pinned marker, so its posture can never be
+///   read. A standing property of the app: it owes one `private_unknown` gap so
+///   `/history status` can name it.
+/// * `Unreadable` — a pinned family whose window title could not be read on THIS
+///   value. One failed read is not a standing condition, so it owes no gap; and since
+///   the absence of a marker is only evidence when the title was readable, its URL is
+///   withheld too (an incognito window whose marker we merely failed to see must not
+///   report where it went).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateState {
+    Private,
+    NotPrivate,
+    Unknown,
+    Unreadable,
+}
+
+impl PrivateState {
+    /// The wire spelling (the store's `private_state` column, which has three values —
+    /// an unreadable read is reported as `unknown`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrivateState::Private => "private",
+            PrivateState::NotPrivate => "not_private",
+            PrivateState::Unknown | PrivateState::Unreadable => "unknown",
+        }
+    }
+}
+
+/// The AX window-title substring that marks a private/incognito window, per browser
+/// family — the single source for the classification below.
+///
+/// Only what `LIVE_CHECK.md` actually exercises is pinned. The Chromium family shares
+/// Chrome's code and its `Incognito` window-title string, and stable Chrome is verified
+/// in LIVE_CHECK §5b, so those channels are pinned together. Every other browser is
+/// deliberately UNPINNED and answers `Unknown` — its URLs still flow, its typed text
+/// does not, and the gap names it — because a marker that has not been checked against
+/// a live window of that browser must never be pinned: a wrong `not_private` leaks
+/// typed text out of a private window (inv. 26), while an `unknown` only loses capture
+/// and says so.
+///
+/// Candidate markers, recorded but NOT pinned (no live check covers them; LIVE_CHECK
+/// "Pinning another browser family" is the procedure): Edge `InPrivate`, Firefox
+/// `Private Browsing`, Safari — reported to expose a `Private Browsing` toolbar element
+/// rather than a title marker at all (§2.2).
+const PRIVATE_WINDOW_MARKERS: &[(&str, &str)] = &[
+    ("com.google.Chrome", "Incognito"),
+    ("com.google.Chrome.canary", "Incognito"),
+    ("com.google.Chrome.beta", "Incognito"),
+    ("com.google.Chrome.dev", "Incognito"),
+    ("org.chromium.Chromium", "Incognito"),
+];
+
+/// Classify one browser window from its AX title. Fail-closed at every step: a
+/// non-browser has no posture to report, an unpinned family stays `Unknown`, and a
+/// pinned family with no readable title is `Unreadable` rather than `NotPrivate` by
+/// absence of evidence. Marker matching is a case-sensitive substring test — the
+/// markers are fixed UI strings.
+pub fn private_state(bundle_id: &str, window_title: &str) -> PrivateState {
+    if !is_browser(bundle_id) {
+        return PrivateState::Unknown;
+    }
+    let Some((_, marker)) = PRIVATE_WINDOW_MARKERS
+        .iter()
+        .find(|(family, _)| *family == bundle_id)
+    else {
+        return PrivateState::Unknown;
+    };
+    if window_title.is_empty() {
+        return PrivateState::Unreadable;
+    }
+    if window_title.contains(marker) {
+        return PrivateState::Private;
+    }
+    PrivateState::NotPrivate
+}
+
+/// Reduce a browser URL to what the store is allowed to keep: scheme + host + path.
+/// The query string, the fragment, the userinfo and the port are dropped HERE, in the
+/// sidecar (inv. 27, §13.2 — never send what the store must not keep), because a query
+/// string is where session ids, tokens and one-time codes live.
+///
+/// `None` means there is no navigation to report: a non-http(s) scheme (`file:` paths
+/// are local secrets; `about:`/`chrome:`/`data:` pages are nothing to recall), a URL
+/// with no host, or a normalized URL past [`MAX_URL_BYTES`]. Returns `(url, host)`; the
+/// host is lowercased (an IDN host passes through as-is) and the path is kept verbatim.
+pub fn normalize_url(raw: &str) -> Option<(String, String)> {
+    let (scheme, rest) = raw.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let host = host_of(authority)?;
+    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+    let url = format!("{scheme}://{host}{}", &tail[..path_end]);
+    if url.len() > MAX_URL_BYTES {
+        // Dropped, never truncated: a cut URL names a page that does not exist and the
+        // store cannot tell it was cut.
+        return None;
+    }
+    Some((url, host))
+}
+
+/// Cap on a normalized URL. Past this the navigation is DROPPED — the length is already
+/// pathological (every real page is far under it) and a clipped URL is worse than none.
+pub const MAX_URL_BYTES: usize = 2048;
+
+/// The host of an authority: userinfo dropped (everything up to the last `@`), port
+/// dropped, lowercased. An IPv6 literal keeps its brackets — the colons inside them
+/// are not a port separator.
+fn host_of(authority: &str) -> Option<String> {
+    let after_userinfo = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let host = match after_userinfo.rfind(']') {
+        Some(end) => &after_userinfo[..=end],
+        None => after_userinfo.split(':').next().unwrap_or(""),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_lowercase())
+}
+
+/// What a bounded web-area walk found, and what the caller must release.
+pub struct WebAreaWalk<T> {
+    /// The page web area, when the walk reached one. The caller owns it.
+    pub found: Option<T>,
+    /// Every OTHER element the walk was handed, root included: the caller releases each
+    /// one. Accounting for them here is what makes the walk leak-free by construction
+    /// rather than by inspection of an early return.
+    pub discarded: Vec<T>,
+}
+
+/// Breadth-first search for a browser window's PAGE web area, factored over the two
+/// reads it makes so its bounds are testable against a synthetic tree.
+///
+/// `children` and `is_page` are the AX reads (`AXChildren`, and `AXRole` + `AXURL`
+/// reduced by [`normalize_url`]); the walk owns only the ORDER and the BOUNDS:
+///
+/// * `max_nodes` bounds the elements TESTED — checked before each read, not merely
+///   before expanding, because a wide tree would otherwise turn a 400-node budget into
+///   one read per enqueued element (400 expansions × 400 children ≈ 160k IPC calls);
+/// * expansion stops once that many elements have been enqueued, so at most `max_nodes`
+///   plus one node's children are ever held at once;
+/// * `max_depth` bounds how deep it descends.
+///
+/// Breadth-first because the content area sits shallow under the window, so a deep
+/// toolbar subtree must never be descended before it.
+pub fn find_page_web_area<T: Copy>(
+    root: T,
+    max_depth: usize,
+    max_nodes: usize,
+    children: &mut impl FnMut(T) -> Vec<T>,
+    is_page: &mut impl FnMut(T) -> bool,
+) -> WebAreaWalk<T> {
+    let mut queue: std::collections::VecDeque<(T, usize)> = std::collections::VecDeque::new();
+    queue.push_back((root, 0));
+    let mut queued = 1usize;
+    let mut discarded: Vec<T> = Vec::new();
+    let mut visited = 0usize;
+
+    while let Some((node, depth)) = queue.pop_front() {
+        // The cap is spent: this element is never READ, only released.
+        if visited >= max_nodes {
+            discarded.push(node);
+            discarded.extend(queue.into_iter().map(|(node, _)| node));
+            return WebAreaWalk {
+                found: None,
+                discarded,
+            };
+        }
+        visited += 1;
+        if is_page(node) {
+            discarded.extend(queue.into_iter().map(|(node, _)| node));
+            return WebAreaWalk {
+                found: Some(node),
+                discarded,
+            };
+        }
+        if depth < max_depth && queued < max_nodes {
+            let kids = children(node);
+            queued += kids.len();
+            queue.extend(kids.into_iter().map(|kid| (kid, depth + 1)));
+        }
+        discarded.push(node);
+    }
+
+    WebAreaWalk {
+        found: None,
+        discarded,
+    }
+}
+
+/// One settled browser navigation, as read off the AX tree. Plain data, so both the
+/// decision it feeds and the frame it becomes are pure and testable without AX.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Navigation {
+    pub window_ref: String,
+    /// The AX window title as read — the text the classifier judged, on the wire so
+    /// the owner can pin a family's marker from the store itself.
+    pub window_title: String,
+    pub tab_ref: String,
+    /// Already stripped by [`normalize_url`].
+    pub url: String,
+    pub host: String,
+    pub page_title: Option<String>,
+    pub private_state: PrivateState,
+}
+
+/// Whether a freshly read `(tab_ref, url)` pair is a navigation worth a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavigationDecision {
+    Emit,
+    Skip,
+}
+
+/// A navigation is a CHANGE of the `(tab, url)` pair last recorded for this window: a
+/// spinner retitling the same page is not one, and refocusing a window whose page has
+/// not changed is not one either. A private window never navigates as far as the wire
+/// is concerned — its URL must not cross the Port (inv. 26) — and neither does an
+/// `Unreadable` one, which may be a private window whose marker we merely failed to
+/// see. An `Unknown` (unpinned) browser DOES report where it went: consent is per
+/// browser, so only typed text waits for a positive signal.
+pub fn navigation_decision(
+    last: Option<(&str, &str)>,
+    tab_ref: &str,
+    url: &str,
+    state: PrivateState,
+) -> NavigationDecision {
+    if matches!(state, PrivateState::Private | PrivateState::Unreadable) {
+        return NavigationDecision::Skip;
+    }
+    if last == Some((tab_ref, url)) {
+        return NavigationDecision::Skip;
+    }
+    NavigationDecision::Emit
+}
+
+/// The `browser.navigated` extras (§8.4). `browser_id` is the bundle id; everything
+/// else comes off the read.
+pub fn navigation_extras(browser_id: &str, nav: &Navigation) -> Map<String, Value> {
+    let mut extra = Map::new();
+    extra.insert("browser_id".into(), json!(browser_id));
+    extra.insert("url".into(), json!(nav.url));
+    extra.insert("host".into(), json!(nav.host));
+    extra.insert("window_ref".into(), json!(nav.window_ref));
+    extra.insert("tab_ref".into(), json!(nav.tab_ref));
+    extra.insert("private_state".into(), json!(nav.private_state.as_str()));
+    insert_str(&mut extra, "page_title", nav.page_title.clone());
+    if !nav.window_title.is_empty() {
+        extra.insert("window_title".into(), json!(nav.window_title));
+    }
+    extra
+}
+
+/// The browser context a `field.value` frame is stamped with (§8.4): which window it
+/// was typed in, and the site the last navigation bound that window to.
+pub struct BrowserFieldContext<'a> {
+    pub browser_id: &'a str,
+    pub window_ref: Option<&'a str>,
+    pub tab_ref: Option<&'a str>,
+    pub host: Option<&'a str>,
+}
+
+/// What the caller still owes after a browser `field.value` frame is built.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BrowserFieldOwed {
+    /// The text was clipped at [`MAX_TEXT_BYTES`]: a `gap{truncated}` is owed.
+    pub truncated: bool,
+    /// The window's posture is unreadable: a `gap{private_unknown}` is owed, once per
+    /// app per session.
+    pub private_unknown: bool,
+}
+
+/// Build the browser half of a `field.value` frame, with the private gate deciding what
+/// may leave (inv. 26). `not_private` sends the text (truncated like any other field)
+/// plus the full site context; every other posture sends the volume and the refs and
+/// withholds everything else. Only `Unknown` — a browser family with no pinned marker —
+/// owes the standing `private_unknown` gap: a private window is working as designed, and
+/// a single `Unreadable` read is not a property of the app.
+pub fn browser_field_extras(
+    text: &str,
+    state: PrivateState,
+    context: &BrowserFieldContext,
+    extra: &mut Map<String, Value>,
+) -> BrowserFieldOwed {
+    extra.insert("char_len".into(), json!(char_len(text)));
+    extra.insert("private_state".into(), json!(state.as_str()));
+    extra.insert("browser_id".into(), json!(context.browser_id));
+    insert_str(extra, "window_ref", context.window_ref.map(str::to_string));
+
+    if state != PrivateState::NotPrivate {
+        extra.insert("content_withheld".into(), json!(true));
+        return BrowserFieldOwed {
+            truncated: false,
+            private_unknown: state == PrivateState::Unknown,
+        };
+    }
+
+    let (sent, truncated) = truncate_text(text);
+    extra.insert("text".into(), json!(sent));
+    extra.insert("content_withheld".into(), json!(false));
+    insert_str(extra, "tab_ref", context.tab_ref.map(str::to_string));
+    insert_str(extra, "host", context.host.map(str::to_string));
+    BrowserFieldOwed {
+        truncated,
+        private_unknown: false,
+    }
 }
 
 /// Roles whose value changes are actual user-entered content (§22.5). A value
@@ -540,26 +889,21 @@ impl<T: Copy> WatchSlot<T> {
 
 // --- session control (portable facade) ---------------------------------------
 
-/// The resolved allowlists an `observe_start` carries.
+/// The resolved app allowlist an `observe_start` carries. There is no site allowlist:
+/// consent is per BROWSER (allowlisting Chrome means "record where I go in Chrome"), so
+/// the retired `sites` key is simply ignored when an older consumer still sends it.
 #[derive(Clone, Debug, Default)]
 pub struct ObserveConfig {
     pub apps: Vec<String>,
-    // The site allowlist is parsed (the full observe_start contract) but not yet
-    // consulted: v1 withholds browser content entirely rather than site-filter it,
-    // so per-site enforcement lands with v1.1's browser.navigated correlation.
-    #[allow(dead_code)]
-    pub sites: Vec<String>,
 }
 
 impl ObserveConfig {
-    /// Parse `{"action":"observe_start","params":{"apps":[…],"sites":[…]}}`. Missing
-    /// or malformed params default to empty allowlists (default-deny; Ingest
-    /// re-enforces at the write boundary, so a permissive parse can never leak).
+    /// Parse `{"action":"observe_start","params":{"apps":[…]}}`. Missing or malformed
+    /// params default to an empty allowlist (default-deny; Ingest re-enforces at the
+    /// write boundary, so a permissive parse can never leak).
     pub fn from_request(req: &Value) -> ObserveConfig {
-        let params = req.get("params");
         ObserveConfig {
-            apps: string_list(params, "apps"),
-            sites: string_list(params, "sites"),
+            apps: string_list(req.get("params"), "apps"),
         }
     }
 }
@@ -704,6 +1048,24 @@ mod imp {
                                        // the attempts are spent (never on the transient first look).
     const PROBE_ATTEMPTS: u32 = 3;
     const ATTACH_ATTEMPTS: u32 = 3;
+    // Every AX read this observer makes is bounded (inv. 28): an app that stops
+    // answering must not wedge the observer thread. Set once per attach on the app
+    // element, which scopes it to every element created from it. A timed-out read
+    // simply answers `None` and no frame is built — the named `observer.gap{ax_timeout}`
+    // is the later v1.1 slice.
+    const AX_MESSAGING_TIMEOUT_S: f32 = 2.0;
+    // The web-area search under one browser window (see `find_page_web_area`):
+    // breadth-first, so the shallow content area is found without descending a deep
+    // toolbar subtree first. `MAX_NODES` bounds the elements actually READ — one AX
+    // round-trip each — and, through the same counter, how many are ever retained at
+    // once; `MAX_DEPTH` bounds the descent. So a browser that exposes no page web area
+    // costs at most 400 reads, not a stall and not a tree pulled into memory.
+    const WEB_AREA_MAX_DEPTH: usize = 12;
+    const WEB_AREA_MAX_NODES: usize = 400;
+    // Per-app browser windows tracked at once. The map is keyed by `window_ref` and
+    // evicts the oldest entry, so a long session with many windows cannot grow without
+    // limit; an evicted window simply re-reads its navigation on the next settle.
+    const BROWSER_WINDOWS_MAX: usize = 32;
 
     fn observe_loop(
         config: ObserveConfig,
@@ -815,6 +1177,35 @@ mod imp {
         ax_tree: AxTree,
         // Per-app window-title debounce (an app switch starts a fresh one).
         title: TitleDebounce,
+        // Populated only for a browser: the per-window navigation context every
+        // browser content event is correlated through (§8.4). Bounded and released on
+        // detach.
+        browser_windows: Vec<BrowserWindow>,
+    }
+
+    // One browser window's correlation state. `web_area` is a RETAINED cache of the
+    // element the URL is read from, validated on every hit against the window title
+    // (see `web_area_for`).
+    struct BrowserWindow {
+        window_ref: String,
+        web_area: CFTypeRef,
+        // The `(tab_ref, url)` pair of the last navigation EMITTED for this window,
+        // plus its host — what a `field.value` typed in this window is stamped with.
+        tab_ref: Option<String>,
+        last_url: Option<String>,
+        host: Option<String>,
+    }
+
+    impl BrowserWindow {
+        fn new(window_ref: &str) -> BrowserWindow {
+            BrowserWindow {
+                window_ref: window_ref.to_string(),
+                web_area: std::ptr::null_mut(),
+                tab_ref: None,
+                last_url: None,
+                host: None,
+            }
+        }
     }
 
     struct PendingValue {
@@ -832,9 +1223,9 @@ mod imp {
             self.emitter.emit_frame(&frame);
         }
 
-        // `app` is Some only for a gap that is a property of ONE app (its coverage);
-        // a system gap — the grant went away, a secure field, a browser's unknown
-        // privacy state — is app-less.
+        // `app` is Some only for a gap that is a property of ONE app (its coverage —
+        // title-only, refused notifications, an unreadable privacy posture); a system
+        // gap — the grant went away, a secure field — is app-less.
         fn emit_gap(&self, reason: GapReason, from_ms: i64, to_ms: i64, app: Option<&AppIdentity>) {
             let frame = gap_frame(&self.boot_id, self.next_seq(), reason, from_ms, to_ms, app);
             self.emitter.emit_frame(&frame);
@@ -966,6 +1357,17 @@ mod imp {
             return;
         }
 
+        // Bound every read this attach will make, before any of them is made.
+        let rc = AXUIElementSetMessagingTimeout(app_element, AX_MESSAGING_TIMEOUT_S);
+        if rc != 0 {
+            log_once(
+                ctx,
+                &app,
+                "messaging_timeout_refused",
+                &format!("{bundle}: AXUIElementSetMessagingTimeout refused (AXError {rc})"),
+            );
+        }
+
         let mut observer: AXObserverRef = std::ptr::null_mut();
         let rc = AXObserverCreate(app.pid, ax_callback, &mut observer);
         if rc != 0 || observer.is_null() {
@@ -1002,6 +1404,7 @@ mod imp {
             observer,
             ax_tree,
             title: TitleDebounce::default(),
+            browser_windows: Vec::new(),
         });
 
         announce_title_only(ctx);
@@ -1155,6 +1558,12 @@ mod imp {
 
         if !attached.app_element.is_null() {
             CFRelease(attached.app_element);
+        }
+
+        // Every cached web area is a +1 this engine owns, so an app switch releases
+        // them all — the browser context does not outlive the attach it describes.
+        for window in attached.browser_windows {
+            release_web_area(window.web_area);
         }
     }
 
@@ -1406,7 +1815,7 @@ mod imp {
             read_attr(element, "AXRoleDescription"),
         );
         insert_str(&mut extra, "field_label", field_label(element));
-        insert_str(&mut extra, "window_title", focused_window_title(&app));
+        insert_str(&mut extra, "window_title", focused_window_title(ctx));
         ctx.emit("focus.changed", Some(&app), extra);
     }
 
@@ -1501,7 +1910,7 @@ mod imp {
             Some(a) => a.identity.clone(),
             None => return,
         };
-        let title = focused_window_title(&app);
+        let title = focused_window_title(ctx);
 
         let mut extra = Map::new();
         insert_str(&mut extra, "window_title", title.clone());
@@ -1514,6 +1923,18 @@ mod imp {
         // A window appearing is the moment a mid-launch app becomes a real one, so it
         // is when an unknown accessibility tree is worth another look.
         reprobe_if_unknown(ctx);
+
+        // The newly focused window is the page the owner is on now. Checked AFTER the
+        // re-probe: switching a browser's accessibility tree on is what makes its web
+        // area — and therefore its URL — readable at all.
+        //
+        // This copies `AXFocusedWindow` a second time (the title read above was the
+        // first), and deliberately: the navigation check runs only for an attached browser
+        // whose tree is on, while this event fires for every app, so threading one
+        // retained window through the emit / seed / re-probe sequence would put a
+        // release-on-every-path obligation on every app's path to save one read on a
+        // browser's.
+        maybe_emit_navigation(ctx);
     }
 
     // A title change is a stream, not an event: record the latest title and let the
@@ -1522,10 +1943,13 @@ mod imp {
     // produced when the read failed.
     unsafe fn on_title_changed(ctx: &mut Ctx) {
         let now = now_ms();
+        if ctx.attached.is_none() {
+            return;
+        }
+        let title = focused_window_title(ctx).unwrap_or_default();
         let Some(attached) = ctx.attached.as_mut() else {
             return;
         };
-        let title = focused_window_title(&attached.identity).unwrap_or_default();
         match attached.title.observe(title, now, TITLE_MAX_WAIT_MS) {
             SettleWhen::Immediately => flush_pending_title(ctx),
             SettleWhen::AfterDebounce => reschedule(ctx.title_timer, TITLE_DEBOUNCE_S),
@@ -1560,6 +1984,9 @@ mod imp {
         };
         let app = attached.identity.clone();
         emit_title_changed(ctx, &app, &title);
+        // A settled title is the moment a page has finished becoming a different page,
+        // so it is the navigation check for a browser (a no-op for anything else).
+        maybe_emit_navigation(ctx);
     }
 
     fn emit_title_changed(ctx: &Ctx, app: &AppIdentity, title: &str) {
@@ -1570,11 +1997,263 @@ mod imp {
         ctx.emit("window.title_changed", Some(app), extra);
     }
 
+    // --- browser navigation (§8.4 `browser.navigated`) -----------------------
+
+    // One navigation check for an attached browser: read the focused window, classify
+    // its privacy from the title, and — only when it is not private — read the web
+    // area's URL and emit `browser.navigated` if the `(tab, url)` pair changed. A
+    // no-op for a non-browser. Bounded: one window read and at most one web-area walk
+    // per call, and the title debounce bounds how often it is called.
+    unsafe fn maybe_emit_navigation(ctx: &mut Ctx) {
+        let Some(app) = attached_browser(ctx) else {
+            return;
+        };
+        let Some(bundle) = app.bundle_id.clone() else {
+            return;
+        };
+        let Some(window) = focused_window(ctx) else {
+            return;
+        };
+        let read = read_navigation(ctx, &bundle, window);
+        CFRelease(window);
+
+        let Some(nav) = read else {
+            return;
+        };
+        emit_navigation(ctx, &app, &bundle, nav);
+    }
+
+    // The attached app's identity, when it is a browser whose accessibility tree is ON.
+    // The tree is part of the gate, not an optimization: a `TitleOnly` app exposes no web
+    // area to find, and an `Unknown` one is still being re-probed (window focus is when it
+    // is looked at again). Walking either would spend up to WEB_AREA_MAX_NODES AX reads
+    // per settled title on a guaranteed nothing.
+    fn attached_browser(ctx: &Ctx) -> Option<AppIdentity> {
+        let attached = ctx.attached.as_ref()?;
+        if attached.ax_tree != AxTree::Enabled {
+            return None;
+        }
+        let app = attached.identity.clone();
+        if !is_browser(app.bundle_id.as_deref()?) {
+            return None;
+        }
+        Some(app)
+    }
+
+    // Everything one frame needs, read off the focused window. `None` when there is
+    // nothing to report: a window whose URL must not cross the Port (private, or a pinned
+    // family whose title could not be read — whose URL is never even looked for), no web
+    // area, an unreadable URL, or a scheme that is not http(s).
+    unsafe fn read_navigation(
+        ctx: &mut Ctx,
+        bundle: &str,
+        window: CFTypeRef,
+    ) -> Option<Navigation> {
+        let window_title = read_attr(window, "AXTitle").unwrap_or_default();
+        let window_ref = hash_ref(window)?;
+        let state = private_state(bundle, &window_title);
+        // Inv. 26 at the earliest point it can be enforced: `navigation_decision` skips
+        // both of these too, but stopping here also saves the web-area walk.
+        if matches!(state, PrivateState::Private | PrivateState::Unreadable) {
+            return None;
+        }
+
+        let web_area = web_area_for(ctx, &window_ref, window, &window_title)?;
+        let Some((url, host)) = page_url_of(web_area.element) else {
+            // The element no longer answers, or it is no longer on a page: drop it so the
+            // next check walks again. One walk per call stays one walk per call.
+            forget_web_area(ctx, &window_ref);
+            return None;
+        };
+
+        Some(Navigation {
+            window_ref,
+            window_title,
+            tab_ref: web_area.tab_ref,
+            url,
+            host,
+            page_title: web_area.page_title,
+            private_state: state,
+        })
+    }
+
+    // Emit the frame when this is a change, and record what was emitted so the next
+    // check can tell. Recording happens only on an emit, so the stored host always
+    // names a site a frame already reported.
+    unsafe fn emit_navigation(ctx: &mut Ctx, app: &AppIdentity, bundle: &str, nav: Navigation) {
+        let last = recorded_navigation(ctx, &nav.window_ref);
+        let decision = navigation_decision(
+            last.as_ref().map(|(tab, url)| (tab.as_str(), url.as_str())),
+            &nav.tab_ref,
+            &nav.url,
+            nav.private_state,
+        );
+        if decision == NavigationDecision::Skip {
+            return;
+        }
+        record_navigation(ctx, &nav);
+        ctx.emit(
+            "browser.navigated",
+            Some(app),
+            navigation_extras(bundle, &nav),
+        );
+    }
+
+    // --- per-window browser context -----------------------------------------
+
+    // This window's entry, created on first sight. Bounded at BROWSER_WINDOWS_MAX, and
+    // LEAST-RECENTLY-TOUCHED first out: the map is ordered by use (a touch moves the entry
+    // to the back), so the entry that goes is the window the owner stopped using. Evicting
+    // a live window instead would drop its `last_url`, and the next check would re-report
+    // the page it is already on as a fresh navigation.
+    unsafe fn browser_entry<'c>(
+        ctx: &'c mut Ctx,
+        window_ref: &str,
+    ) -> Option<&'c mut BrowserWindow> {
+        let windows = &mut ctx.attached.as_mut()?.browser_windows;
+        if let Some(index) = windows.iter().position(|w| w.window_ref == window_ref) {
+            let touched = windows.remove(index);
+            windows.push(touched);
+            return windows.last_mut();
+        }
+        if windows.len() >= BROWSER_WINDOWS_MAX {
+            let evicted = windows.remove(0);
+            release_web_area(evicted.web_area);
+        }
+        windows.push(BrowserWindow::new(window_ref));
+        windows.last_mut()
+    }
+
+    // The `(tab_ref, url)` pair of the last navigation emitted for this window.
+    unsafe fn recorded_navigation(ctx: &mut Ctx, window_ref: &str) -> Option<(String, String)> {
+        let entry = browser_entry(ctx, window_ref)?;
+        Some((entry.tab_ref.clone()?, entry.last_url.clone()?))
+    }
+
+    unsafe fn record_navigation(ctx: &mut Ctx, nav: &Navigation) {
+        let Some(entry) = browser_entry(ctx, &nav.window_ref) else {
+            return;
+        };
+        entry.tab_ref = Some(nav.tab_ref.clone());
+        entry.last_url = Some(nav.url.clone());
+        entry.host = Some(nav.host.clone());
+    }
+
+    // The tab and host a `field.value` typed in this window is stamped with: `(None,
+    // None)` until that window has reported a navigation.
+    unsafe fn recorded_site(ctx: &mut Ctx, window_ref: &str) -> (Option<String>, Option<String>) {
+        match browser_entry(ctx, window_ref) {
+            Some(entry) => (entry.tab_ref.clone(), entry.host.clone()),
+            None => (None, None),
+        }
+    }
+
+    // The cached-or-walked page web area of one window.
+    struct WebArea {
+        // Owned by the CACHE — the caller must not release it.
+        element: CFTypeRef,
+        tab_ref: String,
+        // The web area's own `AXTitle` when non-empty: the frame's `page_title`, and on a
+        // cache hit the value that validated the cache.
+        page_title: Option<String>,
+    }
+
+    // The window's page web area, from the cache or by ONE bounded walk.
+    //
+    // A cache hit is VALIDATED with a single read: the web area's own `AXTitle` must be
+    // non-empty and appear inside the current window title. A same-tab retitle (a
+    // countdown, an unread-count badge) moves both titles in step, so that one read
+    // confirms the cached element is still the visible page; a tab switch replaces the
+    // window title with the other tab's, which the cached web area's title no longer
+    // matches. An empty web-area title is always a miss — never a hit by vacuous
+    // containment. Validation cannot be left to a failing read instead: a Chromium
+    // background tab's web area stays alive and keeps answering with ITS url, so a stale
+    // hit would be silent rather than an error.
+    unsafe fn web_area_for(
+        ctx: &mut Ctx,
+        window_ref: &str,
+        window: CFTypeRef,
+        window_title: &str,
+    ) -> Option<WebArea> {
+        if let Some(valid) = valid_cached_web_area(ctx, window_ref, window_title) {
+            return Some(valid);
+        }
+        forget_web_area(ctx, window_ref);
+
+        let web_area = web_area_of(window)?;
+        // The walk's +1 belongs to the cache, so an entry that vanished under us (the app
+        // detached) releases it here rather than leaking it.
+        let Some(entry) = browser_entry(ctx, window_ref) else {
+            release_web_area(web_area);
+            return None;
+        };
+        entry.web_area = web_area;
+        Some(WebArea {
+            element: web_area,
+            tab_ref: hash_ref(web_area)?,
+            page_title: read_attr(web_area, "AXTitle").filter(|title| !title.is_empty()),
+        })
+    }
+
+    unsafe fn valid_cached_web_area(
+        ctx: &mut Ctx,
+        window_ref: &str,
+        window_title: &str,
+    ) -> Option<WebArea> {
+        let cached = browser_entry(ctx, window_ref)?.web_area;
+        if cached.is_null() {
+            return None;
+        }
+        let page_title = read_attr(cached, "AXTitle").filter(|title| !title.is_empty())?;
+        if !window_title.contains(page_title.as_str()) {
+            return None;
+        }
+        Some(WebArea {
+            element: cached,
+            tab_ref: hash_ref(cached)?,
+            page_title: Some(page_title),
+        })
+    }
+
+    unsafe fn forget_web_area(ctx: &mut Ctx, window_ref: &str) {
+        let Some(entry) = browser_entry(ctx, window_ref) else {
+            return;
+        };
+        release_web_area(entry.web_area);
+        entry.web_area = std::ptr::null_mut();
+    }
+
+    unsafe fn release_web_area(web_area: CFTypeRef) {
+        if !web_area.is_null() {
+            CFRelease(web_area);
+        }
+    }
+
+    // A browser whose privacy posture cannot be read is a STANDING condition of that
+    // app (no marker is pinned for its family), so it is announced once per app per
+    // session and carries the app — the same discipline as `title_only`.
+    fn announce_private_unknown(ctx: &mut Ctx, app: &AppIdentity, from_ms: i64) {
+        let Some(bundle) = app.bundle_id.clone() else {
+            return;
+        };
+        if !ctx
+            .gap_ledger
+            .announce((bundle.clone(), GapReason::PrivateUnknown))
+        {
+            return;
+        }
+        log(&format!(
+            "{bundle}: private-browsing state unreadable — typed text is withheld for it"
+        ));
+        ctx.emit_gap(GapReason::PrivateUnknown, from_ms, now_ms(), Some(app));
+    }
+
     // Read the settled value of the pending element and emit field.value. THE only way
     // a value leaves the debounce — the timer, the ceiling, a blur, and detach all come
     // through here — so an edit is never dropped by one path and kept by another. In a
-    // browser the CONTENT is withheld (metadata only) until v1.1 correlates
-    // tabs/privacy; an unreadable element emits nothing and is simply released.
+    // browser the content rides the private gate (inv. 26) and carries the site context
+    // of the window it was typed in; an unreadable element emits nothing and is simply
+    // released.
     unsafe fn flush_pending_value(ctx: &mut Ctx) {
         let Some(pending) = ctx.pending_value.take() else {
             return;
@@ -1592,7 +2271,12 @@ mod imp {
         CFRelease(pending.element);
     }
 
-    unsafe fn emit_field_value(ctx: &Ctx, app: &AppIdentity, element: CFTypeRef, started_ms: i64) {
+    unsafe fn emit_field_value(
+        ctx: &mut Ctx,
+        app: &AppIdentity,
+        element: CFTypeRef,
+        started_ms: i64,
+    ) {
         let role = read_attr(element, "AXRole");
 
         // Only editable fields carry typed content; a value change on a label/title
@@ -1619,13 +2303,7 @@ mod imp {
 
         match value {
             Some(text) if is_browser_app => {
-                // Can't site-correlate or detect a private window in v1 → withhold
-                // the content before it crosses the Port (§13.2), keep the volume.
-                extra.insert("char_len".into(), json!(char_len(&text)));
-                extra.insert("content_withheld".into(), json!(true));
-                extra.insert("private_state".into(), json!("unknown"));
-                ctx.emit("field.value", Some(app), extra);
-                ctx.emit_gap(GapReason::PrivateUnknown, started_ms, now_ms(), None);
+                emit_browser_field_value(ctx, app, element, &text, extra, started_ms);
             }
             Some(text) => {
                 let full_len = char_len(&text);
@@ -1649,6 +2327,90 @@ mod imp {
         }
     }
 
+    // A browser field's content is gated on the window's private-browsing posture
+    // (inv. 26) and stamped with the site the last navigation bound that window to
+    // (§8.4). The posture is re-read here rather than trusted from the last navigation:
+    // a tab switch changes the window title, and the marker rides the title.
+    unsafe fn emit_browser_field_value(
+        ctx: &mut Ctx,
+        app: &AppIdentity,
+        element: CFTypeRef,
+        text: &str,
+        mut extra: Map<String, Value>,
+        started_ms: i64,
+    ) {
+        let Some(bundle) = app.bundle_id.clone() else {
+            return;
+        };
+        let site = browser_field_site(ctx, &bundle, element);
+        let context = BrowserFieldContext {
+            browser_id: &bundle,
+            window_ref: site.window_ref.as_deref(),
+            tab_ref: site.tab_ref.as_deref(),
+            host: site.host.as_deref(),
+        };
+        let owed = browser_field_extras(text, site.private_state, &context, &mut extra);
+        ctx.emit("field.value", Some(app), extra);
+
+        if owed.truncated {
+            ctx.emit_gap_reason_truncated(started_ms);
+        }
+        if owed.private_unknown {
+            announce_private_unknown(ctx, app, started_ms);
+        }
+    }
+
+    // What the private gate and the site stamp need for one settled browser value.
+    struct BrowserFieldSite {
+        private_state: PrivateState,
+        window_ref: Option<String>,
+        tab_ref: Option<String>,
+        host: Option<String>,
+    }
+
+    // Classify the window this value was typed in and look up its site. The window comes
+    // from the ELEMENT (`AXWindow`), not from the app's focused window — a value can
+    // settle after focus has moved on.
+    //
+    // A window that cannot be read is classified from an EMPTY title, the same answer a
+    // window that answered with no title gets: `Unreadable` for a pinned family (withhold
+    // this one value, claim nothing about the app) and `Unknown` for an unpinned one
+    // (a standing fact that owes its gap). Never `NotPrivate` by absence of evidence.
+    unsafe fn browser_field_site(
+        ctx: &mut Ctx,
+        bundle: &str,
+        element: CFTypeRef,
+    ) -> BrowserFieldSite {
+        let Some(window) = copy_element_attr(element, "AXWindow") else {
+            return BrowserFieldSite {
+                private_state: private_state(bundle, ""),
+                window_ref: None,
+                tab_ref: None,
+                host: None,
+            };
+        };
+        let window_title = read_attr(window, "AXTitle").unwrap_or_default();
+        let window_ref = hash_ref(window);
+        CFRelease(window);
+
+        let state = private_state(bundle, &window_title);
+        let Some(window_ref) = window_ref else {
+            return BrowserFieldSite {
+                private_state: state,
+                window_ref: None,
+                tab_ref: None,
+                host: None,
+            };
+        };
+        let (tab_ref, host) = recorded_site(ctx, &window_ref);
+        BrowserFieldSite {
+            private_state: state,
+            window_ref: Some(window_ref),
+            tab_ref,
+            host,
+        }
+    }
+
     impl Ctx<'_> {
         // A "truncated" gap is a transport reason Fermix also authors; the sidecar
         // uses the shared spelling so a reader sees one vocabulary. Kept here (not in
@@ -1665,8 +2427,12 @@ mod imp {
 
     // --- AX reads (single-shot, on the observer thread) ----------------------
 
-    // Read a string attribute of an element; None if absent or non-string.
-    unsafe fn read_attr(element: CFTypeRef, attr: &str) -> Option<String> {
+    // Copy a CFType-valued attribute of an element. The result follows the Copy rule
+    // (+1), so the CALLER releases it.
+    unsafe fn copy_element_attr(element: CFTypeRef, attr: &str) -> Option<CFTypeRef> {
+        if element.is_null() {
+            return None;
+        }
         let cf = CFString::new(attr);
         let mut out: CFTypeRef = std::ptr::null_mut();
         if AXUIElementCopyAttributeValue(element, cf.as_concrete_TypeRef(), &mut out) != 0
@@ -1674,9 +2440,15 @@ mod imp {
         {
             return None;
         }
-        let s = cfstring_to_string(out as CFStringRef);
+        Some(out)
+    }
+
+    // Read a string attribute of an element; None if absent or non-string.
+    unsafe fn read_attr(element: CFTypeRef, attr: &str) -> Option<String> {
+        let out = copy_element_attr(element, attr)?;
+        let text = cfstring_to_string(out as CFStringRef);
         CFRelease(out);
-        s
+        text
     }
 
     // The human label of a field: AXTitle, else AXDescription.
@@ -1684,24 +2456,106 @@ mod imp {
         read_attr(element, "AXTitle").or_else(|| read_attr(element, "AXDescription"))
     }
 
+    // The attached app's focused window, RETAINED — the caller releases it. Read off
+    // the app element the attach created, so it inherits that app's messaging timeout.
+    unsafe fn focused_window(ctx: &Ctx) -> Option<CFTypeRef> {
+        let app_element = ctx.attached.as_ref()?.app_element;
+        copy_element_attr(app_element, "AXFocusedWindow")
+    }
+
     // Title of the app's focused window (best-effort).
-    unsafe fn focused_window_title(app: &AppIdentity) -> Option<String> {
-        let app_element = AXUIElementCreateApplication(app.pid);
-        if app_element.is_null() {
+    unsafe fn focused_window_title(ctx: &Ctx) -> Option<String> {
+        let window = focused_window(ctx)?;
+        let title = read_attr(window, "AXTitle");
+        CFRelease(window);
+        title
+    }
+
+    // A stable per-element identity for the wire: `CFHash` of the AX element, decimal so
+    // the store can group by it. `window_ref` and `tab_ref` are these.
+    unsafe fn hash_ref(element: CFTypeRef) -> Option<String> {
+        if element.is_null() {
             return None;
         }
-        let cf = CFString::new("AXFocusedWindow");
-        let mut window: CFTypeRef = std::ptr::null_mut();
-        let rc = AXUIElementCopyAttributeValue(app_element, cf.as_concrete_TypeRef(), &mut window);
-        let title = if rc == 0 && !window.is_null() {
-            let t = read_attr(window, "AXTitle");
-            CFRelease(window);
-            t
-        } else {
-            None
+        Some(CFHash(element).to_string())
+    }
+
+    // The window's page web area, RETAINED — the caller (the per-window cache) owns it.
+    // The traversal, its order and its bounds live in `find_page_web_area`; this is only
+    // the AX half: the two reads, and releasing every element the walk hands back.
+    unsafe fn web_area_of(window: CFTypeRef) -> Option<CFTypeRef> {
+        if window.is_null() {
+            return None;
+        }
+        // The root is retained so it is released through the same accounting as every
+        // element the walk copies.
+        CFRetain(window);
+        let walk = find_page_web_area(
+            window,
+            WEB_AREA_MAX_DEPTH,
+            WEB_AREA_MAX_NODES,
+            &mut |element| copy_children(element),
+            &mut |element| page_url_of(element).is_some(),
+        );
+        for element in walk.discarded {
+            CFRelease(element);
+        }
+        walk.found
+    }
+
+    // The walk's page test, and the authoritative URL read for a navigation: an
+    // `AXWebArea` whose `AXURL` reduces to an http(s) page. A browser window holds more
+    // than one web area — a side panel, a `chrome://` new-tab page — so the ROLE alone
+    // is not the page, and the walk keeps going past the ones that are not.
+    unsafe fn page_url_of(element: CFTypeRef) -> Option<(String, String)> {
+        if read_attr(element, "AXRole").as_deref() != Some(WEB_AREA_ROLE) {
+            return None;
+        }
+        normalize_url(&read_url(element)?)
+    }
+
+    const WEB_AREA_ROLE: &str = "AXWebArea";
+
+    // One element's children, each RETAINED (the caller releases them).
+    unsafe fn copy_children(element: CFTypeRef) -> Vec<CFTypeRef> {
+        let Some(array) = copy_element_attr(element, "AXChildren") else {
+            return Vec::new();
         };
-        CFRelease(app_element);
-        title
+        // AXChildren SHOULD be a CFArray, but an app with a custom or broken AX
+        // implementation can return another CFType, and the array getters would then
+        // type-confuse and read garbage. Verify before treating it as an array.
+        if CFGetTypeID(array) != CFArrayGetTypeID() {
+            CFRelease(array);
+            return Vec::new();
+        }
+        let count = CFArrayGetCount(array);
+        let mut children = Vec::new();
+        let mut index = 0;
+        while index < count && children.len() < WEB_AREA_MAX_NODES {
+            let child = CFArrayGetValueAtIndex(array, index);
+            if !child.is_null() {
+                CFRetain(child);
+                children.push(child);
+            }
+            index += 1;
+        }
+        CFRelease(array);
+        children
+    }
+
+    // The web area's `AXURL`, as the browser reports it (still unstripped — the caller
+    // runs it through `normalize_url` before anything reaches the wire). The attribute
+    // is a CFURL; any other type is refused rather than reinterpreted.
+    unsafe fn read_url(web_area: CFTypeRef) -> Option<String> {
+        let value = copy_element_attr(web_area, "AXURL")?;
+        if CFGetTypeID(value) != CFURLGetTypeID() {
+            CFRelease(value);
+            return None;
+        }
+        // CFURLGetString follows the GET rule (do not release the result).
+        let url = cfstring_to_string(CFURLGetString(value as CFURLRef));
+        CFRelease(value);
+        url
     }
 
     // --- frontmost app + identity (CGWindowList + CFBundle, no objc2) ---------
@@ -1799,16 +2653,6 @@ mod imp {
         // Reuse core-foundation's tested conversion (handles encoding + memory).
         let cf = CFString::wrap_under_get_rule(s);
         Some(cf.to_string())
-    }
-
-    fn char_len(s: &str) -> i64 {
-        s.chars().count() as i64
-    }
-
-    fn insert_str(map: &mut Map<String, Value>, key: &str, value: Option<String>) {
-        if let Some(v) = value {
-            map.insert(key.to_string(), json!(v));
-        }
     }
 
     // --- CFDictionary readers (CGWindow info) --------------------------------
@@ -1956,6 +2800,9 @@ mod imp {
             notification: CFStringRef,
         ) -> i32;
         fn AXObserverGetRunLoopSource(observer: AXObserverRef) -> CFRunLoopSourceRef;
+        // Inv. 28: bound every read made through an app's elements, so an app that
+        // stops answering cannot wedge the observer thread. Set once per attach.
+        fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout_s: f32) -> i32;
     }
 
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -1972,9 +2819,17 @@ mod imp {
         fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
         // Element identity: two AXUIElementRefs can name the same element.
         fn CFEqual(a: CFTypeRef, b: CFTypeRef) -> u8;
+        // The wire's `window_ref` / `tab_ref`: a stable identity for one AX element.
+        fn CFHash(cf: CFTypeRef) -> usize;
         fn CFRelease(cf: CFTypeRef);
         fn CFArrayGetCount(array: CFTypeRef) -> isize;
         fn CFArrayGetValueAtIndex(array: CFTypeRef, index: isize) -> CFTypeRef;
+        // AXChildren and AXURL are type-checked before use: an app with a broken AX
+        // implementation can answer with a different CFType entirely.
+        fn CFGetTypeID(cf: CFTypeRef) -> usize;
+        fn CFArrayGetTypeID() -> usize;
+        fn CFURLGetTypeID() -> usize;
+        fn CFURLGetString(url: CFURLRef) -> CFStringRef;
         fn CFDictionaryGetValue(dict: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
         fn CFNumberGetValue(number: CFTypeRef, the_type: isize, out: *mut c_void) -> bool;
 
@@ -2079,12 +2934,25 @@ mod imp {
         }
 
         fn attached_with(tree: AxTree, title: TitleDebounce) -> Attached {
+            attached_as(test_identity(), tree, title)
+        }
+
+        fn attached_as(identity: AppIdentity, tree: AxTree, title: TitleDebounce) -> Attached {
             Attached {
-                identity: test_identity(),
+                identity,
                 app_element: std::ptr::null_mut(),
                 observer: std::ptr::null_mut(),
                 ax_tree: tree,
                 title,
+                browser_windows: Vec::new(),
+            }
+        }
+
+        fn browser_identity() -> AppIdentity {
+            AppIdentity {
+                bundle_id: Some("com.google.Chrome".into()),
+                name: Some("Google Chrome".into()),
+                pid: TEST_PID,
             }
         }
 
@@ -2153,6 +3021,207 @@ mod imp {
             assert_eq!(frames[0]["kind"], json!("observer.gap"));
             assert_eq!(frames[0]["gap_reason"], json!("title_only"));
             assert_eq!(frames[0]["app"]["bundle_id"], json!("com.microsoft.VSCode"));
+        }
+
+        // The navigation read is gated on the app's accessibility tree, not just on it
+        // being a browser: a `TitleOnly` app has no web area to walk at all, and an
+        // `Unknown` tree is still being re-probed. Walking either is pure cost — up to
+        // WEB_AREA_MAX_NODES AX reads per settled title — for a guaranteed nothing.
+        #[test]
+        fn a_browser_without_an_enabled_tree_is_never_walked() {
+            let seq = AtomicU64::new(0);
+
+            for tree in [AxTree::TitleOnly, AxTree::Unknown] {
+                let mut ctx = test_ctx(
+                    &seq,
+                    Some(attached_as(
+                        browser_identity(),
+                        tree,
+                        TitleDebounce::default(),
+                    )),
+                );
+                assert!(
+                    attached_browser(&ctx).is_none(),
+                    "{tree:?} must not be walked"
+                );
+                unsafe { maybe_emit_navigation(&mut ctx) };
+                assert!(ctx.emitter.captured().is_empty());
+            }
+
+            // An enabled tree IS the one that gets walked (the AX reads then answer
+            // nothing here, since this Ctx owns no real app element).
+            let mut ctx = test_ctx(
+                &seq,
+                Some(attached_as(
+                    browser_identity(),
+                    AxTree::Enabled,
+                    TitleDebounce::default(),
+                )),
+            );
+            assert!(attached_browser(&ctx).is_some());
+            unsafe { maybe_emit_navigation(&mut ctx) };
+            assert!(ctx.emitter.captured().is_empty());
+
+            // A non-browser with an enabled tree is not walked either.
+            let ctx = test_ctx(
+                &seq,
+                Some(attached_with(AxTree::Enabled, TitleDebounce::default())),
+            );
+            assert!(attached_browser(&ctx).is_none());
+        }
+
+        // The per-window map is bounded, and what it drops is the window the owner has
+        // not looked at in longest — not the one they are typing in. Dropping a live
+        // window's entry would lose its `last_url`, so the next check would re-report the
+        // page it is already on as a fresh navigation.
+        #[test]
+        fn the_browser_window_map_evicts_the_least_recently_touched_entry() {
+            let seq = AtomicU64::new(0);
+            let mut ctx = test_ctx(
+                &seq,
+                Some(attached_as(
+                    browser_identity(),
+                    AxTree::Enabled,
+                    TitleDebounce::default(),
+                )),
+            );
+
+            for window in 0..BROWSER_WINDOWS_MAX {
+                let entry = unsafe { browser_entry(&mut ctx, &window.to_string()) }
+                    .expect("an attached app always has a map");
+                entry.last_url = Some(format!("https://example.com/{window}"));
+            }
+            assert_eq!(
+                ctx.attached.as_ref().unwrap().browser_windows.len(),
+                BROWSER_WINDOWS_MAX
+            );
+
+            // Touch the oldest so it is no longer the oldest …
+            unsafe { browser_entry(&mut ctx, "0") };
+            // … then overflow the bound by one.
+            unsafe { browser_entry(&mut ctx, "fresh") };
+
+            let windows = &ctx.attached.as_ref().unwrap().browser_windows;
+            assert_eq!(windows.len(), BROWSER_WINDOWS_MAX, "the bound holds");
+            let refs: Vec<&str> = windows.iter().map(|w| w.window_ref.as_str()).collect();
+            assert!(refs.contains(&"fresh"), "the new window is tracked");
+            assert!(
+                refs.contains(&"0"),
+                "re-touching kept the recently used window alive"
+            );
+            assert!(!refs.contains(&"1"), "the least recently touched one went");
+            // The surviving entry kept what it had recorded.
+            let zero = windows.iter().find(|w| w.window_ref == "0").unwrap();
+            assert_eq!(zero.last_url.as_deref(), Some("https://example.com/0"));
+        }
+
+        // A window read that fails is a failed READ, wherever in the value path it fails.
+        // An unreadable `AXWindow` used to classify every family as `Unknown`, so one
+        // failed read on a PINNED family named it private-unknown for the rest of the
+        // session — the thing the Unreadable split exists to prevent, on the other branch
+        // of the same function. A null element takes that branch without an AX call.
+        #[test]
+        fn an_unreadable_value_window_owes_no_gap_for_a_pinned_family() {
+            let seq = AtomicU64::new(0);
+            let chrome = browser_identity();
+            let mut ctx = test_ctx(
+                &seq,
+                Some(attached_as(
+                    chrome.clone(),
+                    AxTree::Enabled,
+                    TitleDebounce::default(),
+                )),
+            );
+
+            unsafe {
+                emit_browser_field_value(
+                    &mut ctx,
+                    &chrome,
+                    std::ptr::null_mut(),
+                    "ship it",
+                    Map::new(),
+                    100,
+                )
+            };
+
+            let frames = ctx.emitter.captured();
+            assert_eq!(frames.len(), 1, "a pinned family owes no gap: {frames:?}");
+            assert_eq!(frames[0]["kind"], json!("field.value"));
+            assert_eq!(frames[0]["private_state"], json!("unknown"));
+            assert_eq!(frames[0]["content_withheld"], json!(true));
+            assert_eq!(frames[0]["char_len"], json!(7));
+            assert!(frames[0].get("text").is_none(), "the text is withheld");
+
+            // An UNPINNED family is a standing fact and still owes its one gap, whether or
+            // not this particular window read worked.
+            let safari = AppIdentity {
+                bundle_id: Some("com.apple.Safari".into()),
+                name: Some("Safari".into()),
+                pid: TEST_PID,
+            };
+            let mut ctx = test_ctx(
+                &seq,
+                Some(attached_as(
+                    safari.clone(),
+                    AxTree::Enabled,
+                    TitleDebounce::default(),
+                )),
+            );
+            unsafe {
+                emit_browser_field_value(
+                    &mut ctx,
+                    &safari,
+                    std::ptr::null_mut(),
+                    "ship it",
+                    Map::new(),
+                    100,
+                )
+            };
+
+            let frames = ctx.emitter.captured();
+            assert_eq!(
+                frames.len(),
+                2,
+                "expected the value and one gap: {frames:?}"
+            );
+            assert_eq!(frames[0]["private_state"], json!("unknown"));
+            assert_eq!(frames[1]["gap_reason"], json!("private_unknown"));
+            assert_eq!(frames[1]["app"]["bundle_id"], json!("com.apple.Safari"));
+        }
+
+        // A browser whose private-browsing posture cannot be read is a standing fact
+        // about THAT app, so the gap carries the app object and is announced once per
+        // app per session — not once per value, which is how v1 emitted it.
+        #[test]
+        fn a_private_unknown_gap_carries_the_app_and_is_announced_once() {
+            let seq = AtomicU64::new(0);
+            let safari = AppIdentity {
+                bundle_id: Some("com.apple.Safari".into()),
+                name: Some("Safari".into()),
+                pid: TEST_PID,
+            };
+            let mut ctx = test_ctx(&seq, None);
+
+            announce_private_unknown(&mut ctx, &safari, 100);
+            announce_private_unknown(&mut ctx, &safari, 200);
+
+            let frames = ctx.emitter.captured();
+            assert_eq!(frames.len(), 1, "announced more than once: {frames:?}");
+            assert_eq!(frames[0]["kind"], json!("observer.gap"));
+            assert_eq!(frames[0]["gap_reason"], json!("private_unknown"));
+            assert_eq!(frames[0]["app"]["bundle_id"], json!("com.apple.Safari"));
+            assert_eq!(frames[0]["gap_from_ts"], json!(100));
+
+            // Another browser with the same unreadable posture is its own fact.
+            let chrome = AppIdentity {
+                bundle_id: Some("com.brave.Browser".into()),
+                name: Some("Brave".into()),
+                pid: TEST_PID,
+            };
+            announce_private_unknown(&mut ctx, &chrome, 300);
+            let frames = ctx.emitter.captured();
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames[1]["app"]["bundle_id"], json!("com.brave.Browser"));
         }
 
         // An `Unknown` tree is the answer for an app that did not answer: it publishes
@@ -2289,13 +3358,9 @@ mod tests {
 
     #[test]
     fn system_gaps_have_no_app_object() {
-        // The grant going away, a secure field, a browser's unknown privacy state: none
-        // of these is a property of one app, so none carries an app object.
-        for reason in [
-            GapReason::SecureInput,
-            GapReason::GrantRevoked,
-            GapReason::PrivateUnknown,
-        ] {
+        // The grant going away and a secure field are not properties of one app, so
+        // neither carries an app object.
+        for reason in [GapReason::SecureInput, GapReason::GrantRevoked] {
             let frame = gap_frame("boot-x", 1, reason, 100, 200, None);
             assert!(frame.get("app").is_none(), "{reason:?} must be app-less");
             assert_eq!(frame["kind"], json!("observer.gap"));
@@ -2338,6 +3403,19 @@ mod tests {
             frame["gap_reason"],
             json!("ax_refused:AXValueChanged,AXFocusedUIElementChanged")
         );
+        assert_eq!(frame["app"]["bundle_id"], json!("com.apple.TextEdit"));
+
+        // An unreadable private-browsing posture is a fact about ONE browser (no marker
+        // is pinned for its family), so it moved into this column in 0.9.0.
+        let frame = gap_frame(
+            "boot-x",
+            4,
+            GapReason::PrivateUnknown,
+            100,
+            100,
+            Some(&identity()),
+        );
+        assert_eq!(frame["gap_reason"], json!("private_unknown"));
         assert_eq!(frame["app"]["bundle_id"], json!("com.apple.TextEdit"));
     }
 
@@ -2653,20 +3731,688 @@ mod tests {
     }
 
     #[test]
-    fn observe_config_parses_apps_and_sites() {
+    fn observe_config_parses_apps_and_ignores_a_retired_sites_key() {
+        // `sites` is retired (consent is per browser, §2.1). An older consumer that
+        // still sends it must be accepted with the key simply ignored — never refused,
+        // and never a second allowlist to enforce.
         let req = json!({
             "action": "observe_start",
             "params": {"apps": ["com.apple.Safari", "com.apple.mail"], "sites": ["github.com"]}
         });
         let cfg = ObserveConfig::from_request(&req);
         assert_eq!(cfg.apps, vec!["com.apple.Safari", "com.apple.mail"]);
-        assert_eq!(cfg.sites, vec!["github.com"]);
     }
 
     #[test]
     fn observe_config_defaults_to_deny_on_missing_params() {
         let cfg = ObserveConfig::from_request(&json!({"action": "observe_start"}));
         assert!(cfg.apps.is_empty());
-        assert!(cfg.sites.is_empty());
+    }
+
+    // --- browser privacy, URLs, navigation -----------------------------------
+
+    #[test]
+    fn private_state_reads_each_pinned_family_from_its_window_title() {
+        use PrivateState::{NotPrivate, Private};
+
+        // The whole Chromium family shares Chrome's code and its "Incognito" string, and
+        // stable Chrome is the one the live check exercises, so they are pinned together.
+        for family in [
+            "com.google.Chrome",
+            "com.google.Chrome.canary",
+            "com.google.Chrome.beta",
+            "com.google.Chrome.dev",
+            "org.chromium.Chromium",
+        ] {
+            assert_eq!(
+                private_state(family, "Inbox - Gmail - Google Chrome (Incognito)"),
+                Private,
+                "{family} must read its pinned marker"
+            );
+            assert_eq!(
+                private_state(family, "Inbox - Gmail - Google Chrome"),
+                NotPrivate,
+                "{family} without the marker is a normal window"
+            );
+        }
+
+        // Case-sensitive: the markers are fixed UI strings, and a lowercase lookalike in
+        // a page title must not be read as the marker.
+        assert_eq!(
+            private_state(
+                "com.google.Chrome",
+                "how incognito mode works - Google Chrome"
+            ),
+            NotPrivate
+        );
+    }
+
+    #[test]
+    fn every_pinned_family_is_a_browser() {
+        // The table is only ever consulted for a browser, so an entry `is_browser` does
+        // not know about would classify nothing and silently answer Unknown forever.
+        for (family, marker) in PRIVATE_WINDOW_MARKERS {
+            assert!(is_browser(family), "{family} is pinned but not a browser");
+            assert!(!marker.is_empty(), "{family} has an empty marker");
+        }
+    }
+
+    #[test]
+    fn private_state_is_unknown_without_pinned_evidence() {
+        // An UNPINNED browser is always Unknown: its private marker has never been checked
+        // against a live window of that browser, and a false "not_private" would leak typed
+        // text out of a private window (inv. 26) where an Unknown only loses capture.
+        // Edge and Firefox are here deliberately — their candidate markers are recorded
+        // beside the table but no live check covers them.
+        for browser in [
+            "com.apple.Safari",
+            "com.apple.SafariTechnologyPreview",
+            "com.brave.Browser",
+            "com.operasoftware.Opera",
+            "com.vivaldi.Vivaldi",
+            "com.arc.Arc",
+            "company.thebrowser.Browser",
+            "com.microsoft.edgemac",
+            "com.microsoft.edgemac.Beta",
+            "org.mozilla.firefox",
+            "org.mozilla.nightly",
+        ] {
+            assert_eq!(
+                private_state(browser, "Anything At All"),
+                PrivateState::Unknown,
+                "{browser} has no pinned marker and must stay unknown"
+            );
+            // Including when its title is unreadable: an unpinned family could not have
+            // been classified from a title anyway.
+            assert_eq!(private_state(browser, ""), PrivateState::Unknown);
+        }
+
+        // The classifier is only ever asked about browsers; anything else answers with
+        // the fail-closed value rather than a guess.
+        assert_eq!(
+            private_state("com.apple.TextEdit", "Untitled"),
+            PrivateState::Unknown
+        );
+    }
+
+    #[test]
+    fn private_state_is_unreadable_for_a_pinned_family_without_a_title() {
+        // A PINNED family whose title could not be read is a failed READ, not an unpinned
+        // browser. Both withhold the text, but only the unpinned case is a standing fact
+        // about the app: conflating them lets one timed-out read name Chrome
+        // private-unknown for the rest of the session (and, before the split, let an
+        // incognito URL cross as "unknown").
+        assert_eq!(
+            private_state("com.google.Chrome", ""),
+            PrivateState::Unreadable
+        );
+        assert_eq!(
+            private_state("org.chromium.Chromium", ""),
+            PrivateState::Unreadable
+        );
+    }
+
+    #[test]
+    fn private_state_wire_spellings_match_the_store_column() {
+        assert_eq!(PrivateState::Private.as_str(), "private");
+        assert_eq!(PrivateState::NotPrivate.as_str(), "not_private");
+        assert_eq!(PrivateState::Unknown.as_str(), "unknown");
+        // The store has three values, so an unreadable read is reported as `unknown`; the
+        // distinction lives in what the sidecar DOES, not in a fourth wire spelling.
+        assert_eq!(PrivateState::Unreadable.as_str(), "unknown");
+    }
+
+    #[test]
+    fn normalize_url_strips_everything_the_store_must_not_keep() {
+        // The brief's worked example: userinfo, port, query and fragment all gone.
+        assert_eq!(
+            normalize_url("https://user:pw@host:8443/a?b#c"),
+            Some(("https://host/a".into(), "host".into()))
+        );
+        // A query string is where session ids and one-time codes live (inv. 27).
+        assert_eq!(
+            normalize_url("https://mail.google.com/mail/u/0?token=abc123"),
+            Some((
+                "https://mail.google.com/mail/u/0".into(),
+                "mail.google.com".into()
+            ))
+        );
+        assert_eq!(
+            normalize_url("http://example.com/docs#section-4"),
+            Some(("http://example.com/docs".into(), "example.com".into()))
+        );
+        // No path at all is still a navigation.
+        assert_eq!(
+            normalize_url("https://example.com"),
+            Some(("https://example.com".into(), "example.com".into()))
+        );
+        assert_eq!(
+            normalize_url("https://example.com/"),
+            Some(("https://example.com/".into(), "example.com".into()))
+        );
+        // A query with no path must not swallow the host.
+        assert_eq!(
+            normalize_url("https://example.com?q=secret"),
+            Some(("https://example.com".into(), "example.com".into()))
+        );
+    }
+
+    #[test]
+    fn normalize_url_normalizes_the_host_and_keeps_the_path_verbatim() {
+        // Scheme and host are case-insensitive; the path is not.
+        assert_eq!(
+            normalize_url("HTTPS://Example.COM/Path/To/Page"),
+            Some((
+                "https://example.com/Path/To/Page".into(),
+                "example.com".into()
+            ))
+        );
+        // An IDN host passes through as-is (lowercased), punycode included.
+        assert_eq!(
+            normalize_url("https://Bücher.example/seite"),
+            Some((
+                "https://bücher.example/seite".into(),
+                "bücher.example".into()
+            ))
+        );
+        assert_eq!(
+            normalize_url("https://xn--bcher-kva.example/seite"),
+            Some((
+                "https://xn--bcher-kva.example/seite".into(),
+                "xn--bcher-kva.example".into()
+            ))
+        );
+        // An IPv6 literal keeps its brackets: the colons inside are not a port.
+        assert_eq!(
+            normalize_url("http://[::1]:8080/health"),
+            Some(("http://[::1]/health".into(), "[::1]".into()))
+        );
+    }
+
+    #[test]
+    fn normalize_url_drops_a_url_over_the_cap_rather_than_cutting_it() {
+        // A truncated URL is worse than no URL: it names a page that does not exist and
+        // the store cannot tell it was cut. So the whole navigation is dropped.
+        let host = "example.com";
+        let at_cap = "/".to_string() + &"a".repeat(MAX_URL_BYTES - "https://example.com/".len());
+        let url = format!("https://{host}{at_cap}");
+        assert_eq!(url.len(), MAX_URL_BYTES);
+        assert_eq!(
+            normalize_url(&url),
+            Some((url.clone(), host.to_string())),
+            "exactly at the cap still reports"
+        );
+
+        let over = format!("{url}b");
+        assert_eq!(over.len(), MAX_URL_BYTES + 1);
+        assert_eq!(normalize_url(&over), None);
+
+        // The cap applies to the NORMALIZED url, so a monstrous query string on a short
+        // path is still a perfectly good navigation.
+        let long_query = format!("https://{host}/search?q={}", "x".repeat(20_000));
+        assert_eq!(
+            normalize_url(&long_query),
+            Some((
+                "https://example.com/search".into(),
+                "example.com".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn normalize_url_refuses_what_is_not_a_page_to_recall() {
+        // A `file:` path is a local secret; the internal pages are nothing to recall.
+        for raw in [
+            "file:///Users/owner/Documents/tax-return.pdf",
+            "about:blank",
+            "chrome://settings/passwords",
+            "safari-resource:///ErrorPage.html",
+            "data:text/html,<h1>hi</h1>",
+            "ftp://files.example.com/pub",
+            "javascript:alert(1)",
+        ] {
+            assert_eq!(normalize_url(raw), None, "{raw} must emit no navigation");
+        }
+        // An http(s) URL with no host is not a site.
+        assert_eq!(normalize_url("https:///just/a/path"), None);
+        assert_eq!(normalize_url("http://@/x"), None);
+        // Not a URL at all.
+        assert_eq!(normalize_url(""), None);
+        assert_eq!(normalize_url("example.com/page"), None);
+    }
+
+    #[test]
+    fn browser_navigation_is_emitted_once_per_url_change() {
+        use NavigationDecision::{Emit, Skip};
+        let tab = "4815162342";
+
+        // The first reading for a window is always a navigation …
+        assert_eq!(
+            navigation_decision(None, tab, "https://a.example/one", PrivateState::NotPrivate),
+            Emit
+        );
+        // … the same pair again is not …
+        assert_eq!(
+            navigation_decision(
+                Some((tab, "https://a.example/one")),
+                tab,
+                "https://a.example/one",
+                PrivateState::NotPrivate
+            ),
+            Skip
+        );
+        // … a new URL in the same tab is …
+        assert_eq!(
+            navigation_decision(
+                Some((tab, "https://a.example/one")),
+                tab,
+                "https://a.example/two",
+                PrivateState::NotPrivate
+            ),
+            Emit
+        );
+        // … and the same URL in a DIFFERENT tab is, too (a second tab on one page is a
+        // place the owner went).
+        assert_eq!(
+            navigation_decision(
+                Some((tab, "https://a.example/one")),
+                "99",
+                "https://a.example/one",
+                PrivateState::NotPrivate
+            ),
+            Emit
+        );
+        // An unpinned browser still reports where the owner went: only TEXT is gated on
+        // a positive signal, URLs are gated on the absence of a private one.
+        assert_eq!(
+            navigation_decision(None, tab, "https://a.example/one", PrivateState::Unknown),
+            Emit
+        );
+    }
+
+    #[test]
+    fn a_retitle_without_a_url_change_is_not_a_navigation() {
+        // The spinner case: a window that re-titles several times a second settles a new
+        // title each time, and every settle asks this. The page did not change.
+        let tab = "7";
+        let last = Some((tab, "https://build.example/job/1742"));
+        for _ in 0..5 {
+            assert_eq!(
+                navigation_decision(
+                    last,
+                    tab,
+                    "https://build.example/job/1742",
+                    PrivateState::NotPrivate
+                ),
+                NavigationDecision::Skip
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_window_never_emits_a_navigation() {
+        // A pinned family whose title could not be read might be an incognito window whose
+        // marker we simply failed to see, so its URL must not cross either (inv. 26). The
+        // absence of a marker is only evidence when the title was actually readable.
+        assert_eq!(
+            navigation_decision(
+                None,
+                "7",
+                "https://bank.example/login",
+                PrivateState::Unreadable
+            ),
+            NavigationDecision::Skip
+        );
+        assert_eq!(
+            navigation_decision(
+                Some(("7", "https://bank.example/login")),
+                "7",
+                "https://bank.example/transfer",
+                PrivateState::Unreadable
+            ),
+            NavigationDecision::Skip
+        );
+    }
+
+    #[test]
+    fn a_private_window_never_emits_a_navigation() {
+        // Inv. 26: the URL of a private window must not cross the Port at all — not on
+        // the first sighting, and not when it changes.
+        assert_eq!(
+            navigation_decision(
+                None,
+                "7",
+                "https://bank.example/login",
+                PrivateState::Private
+            ),
+            NavigationDecision::Skip
+        );
+        assert_eq!(
+            navigation_decision(
+                Some(("7", "https://bank.example/login")),
+                "7",
+                "https://bank.example/transfer",
+                PrivateState::Private
+            ),
+            NavigationDecision::Skip
+        );
+    }
+
+    #[test]
+    fn browser_navigated_frame_carries_the_stripped_url_and_both_refs() {
+        let nav = Navigation {
+            window_ref: "111".into(),
+            window_title: "Pull requests - Google Chrome".into(),
+            tab_ref: "222".into(),
+            url: "https://github.com/tezra-io/compux/pulls".into(),
+            host: "github.com".into(),
+            page_title: Some("Pull requests".into()),
+            private_state: PrivateState::NotPrivate,
+        };
+        let frame = event_frame(
+            "boot-x",
+            9,
+            "browser.navigated",
+            Some(&identity()),
+            navigation_extras("com.google.Chrome", &nav),
+        );
+
+        assert_eq!(frame["kind"], json!("browser.navigated"));
+        assert_eq!(frame["browser_id"], json!("com.google.Chrome"));
+        assert_eq!(
+            frame["url"],
+            json!("https://github.com/tezra-io/compux/pulls")
+        );
+        assert_eq!(frame["host"], json!("github.com"));
+        assert_eq!(frame["page_title"], json!("Pull requests"));
+        assert_eq!(
+            frame["window_title"],
+            json!("Pull requests - Google Chrome")
+        );
+        assert_eq!(frame["window_ref"], json!("111"));
+        assert_eq!(frame["tab_ref"], json!("222"));
+        assert_eq!(frame["private_state"], json!("not_private"));
+        // Navigation carries no content field of its own.
+        assert!(frame.get("text").is_none());
+
+        // An empty web-area title is an ABSENT page_title, never the window title
+        // substituted for it; an unreadable window title is absent too.
+        let bare = Navigation {
+            page_title: None,
+            window_title: String::new(),
+            ..nav
+        };
+        let extra = navigation_extras("com.google.Chrome", &bare);
+        assert!(extra.get("page_title").is_none());
+        assert!(extra.get("window_title").is_none());
+    }
+
+    // --- the web-area walk, over a synthetic tree -----------------------------
+    //
+    // The real walk's two reads are AX IPC calls, so what matters is HOW MANY it makes
+    // and that every element it obtains comes back to be released. Both are properties
+    // of the traversal, not of AX, so the traversal takes its reads as closures and is
+    // exercised here against a tree built in memory.
+    struct FakeTree {
+        // `kids[i]` are node i's children.
+        kids: Vec<Vec<usize>>,
+        // The nodes that answer "this is the page".
+        pages: Vec<usize>,
+        // One entry per `is_page` call — the count the cap must bound.
+        reads: Vec<usize>,
+        // Every node the walk was handed, root included: each must come back exactly once.
+        handed: Vec<usize>,
+    }
+
+    impl FakeTree {
+        // A root with `width` children, each with `width` children of its own.
+        fn wide(width: usize) -> FakeTree {
+            let mut kids = vec![(1..=width).collect::<Vec<usize>>()];
+            for parent in 1..=width {
+                let first = 1 + width + (parent - 1) * width;
+                kids.push((first..first + width).collect());
+            }
+            while kids.len() < 1 + width + width * width {
+                kids.push(Vec::new());
+            }
+            FakeTree {
+                kids,
+                pages: Vec::new(),
+                reads: Vec::new(),
+                handed: vec![0],
+            }
+        }
+
+        fn walk(&mut self, max_depth: usize, max_nodes: usize) -> WebAreaWalk<usize> {
+            let (kids, pages) = (self.kids.clone(), self.pages.clone());
+            let (reads, handed) = (&mut self.reads, &mut self.handed);
+            find_page_web_area(
+                0,
+                max_depth,
+                max_nodes,
+                &mut |node| {
+                    let children = kids.get(node).cloned().unwrap_or_default();
+                    handed.extend(children.iter().copied());
+                    children
+                },
+                &mut |node| {
+                    reads.push(node);
+                    pages.contains(&node)
+                },
+            )
+        }
+    }
+
+    fn assert_every_node_came_back(tree: &FakeTree, walk: &WebAreaWalk<usize>) {
+        let mut returned = walk.discarded.clone();
+        returned.extend(walk.found);
+        returned.sort_unstable();
+        let mut handed = tree.handed.clone();
+        handed.sort_unstable();
+        assert_eq!(
+            returned, handed,
+            "every element the walk obtained must come back exactly once to be released"
+        );
+    }
+
+    #[test]
+    fn the_web_area_walk_reads_no_more_nodes_than_its_cap() {
+        // A wide tree is the hazard: gating only EXPANSION lets 10 expansions × 8 children
+        // enqueue 80 elements and read all of them. The cap is checked before each read.
+        let mut tree = FakeTree::wide(8);
+        let walk = tree.walk(12, 10);
+
+        assert_eq!(walk.found, None, "there is no page in this tree");
+        assert_eq!(
+            tree.reads.len(),
+            10,
+            "the cap bounds the READS, not just the expansions"
+        );
+        // Retention is bounded too: at most the cap plus one node's children are ever
+        // held, so a 160k-node tree cannot be pulled into memory.
+        assert!(
+            tree.handed.len() <= 10 + 8,
+            "held {} elements at once",
+            tree.handed.len()
+        );
+        assert_every_node_came_back(&tree, &walk);
+    }
+
+    #[test]
+    fn the_web_area_walk_keeps_going_past_a_web_area_that_is_not_a_page() {
+        // A browser window holds more than one web area: a side panel, a `chrome://`
+        // new-tab page. The predicate is "web area whose URL is a page", so the walk must
+        // keep going past the ones that are not rather than caching the first hit.
+        let mut tree = FakeTree::wide(3);
+        // Node 1 is the chrome:// web area (not a page); node 3 is the real one.
+        tree.pages = vec![3];
+        let walk = tree.walk(12, 100);
+
+        assert_eq!(walk.found, Some(3));
+        assert!(
+            tree.reads.contains(&1),
+            "the non-page web area was tested and rejected"
+        );
+        assert!(
+            walk.discarded.contains(&1),
+            "a rejected web area must be released, not cached"
+        );
+        assert_every_node_came_back(&tree, &walk);
+    }
+
+    #[test]
+    fn the_web_area_walk_is_breadth_first_and_stops_at_its_depth_cap() {
+        // Breadth-first: the content area sits shallow under the window, so a deep
+        // toolbar subtree must never be descended before it.
+        let mut tree = FakeTree::wide(3);
+        tree.pages = vec![2, 7];
+        let walk = tree.walk(12, 100);
+        assert_eq!(walk.found, Some(2), "the shallow page wins");
+
+        // The depth cap: a page below it is simply not found, and nothing leaks.
+        let mut tree = FakeTree::wide(3);
+        tree.pages = vec![7]; // a grandchild, at depth 2
+        let walk = tree.walk(1, 100);
+        assert_eq!(walk.found, None);
+        assert_every_node_came_back(&tree, &walk);
+    }
+
+    fn field_context<'a>() -> BrowserFieldContext<'a> {
+        BrowserFieldContext {
+            browser_id: "com.google.Chrome",
+            window_ref: Some("111"),
+            tab_ref: Some("222"),
+            host: Some("github.com"),
+        }
+    }
+
+    #[test]
+    fn a_not_private_browser_field_sends_its_text_with_the_site_context() {
+        let mut extra = Map::new();
+        let owed = browser_field_extras(
+            "ship it",
+            PrivateState::NotPrivate,
+            &field_context(),
+            &mut extra,
+        );
+
+        assert_eq!(extra["text"], json!("ship it"));
+        assert_eq!(extra["char_len"], json!(7));
+        assert_eq!(extra["content_withheld"], json!(false));
+        assert_eq!(extra["private_state"], json!("not_private"));
+        assert_eq!(extra["browser_id"], json!("com.google.Chrome"));
+        assert_eq!(extra["window_ref"], json!("111"));
+        assert_eq!(extra["tab_ref"], json!("222"));
+        assert_eq!(extra["host"], json!("github.com"));
+        assert_eq!(owed, BrowserFieldOwed::default());
+
+        // A window that has not reported a navigation yet has no site to stamp: the keys
+        // are absent, never null.
+        let mut extra = Map::new();
+        let context = BrowserFieldContext {
+            tab_ref: None,
+            host: None,
+            ..field_context()
+        };
+        browser_field_extras("ship it", PrivateState::NotPrivate, &context, &mut extra);
+        assert!(extra.get("tab_ref").is_none());
+        assert!(extra.get("host").is_none());
+
+        // Over the cap the text is clipped, the FULL length is still reported, and a
+        // truncated gap is owed.
+        let long = "a".repeat(MAX_TEXT_BYTES + 10);
+        let mut extra = Map::new();
+        let owed = browser_field_extras(
+            &long,
+            PrivateState::NotPrivate,
+            &field_context(),
+            &mut extra,
+        );
+        assert_eq!(extra["char_len"], json!((MAX_TEXT_BYTES + 10) as i64));
+        assert!(extra["text"].as_str().unwrap().len() <= MAX_TEXT_BYTES);
+        assert!(owed.truncated);
+        assert!(!owed.private_unknown);
+    }
+
+    #[test]
+    fn a_private_browser_field_withholds_its_text_and_owes_no_gap() {
+        let mut extra = Map::new();
+        let owed = browser_field_extras(
+            "my card number",
+            PrivateState::Private,
+            &field_context(),
+            &mut extra,
+        );
+
+        // Inv. 26: no text, and no site either — a private window's host never reached
+        // the wire, so nothing may imply it did.
+        assert!(extra.get("text").is_none());
+        assert!(extra.get("host").is_none());
+        assert!(extra.get("tab_ref").is_none());
+        assert_eq!(extra["content_withheld"], json!(true));
+        assert_eq!(extra["private_state"], json!("private"));
+        assert_eq!(extra["char_len"], json!(14));
+        assert_eq!(extra["browser_id"], json!("com.google.Chrome"));
+        assert_eq!(extra["window_ref"], json!("111"));
+        // A private window is working as designed, not a coverage gap.
+        assert_eq!(owed, BrowserFieldOwed::default());
+    }
+
+    #[test]
+    fn an_unknown_browser_field_withholds_its_text_and_owes_the_gap() {
+        let mut extra = Map::new();
+        let owed = browser_field_extras(
+            "my card number",
+            PrivateState::Unknown,
+            &field_context(),
+            &mut extra,
+        );
+
+        assert!(extra.get("text").is_none());
+        assert!(extra.get("host").is_none());
+        assert_eq!(extra["content_withheld"], json!(true));
+        assert_eq!(extra["private_state"], json!("unknown"));
+        assert_eq!(extra["char_len"], json!(14));
+        assert_eq!(extra["window_ref"], json!("111"));
+        assert!(
+            owed.private_unknown,
+            "an unreadable posture is a coverage fact the session must name"
+        );
+        assert!(!owed.truncated);
+
+        // No window to classify at all: the refs are absent, the posture is still
+        // unknown, and the text is still withheld.
+        let mut extra = Map::new();
+        let context = BrowserFieldContext {
+            window_ref: None,
+            tab_ref: None,
+            host: None,
+            ..field_context()
+        };
+        let owed = browser_field_extras("x", PrivateState::Unknown, &context, &mut extra);
+        assert!(extra.get("window_ref").is_none());
+        assert_eq!(extra["content_withheld"], json!(true));
+        assert!(owed.private_unknown);
+    }
+
+    #[test]
+    fn an_unreadable_browser_field_withholds_without_a_standing_gap() {
+        let mut extra = Map::new();
+        let owed = browser_field_extras(
+            "my card number",
+            PrivateState::Unreadable,
+            &field_context(),
+            &mut extra,
+        );
+
+        // The text is withheld exactly as for an unknown window …
+        assert!(extra.get("text").is_none());
+        assert!(extra.get("host").is_none());
+        assert_eq!(extra["content_withheld"], json!(true));
+        assert_eq!(extra["private_state"], json!("unknown"));
+        assert_eq!(extra["char_len"], json!(14));
+        // … but ONE failed read is not a standing property of the app, so it owes no gap:
+        // a pinned family must never be named private-unknown for the whole session.
+        assert_eq!(owed, BrowserFieldOwed::default());
     }
 }
