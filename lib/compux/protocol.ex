@@ -45,6 +45,11 @@ defmodule Compux.Protocol do
   # `@actions`), but the wire is no longer strictly one-response-per-request, so a
   # pre-v6 sidecar cannot speak it and the handshake refuses the pairing. The
   # consuming Fermix `Capturer` owns the Port and demuxes the discriminated frames.
+  #
+  # Sidecar 0.9.0 stays on v6: it adds the `browser.navigated` observation kind and the
+  # browser context (`browser_id`/`window_ref`/`tab_ref`/`host`/`private_state`) on
+  # `field.value`, both ADDITIVE fields on that same push wire, and accepts-and-ignores
+  # the retired `sites` key of `observe_start` — no control action changed.
   @protocol_version 6
 
   @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows)
