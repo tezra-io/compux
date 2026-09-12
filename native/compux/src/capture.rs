@@ -1567,12 +1567,23 @@ mod imp {
         }
     }
 
+    // `kAXErrorInvalidUIElement`: the element the notification was on is gone. This
+    // is the expected, benign case for a removal — on detach (the app exited) and,
+    // far more often, on the steady-state re-point in `track_value_source`, where
+    // every focus change unregisters the previously watched field. A focus-heavy
+    // app (a terminal redraws its focused element on every click) would otherwise
+    // log this on every click. Removal is a no-op against a dead element either way,
+    // so it is not worth a line; any OTHER refusal still surfaces.
+    const INVALID_ELEMENT: i32 = -25202;
+
+    fn removal_worth_logging(rc: i32) -> bool {
+        rc != 0 && rc != INVALID_ELEMENT
+    }
+
     unsafe fn remove_notification(observer: AXObserverRef, element: CFTypeRef, name: &str) {
         let cf = CFString::new(name);
         let rc = AXObserverRemoveNotification(observer, element, cf.as_concrete_TypeRef());
-        // A refused removal on teardown is benign (the app may have exited), but it
-        // is never silent: the observer is released next, which drops the registration.
-        if rc != 0 {
+        if removal_worth_logging(rc) {
             log(&format!("{name} removal refused (AXError {rc})"));
         }
     }
@@ -2876,6 +2887,17 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn a_gone_element_is_not_worth_logging_on_removal() {
+            // kAXErrorInvalidUIElement: the element is already gone, which is exactly
+            // what a removal handles — the expected case during focus churn.
+            assert!(!removal_worth_logging(0));
+            assert!(!removal_worth_logging(INVALID_ELEMENT));
+            // A genuinely unexpected refusal still surfaces.
+            assert!(removal_worth_logging(-25204));
+            assert!(removal_worth_logging(-25200));
+        }
 
         static FIRES: AtomicU64 = AtomicU64::new(0);
 
