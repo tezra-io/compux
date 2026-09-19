@@ -7,9 +7,16 @@
 # mirroring the real sidecar (`native/compux/src/wire.rs`, `control.rs`, `gate.rs`):
 #
 #   * a mutating success carries a receipt, derived the way `Receipt::derive` does
-#     it — `dispatch: "sent"`, and `effect: "not_observed"` only when the payload
-#     really has `data`, else `unknown`. Whether a request mutates is read off the
-#     line's own `mutation_seq`, which is exactly the sidecar's rule;
+#     it — `dispatch: "sent"`, and `effect: "not_observed"` only when the check
+#     really brought evidence back, else `unknown`. Whether a request mutates is
+#     read off the line's own `mutation_seq`, which is exactly the sidecar's rule;
+#   * CHECKS (protocol 10): a successful action that dispatches input ALWAYS carries
+#     `check` in its receipt — `{"kind":"none"}` when none was asked for — because a
+#     fake that could leave it out would hide a consumer that stopped reading it.
+#     This one settles instantly (`settle: "stable"`, `changed: false`) and reports
+#     timings of zero, and an `image` check really does answer an image, so the
+#     `not_observed` effect and the `observation_id_after` that ride one are the
+#     helper's own shapes rather than convenient ones;
 #   * a TYPELESS line is the protocol-6 shape and there is no legacy mode, so it
 #     is refused. Naming an action it is answered with an `ack` carrying THIS
 #     protocol version (`wire::untagged` -> `Reply::CaptureAck`); naming none it
@@ -38,7 +45,7 @@
 # write to a pipe would hang the reader).
 #
 # Request actions:
-#   hello         -> the identity handshake (protocol 9, a boot generation)
+#   hello         -> the identity handshake (protocol 10, a boot generation)
 #   screenshot    -> a 100x50 image that mints an observation and names it
 #   elements      -> one element (`e1`) in a fresh observation, as the helper lists it
 #   left_click, right_click, double_click, mouse_move, left_click_drag, scroll,
@@ -76,7 +83,7 @@ use strict;
 use warnings;
 $| = 1;
 
-my $PROTOCOL     = defined $ENV{FAKE_PROTOCOL_VERSION}   ? $ENV{FAKE_PROTOCOL_VERSION}   : 9;
+my $PROTOCOL     = defined $ENV{FAKE_PROTOCOL_VERSION}   ? $ENV{FAKE_PROTOCOL_VERSION}   : 10;
 my $BOOT         = defined $ENV{FAKE_SIDECAR_GENERATION} ? $ENV{FAKE_SIDECAR_GENERATION} : 'boot-test';
 my $CONTROL_MODE = defined $ENV{FAKE_CONTROL_MODE}       ? $ENV{FAKE_CONTROL_MODE}       : 'ack';
 
@@ -123,20 +130,36 @@ sub envelope {
     return qq("request_id":"$id","sidecar_generation":"$boot","session_generation":$session);
 }
 
-# A mutating request earns a receipt, and only a payload that really carries
-# `data` has an after-image to assess.
+# The check a request asked for, as the receipt reports it. Absent means `none`:
+# the helper always says which evidence it carries, and a fake that left the field
+# off would hide a consumer that stopped reading it. This one settles instantly, so
+# a check that ran is always `stable`.
+sub check_for {
+    my ($line) = @_;
+    my ($kind) = $line =~ /"check":"([^"]*)"/;
+    return qq(,"check":{"kind":"none"}) unless defined $kind && $kind ne 'none';
+    return qq(,"check":{"kind":"semantic"}) if $kind eq 'semantic';
+    return qq(,"check":{"kind":"image","settle":"stable","changed":false});
+}
+
+# A mutating request earns a receipt, and only a check that really brought
+# something back has evidence to assess.
 sub receipt_for {
-    my ($line, $has_data) = @_;
+    my ($line, $has_evidence, $after) = @_;
     return '' unless $line =~ /"mutation_seq":\d+/;
-    my $effect = $has_data ? 'not_observed' : 'unknown';
+    my $effect = $has_evidence ? 'not_observed' : 'unknown';
+    my ($named) = $line =~ /"observation_id":"([^"]*)"/;
+    my $before = defined $named ? qq(,"observation_id_before":"$named") : '';
+    my $ids = defined $after ? qq($before,"observation_id_after":"$after") : $before;
     return qq(,"receipt":{"dispatch":"sent","effect":"$effect",)
-        . qq("input_method":"foreground_hid","timings_ms":{"input":1,"settle":0,"capture":0}});
+        . qq("input_method":"foreground_hid","timings_ms":{"input":1,"settle":0,)
+        . qq("capture":0,"encode":0}$ids) . check_for($line) . qq(});
 }
 
 sub ok_response {
-    my ($id, $extra, $line, $has_data) = @_;
+    my ($id, $extra, $line, $has_evidence, $after) = @_;
     my $head = envelope($id, $BOOT, 1);
-    my $receipt = defined $line ? receipt_for($line, $has_data) : '';
+    my $receipt = defined $line ? receipt_for($line, $has_evidence, $after) : '';
     print qq({"type":"response",$head,"ok":true,$extra$receipt}\n);
 }
 
@@ -180,7 +203,8 @@ sub refuse {
     my $before = defined $named ? qq(,"observation_id_before":"$named") : '';
     print qq({"type":"response",$head,"ok":false,"error":"$error","detail":"$detail",)
         . qq("receipt":{"dispatch":"not_sent","effect":"unknown",)
-        . qq("input_method":"foreground_hid"$before}}\n);
+        . qq("input_method":"foreground_hid","timings_ms":{"input":0,"settle":0,)
+        . qq("capture":0,"encode":0}$before}}\n);
 }
 
 # Protocol 8/9: an addressed action names the reply its target was read from, and
@@ -242,15 +266,54 @@ sub addressed {
 
 # The receipt an accessibility action earns: the `ax` input method, and the effect
 # its own read-back proved (never inferred from an after-image, which it has none
-# of).
+# of). A `semantic` check re-reads the control afterwards and answers
+# `element_after`, which is the one evidence an accessibility action can bring.
 sub ax_response {
-    my ($id, $extra, $effect) = @_;
+    my ($id, $extra, $effect, $line) = @_;
     my $head = envelope($id, $BOOT, 1);
+    my ($kind) = $line =~ /"check":"([^"]*)"/;
+    $kind = 'none' unless defined $kind;
+    my ($named) = $line =~ /"observation_id":"([^"]*)"/;
+    my $before = defined $named ? qq(,"observation_id_before":"$named") : '';
+
+    if ($kind eq 'semantic') {
+        my $after = qq("element_after":{"present":true,"role":"AXButton",)
+            . qq("label":"Save","enabled":true});
+        $extra = $extra eq '' ? $after : qq($extra,$after);
+        $effect = 'not_observed' if $effect eq 'unknown';
+    }
     $extra = "$extra," if $extra ne '';
+
+    my $check = $kind eq 'semantic'
+        ? qq("check":{"kind":"semantic"})
+        : qq("check":{"kind":"none"});
+
     print qq({"type":"response",$head,"ok":true,$extra)
         . qq("receipt":{"dispatch":"sent","effect":"$effect","input_method":"ax",)
         . qq("foreground_changed":false,)
-        . qq("timings_ms":{"input":1,"settle":0,"capture":0}}}\n);
+        . qq("timings_ms":{"input":1,"settle":0,"capture":0,"encode":0}$before,$check}}\n);
+}
+
+# An action that dispatches input over the pointer, answered with the evidence it
+# asked for: an `image` check really mints an observation and answers a picture, so
+# the reply a consumer reads is the helper's shape and not a convenient one.
+sub checked_response {
+    my ($id, $extra, $line) = @_;
+    my ($kind) = $line =~ /"check":"([^"]*)"/;
+
+    if (defined $kind && $kind eq 'image') {
+        $OBS_COUNTER++;
+        my $obs = "fake-$OBS_COUNTER";
+        $OBSERVED{$obs} = 1;
+        ok_response($id,
+            qq($extra,"mime":"image/jpeg","width":$SENT_W,"height":$SENT_H,"data":"AAA",)
+            . qq("observation_id":"$obs","observation_kind":"image",)
+            . qq("captured_at_monotonic_ns":1,"frame_seq":$OBS_COUNTER),
+            $line, 1, $obs);
+        return;
+    }
+
+    ok_response($id, $extra, $line);
 }
 
 sub request {
@@ -265,17 +328,17 @@ sub request {
             # The helper's own shape: no payload of its own, and a `not_observed`
             # effect, because a clean AX return is a dispatch result and not proof
             # that anything happened.
-            ax_response($id, '', 'not_observed');
+            ax_response($id, '', 'not_observed', $line);
         }
         elsif ($action eq 'set_value') {
             # Set, then read back. Equal earns `verified`, and the value on the
             # reply is what the control holds NOW — the helper's two fields.
             my ($value) = $line =~ /"value":"([^"]*)"/;
             $value = '' unless defined $value;
-            ax_response($id, qq("verified":true,"value":"$value"), 'verified');
+            ax_response($id, qq("verified":true,"value":"$value"), 'verified', $line);
         }
         else {
-            ok_response($id, '"pong":true', $line);
+            checked_response($id, '"pong":true', $line);
         }
         return;
     }

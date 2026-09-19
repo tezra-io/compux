@@ -54,11 +54,11 @@ defmodule CompuxTest do
                        }}
     end
 
-    test "click button variants + modifiers + screenshot_after", %{cu: cu} do
+    test "click button variants + modifiers + check", %{cu: cu} do
       Compux.click(cu, {10, 20},
         button: :right,
         modifiers: [:cmd, :shift],
-        screenshot_after: true,
+        check: :image,
         observation_id: "7c1e-12"
       )
 
@@ -68,7 +68,7 @@ defmodule CompuxTest do
                          "x" => 10,
                          "y" => 20,
                          "modifiers" => ["cmd", "shift"],
-                         "screenshot_after" => true,
+                         "check" => "image",
                          "observation_id" => "7c1e-12"
                        }}
 
@@ -77,6 +77,27 @@ defmodule CompuxTest do
 
       Compux.click(cu, {1, 2}, observation_id: "7c1e-12")
       assert_received {:executed, %{"action" => "left_click"}}
+    end
+
+    # The evidence an action brings back is asked for by name, on the same call.
+    # A kind this wire does not have never reaches the driver.
+    test "check rides every call that dispatches input", %{cu: cu} do
+      Compux.type(cu, "hi", check: :none)
+      assert_received {:executed, %{"action" => "type", "check" => "none"}}
+
+      Compux.press(cu, "e3", observation_id: "7c1e-12", check: :semantic)
+      assert_received {:executed, %{"action" => "press", "check" => "semantic"}}
+
+      Compux.set_value(cu, "e3", "42", observation_id: "7c1e-12", check: "image")
+      assert_received {:executed, %{"action" => "set_value", "check" => "image"}}
+
+      Compux.paste(cu, "text")
+      assert_received {:executed, executed}
+      refute Map.has_key?(executed, "check")
+
+      assert {:error, reason} = Compux.click(cu, {1, 2}, observation_id: "7c1e-12", check: :bogus)
+      assert reason =~ "check"
+      refute_received {:executed, %{"action" => "left_click"}}
     end
 
     # Every coordinate names the image it was read in. The facade will not build a

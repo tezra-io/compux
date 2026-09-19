@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use enigo::{Axis, Button, Direction, Key};
 
 use crate::held::Platform;
-use crate::wire::{ControlAction, Effect, Envelope, InputMethod, Request, Timings};
+use crate::wire::{Checked, ControlAction, Effect, Envelope, InputMethod, Request, Timings};
 
 /// The coarsest a cancellation may be noticed inside a loop or a sleep of ours.
 pub const CHECKPOINT_MS: u64 = 25;
@@ -54,6 +54,7 @@ pub enum Phase {
     Input,
     Settle,
     Capture,
+    Encode,
 }
 
 /// Why the gate said no. Each maps to one wire code; there is no general-purpose
@@ -160,16 +161,25 @@ pub struct Dispatched {
     /// Whether the foreground moved while the action ran, for the actions that
     /// promise not to move it. `None` where the question was never asked.
     pub foreground_changed: Option<bool>,
+    /// The evidence the action's check brought back. `None` where no check ran —
+    /// the action was refused, or it was cancelled before its check could finish —
+    /// so the receipt reports what was dispatched and claims no evidence.
+    pub check: Option<Checked>,
 }
 
 struct InFlight {
     request_id: String,
     posted: bool,
     input_complete: bool,
+    /// When the input sequence finished, on this process's one clock. A check's
+    /// quiet window is counted from HERE and not from its own first look, because a
+    /// display has to be resolved and may have to be measured in between.
+    completed_at: Option<u64>,
     timings: Timings,
     input_method: InputMethod,
     effect: Option<Effect>,
     foreground_changed: Option<bool>,
+    check: Option<Checked>,
 }
 
 struct State {
@@ -280,10 +290,12 @@ impl Gate {
             request_id: request.request_id.clone(),
             posted: false,
             input_complete: false,
+            completed_at: None,
             timings: Timings::default(),
             input_method: InputMethod::default(),
             effect: None,
             foreground_changed: None,
+            check: None,
         });
         self.cancelled.store(false, Ordering::SeqCst);
 
@@ -419,14 +431,32 @@ impl Gate {
     }
 
     /// The input sequence finished. Latched HERE rather than derived from the
-    /// action's overall result, because the post-action check image is taken after
-    /// it: a click whose every event landed and whose own screenshot then failed
+    /// action's overall result, because the post-action check is taken after it: a
+    /// click whose every event landed and whose own screenshot then failed
     /// dispatched `sent`, not `partial`.
+    ///
+    /// **A consumer depends on this being the LAST fallible thing before the
+    /// check.** Fermix reads "an image check was asked for, `dispatch` says `sent`,
+    /// and the receipt carries no check" as "the evidence could not be obtained";
+    /// a fallible step added between this latch and the check would produce those
+    /// same three facts for a different reason. `main.rs` has a test that reads the
+    /// source and fails when one appears.
     pub fn input_complete(&self) {
         let mut state = self.lock();
+        let now = self.clock.now_ms();
         if let Some(in_flight) = state.in_flight.as_mut() {
             in_flight.input_complete = true;
+            in_flight.completed_at = Some(now);
         }
+    }
+
+    /// When the input finished, for the check that follows it. `None` before the
+    /// latch, and for an action that never reached it.
+    pub fn input_completed_at(&self) -> Option<u64> {
+        self.lock()
+            .in_flight
+            .as_ref()
+            .and_then(|in_flight| in_flight.completed_at)
     }
 
     /// How this action reached the machine. Said, never inferred: `press` and
@@ -456,6 +486,17 @@ impl Gate {
         let mut state = self.lock();
         if let Some(in_flight) = state.in_flight.as_mut() {
             in_flight.foreground_changed = Some(changed);
+        }
+    }
+
+    /// What the action's check brought back. Recorded only once the check has RUN,
+    /// so a receipt carrying one means evidence was really obtained: a check
+    /// cancelled part way through leaves this unsaid and the action still reports
+    /// its dispatch truthfully.
+    pub fn observed_check(&self, checked: Checked) {
+        let mut state = self.lock();
+        if let Some(in_flight) = state.in_flight.as_mut() {
+            in_flight.check = Some(checked);
         }
     }
 
@@ -509,6 +550,7 @@ impl Gate {
                 input_method: in_flight.input_method,
                 effect: in_flight.effect,
                 foreground_changed: in_flight.foreground_changed,
+                check: in_flight.check,
             },
             None => Dispatched {
                 cancelled,
@@ -586,12 +628,19 @@ fn mark(state: &mut State, phase: Phase, ms: u64) {
     }
 }
 
+/// Every phase is accumulated and CLAMPED here, the one place a timing is written.
+/// A monotonic clock should make the ceiling unreachable; a clock that jumped, or a
+/// reading taken across a suspend, would otherwise put a number on the wire that a
+/// reader has to decide what to do with. See [`MAX_TIMING_MS`].
 fn add_timing(timings: &mut Timings, phase: Phase, ms: u64) {
-    match phase {
-        Phase::Input => timings.input_ms += ms,
-        Phase::Settle => timings.settle_ms += ms,
-        Phase::Capture => timings.capture_ms += ms,
-    }
+    let counter = match phase {
+        Phase::Input => &mut timings.input_ms,
+        Phase::Settle => &mut timings.settle_ms,
+        Phase::Capture => &mut timings.capture_ms,
+        Phase::Encode => &mut timings.encode_ms,
+    };
+
+    *counter = counter.saturating_add(ms).min(crate::wire::MAX_TIMING_MS);
 }
 
 // --- the gated platform -------------------------------------------------------
@@ -752,6 +801,7 @@ mod tests {
             },
             observation_id: None,
             element_ref: None,
+            check: wire::Check::None,
         }
     }
 

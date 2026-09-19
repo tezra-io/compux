@@ -26,6 +26,18 @@ defmodule Compux.ProtocolTest do
     Map.merge(%{"action" => action, "observation_id" => "7c1e-12", "element_ref" => "e3"}, extra)
   end
 
+  # A valid request for one action that dispatches input, whichever way that action
+  # is addressed — so a test about the `check` field can be written over the whole
+  # set and an action added later joins it or fails it.
+  defp check_params(action) do
+    cond do
+      action in ~w(press set_value) -> element_params(action, %{"value" => "v"})
+      action in ~w(type paste) -> %{"action" => action, "text" => "hi"}
+      action == "key" -> %{"action" => "key", "chord" => "ctrl+s"}
+      true -> addressed_params(action)
+    end
+  end
+
   describe "protocol_version/0" do
     test "is a positive integer" do
       assert is_integer(Protocol.protocol_version())
@@ -359,6 +371,79 @@ defmodule Compux.ProtocolTest do
         assert {:error, reason} = Protocol.validate(params)
         assert reason =~ "element_ref"
       end
+    end
+  end
+
+  # v10: the evidence an action brings back. One field, three kinds, and the rules
+  # that decide which of them a given action may ask for.
+  describe "validate/1 — check (v10)" do
+    test "every action that dispatches input takes an image check and a bare receipt" do
+      for action <- Enum.reject(Protocol.actions(), &Protocol.read_only?/1),
+          kind <- ~w(image none) do
+        params = Map.put(check_params(action), "check", kind)
+
+        assert {:ok, request} = Protocol.validate(params), "#{action} must accept check #{kind}"
+        assert request["check"] == kind
+      end
+    end
+
+    test "an absent check is absent on the wire" do
+      assert {:ok, request} = Protocol.validate(addressed_params("left_click"))
+      refute Map.has_key?(request, "check")
+    end
+
+    test "a kind this wire does not have is refused by name" do
+      for bad <- ["bogus", "IMAGE", true, 1] do
+        params = Map.put(addressed_params("left_click"), "check", bad)
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "check"
+      end
+    end
+
+    # A semantic check re-reads the control the action named. An action that named
+    # a point has no control to re-read, so asking for one is a contradiction and
+    # not a request to photograph it instead.
+    test "a semantic check needs a control, not a point" do
+      params = Map.put(addressed_params("left_click"), "check", "semantic")
+      assert {:error, reason} = Protocol.validate(params)
+      assert reason =~ "element_ref"
+
+      for action <- ~w(left_click right_click double_click scroll press set_value) do
+        extra =
+          case action do
+            "scroll" -> %{"direction" => "down", "amount" => 2}
+            "set_value" -> %{"value" => "v"}
+            _other -> %{}
+          end
+
+        params = element_params(action, Map.put(extra, "check", "semantic"))
+        assert {:ok, request} = Protocol.validate(params), "#{action} names a control"
+        assert request["check"] == "semantic"
+      end
+    end
+
+    test "an action that dispatches no input takes no check" do
+      for action <- Enum.filter(Protocol.actions(), &Protocol.read_only?/1) do
+        params =
+          if action in ~w(mouse_move inspect),
+            do: addressed_params(action),
+            else: %{"action" => action}
+
+        assert {:error, reason} = Protocol.validate(Map.put(params, "check", "image")),
+               "#{action} must take no check"
+
+        assert reason =~ "check"
+      end
+    end
+
+    # `screenshot_after` was replaced, not kept beside `check`. Dropping it in
+    # silence would leave a caller that still sends it with no check at all, and
+    # nothing said about it.
+    test "screenshot_after is gone, and saying so is loud" do
+      params = Map.put(addressed_params("left_click"), "screenshot_after", true)
+      assert {:error, reason} = Protocol.validate(params)
+      assert reason =~ "screenshot_after"
+      assert reason =~ "check"
     end
   end
 

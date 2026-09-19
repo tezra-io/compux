@@ -36,6 +36,37 @@ pub const MAX_OBSERVATIONS: usize = 3;
 /// How long coordinates read off an image stay addressable.
 pub const TTL_MS: u64 = 30_000;
 
+/// The hash of one rectangle of one captured frame, kept with the rectangle it was
+/// taken over and the size of the frame it came out of.
+///
+/// Those two ride along because they are what makes a comparison POSSIBLE. Two
+/// hashes answer "is this the same picture?" only when they cover the same
+/// rectangle of a frame of the same size; anything else is two different pictures,
+/// and the honest answer is that there is no comparison to make — never "it
+/// changed", which would tell a caller its view had moved on when nobody had looked
+/// at the same view twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewHash {
+    /// Every pixel of the rectangle, hashed in place out of the frame.
+    pub pixels: u64,
+    /// The rectangle's whole pixels in that frame: left, top, width, height.
+    pub rect: (u32, u32, u32, u32),
+    /// The frame's own size, which the rectangle's numbers only mean anything in.
+    pub frame: (u32, u32),
+}
+
+impl ViewHash {
+    /// Did this view change since `before`? `None` when the two are not comparable
+    /// at all, which a caller reports as "nothing is known" rather than as a change.
+    pub fn changed_from(&self, before: &ViewHash) -> Option<bool> {
+        if self.rect == before.rect && self.frame == before.frame {
+            Some(self.pixels != before.pixels)
+        } else {
+            None
+        }
+    }
+}
+
 /// What a reply handed the model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -81,6 +112,12 @@ pub struct Observation {
     /// One counter per process, images only, so a reader can order the pictures a
     /// session produced.
     pub frame_seq: Option<u64>,
+    /// The hash of the crop this image covers, kept with it so a later check can
+    /// say whether this view CHANGED since the caller acted on it — without the
+    /// caller holding anything and without a second capture proving it. `None` on a
+    /// listing: it has no picture, and inventing a comparison there would answer a
+    /// question nobody has evidence for.
+    pub view_hash: Option<ViewHash>,
     /// The controls this reply listed, and the native references behind them.
     ///
     /// Shared rather than owned, because an action COPIES the observation it named
@@ -172,6 +209,7 @@ pub struct Minting {
     pub region: Region,
     pub sent: (u32, u32),
     pub elements: Option<Rc<Elements>>,
+    pub view_hash: Option<ViewHash>,
 }
 
 impl Observations {
@@ -215,6 +253,7 @@ impl Observations {
             captured_at_monotonic_ns: self.clock.now_ns(),
             frame_seq,
             elements: minting.elements,
+            view_hash: minting.view_hash,
         };
 
         self.entries.push(observation.clone());
@@ -375,6 +414,7 @@ mod tests {
             region,
             sent: (1366, 887),
             elements,
+            view_hash: None,
         })
     }
 

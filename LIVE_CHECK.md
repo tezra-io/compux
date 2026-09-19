@@ -58,11 +58,11 @@ Sanity-check the wire without starting a session (the binary reads stdin, so it 
 given a line — never run it with no input, it will simply wait):
 
 ```sh
-printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":9,"deadline_ms":10000}\n' \
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":10,"deadline_ms":10000}\n' \
   | COMPUX_DISCLAIMED=1 "$SIDE/compux"
 ```
 
-It must report `"protocol_version":9`. **Every line into this sidecar is a tagged frame
+It must report `"protocol_version":10`. **Every line into this sidecar is a tagged frame
 now** — a request carries a `type` and a `request_id`, and an untagged protocol-6 line
 is refused rather than served. That is why the `printf` above looks nothing like the one
 this document carried when it was written against protocol 6.
@@ -376,7 +376,7 @@ def recv():
     return reply
 
 send({"type": "request", "request_id": "r1", "action": "hello",
-      "protocol_version": 9, "deadline_ms": 10000})
+      "protocol_version": 10, "deadline_ms": 10000})
 hello = recv()
 print("hello   ", json.dumps(hello))
 
@@ -431,7 +431,7 @@ PYEOF
 ```
 
 The first line it prints is always the handshake, and it must say
-`"protocol_version": 9`, with a `capabilities.observations` of
+`"protocol_version": 10`, with a `capabilities.observations` of
 `{"max": 3, "ttl_ms": 30000}`. If it does not, the binary is not the one you just
 built. Every `image` or `elements` line names the reply the action after it is
 aimed at. If that line reads `"ok": false`, the sidecar could not capture — the
@@ -483,11 +483,11 @@ The disclaim re-exec runs on every launch and now reports a failed spawn attribu
 check the disclaimed path too, since step 1 skipped it:
 
 ```sh
-printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":9,"deadline_ms":10000}\n' \
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":10,"deadline_ms":10000}\n' \
   | "$CX"; echo "exit=$?"
 ```
 
-It must print the hello frame with `"protocol_version":9` and `exit=0`. An exit in
+It must print the hello frame with `"protocol_version":10` and `exit=0`. An exit in
 the 70s here is a disclaim failure and the
 stderr line above it names which step; report the number. There is no way to provoke
 `posix_spawnattr_setflags` failing on a healthy machine, so 77 itself is proved by
@@ -665,11 +665,11 @@ moved under it. In the order that fails fastest.
 ## 1. The handshake, before any daemon (10 seconds)
 
 ```sh
-printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":9,"deadline_ms":10000}\n' \
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":10,"deadline_ms":10000}\n' \
   | COMPUX_DISCLAIMED=1 "$CX"
 ```
 
-One line back, `"type":"response"`, `"request_id":"r1"`, `"protocol_version":9`, a
+One line back, `"type":"response"`, `"request_id":"r1"`, `"protocol_version":10`, a
 `"sidecar_generation"` that starts `boot-`, a `"capabilities"` object listing
 `["foreground_hid","ax"]`, the three controls and
 `"observations":{"max":3,"ttl_ms":30000}`. A different `protocol_version` means the
@@ -1243,3 +1243,354 @@ hold; say which in the note.
   same courtesy wait and the same input seat as a click. Window-scoped traversal
   and acting on a window that is not in front need a bound target, which is the
   next slice.
+
+---
+
+# Live check — one action with its check, settled, and timed (M42 slice 6)
+
+**What this is for.** An action's check image used to be captured the instant the
+input left, with no wait for the application to react: a click on anything that
+repaints in more than a few milliseconds came back showing the screen BEFORE the
+change, which reads as "the click did nothing" and costs a model turn. A zoomed
+action then cost a second round trip to get its crop, and `wait_for_change`
+returned a third frame that may show something else again.
+
+Protocol 10 answers all three. `check` replaces `screenshot_after` on the wire:
+`image` returns the view the action was aimed in — its crop, not the whole screen —
+waited on until it has stopped moving, and encoded from the sample that proved it.
+"Stopped moving" is two consecutive equal samples AND either a change already seen
+or 300 ms of quiet since the input: two equal samples alone would call an
+application that starts repainting a poll later "unchanged", which is the same
+misleading check by another route. `semantic` re-reads the control an `element_ref` named instead of
+photographing it. `none` is the receipt alone. The receipt says which evidence it
+carries and what each phase cost.
+
+**Only the owner can prove:** that a slow-repainting control comes back repainted;
+that `settle` reads `stable` on an ordinary control and `timeout` over a playing
+video, both inside 1.5 s; that `/pause` during a settle returns at once with the
+input still reported as sent; and what `timings_ms` actually reads on this machine
+— which is the input to the copy-and-encode work the performance specification
+leaves deferred until these numbers say it is worth doing.
+
+## 0. Preconditions
+
+* The sidecar built from this branch (`cd native/compux && cargo build --release`),
+  `CX` pointing at it, and `/tmp/cx.py` from the held-input check above — which
+  now says hello at **protocol 10**. A sidecar that answers 9 is the old one.
+* **Every action here names its check explicitly.** `cx.py` sends the body you
+  type, and Fermix is the half that fills `check` in by rule, so an action typed
+  without one brings nothing back at all. That is the new default and it is
+  correct: `{"action":"left_click","x":400,"y":300}` now answers a bare
+  `{"ok":true}` with a receipt.
+* Steps 1 to 4 drive the sidecar directly and need Screen Recording and
+  Accessibility on the launching terminal. Step 6 goes through Fermix.
+* **Steps 2 to 5 post REAL input to the machine you are sitting at**, and step 5
+  clicks FORTY times. Step 1 is the only one that cannot: every request in it is
+  refused before anything is dispatched. So choose a target deliberately — empty
+  desktop, or a scratch window — close anything you care about, and **never leave
+  one of these running unattended**. That a click dispatches correctly is proved in
+  the test suite against a recording platform; these steps exist for the half only a
+  real screen can show.
+
+## 1. The field that was replaced is refused (10 seconds, fails fastest)
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX" \
+  '{"action":"left_click","x":400,"y":300,"screenshot_after":true}'
+```
+
+* `"error": "unknown_field"`, and the detail names `check` and its three kinds.
+  **Nothing is clicked** — `receipt.dispatch` is `not_sent`. A build that still
+  sends the old field gets this rather than a silent action with no evidence, which
+  is the whole reason it is refused instead of ignored.
+* Two more that must be refused before anything is dispatched:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX" \
+  '{"action":"left_click","x":400,"y":300,"check":"semantic"}' \
+  '{"action":"left_click","x":400,"y":300,"check":"bogus"}'
+```
+
+  The first is `check_unsupported` saying a semantic check re-reads a control and
+  this click names a point; the second is `check_unsupported` naming the three
+  kinds. Neither clicks anything.
+
+## 2. A control that repaints slowly comes back repainted
+
+This is the defect the slice exists for. There are TWO shapes of it and they fail
+differently, so run both if you can find them:
+
+* **slow to FINISH** — the repaint starts at once and goes on for a while. Two
+  equal samples catch it, and this is what the old code got wrong by capturing
+  immediately.
+* **slow to START** — nothing happens for a few hundred milliseconds and then the
+  view changes. This is the one the quiet window is for: without it the first two
+  looks would both show the view as it was, and the check would say `stable`,
+  `changed: false` of a click that worked. A menu that opens after a beat, a button
+  whose handler does a round trip, a window that appears late.
+
+Any of these will do; use the one you have:
+
+* a Finder window's sidebar item that loads a large folder;
+* a browser tab's Reload button on a heavy page;
+* the fixture app from the slice-4 check, with its button pressed by point.
+
+Take a screenshot, pick the control's point out of it, and click it with an image
+check — one sidecar, so the click names the image you read the point in:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX"
+{"action":"screenshot"}
+#   ... read the control's point out of the image, then:
+{"action":"left_click","observation_id":"<the id it printed>","x":<x>,"y":<y>,"check":"image"}
+```
+
+* The reply carries an image, and **that image shows the screen AFTER the repaint**
+  — the folder loaded, the page reloading, the button in its pressed-through state.
+  Write the base64 to a file and open it if you cannot tell from the numbers:
+  `python3 -c 'import json,sys,base64;d=json.load(sys.stdin);open("/tmp/check.png","wb").write(base64.b64decode(d["data"]))'`.
+  An image showing the screen as it was before the click is this step failing, and
+  it is the only step here that cannot be argued about.
+* `receipt.check.settle` is `"stable"`.
+* `receipt.check.changed` is `true`: the view moved on from the image you acted in.
+  On a control whose click changes nothing visible it is `false`, and that is
+  evidence about the view rather than a verdict on the click.
+* **On the slow-to-START control, `changed` must still be `true`.** A `false` there
+  is this step failing, and the reply's `timings_ms.settle` says why: a settle that
+  finished in well under 300 ms did not wait for the repaint to begin.
+* An action that really changes nothing costs that window once — about 300 ms of
+  `settle`, plus its looks. That is the price of the line above being trustworthy.
+* The image is the CROP of the observation you named. On a full screenshot that is
+  the whole display as PNG; do the same thing again from a zoomed screenshot
+  (`{"action":"screenshot","region":{...}}`) and the check comes back as that same
+  rectangle, as JPEG, at the zoom you were working at — one reply, where the old
+  build needed a second request to get it.
+
+## 3. `stable` on an ordinary control, `timeout` over a video
+
+Open a video and start it playing. Full screen is easiest; a window works if you
+crop to it.
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX"
+{"action":"screenshot"}
+{"action":"left_click","observation_id":"<id>","x":<a point over the playing video>,"y":<y>,"check":"image"}
+```
+
+* `receipt.check.settle` is `"timeout"`. A playing video never agrees with itself,
+  so the settle runs to its cap and returns the last sample. **That is an
+  observation state, not a failure, and never a reason to send the input again** —
+  the image is still a real frame of the screen.
+* **The honest bound is 1.5 s plus one poll plus one capture.** The cap is checked
+  AFTER a look has been taken and hashed, so the last one always runs past it: add
+  `receipt.timings_ms.settle` and `receipt.timings_ms.capture` (the settle's own
+  looks are counted in `capture`) and the sum should sit just above 1500, not near
+  2500. Much more than that means the cap is not binding, which is the one thing
+  here that would eat a caller's deadline.
+* The same click over a still part of the screen reads `stable`. Both on one
+  machine, minutes apart, is the comparison worth recording.
+
+## 4. A pause during a settle returns at once
+
+The pause has to arrive WHILE the settle is polling, which `cx.py` cannot do —
+it writes one line and then blocks reading the reply. This one sends the pause
+from a second thread, a tenth of a second after the click:
+
+```sh
+cat > /tmp/cxpause.py <<'PYEOF2'
+import json, os, subprocess, sys, threading, time
+
+side = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        env=os.environ.copy(), text=True, bufsize=1)
+lock = threading.Lock()
+
+def send(frame):
+    with lock:
+        side.stdin.write(json.dumps(frame) + "\n")
+        side.stdin.flush()
+
+def recv():
+    reply = json.loads(side.stdout.readline())
+    if "data" in reply:
+        reply["data"] = "<%d base64 bytes>" % len(reply["data"])
+    return reply
+
+send({"type": "request", "request_id": "r1", "action": "hello",
+      "protocol_version": 10, "deadline_ms": 10000})
+hello = recv()
+envelope = {"sidecar_generation": hello["sidecar_generation"],
+            "session_generation": 1, "authorization_generation": 1}
+
+shot = {"type": "request", "request_id": "r2", "action": "screenshot",
+        "deadline_ms": 30000}
+shot.update(envelope)
+send(shot)
+image = recv()
+
+click = {"type": "request", "request_id": "r3", "action": "left_click",
+         "observation_id": image["observation_id"], "x": int(sys.argv[2]),
+         "y": int(sys.argv[3]), "check": "image", "mutation_seq": 1,
+         "deadline_ms": 30000}
+click.update(envelope)
+
+started = time.monotonic()
+threading.Timer(0.1, lambda: send({"type": "control", "request_id": "c1",
+                                   "action": "pause"})).start()
+send(click)
+
+for _ in range(2):
+    reply = recv()
+    print("%6.0f ms  %s" % ((time.monotonic() - started) * 1000, json.dumps(reply)))
+
+side.stdin.close()
+PYEOF2
+
+COMPUX_DISCLAIMED=1 python3 /tmp/cxpause.py "$CX" 400 300
+```
+
+Point it at something that repaints for a while, so the pause really lands inside
+the settle rather than after it.
+
+* The `control_ack` comes back at once, and the click's own reply follows it
+  **well inside the settle's 1.5 s cap** — the settle sleeps through the gate, so a
+  pause ends it rather than running it out.
+* The click answers `"error": "cancelled"`.
+* **Its receipt still says `dispatch: "sent"`.** The input went out; the evidence
+  did not. Those are two facts and the receipt reports them separately, so the model
+  must not be told the action failed — this is the rule the whole receipt design
+  exists for, and the one a live run is the only proof of.
+* There is **no `check` on that receipt at all**. Evidence that could not be
+  obtained is claimed by nobody.
+* The same thing through Fermix — `/pause` during a slow computer-use action — must
+  read the same way to the person: the action stops promptly and nothing says it
+  failed to act.
+
+## 5. Twenty clicks and twenty zoomed clicks, timed
+
+This is the measurement the deferred encode work is decided on, so it is worth
+running properly: one sidecar, the same target, no other load on the machine.
+
+```sh
+cat > /tmp/cxtime.py <<'PYEOF2'
+import json, os, subprocess, sys
+
+side = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        env=os.environ.copy(), text=True, bufsize=1)
+seq = [1]
+
+def send(frame):
+    side.stdin.write(json.dumps(frame) + "\n")
+    side.stdin.flush()
+
+def recv():
+    return json.loads(side.stdout.readline())
+
+send({"type": "request", "request_id": "r1", "action": "hello",
+      "protocol_version": 10, "deadline_ms": 10000})
+hello = recv()
+envelope = {"sidecar_generation": hello["sidecar_generation"],
+            "session_generation": 1, "authorization_generation": 1}
+
+def act(body):
+    seq[0] += 1
+    frame = {"type": "request", "request_id": "r%d" % seq[0], "deadline_ms": 30000,
+             "mutation_seq": seq[0] - 1}
+    frame.update(envelope)
+    frame.update(body)
+    send(frame)
+    return recv()
+
+# argv: CX, x, y, rounds, and an optional region "x,y,w,h" for the zoomed run.
+x, y, rounds = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+shot_body = {"action": "screenshot"}
+if len(sys.argv) > 5:
+    rx, ry, rw, rh = (int(n) for n in sys.argv[5].split(","))
+    shot_body["region"] = {"x": rx, "y": ry, "w": rw, "h": rh}
+
+print("| # | input | settle | capture | encode | total | settle | changed | bytes |")
+print("|---|---|---|---|---|---|---|---|---|")
+for round in range(1, rounds + 1):
+    shot = act(shot_body)
+    click = act({"action": "left_click", "observation_id": shot["observation_id"],
+                 "x": x, "y": y, "check": "image"})
+    if not click.get("ok"):
+        print("| %d | %s |" % (round, click.get("error")))
+        continue
+    t = click["receipt"]["timings_ms"]
+    check = click["receipt"]["check"]
+    total = t["input"] + t["settle"] + t["capture"] + t["encode"]
+    print("| %d | %d | %d | %d | %d | %d | %s | %s | %d |" % (
+        round, t["input"], t["settle"], t["capture"], t["encode"], total,
+        check.get("settle"), check.get("changed"), len(click.get("data", ""))))
+
+side.stdin.close()
+PYEOF2
+
+# Twenty full-screen clicks. This CLICKS, twenty times, at the point you give it:
+# pick one over empty desktop or a scratch window, and watch it run.
+COMPUX_DISCLAIMED=1 python3 /tmp/cxtime.py "$CX" 400 300 20
+
+# Twenty zoomed ones, which click twenty MORE times: the coordinates are pixels in
+# the CROP, so pick them from a screenshot of that region first.
+COMPUX_DISCLAIMED=1 python3 /tmp/cxtime.py "$CX" 120 90 20 200,150,480,360
+```
+
+Paste both tables here, with the machine and the display arrangement beside them:
+
+**Full-screen checks** — machine: , display: 
+
+| # | input | settle | capture | encode | total | settle | changed | bytes |
+|---|---|---|---|---|---|---|---|---|
+| | | | | | | | | |
+
+**Zoomed checks** — region: 
+
+| # | input | settle | capture | encode | total | settle | changed | bytes |
+|---|---|---|---|---|---|---|---|---|
+| | | | | | | | | |
+
+What to read out of them, and what each answer would mean:
+
+* **`capture` dominates** — the frame grab is the cost, and a settle needs at least
+  two of them. The lever is capturing less, not encoding less.
+* **`settle` dominates** — the waiting between looks, and the hashing that decides
+  whether to stop. The hash reads the crop's raw pixel rows in place, about 10 ms
+  for a whole 3840x1080 frame; the first version downscaled a COPY of the crop to a
+  256x256 thumbnail instead and cost around 250 ms a sample, more than the capture
+  beside it, which is why it is gone (`cargo test --release the_hash_costs --
+  --nocapture` re-takes that measurement). If `settle` still dominates here, it is
+  the 50 ms poll interval and the number of looks, not the hash.
+* **`encode` dominates** — then the copy-and-encode work the performance
+  specification lists is worth doing, and this is the table that says so.
+* **A zoomed check is not cheaper than a full one** — the crop is taken from a
+  whole frame either way, so only the encode shrinks. If the difference is small,
+  cropping is not the latency lever it looks like.
+
+## 6. Through Fermix, once each
+
+* An ordinary click: the result names the check it got, and the image is the view
+  the model acted in.
+* A `press` by reference: Fermix asks for a `semantic` check, so the result says
+  what the control reads NOW — which control it was (`label`), its role, whether it
+  is enabled, and its value unless it is a secure field — and there is no image at
+  all. A secure field's LABEL is fine; its value must not appear anywhere. A control
+  that went away between the action and the read says only that it is not there.
+* A click that changes nothing visible: the result says so in one sentence and
+  says plainly that it is not a reason to repeat the action. Three of those in a
+  row and the session says so and names the ways out.
+
+## 7. What this check still cannot prove
+
+* **That the settle waits long enough for every application.** 1.5 s is a cap, not
+  a promise: an application that repaints in two seconds returns `timeout` with a
+  frame from the middle of its repaint, and the receipt says so honestly. Whether
+  that is often enough to matter is what step 5's tables are for.
+* **That the settle's rule holds for every application.** Two equal samples plus
+  either a seen change or 300 ms of quiet is a heuristic, and an application that
+  repaints in stages can be still between two looks, or start later than the window
+  allows. What the hash itself cannot miss is a changed pixel: every pixel of the
+  rectangle is read, so a one-pixel change flips it. If a real control fools it,
+  the number to change is `SETTLE_QUIET_MS`, and this step is where that is decided.
+* **Anything about a display this machine does not have.** Every number above is
+  this panel's; a Retina panel at a scaled mode, or two displays of different
+  backing scales, are their own rows.

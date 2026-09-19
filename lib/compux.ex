@@ -46,6 +46,26 @@ defmodule Compux do
   `scroll/5` may take `{:element, ref}` instead of a point, and the sidecar
   re-reads that control's bounds before it clicks its centre.
 
+  ## Every action says what evidence it wants back
+
+  An action that dispatches input carries `:check`, and the reply's `receipt` says
+  which evidence it really carries (`check: %{kind:, settle:, changed:}`).
+
+    * `:image` — the view you acted in: the crop of the image (or listing) the
+      action named, or the whole display when that is what it named and when the
+      action names none at all. The helper waits for the view to stop moving
+      first, and `settle` says whether it did (`"stable"`) or was still moving at
+      the cap (`"timeout"`). `changed` says whether that view differs from the one
+      you acted on — evidence about the view, never a verdict on the action.
+    * `:semantic` — for an action addressed by `element_ref`: the control is read
+      again and returned as `element_after` (role, whether it is enabled, and its
+      value unless it is a secure field). No capture, so it is not visual evidence.
+    * `:none` — the receipt alone.
+
+  Left out, the action brings nothing back. Whatever the check says, the receipt's
+  `dispatch` is about the INPUT and is decided before the check runs: evidence that
+  could not be obtained never changes what was sent.
+
   ## The version handshake
 
   `start/1` reads the sidecar's `hello` identity and refuses to run a binary whose
@@ -114,7 +134,8 @@ defmodule Compux do
 
   @doc """
   Run a raw action params map (string keys) through validation and the driver.
-  `opts` may carry `:screenshot_after` (a transport flag, not an action argument).
+  `opts` may carry `:check` (see the module doc), which is an action argument like
+  any other and is validated with them.
   """
   @spec execute(t(), map(), keyword()) :: response()
   def execute(%__MODULE__{} = cu, params, opts \\ []) when is_map(params),
@@ -138,7 +159,7 @@ defmodule Compux do
   image's `elements` reply listed (`{:element, "e3"}`) — the sidecar re-reads that
   control's bounds and clicks its centre, so a control that moved since the
   listing is hit where it is now. `:button` is `:left` (default), `:right`, or
-  `:double`; other opts: `:modifiers`, `:display`, `:screenshot_after`.
+  `:double`; other opts: `:modifiers`, `:display`, `:check`.
   """
   @spec click(t(), target(), keyword()) :: response()
   def click(%__MODULE__{} = cu, target, opts \\ []) do
@@ -355,15 +376,19 @@ defmodule Compux do
   # --- internals ------------------------------------------------------------
 
   defp run(%__MODULE__{driver: driver, state: state}, params, opts) do
-    with {:ok, request} <- Protocol.validate(params) do
-      request =
-        if Keyword.get(opts, :screenshot_after, false),
-          do: Map.put(request, "screenshot_after", true),
-          else: request
+    params = maybe_put(params, "check", check_kind(Keyword.get(opts, :check)))
 
+    with {:ok, request} <- Protocol.validate(params) do
       driver.execute(state, request)
     end
   end
+
+  # The kind as the wire spells it. An atom is the ergonomic form and a string is
+  # what a caller reading it off a config already has; anything else goes through
+  # unchanged so `Protocol.validate/1` refuses it by name rather than here.
+  defp check_kind(nil), do: nil
+  defp check_kind(kind) when is_atom(kind), do: Atom.to_string(kind)
+  defp check_kind(kind), do: kind
 
   defp maybe_default_binary_path(Compux.PortDriver, opts) do
     if Keyword.has_key?(opts, :binary_path),

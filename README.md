@@ -115,6 +115,45 @@ Every receipt says which method carried the action: `input_method` is `"ax"` for
 action also reports `foreground_changed`, read before and after, because an action
 that promises not to take the focus should have to say when it did.
 
+## Every action says what evidence it wants back
+
+An action that dispatches input carries `:check`, and the reply's `receipt` says
+which evidence it really came back with.
+
+* **`:image`** — the view you acted in: the crop of the image or listing the action
+  named, or the whole display when that is what it named and when it names none at
+  all. The helper waits for the view to stop moving before it takes it, and the
+  sample that proved it stable is the one encoded, so nothing is captured after the
+  evidence. Stable means two consecutive samples of the same rectangle agree AND
+  either a change has already been seen or the view has been quiet for 300 ms since
+  the input — two equal samples alone would call an application that starts
+  repainting late "unchanged". At most 1.5 seconds and 30 samples, with 50 ms as the
+  floor between looks rather than a delay added to each one. The check's own image
+  is an observation like any other, with rulers drawn and the executed point marked.
+* **`:semantic`** — for an action addressed by `element_ref`: the control is read
+  again and returned as `element_after` — `{present, role, label, enabled, value}`,
+  with `value` absent for a secure field and `{"present": false}` alone for a
+  control that no longer answers. No capture, and never visual evidence.
+* **`:none`** — the receipt alone.
+
+```json
+"check": {"kind": "image", "settle": "stable", "changed": false}
+```
+
+`settle` is `"stable"` or `"timeout"`: a caret, a spinner or a playing video
+reaches the cap every time, which is an observation state and never a reason to
+send the input again. `changed` says whether that view differs from the image you
+acted on — evidence about the VIEW, not a verdict on the action, and absent when
+the action named a listing, which has no picture to compare against.
+
+Whatever the check says, `dispatch` is decided before it runs: evidence that could
+not be obtained never changes what was sent. A pause during a settle answers
+`cancelled`, with the input reported as `sent` and no check claimed.
+
+`timings_ms` carries `input`, `settle`, `capture` and `encode` — wall time on the
+process's one monotonic clock, with every frame grabbed counted as capture, the
+settle's own polls included.
+
 ## The version handshake
 
 `Compux.start/1` performs a `hello` handshake and refuses a sidecar whose

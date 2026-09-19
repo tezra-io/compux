@@ -161,7 +161,7 @@ fn refuse(gate: &Gate, emitter: &Emitter, failure: &ParseFailure) {
 /// is exactly the fact the caller needs before deciding whether to retry.
 fn refusal_receipt(action: &str) -> Option<Receipt> {
     if wire::carries_mutation_seq(action) {
-        Some(Receipt::derive(false, false, false, Timings::default()))
+        Some(Receipt::derive(false, false, None, Timings::default()))
     } else {
         None
     }
@@ -259,6 +259,7 @@ mod tests {
             mutation_seq: Some(1),
             observation_id: Some("7c1e-1".to_string()),
             element_ref: None,
+            check: wire::Check::None,
         };
         gate.admit(&running).unwrap();
 
@@ -409,6 +410,7 @@ mod tests {
             mutation_seq: None,
             observation_id: None,
             element_ref: None,
+            check: wire::Check::None,
         };
         gate.admit(&request).unwrap();
 

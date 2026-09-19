@@ -91,7 +91,17 @@ defmodule Compux.Protocol do
   # `addressing_conflict`. `element_ref` was a reserved field the sidecar refused
   # outright until now, so the version bumps and the handshake refuses the
   # pairing.
-  @protocol_version 9
+  #
+  # v10 (M42 slice 6, the check): an action that dispatches input says what
+  # evidence it wants back, and `check` REPLACES `screenshot_after` — deleted, not
+  # kept beside it, so a request carrying the old field is refused rather than run
+  # with no check at all. `image` returns the view the caller acted in (the crop of
+  # the observation the action named, or the full display when that observation was
+  # the full display or the action names none), settled before it is taken;
+  # `semantic` re-reads the control an `element_ref` named and answers
+  # `element_after`, with no capture; `none` is the receipt alone. The receipt says
+  # which evidence it carries in `check` and what each phase cost in `timings_ms`.
+  @protocol_version 10
 
   @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows press set_value)
 
@@ -123,6 +133,12 @@ defmodule Compux.Protocol do
   # beside it says which image the rectangle is read in.
   @viewing ~w(screenshot elements wait_for_change)
 
+  # v10: the evidence an action brings back. Only an action that DISPATCHES INPUT
+  # has anything to bring back, so the field is offered exactly there — `mouse_move`
+  # is read-only on the wire and returns no check, and a read-only verb asking for
+  # one has misunderstood what it is.
+  @check_kinds ~w(image semantic none)
+
   @modifiers ~w(cmd ctrl alt shift)
   @scroll_directions ~w(up down left right)
   @max_type_bytes 10_000
@@ -150,16 +166,18 @@ defmodule Compux.Protocol do
   @doc """
   Validate + canonicalize an action params map (string keys) into a sidecar
   request. Returns `{:ok, request}` or `{:error, reason}`. The caller fills the
-  default `display` and the transport `screenshot_after` flag before encoding;
-  this function validates only the action's own arguments.
+  default `display`; this function validates the action's own arguments, the
+  observation and control it is addressed at, and the `check` it asks for.
   """
   @spec validate(map()) :: {:ok, map()} | {:error, String.t()}
   def validate(params) when is_map(params) do
     case Map.get(params, "action") do
       action when action in @actions ->
         with :ok <- check_addressing(action, params),
+             :ok <- check_evidence(action, params),
              {:ok, request} <- validate_action(action, params) do
-          {:ok, put_observation(request, Map.get(params, "observation_id"))}
+          request = put_observation(request, Map.get(params, "observation_id"))
+          {:ok, put_check(request, Map.get(params, "check"))}
         end
 
       nil ->
@@ -252,6 +270,39 @@ defmodule Compux.Protocol do
       "send the coordinates, or the reference, not the two together"
   end
 
+  # v10: the evidence this action asks for. Checked here rather than inside each
+  # action, because the rule is about what the action IS — whether it dispatches
+  # input, and whether it named a control — and not about its own arguments.
+  #
+  # `screenshot_after` is refused by name. It was replaced by `check`, and this
+  # function builds a canonical request from a whitelist, so dropping it in silence
+  # would leave a caller that still sends it with no check at all and nothing said.
+  defp check_evidence(action, params) do
+    cond do
+      Map.has_key?(params, "screenshot_after") ->
+        {:error,
+         ~s(screenshot_after was replaced by check: send check with "image", "semantic" ) <>
+           ~s(or "none")}
+
+      not Map.has_key?(params, "check") ->
+        :ok
+
+      read_only?(action) ->
+        {:error, "#{action} takes no check — it dispatches no input, so it reports no evidence"}
+
+      Map.get(params, "check") not in @check_kinds ->
+        {:error, "check must be one of #{Enum.join(@check_kinds, ", ")}"}
+
+      Map.get(params, "check") == "semantic" and not element?(params) ->
+        {:error,
+         "a semantic check re-reads the control the action named, so it needs an element_ref: " <>
+           "address this action by reference, or ask for an image check"}
+
+      true ->
+        :ok
+    end
+  end
+
   defp observation?(params), do: nonempty_string?(Map.get(params, "observation_id"))
   defp element?(params), do: nonempty_string?(Map.get(params, "element_ref"))
 
@@ -261,6 +312,9 @@ defmodule Compux.Protocol do
 
   defp put_observation(request, nil), do: request
   defp put_observation(request, id), do: Map.put(request, "observation_id", id)
+
+  defp put_check(request, nil), do: request
+  defp put_check(request, kind), do: Map.put(request, "check", kind)
 
   # This module validates and classifies; it no longer writes a line. `encode_request/1`
   # produced the UNTAGGED protocol-6 shape, which a protocol-7 sidecar refuses —

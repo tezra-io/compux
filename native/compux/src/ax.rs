@@ -223,6 +223,12 @@ pub trait Ax {
     /// DIFFERENT role now points at something the caller never saw.
     fn role(&self, handle: Handle) -> Option<String>;
 
+    /// What the control calls itself — its title, else its description — bounded
+    /// and collapsed to one line exactly as a listing publishes it, so a caller
+    /// re-reading a control can say WHICH one without keeping its own copy. `None`
+    /// when it publishes neither, or when the element is gone.
+    fn label(&self, handle: Handle) -> Option<String>;
+
     /// Whether the control will accept input. An element that publishes no
     /// `AXEnabled` at all is enabled: it did not say otherwise.
     fn enabled(&self, handle: Handle) -> bool;
@@ -612,6 +618,18 @@ mod mac {
         fn role(&self, handle: Handle) -> Option<String> {
             let element = self.element(handle)?;
             unsafe { copy_string_attr(&element, ROLE) }
+        }
+
+        /// Title, else description — the same two attributes in the same order a
+        /// walk reads them, bounded and collapsed here so application text cannot
+        /// forge a line wherever this is published.
+        fn label(&self, handle: Handle) -> Option<String> {
+            let element = self.element(handle)?;
+            unsafe {
+                copy_string_attr(&element, TITLE)
+                    .or_else(|| copy_string_attr(&element, DESCRIPTION))
+                    .map(|label| super::one_line(&label, super::MAX_TEXT_CHARS))
+            }
         }
 
         fn enabled(&self, handle: Handle) -> bool {
@@ -1348,6 +1366,10 @@ mod stub {
             None
         }
 
+        fn label(&self, _handle: Handle) -> Option<String> {
+            None
+        }
+
         fn enabled(&self, _handle: Handle) -> bool {
             false
         }
@@ -1563,6 +1585,12 @@ impl Recorder {
         edit(&mut self.state().elements[index]);
     }
 
+    /// The control went away. Its references still exist and answer nothing, which
+    /// is what a dialog that closed or a row that was removed looks like to one.
+    pub fn vanish(&self, index: usize) {
+        self.state().held.retain(|_, held| *held != index);
+    }
+
     /// The next `perform` or `set_value` answers this refusal.
     pub fn fail_next(&self, refusal: Refusal) {
         self.state().fail_next = Some(refusal);
@@ -1650,6 +1678,12 @@ impl Ax for Recorder {
 
     fn role(&self, handle: Handle) -> Option<String> {
         self.scripted(handle).map(|element| element.role)
+    }
+
+    fn label(&self, handle: Handle) -> Option<String> {
+        self.scripted(handle)
+            .and_then(|element| element.label)
+            .map(|label| one_line(&label, MAX_TEXT_CHARS))
     }
 
     fn enabled(&self, handle: Handle) -> bool {

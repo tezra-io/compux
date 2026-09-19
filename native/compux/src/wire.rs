@@ -1,4 +1,4 @@
-//! The protocol-8 frames, as types. Pure: it neither reads nor writes a pipe.
+//! The protocol-10 frames, as types. Pure: it neither reads nor writes a pipe.
 //!
 //! Every line of the ACTION wire is one JSON object carrying a `type`. A request
 //! carries a `request_id` its response echoes, and — after the handshake — the
@@ -35,6 +35,16 @@ use serde_json::{json, Map, Value};
 /// `element_ref` left it at protocol 9, where it became the way an action names a
 /// control. `target_id` — a bound window — is slice 5's.
 const RESERVED_FIELDS: [&str; 1] = ["target_id"];
+
+/// A field this wire USED to have, and the sentence that says what replaced it. A
+/// request carrying one is refused rather than run without it: `screenshot_after`
+/// was how an action asked for the screen back, and a build that still sent it
+/// would otherwise get every action with no check at all and nothing said about it.
+const RETIRED_FIELDS: [(&str, &str); 1] = [(
+    "screenshot_after",
+    "screenshot_after was replaced by check at protocol 10: send check with \"image\", \
+     \"semantic\" or \"none\"",
+)];
 
 /// The actions addressed INTO an observation: their target is read out of a reply
 /// the caller was handed, as a pixel of that image or as one of the controls it
@@ -150,6 +160,17 @@ pub fn carries_mutation_seq(action: &str) -> bool {
     !READ_ONLY_ACTIONS.contains(&action)
 }
 
+/// Does this action bring evidence back, and therefore take a `check`?
+///
+/// Derived from the two lists above rather than written a third time: an action
+/// has something to show afterwards exactly when it dispatched input AND earns a
+/// receipt to report it on. That excludes `mouse_move`, which moves the pointer
+/// and changes nothing to look at, and `request_permissions`, which is a mutation
+/// on the wire that dispatches nothing.
+pub fn takes_a_check(action: &str) -> bool {
+    touches_input(action) && carries_mutation_seq(action)
+}
+
 /// The generations every frame this process writes is stamped with. One per boot.
 #[derive(Clone, Debug)]
 pub struct Envelope {
@@ -213,6 +234,95 @@ pub struct Request {
     /// `press` and `set_value`, an alternative to `x`/`y` on a pointer action, and
     /// refused everywhere else — also decided in `parse`.
     pub element_ref: Option<String>,
+    /// The evidence this action is to bring back. Offered only to the actions that
+    /// dispatch input, and `semantic` only to one addressed at a control — both
+    /// decided in `parse`, so no action function can be asked for a check it has
+    /// no way to take.
+    pub check: Check,
+}
+
+/// What an action is asked to show for itself afterwards.
+///
+/// One field, three kinds, and each is a different KIND of evidence rather than a
+/// different amount of it. An image is what the view looks like now; a semantic
+/// check is what one control reports about itself; `none` is the receipt alone.
+/// Nothing here is a verdict on whether the action worked — that is the model's to
+/// read, and the receipt's `dispatch` is decided before any of this runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Check {
+    /// The view the action was aimed in, settled and drawn on.
+    Image,
+    /// The control the action named, read again.
+    Semantic,
+    #[default]
+    None,
+}
+
+impl Check {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Check::Image => "image",
+            Check::Semantic => "semantic",
+            Check::None => "none",
+        }
+    }
+}
+
+/// Whether the view stopped moving before the check image was taken.
+///
+/// `Timeout` is an observation state and never a reason to send the input again: a
+/// caret, a spinner or a playing video reaches the cap every time, and the frame
+/// returned is the last one sampled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Settle {
+    Stable,
+    Timeout,
+}
+
+impl Settle {
+    fn as_str(self) -> &'static str {
+        match self {
+            Settle::Stable => "stable",
+            Settle::Timeout => "timeout",
+        }
+    }
+}
+
+/// The evidence an action really came back with, as the receipt reports it.
+///
+/// Recorded only once a check has RUN, so its presence on a reply means evidence
+/// was obtained and its absence means none was. `settle` and `changed` ride an
+/// image check alone, and `changed` only when the observation the action named had
+/// a hash to compare against — a listing has no picture, and inventing `false`
+/// there would claim the view had not moved on evidence nobody has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Checked {
+    pub kind: Check,
+    pub settle: Option<Settle>,
+    pub changed: Option<bool>,
+}
+
+impl Checked {
+    /// A check that brought something back to look at. `none` did not, and its
+    /// receipt says so while still reporting what was dispatched.
+    pub fn evidence(&self) -> bool {
+        self.kind != Check::None
+    }
+
+    fn into_value(self) -> Value {
+        let mut check = json!({ "kind": self.kind.as_str() });
+
+        if let Some(object) = check.as_object_mut() {
+            if let Some(settle) = self.settle {
+                object.insert("settle".to_string(), json!(settle.as_str()));
+            }
+            if let Some(changed) = self.changed {
+                object.insert("changed".to_string(), json!(changed));
+            }
+        }
+
+        check
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -349,6 +459,18 @@ fn parse_request(value: &Value) -> Result<Inbound, ParseFailure> {
         });
     }
 
+    if let Some((_, detail)) = RETIRED_FIELDS
+        .iter()
+        .find(|(field, _)| value.get(*field).is_some())
+    {
+        return Err(ParseFailure {
+            error: "unknown_field",
+            detail: detail.to_string(),
+            reply: Reply::Response(request_id),
+            action: Some(action),
+        });
+    }
+
     let (observation_id, element_ref) = match addressing(value, &action) {
         Ok(addressed) => addressed,
         Err((error, detail)) => {
@@ -361,11 +483,24 @@ fn parse_request(value: &Value) -> Result<Inbound, ParseFailure> {
         }
     };
 
+    let check = match evidence(value, &action, element_ref.is_some()) {
+        Ok(check) => check,
+        Err(detail) => {
+            return Err(ParseFailure {
+                error: "check_unsupported",
+                detail,
+                reply: Reply::Response(request_id),
+                action: Some(action),
+            })
+        }
+    };
+
     Ok(Inbound::Request(Request {
         request_id,
         action,
         observation_id,
         element_ref,
+        check,
         sidecar_generation: value
             .get("sidecar_generation")
             .and_then(Value::as_str)
@@ -377,6 +512,42 @@ fn parse_request(value: &Value) -> Result<Inbound, ParseFailure> {
         mutation_seq: value.get("mutation_seq").and_then(Value::as_u64),
         body: value.clone(),
     }))
+}
+
+/// The evidence this request asks for, decided before the action runs.
+///
+/// Two refusals, one code, because the fix for both is the same kind of thing — a
+/// build that sends a check this wire cannot give it — and the detail says which:
+///
+///   * an action that dispatches no input has nothing to show afterwards, so a
+///     check on one is a misunderstanding of what it is rather than a request to
+///     photograph the screen;
+///   * a `semantic` check re-reads the control the action named, so an action that
+///     named a POINT has nothing to re-read. Falling back to an image there would
+///     be this build choosing the evidence, which is the caller's decision.
+fn evidence(value: &Value, action: &str, addressed_at_element: bool) -> Result<Check, String> {
+    let Some(asked) = value.get("check") else {
+        return Ok(Check::None);
+    };
+
+    if !takes_a_check(action) {
+        return Err(format!(
+            "{action} takes no check: it dispatches no input, so it has no evidence to bring back"
+        ));
+    }
+
+    match asked.as_str() {
+        Some("image") => Ok(Check::Image),
+        Some("none") => Ok(Check::None),
+        Some("semantic") if addressed_at_element => Ok(Check::Semantic),
+        Some("semantic") => Err(format!(
+            "a semantic check re-reads the control the action named, and this {action} names a \
+             point: address it by element_ref, or ask for an image check"
+        )),
+        _ => Err(format!(
+            "check must be one of image, semantic, none; {asked} is not a kind this build has"
+        )),
+    }
 }
 
 /// What this request is addressed at, decided before the action runs: the
@@ -679,11 +850,26 @@ impl InputMethod {
 }
 
 /// Measured, never estimated. A phase that did not run is 0.
+///
+/// The four are disjoint and each is wall time on the process's one monotonic
+/// clock: `input` is the dispatch itself, `settle` is time spent WAITING (the
+/// pointer's dwell, and the poll intervals of a check's settle), `capture` is every
+/// frame grabbed — a settle's polls included, because a grab costs what a grab
+/// costs wherever it happens and hiding it inside `settle` would lose exactly the
+/// number this exists to report — and `encode` is turning the last of those frames
+/// into the bytes on the wire.
+/// The ceiling on any one phase. No phase of one action can honestly take longer
+/// than the caller's own deadline — 30 s in Fermix, and every blocking verb here is
+/// capped at 25 s — so a minute is twice the longest honest answer and anything
+/// above it is a clock that moved rather than work that happened.
+pub const MAX_TIMING_MS: u64 = 60_000;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Timings {
     pub input_ms: u64,
     pub settle_ms: u64,
     pub capture_ms: u64,
+    pub encode_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -701,21 +887,34 @@ pub struct Receipt {
     /// can be asked. `None` is "not applicable" — a click takes the foreground by
     /// definition — and is left off the wire rather than published as `false`.
     pub foreground_changed: Option<bool>,
+    /// The evidence this action came back with. `None` means none was obtained —
+    /// nothing was dispatched, or the check never ran — and it is left off the wire
+    /// rather than published as an empty one.
+    pub check: Option<Checked>,
 }
 
 impl Receipt {
     /// The one derivation. `posted` is whether the gate let at least one input
-    /// call through, `completed` whether the action ran to its own end.
-    pub fn derive(posted: bool, completed: bool, after_image: bool, timings: Timings) -> Receipt {
+    /// call through, `completed` whether the action ran to its own end, and
+    /// `checked` what the check brought back, which is the only thing that can
+    /// make an effect observable at all.
+    pub fn derive(
+        posted: bool,
+        completed: bool,
+        checked: Option<Checked>,
+        timings: Timings,
+    ) -> Receipt {
         let dispatch = match (posted, completed) {
             (false, _) => Dispatch::NotSent,
             (true, true) => Dispatch::Sent,
             (true, false) => Dispatch::Partial,
         };
 
+        let evidence = checked.is_some_and(|checked| checked.evidence());
+
         Receipt {
             dispatch,
-            effect: if after_image {
+            effect: if evidence {
                 Effect::NotObserved
             } else {
                 Effect::Unknown
@@ -725,6 +924,7 @@ impl Receipt {
             observation_id_before: None,
             observation_id_after: None,
             foreground_changed: None,
+            check: checked,
         }
     }
 
@@ -763,6 +963,7 @@ impl Receipt {
                 "input": self.timings.input_ms,
                 "settle": self.timings.settle_ms,
                 "capture": self.timings.capture_ms,
+                "encode": self.timings.encode_ms,
             }
         });
 
@@ -777,6 +978,9 @@ impl Receipt {
             }
             if let Some(changed) = self.foreground_changed {
                 object.insert("foreground_changed".to_string(), json!(changed));
+            }
+            if let Some(checked) = self.check {
+                object.insert("check".to_string(), checked.into_value());
             }
         }
 
@@ -882,6 +1086,32 @@ mod tests {
         Envelope {
             sidecar_generation: "boot-1".to_string(),
             session_generation: 1,
+        }
+    }
+
+    /// A check that brought a settled image back, and one that was asked for
+    /// nothing — the two ends of what a receipt can carry.
+    fn image_check() -> Checked {
+        Checked {
+            kind: Check::Image,
+            settle: Some(Settle::Stable),
+            changed: Some(true),
+        }
+    }
+
+    fn no_check() -> Checked {
+        Checked {
+            kind: Check::None,
+            settle: None,
+            changed: None,
+        }
+    }
+
+    /// The parsed request for one line, or a panic naming what came back instead.
+    fn request(line: &str) -> Request {
+        match parse(line) {
+            Ok(Inbound::Request(request)) => request,
+            other => panic!("not a request: {other:?}"),
         }
     }
 
@@ -1287,7 +1517,7 @@ mod tests {
 
     #[test]
     fn a_failure_carries_a_code_and_may_carry_a_receipt() {
-        let receipt = Receipt::derive(false, false, false, Timings::default());
+        let receipt = Receipt::derive(false, false, None, Timings::default());
         let frame = error_response(
             &envelope(),
             "r7",
@@ -1328,51 +1558,53 @@ mod tests {
     fn a_receipt_reports_what_the_gate_let_through() {
         let t = Timings::default();
         assert_eq!(
-            Receipt::derive(false, false, false, t).dispatch,
+            Receipt::derive(false, false, None, t).dispatch,
             Dispatch::NotSent
         );
         assert_eq!(
-            Receipt::derive(false, true, false, t).dispatch,
+            Receipt::derive(false, true, None, t).dispatch,
             Dispatch::NotSent,
             "a completed action that posted nothing still sent nothing"
         );
         assert_eq!(
-            Receipt::derive(true, true, false, t).dispatch,
+            Receipt::derive(true, true, None, t).dispatch,
             Dispatch::Sent
         );
         assert_eq!(
-            Receipt::derive(true, false, false, t).dispatch,
+            Receipt::derive(true, false, None, t).dispatch,
             Dispatch::Partial
         );
         assert_eq!(
-            Receipt::derive(true, true, true, t).effect,
+            Receipt::derive(true, true, Some(image_check()), t).effect,
             Effect::NotObserved
         );
         assert_eq!(
-            Receipt::derive(true, true, false, t).effect,
-            Effect::Unknown
+            Receipt::derive(true, true, Some(no_check()), t).effect,
+            Effect::Unknown,
+            "a check that was asked for nothing brought nothing back"
         );
+        assert_eq!(Receipt::derive(true, true, None, t).effect, Effect::Unknown);
     }
 
     // What a click aimed at and what it handed back. Present only when there is
     // one: a keystroke names no image, and a refusal has no after.
     #[test]
     fn a_receipt_names_the_images_on_both_sides_of_the_action() {
-        let receipt = Receipt::derive(true, true, true, Timings::default())
+        let receipt = Receipt::derive(true, true, Some(image_check()), Timings::default())
             .addressing(Some("7c1e-12".to_string()), Some("7c1e-13".to_string()));
         let frame = response(&envelope(), "r1", json!({"ok": true}), Some(receipt));
 
         assert_eq!(frame["receipt"]["observation_id_before"], json!("7c1e-12"));
         assert_eq!(frame["receipt"]["observation_id_after"], json!("7c1e-13"));
 
-        let refused = Receipt::derive(false, false, false, Timings::default())
+        let refused = Receipt::derive(false, false, None, Timings::default())
             .addressing(Some("7c1e-12".to_string()), None);
         let frame = error_response(&envelope(), "r1", "paused", None, Some(refused));
 
         assert_eq!(frame["receipt"]["observation_id_before"], json!("7c1e-12"));
         assert!(frame["receipt"].get("observation_id_after").is_none());
 
-        let plain = Receipt::derive(true, true, false, Timings::default());
+        let plain = Receipt::derive(true, true, None, Timings::default());
         let frame = response(&envelope(), "r1", json!({"ok": true}), Some(plain));
         assert!(frame["receipt"].get("observation_id_before").is_none());
     }
@@ -1382,7 +1614,7 @@ mod tests {
     // foreground moved — and a pointer action reports none of the last.
     #[test]
     fn a_receipt_reports_the_method_the_effect_and_the_foreground() {
-        let ax = Receipt::derive(true, true, false, Timings::default()).noted(
+        let ax = Receipt::derive(true, true, None, Timings::default()).noted(
             InputMethod::Ax,
             Some(Effect::Verified),
             Some(false),
@@ -1395,7 +1627,7 @@ mod tests {
 
         // An after-image would have derived `not_observed`; a proven effect wins,
         // because it is the stronger claim and the only one that was measured.
-        let verified = Receipt::derive(true, true, true, Timings::default()).noted(
+        let verified = Receipt::derive(true, true, Some(image_check()), Timings::default()).noted(
             InputMethod::Ax,
             Some(Effect::Verified),
             Some(true),
@@ -1406,7 +1638,7 @@ mod tests {
 
         // A click says nothing about the foreground: it takes it by definition, so
         // the field is absent rather than published as a meaningless false.
-        let click = Receipt::derive(true, true, true, Timings::default()).noted(
+        let click = Receipt::derive(true, true, Some(image_check()), Timings::default()).noted(
             InputMethod::default(),
             None,
             None,
@@ -1422,11 +1654,12 @@ mod tests {
         let receipt = Receipt::derive(
             true,
             true,
-            true,
+            Some(image_check()),
             Timings {
                 input_ms: 12,
                 settle_ms: 80,
                 capture_ms: 140,
+                encode_ms: 35,
             },
         );
         let frame = response(&envelope(), "r1", json!({"ok": true}), Some(receipt));
@@ -1434,5 +1667,143 @@ mod tests {
         assert_eq!(frame["receipt"]["timings_ms"]["input"], json!(12));
         assert_eq!(frame["receipt"]["timings_ms"]["settle"], json!(80));
         assert_eq!(frame["receipt"]["timings_ms"]["capture"], json!(140));
+        assert_eq!(frame["receipt"]["timings_ms"]["encode"], json!(35));
+    }
+
+    // --- protocol 10: the check a request asks for, and the one a receipt carries
+
+    #[test]
+    fn an_action_that_dispatches_input_takes_all_three_kinds() {
+        for action in INPUT_ACTIONS.iter().filter(|a| takes_a_check(a)) {
+            for (asked, expected) in [("image", Check::Image), ("none", Check::None)] {
+                let line = format!(
+                    r#"{{"type":"request","request_id":"r1","action":"{action}",{}"check":"{asked}"}}"#,
+                    addressing_for(action)
+                );
+                assert_eq!(request(&line).check, expected, "{action} check {asked}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_that_asks_for_no_check_brings_nothing_back() {
+        let line = r#"{"type":"request","request_id":"r1","action":"type","text":"hi"}"#;
+        assert_eq!(request(line).check, Check::None);
+    }
+
+    // A semantic check re-reads the control the action named, so an action that
+    // named a POINT has nothing to re-read. Quietly taking an image instead would
+    // be this build choosing the evidence.
+    #[test]
+    fn a_semantic_check_needs_the_control_the_action_named() {
+        let point = r#"{"type":"request","request_id":"r1","action":"left_click","x":4,"y":9,
+            "observation_id":"7c1e-12","check":"semantic"}"#;
+        let failure = parse(point).expect_err("a point has no control to re-read");
+        assert_eq!(failure.error, "check_unsupported");
+        assert!(failure.detail.contains("element_ref"), "{}", failure.detail);
+        assert_eq!(failure.action.as_deref(), Some("left_click"));
+
+        let named = r#"{"type":"request","request_id":"r1","action":"left_click",
+            "observation_id":"7c1e-12","element_ref":"e3","check":"semantic"}"#;
+        assert_eq!(request(named).check, Check::Semantic);
+    }
+
+    #[test]
+    fn a_kind_this_build_does_not_have_is_refused_by_name() {
+        for asked in ["\"bogus\"", "\"IMAGE\"", "true", "7"] {
+            let line = format!(
+                r#"{{"type":"request","request_id":"r1","action":"type","text":"hi","check":{asked}}}"#
+            );
+            let failure = parse(&line).expect_err("not a kind");
+            assert_eq!(failure.error, "check_unsupported");
+            assert!(failure.detail.contains("image, semantic, none"));
+        }
+    }
+
+    // An action that dispatches nothing has nothing to show afterwards. `mouse_move`
+    // is the one worth pinning: it touches input and is still read-only on the wire.
+    #[test]
+    fn an_action_that_dispatches_no_input_takes_no_check() {
+        for action in READ_ONLY_ACTIONS {
+            let line = format!(
+                r#"{{"type":"request","request_id":"r1","action":"{action}",{}"check":"image"}}"#,
+                addressing_for(action)
+            );
+            let failure = parse(&line).expect_err("{action} dispatches nothing");
+            assert_eq!(failure.error, "check_unsupported", "{action}");
+            assert!(failure.detail.contains("takes no check"), "{action}");
+        }
+        assert!(!takes_a_check("mouse_move"), "read-only on the wire");
+        assert!(!takes_a_check("request_permissions"), "dispatches nothing");
+    }
+
+    // `screenshot_after` was replaced, not kept beside `check`. Running the action
+    // without it would leave a build that still sends it with no check at all and
+    // nothing said about it.
+    #[test]
+    fn the_field_check_replaced_is_refused_and_says_what_replaced_it() {
+        let line = r#"{"type":"request","request_id":"r1","action":"left_click","x":4,"y":9,
+            "observation_id":"7c1e-12","screenshot_after":true}"#;
+        let failure = parse(line).expect_err("a retired field");
+        assert_eq!(failure.error, "unknown_field");
+        assert!(failure.detail.contains("check"), "{}", failure.detail);
+        // Still a mutation, so the refusal earns the receipt that says nothing went.
+        assert_eq!(failure.action.as_deref(), Some("left_click"));
+    }
+
+    // The evidence a receipt carries, and the two halves that ride an image check
+    // only. A listing has no picture, so `changed` is absent rather than false.
+    #[test]
+    fn a_receipt_says_which_evidence_it_carries() {
+        let frame = |checked| {
+            response(
+                &envelope(),
+                "r1",
+                json!({"ok": true}),
+                Some(Receipt::derive(true, true, checked, Timings::default())),
+            )
+        };
+
+        let image = frame(Some(image_check()));
+        assert_eq!(image["receipt"]["check"]["kind"], json!("image"));
+        assert_eq!(image["receipt"]["check"]["settle"], json!("stable"));
+        assert_eq!(image["receipt"]["check"]["changed"], json!(true));
+
+        let semantic = frame(Some(Checked {
+            kind: Check::Semantic,
+            settle: None,
+            changed: None,
+        }));
+        assert_eq!(semantic["receipt"]["check"]["kind"], json!("semantic"));
+        assert!(semantic["receipt"]["check"].get("settle").is_none());
+        assert!(semantic["receipt"]["check"].get("changed").is_none());
+
+        let unlisted = frame(Some(Checked {
+            kind: Check::Image,
+            settle: Some(Settle::Timeout),
+            changed: None,
+        }));
+        assert_eq!(unlisted["receipt"]["check"]["settle"], json!("timeout"));
+        assert!(
+            unlisted["receipt"]["check"].get("changed").is_none(),
+            "a view with nothing to compare against claims nothing"
+        );
+
+        // No check ran at all: the receipt still reports what was dispatched.
+        let none = frame(None);
+        assert!(none["receipt"].get("check").is_none());
+        assert_eq!(none["receipt"]["dispatch"], json!("sent"));
+    }
+
+    /// The addressing a given action needs before anything else about it can be
+    /// tested — the image its target was read in, and the control when it takes one.
+    fn addressing_for(action: &str) -> &'static str {
+        if addresses_an_element(action) {
+            r#""observation_id":"7c1e-12","element_ref":"e3","#
+        } else if addresses_an_image(action) {
+            r#""observation_id":"7c1e-12","x":4,"y":9,"#
+        } else {
+            ""
+        }
     }
 }

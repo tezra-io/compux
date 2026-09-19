@@ -139,9 +139,9 @@ defmodule Compux.TransportTest do
     end
 
     # The fixture derives the receipt the way the sidecar does — off the request's
-    # own `mutation_seq`, with an after-image only when the payload really has
-    # `data` — so EVERY mutating success in this suite carries one. A library
-    # change that dropped or rewrote receipts now fails broadly, not in one test.
+    # own `mutation_seq`, with evidence only when a check really brought some back
+    # — so EVERY mutating success in this suite carries one. A library change that
+    # dropped or rewrote receipts now fails broadly, not in one test.
     test "a mutating success carries its receipt and a read-only one carries none" do
       transport = start!()
 
@@ -151,6 +151,7 @@ defmodule Compux.TransportTest do
       assert receipt["dispatch"] == "sent"
       assert receipt["input_method"] == "foreground_hid"
       assert receipt["effect"] == "unknown", "nothing was captured, so nothing was observed"
+      assert receipt["check"] == %{"kind" => "none"}, "the receipt always says which evidence"
 
       assert {:ok, read} = Transport.request(transport, %{"action" => "windows"}, 2_000)
       refute Map.has_key?(read, "receipt")
@@ -158,13 +159,17 @@ defmodule Compux.TransportTest do
       Transport.stop(transport)
     end
 
-    test "an after-image makes the effect not_observed" do
+    test "a check that brought an image back makes the effect not_observed" do
       transport = start!()
 
       assert {:ok, %{"receipt" => receipt, "data" => "AAA"}} =
-               Transport.request(transport, %{"action" => "capture"}, 2_000)
+               Transport.request(transport, %{"action" => "capture", "check" => "image"}, 2_000)
 
       assert receipt["effect"] == "not_observed"
+
+      # What the view did while the evidence was taken rides the receipt, and the
+      # transport carries it through unaltered.
+      assert receipt["check"] == %{"kind" => "image", "settle" => "stable", "changed" => false}
 
       Transport.stop(transport)
     end

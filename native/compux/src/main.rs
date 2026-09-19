@@ -21,7 +21,7 @@
 //! action answers with `{"ok": true, ...}` or `{"ok": false, "error": "..."}`.
 
 use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::io;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,7 +41,7 @@ use geometry::{
     crop_rect, sent_scale, to_logical, to_sent, Geometry, Host, Measured, MonitorFacts, Region,
 };
 use held::Platform as _;
-use observation::{Kind, Observation, Observations};
+use observation::{Kind, Observation, Observations, ViewHash};
 use wire::Failure;
 
 /// Capture mode (MILESTONE_32 §8.4a): the AXObserver/CFRunLoop event-push engine +
@@ -57,7 +57,7 @@ mod ax;
 /// sequence posts through, so nothing this process presses can outlive the action.
 mod held;
 
-/// The protocol-9 frames as types: line parsing, the outbound builders, receipts.
+/// The protocol-10 frames as types: line parsing, the outbound builders, receipts.
 mod wire;
 
 /// Display geometry and the one coordinate transform, pure and platform-injected.
@@ -130,7 +130,19 @@ mod control;
 /// `addressing_conflict`. Receipts gained `input_method: "ax"`, the `verified`
 /// effect a read-back earns, and `foreground_changed`. `element_ref` was a
 /// reserved field this sidecar refused outright until now. See `mod ax`.
-const PROTOCOL_VERSION: u32 = 9;
+///
+/// v10 (M42 slice 6): an action that dispatches input says what evidence it is to
+/// bring back, and `check` REPLACES `screenshot_after` — deleted, not kept beside
+/// it, so a caller that still sends the old field is refused rather than run with
+/// no check at all. `image` answers the view the action was aimed in (the crop of
+/// the observation it named, or the display when it named none), waited on until
+/// two consecutive samples agree and encoded from the sample that proved it;
+/// `semantic` re-reads the control an `element_ref` named and answers
+/// `element_after` with no capture; `none` is the receipt alone. The receipt says
+/// which evidence it carries (`check: {kind, settle, changed}`) and what each
+/// phase cost (`timings_ms` gained `encode`). `wait_for_change` returns the frame
+/// whose hash differed rather than a third one taken after the fact.
+const PROTOCOL_VERSION: u32 = 10;
 
 /// The capture-stall self-reap (EX_TEMPFAIL), and NOTHING else.
 ///
@@ -355,6 +367,7 @@ struct Worker {
     observations: Observations,
     measured: Measured,
     ax: Rc<dyn ax::Ax>,
+    frames: Rc<dyn Frames>,
 }
 
 /// The serial action worker. One request at a time, to completion, on this thread.
@@ -363,6 +376,7 @@ fn run_worker(jobs: mpsc::Receiver<control::Job>, gate: &Gate, emitter: &capture
         observations: Observations::new(&gate.envelope().sidecar_generation, gate.clock()),
         measured: Measured::new(),
         ax: Rc::new(ax::Real::new()),
+        frames: Rc::new(Screen),
     };
 
     for job in jobs {
@@ -409,7 +423,7 @@ fn serve(
             &request.request_id,
             refusal.code(),
             Some(refusal.detail().to_string()),
-            receipt(request, &gate::Dispatched::default(), false, None),
+            receipt(request, &gate::Dispatched::default(), None),
         );
     }
 
@@ -436,26 +450,25 @@ fn reply(
 
     match outcome {
         Ok(payload) => {
-            // An after-image is whatever the action actually produced, never what
-            // it was asked to produce: `data` is present only when a capture ran.
-            let after_image = payload.get("data").is_some();
             // The image this action handed back, when it handed one back — read
-            // off the payload for the same reason: what was produced, not what was
-            // asked for.
+            // off the payload rather than off the request: what was produced, not
+            // what was asked for.
             let after = payload
                 .get("observation_id")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let receipt = receipt(request, &done, after_image, after);
+            let receipt = receipt(request, &done, after);
             wire::response(gate.envelope(), &request.request_id, payload, receipt)
         }
 
         Err(failure) => {
-            // `input_complete`, not `false`: the post-action check image is taken
-            // INSIDE the action, so a click whose every event landed and whose own
-            // screenshot then failed dispatched `sent`. Calling that `partial` would
-            // have Fermix report `unknown` where the truth is performed-unverified.
-            let receipt = receipt(request, &done, false, None);
+            // `input_complete`, not `false`: the check is taken INSIDE the action,
+            // so a click whose every event landed and whose own check then failed
+            // dispatched `sent`. Calling that `partial` would have Fermix report
+            // `unknown` where the truth is performed-unverified. The gate recorded
+            // no check either, so the receipt claims no evidence: input that went
+            // out and evidence that did not are two facts, both reported.
+            let receipt = receipt(request, &done, None);
             // Every refusal that reaches here was cancelled (a pause sets both
             // flags), so a refusal code only ever lands in `detail` and never
             // stands in for the action's own error. A detail that merely repeats
@@ -478,17 +491,17 @@ fn reply(
 ///
 /// Everything it reports comes from the gate, which is the only path from an
 /// action to the screen: whether input was posted, how long each phase took,
-/// which method carried it, whether the action could verify its own effect, and
-/// whether the foreground moved. None of it is inferred from the action's name.
+/// which method carried it, what its check brought back, whether the action could
+/// verify its own effect, and whether the foreground moved. None of it is inferred
+/// from the action's name.
 fn receipt(
     request: &wire::Request,
     done: &gate::Dispatched,
-    after_image: bool,
     after: Option<String>,
 ) -> Option<wire::Receipt> {
     if wire::carries_mutation_seq(&request.action) {
         Some(
-            wire::Receipt::derive(done.posted, done.input_complete, after_image, done.timings)
+            wire::Receipt::derive(done.posted, done.input_complete, done.check, done.timings)
                 .addressing(request.observation_id.clone(), after)
                 .noted(done.input_method, done.effect, done.foreground_changed),
         )
@@ -525,12 +538,12 @@ fn handle(
         "double_click" => click(request, gate, worker, Button::Left, 2),
         "left_click_drag" => drag(request, gate, worker),
         "scroll" => scroll(request, gate, worker),
-        "type" => type_text(req, gate, worker),
-        "key" => key_chord(req, gate, worker),
+        "type" => type_text(request, gate, worker),
+        "key" => key_chord(request, gate, worker),
         "wait" => wait(req, gate),
         "inspect" => inspect(request, worker),
         "wait_for_change" => wait_for_change(request, gate, worker),
-        "paste" => paste(req, gate, worker),
+        "paste" => paste(request, gate, worker),
         "elements" => elements(request, gate, worker),
         "windows" => windows(req, gate, worker),
         "press" => press(request, gate, worker),
@@ -1197,8 +1210,7 @@ fn measured_geometry(
         return Ok(Geometry::from_facts(&display.facts, measured, Host::HERE));
     }
 
-    ensure_display_awake(display)?;
-    let image = timed_capture(display, gate)?;
+    let image = take_frame(display, gate, &worker.frames)?;
     measure_geometry(display, &image, worker)
 }
 
@@ -1462,8 +1474,11 @@ mod overlay {
 fn screenshot(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let req = &request.body;
     let display = target_display(req)?;
+    let frame = take_frame(&display, gate, &worker.frames)?;
+
     capture_payload_encoded(
         &display,
+        &frame,
         Requested::Region(request),
         parse_jpeg_quality(req)?,
         parse_overlays(req)?,
@@ -1472,14 +1487,13 @@ fn screenshot(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resu
     )
 }
 
-/// What a capture is being asked to cover. An action's check image is always the
-/// FULL display — the model has just changed something and needs the broader
-/// result — while a `screenshot` carries the request whose `region` says which
-/// rectangle of it, and whose `observation_id` says which image that rectangle was
-/// read in. `wait_for_change` has resolved its rectangle already, because it needs
-/// one before it starts polling.
+/// What a capture is being asked to cover. A `screenshot` carries the request whose
+/// `region` says which rectangle of the display, and whose `observation_id` says
+/// which image that rectangle was read in. A `wait_for_change` and an action's
+/// check have each resolved their rectangle already — the wait because every poll
+/// must watch the same patch, the check because it is the view the action was
+/// aimed in.
 enum Requested<'a> {
-    Full,
     Region(&'a wire::Request),
     Exactly(Region),
 }
@@ -1551,21 +1565,21 @@ fn parse_jpeg_quality(req: &Value) -> Result<Option<u8>, String> {
 /// stuck in that wait wedges SCK for every later capture system-wide (observed
 /// live, 2026-07-01). The typed error lets the caller say what is actually wrong.
 #[cfg(target_os = "macos")]
-fn ensure_display_awake(display: &Display) -> Result<(), String> {
+fn ensure_display_awake(display_id: u32) -> Result<(), String> {
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         // boolean_t CGDisplayIsAsleep(CGDirectDisplayID display)
         fn CGDisplayIsAsleep(display: u32) -> u32;
     }
 
-    if unsafe { CGDisplayIsAsleep(display.id) } != 0 {
+    if unsafe { CGDisplayIsAsleep(display_id) } != 0 {
         return Err("display_asleep".to_string());
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn ensure_display_awake(_display: &Display) -> Result<(), String> {
+fn ensure_display_awake(_display_id: u32) -> Result<(), String> {
     Ok(())
 }
 
@@ -1676,33 +1690,65 @@ fn encode_image(
     }
 }
 
+/// One display frame, and the seam a test feeds them through.
+///
+/// Narrow on purpose. What a caller of this module decides is WHICH frame to keep
+/// — the one a settle stopped on, the one that ended a wait — and that decision is
+/// what has to be provable without a screen. How a frame is grabbed (a worker
+/// thread, a stall budget, a re-resolve by display id) is not this trait's
+/// business and stays exactly where it was.
+trait Frames {
+    fn capture(&self, display_id: u32) -> Result<image::RgbaImage, String>;
+}
+
+/// The real screen.
+struct Screen;
+
+impl Frames for Screen {
+    fn capture(&self, display_id: u32) -> Result<image::RgbaImage, String> {
+        ensure_display_awake(display_id)?;
+        capture_display_image(display_id)
+    }
+}
+
 /// One capture, timed the way the receipt reports it: measured, never estimated.
-fn timed_capture(display: &Display, gate: &Gate) -> Result<image::RgbaImage, String> {
+fn timed_capture(
+    display: &Display,
+    gate: &Gate,
+    frames: &Rc<dyn Frames>,
+) -> Result<image::RgbaImage, String> {
     let started = gate.now_ms();
-    let image = capture_display_image(display.id)?;
+    let image = frames.capture(display.id)?;
     gate.record(Phase::Capture, gate.now_ms().saturating_sub(started));
     Ok(image)
 }
 
+/// One frame, as an action reads it. Every capture in this process goes through
+/// here, so what a frame costs is counted once and in one place.
+fn take_frame(
+    display: &Display,
+    gate: &Gate,
+    frames: &Rc<dyn Frames>,
+) -> Result<image::RgbaImage, Failure> {
+    Ok(timed_capture(display, gate, frames)?)
+}
+
 fn capture_payload_encoded(
     display: &Display,
+    image: &image::RgbaImage,
     requested: Requested<'_>,
     jpeg_quality: Option<u8>,
     overlays: Overlays,
     gate: &Gate,
     worker: &mut Worker,
 ) -> Result<Value, Failure> {
-    ensure_display_awake(display)?;
-
-    // The frame comes FIRST, because the transform is built from it: how many
-    // pixels the OS answers per point is a fact about the image, not about the
-    // display mode. A frame that cannot be explained that way fails the action
-    // here, before any of it is handed out as coordinates.
-    let image = timed_capture(display, gate)?;
-    let geom = measure_geometry(display, &image, worker)?;
+    // The transform is built from the FRAME, because how many pixels the OS answers
+    // per point is a fact about the image and not about the display mode. A frame
+    // that cannot be explained that way fails the action here, before any of it is
+    // handed out as coordinates.
+    let geom = measure_geometry(display, image, worker)?;
 
     let region = match requested {
-        Requested::Full => Region::full(&geom),
         Requested::Exactly(region) => region,
         Requested::Region(request) => viewing_region(request, &geom, worker)?,
     };
@@ -1711,14 +1757,7 @@ fn capture_payload_encoded(
 
     // Crop to the region's physical rect, then downscale to the sent size. The
     // model's coordinates live in this (sent) space; `to_logical` inverts it.
-    let cropped = image::imageops::crop_imm(
-        &image,
-        crop.left_phys.round() as u32,
-        crop.top_phys.round() as u32,
-        crop.w_phys.round().max(1.0) as u32,
-        crop.h_phys.round().max(1.0) as u32,
-    )
-    .to_image();
+    let cropped = crop_out(image, &crop);
 
     let mut resized = image::imageops::resize(
         &cropped,
@@ -1756,8 +1795,10 @@ fn capture_payload_encoded(
         overlay::executed_point(&mut resized, ax, ay);
     }
 
+    let started = gate.now_ms();
     let (encoded, mime) = encode_image(&resized, sent_w, sent_h, jpeg_quality)?;
     let data = base64::engine::general_purpose::STANDARD.encode(&encoded);
+    gate.record(Phase::Encode, gate.now_ms().saturating_sub(started));
 
     let mut payload = json!({
         "ok": true,
@@ -1818,6 +1859,11 @@ fn capture_payload_encoded(
         region,
         sent: (sent_w, sent_h),
         elements: listed,
+        // Kept with the image so a later check can say whether this view changed,
+        // without the caller holding anything or a second capture proving it.
+        // Hashed off the FRAME, not off `cropped`: the same pixels either way, and
+        // the rectangle that rides with it is then the one in the frame's own space.
+        view_hash: Some(view_hash(image, &crop)),
     });
     name_observation(&mut payload, &observation);
 
@@ -2003,9 +2049,10 @@ fn modifiers(req: &Value) -> Vec<Key> {
 fn aim(
     request: &wire::Request,
     observation: &Observation,
+    element: Option<&ax::Entry>,
     worker: &Worker,
 ) -> Result<(i32, i32), Failure> {
-    let Some(entry) = addressed_element(request, observation)? else {
+    let Some(entry) = element else {
         let (x, y) = coords(&request.body)?;
         return point_in(observation, x, y);
     };
@@ -2052,7 +2099,8 @@ fn display_for(request: &wire::Request, observation: &Observation) -> Result<Dis
 
 fn mouse_move(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let observation = observed(request, worker)?;
-    let (lx, ly) = aim(request, &observation, worker)?;
+    let element = addressed_element(request, &observation)?;
+    let (lx, ly) = aim(request, &observation, element, worker)?;
     display_for(request, &observation)?;
     // Read-only on the wire and still the human's pointer, so it goes through the
     // gate like every other input and a pause stops it.
@@ -2076,7 +2124,8 @@ fn click(
 ) -> Result<Value, Failure> {
     let req = &request.body;
     let observation = observed(request, worker)?;
-    let (lx, ly) = aim(request, &observation, worker)?;
+    let element = addressed_element(request, &observation)?;
+    let (lx, ly) = aim(request, &observation, element, worker)?;
     let display = display_for(request, &observation)?;
     let mods = modifiers(req);
 
@@ -2087,7 +2136,12 @@ fn click(
     click_seq(&mut platform, lx, ly, button, count, &mods)?;
     gate.input_complete();
 
-    post(req, &display, gate, worker, Some((lx, ly)))
+    let acted = Acted {
+        named: Some(&observation),
+        executed: Some((lx, ly)),
+        element,
+    };
+    post(request, Some(display), gate, worker, acted)
 }
 
 /// The click itself, over the injected platform: warp, settle, hold the modifiers,
@@ -2141,7 +2195,12 @@ fn drag(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Val
 
     // The drag DESTINATION is what the check image marks: that is where the action
     // ended and the place the model has to judge.
-    post(req, &display, gate, worker, Some((tx, ty)))
+    let acted = Acted {
+        named: Some(&observation),
+        executed: Some((tx, ty)),
+        element: None,
+    };
+    post(request, Some(display), gate, worker, acted)
 }
 
 /// The drag itself, over the injected platform. Everything from the press to the
@@ -2200,7 +2259,8 @@ fn drag_through<P: held::Platform>(
 fn scroll(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let req = &request.body;
     let observation = observed(request, worker)?;
-    let (lx, ly) = aim(request, &observation, worker)?;
+    let element = addressed_element(request, &observation)?;
+    let (lx, ly) = aim(request, &observation, element, worker)?;
     let display = display_for(request, &observation)?;
     let amount = req.get("amount").and_then(Value::as_i64).unwrap_or(3) as i32;
     let (axis, length) = match req.get("direction").and_then(Value::as_str) {
@@ -2219,10 +2279,16 @@ fn scroll(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<V
     platform.scroll(length, axis)?;
     gate.input_complete();
 
-    post(req, &display, gate, worker, Some((lx, ly)))
+    let acted = Acted {
+        named: Some(&observation),
+        executed: Some((lx, ly)),
+        element,
+    };
+    post(request, Some(display), gate, worker, acted)
 }
 
-fn type_text(req: &Value, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
+fn type_text(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
+    let req = &request.body;
     let text = req
         .get("text")
         .and_then(Value::as_str)
@@ -2234,11 +2300,13 @@ fn type_text(req: &Value, gate: &Gate, worker: &mut Worker) -> Result<Value, Fai
     let mut platform = Gated::new(gate, held::Real::default());
     platform.text(text)?;
     gate.input_complete();
-    // Typing executes at the focus, not at a coordinate: nothing to mark.
-    post(req, &target_display(req)?, gate, worker, None)
+    // Typing executes at the focus, not at a coordinate: it names no image and
+    // there is nothing to mark, so its check is the whole display.
+    post(request, None, gate, worker, nothing_named())
 }
 
-fn key_chord(req: &Value, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
+fn key_chord(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
+    let req = &request.body;
     let chord = req
         .get("chord")
         .and_then(Value::as_str)
@@ -2255,7 +2323,7 @@ fn key_chord(req: &Value, gate: &Gate, worker: &mut Worker) -> Result<Value, Fai
     key_chord_seq(&mut platform, &mods, main)?;
     gate.input_complete();
 
-    post(req, &target_display(req)?, gate, worker, None)
+    post(request, None, gate, worker, nothing_named())
 }
 
 /// The chord itself, over the injected platform. This was the one sequence that
@@ -2299,12 +2367,27 @@ fn wait_for_change(
     gate: &Gate,
     worker: &mut Worker,
 ) -> Result<Value, Failure> {
+    let display = target_display(&request.body)?;
+    wait_for_change_on(&display, request, gate, worker)
+}
+
+/// The wait itself, on a display already resolved — which is the whole of it, and
+/// the half that is provable without a screen.
+fn wait_for_change_on(
+    display: &Display,
+    request: &wire::Request,
+    gate: &Gate,
+    worker: &mut Worker,
+) -> Result<Value, Failure> {
     let req = &request.body;
-    let display = target_display(req)?;
+    // The image the caller named, resolved before anything is captured: an id the
+    // table no longer holds is refused here rather than after a wait.
+    let named = named_observation(request, worker)?;
     // The rectangle is resolved once, before the first baseline, so every poll and
     // the frame that ends the wait all watch the same patch of screen.
-    let geom = measured_geometry(&display, gate, worker)?;
+    let geom = measured_geometry(display, gate, worker)?;
     let region = viewing_region(request, &geom, worker)?;
+    let crop = crop_rect(&geom, &region);
     let timeout_ms = req
         .get("timeout_ms")
         .and_then(Value::as_u64)
@@ -2316,13 +2399,33 @@ fn wait_for_change(
         .unwrap_or(250)
         .max(1);
 
-    let baseline = region_hash(&display, &geom, &region)?;
+    // What "changed" is measured against: the hash kept with the image the caller
+    // named, when the rectangle being watched IS that image's own view, and a
+    // sample taken now otherwise. Naming an image and watching a different
+    // rectangle of it is a different question, and answering it from that image's
+    // hash would report a change the instant the wait began.
+    let baseline = match stored_baseline(named.as_ref(), &region) {
+        Some(hash) => hash,
+        None => sample_hash(&take_frame(display, gate, &worker.frames)?, &crop, gate),
+    };
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
     loop {
         gate.sleep(poll_ms)
             .map_err(|refusal| refusal.code().to_string())?;
-        let changed = region_hash(&display, &geom, &region)? != baseline;
+
+        // Each poll KEEPS its frame, and the one whose hash differs is the one
+        // encoded: capturing a third time would hand back a frame that may show
+        // something else again, which is not what the wait was satisfied by. A
+        // timeout returns its last sample for the same reason.
+        let frame = take_frame(display, gate, &worker.frames)?;
+        // A pair that is not comparable at all — the frame changed shape under the
+        // wait — IS a change: whatever the caller was watching, it is not what it is
+        // looking at now, and the fresh frame is the answer to that.
+        let changed = sample_hash(&frame, &crop, gate)
+            .changed_from(&baseline)
+            .unwrap_or(true);
+
         if changed || Instant::now() >= deadline {
             // The returned frame becomes the caller's coordinate view, so it
             // carries the same `rulers` grid an explicit screenshot would.
@@ -2332,7 +2435,8 @@ fn wait_for_change(
                 annotate: None,
             };
             let mut payload = capture_payload_encoded(
-                &display,
+                display,
+                &frame,
                 Requested::Exactly(region),
                 None,
                 overlays,
@@ -2347,26 +2451,101 @@ fn wait_for_change(
     }
 }
 
-/// A change-detector: capture the region and hash an AVERAGED thumbnail of it.
-/// Triangle (not Nearest) folds every source pixel into a cell, so a small change
-/// still perturbs the hash instead of landing between sample points and being
-/// missed — a miss would block `wait_for_change` to its full timeout.
-fn region_hash(display: &Display, geom: &Geometry, region: &Region) -> Result<u64, String> {
-    ensure_display_awake(display)?;
-    let crop = crop_rect(geom, region);
-    let image = capture_display_image(display.id)?;
-    let cropped = image::imageops::crop_imm(
-        &image,
-        crop.left_phys.round() as u32,
-        crop.top_phys.round() as u32,
-        crop.w_phys.round().max(1.0) as u32,
-        crop.h_phys.round().max(1.0) as u32,
-    )
-    .to_image();
-    let thumb = image::imageops::resize(&cropped, 256, 256, image::imageops::FilterType::Triangle);
+/// The hash kept with the image a request named, when that image's own view is
+/// what is being watched. `None` is "there is nothing remembered to compare
+/// against", and the caller takes a sample instead.
+fn stored_baseline(named: Option<&Observation>, region: &Region) -> Option<ViewHash> {
+    let observation = named?;
+
+    if same_rect(&observation.region, region) {
+        observation.view_hash
+    } else {
+        None
+    }
+}
+
+/// The observation a request names, when it names one. Separate from `observed`,
+/// which is the ADDRESSED form and refuses a request that names none.
+fn named_observation(
+    request: &wire::Request,
+    worker: &Worker,
+) -> Result<Option<Observation>, Failure> {
+    match request.observation_id.as_deref() {
+        None => Ok(None),
+        Some(id) => Ok(Some(
+            worker.observations.resolve(id).map_err(refused)?.clone(),
+        )),
+    }
+}
+
+/// An action that names no image and marks no point: its check is the display.
+fn nothing_named<'a>() -> Acted<'a> {
+    Acted {
+        named: None,
+        executed: None,
+        element: None,
+    }
+}
+
+/// A crop's whole pixels inside a frame: rounded, and clamped to the frame so a
+/// rectangle that runs past an edge indexes nothing that is not there. One reader,
+/// so the rectangle that is HASHED and the rectangle that is ENCODED are the same
+/// rectangle by construction rather than by two roundings that happen to agree.
+fn crop_bounds(image: &image::RgbaImage, crop: &geometry::CropRect) -> (u32, u32, u32, u32) {
+    let left = (crop.left_phys.round().max(0.0) as u32).min(image.width().saturating_sub(1));
+    let top = (crop.top_phys.round().max(0.0) as u32).min(image.height().saturating_sub(1));
+    let w = (crop.w_phys.round().max(1.0) as u32).min(image.width() - left);
+    let h = (crop.h_phys.round().max(1.0) as u32).min(image.height() - top);
+    (left, top, w, h)
+}
+
+/// The physical rectangle of one frame, at full resolution.
+fn crop_out(image: &image::RgbaImage, crop: &geometry::CropRect) -> image::RgbaImage {
+    let (left, top, w, h) = crop_bounds(image, crop);
+    image::imageops::crop_imm(image, left, top, w, h).to_image()
+}
+
+/// The change-detector: hash every pixel of a rectangle, read IN PLACE out of the
+/// frame it lives in — one contiguous run per row, no copy and no resize.
+///
+/// The first version hashed a 256x256 downscale of the crop, and that bought
+/// nothing. A thumbnail is not more tolerant than the pixels for an EQUALITY test:
+/// a blinking caret perturbs an averaged cell exactly as it perturbs a pixel, so
+/// either hash differs, and the resize only added time — measured at 258 ms a
+/// sample against the 195 ms capture beside it on a 3840x1080 panel, which made the
+/// settle cost more than the thing it was waiting for.
+///
+/// Every pixel participates. A stride would be the way to miss a small change; the
+/// rows are read whole, so nothing falls between sample points.
+///
+/// One function for every comparison in this process: the hash kept with an image
+/// when it is minted, the samples a settle compares, and the polls of a wait. What
+/// makes two of them comparable rides with them (see [`ViewHash`]).
+fn view_hash(image: &image::RgbaImage, crop: &geometry::CropRect) -> ViewHash {
+    let (left, top, w, h) = crop_bounds(image, crop);
+    let stride = image.width() as usize * 4;
+    let raw = image.as_raw();
     let mut hasher = DefaultHasher::new();
-    thumb.as_raw().hash(&mut hasher);
-    Ok(hasher.finish())
+
+    for row in top..top + h {
+        let start = row as usize * stride + left as usize * 4;
+        hasher.write(&raw[start..start + w as usize * 4]);
+    }
+
+    ViewHash {
+        pixels: hasher.finish(),
+        rect: (left, top, w, h),
+        frame: (image.width(), image.height()),
+    }
+}
+
+/// One sample of a rectangle, counted as settling time because deciding whether the
+/// view has stopped moving is what it is for.
+fn sample_hash(image: &image::RgbaImage, crop: &geometry::CropRect, gate: &Gate) -> ViewHash {
+    let started = gate.now_ms();
+    let hash = view_hash(image, crop);
+    gate.record(Phase::Settle, gate.now_ms().saturating_sub(started));
+    hash
 }
 
 // --- idle detection (coexistence: yield the seat to a present human) --------
@@ -2458,7 +2637,8 @@ fn wait_for_idle(_req: &Value, _gate: &Gate) -> Result<Value, Failure> {
 
 /// Paste `text` via the clipboard + the platform paste chord — fast and
 /// unicode-safe for long strings that char-by-char typing would stall on.
-fn paste(req: &Value, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
+fn paste(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
+    let req = &request.body;
     let text = req
         .get("text")
         .and_then(Value::as_str)
@@ -2470,7 +2650,7 @@ fn paste(req: &Value, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure
     paste_seq(&mut platform, text)?;
     gate.input_complete();
 
-    post(req, &target_display(req)?, gate, worker, None)
+    post(request, None, gate, worker, nothing_named())
 }
 
 /// Let the pasteboard write settle before the paste keystroke.
@@ -2517,7 +2697,7 @@ fn press(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Va
     revalidate(&worker.ax, &observation, entry, Capability::Press)?;
 
     let handle = entry.element.handle();
-    let aimed = aimed_point(&request.body, &worker.ax, handle);
+    let aimed = aimed_point(request, &worker.ax, handle);
     let before = worker.ax.frontmost_pid();
 
     let outcome = gate
@@ -2532,7 +2712,13 @@ fn press(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Va
     // at. Saying `verified` here would be the one lie this receipt exists to
     // prevent.
     gate.observed_effect(wire::Effect::NotObserved);
-    post_ax(&request.body, gate, worker, aimed)
+
+    let acted = Acted {
+        named: Some(&observation),
+        executed: aimed,
+        element: Some(entry),
+    };
+    post(request, None, gate, worker, acted)
 }
 
 /// Set the control's value, then read it back — which is the only thing in this
@@ -2559,7 +2745,7 @@ fn set_value(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resul
     revalidate(&worker.ax, &observation, entry, Capability::SetValue)?;
 
     let (handle, secure) = (entry.element.handle(), entry.secure);
-    let aimed = aimed_point(&request.body, &worker.ax, handle);
+    let aimed = aimed_point(request, &worker.ax, handle);
     let before = worker.ax.frontmost_pid();
 
     let outcome = gate
@@ -2584,7 +2770,12 @@ fn set_value(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resul
         wire::Effect::NotObserved
     });
 
-    let mut payload = post_ax(&request.body, gate, worker, aimed)?;
+    let acted = Acted {
+        named: Some(&observation),
+        executed: aimed,
+        element: Some(entry),
+    };
+    let mut payload = post(request, None, gate, worker, acted)?;
 
     if let Some(object) = payload.as_object_mut() {
         object.insert("verified".to_string(), json!(verified));
@@ -2598,33 +2789,18 @@ fn set_value(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resul
     Ok(payload)
 }
 
-/// The check image after an accessibility action, when one was asked for.
-///
-/// The display is resolved only then, deliberately: an accessibility action needs
-/// no display, so refusing one because the screen is asleep would fail an action
-/// that would have worked — and a press through the AX API is exactly the action
-/// that still works when a capture does not.
-fn post_ax(
-    req: &Value,
-    gate: &Gate,
-    worker: &mut Worker,
-    aimed: Option<(i32, i32)>,
-) -> Result<Value, Failure> {
-    if !wants_check_image(req) {
-        return Ok(json!({ "ok": true }));
-    }
-
-    post(req, &target_display(req)?, gate, worker, aimed)
-}
-
 /// Where the control is, for the check image's executed-point marker.
 ///
 /// Read only when there is going to be an image to draw it on: an accessibility
 /// action aims at a name, not a place, so a bounds read it will not use is one
 /// more message to an application that may be slow to answer. Best effort even
 /// then — a control that will not say where it is still gets its action.
-fn aimed_point(req: &Value, ax: &Rc<dyn ax::Ax>, handle: ax::Handle) -> Option<(i32, i32)> {
-    if !wants_check_image(req) {
+fn aimed_point(
+    request: &wire::Request,
+    ax: &Rc<dyn ax::Ax>,
+    handle: ax::Handle,
+) -> Option<(i32, i32)> {
+    if request.check != wire::Check::Image {
         return None;
     }
 
@@ -2650,6 +2826,345 @@ fn note_ax(gate: &Gate, worker: &Worker, before: Option<i32>) {
     if let (Some(before), Some(after)) = (before, worker.ax.frontmost_pid()) {
         gate.note_foreground(before != after);
     }
+}
+
+// --- the check: what an action shows for itself (protocol 10) ----------------
+
+/// How long a settle may go on, and how many looks it may take to get there. BOTH
+/// bind: the wall clock is the promise a caller's own deadline is built on, and the
+/// sample count is the promise that a machine whose captures are instant does not
+/// spin.
+const SETTLE_CAP_MS: u64 = 1_500;
+const MAX_SETTLE_SAMPLES: u32 = 30;
+
+/// The FLOOR between two looks, not a delay added to each one. A capture that took
+/// 200 ms has already provided the gap, so only the shortfall is slept; a machine
+/// whose captures are instant is paced to this.
+const SETTLE_POLL_MS: u64 = 50;
+
+/// The shortest sleep between two looks. A look is never immediately followed by
+/// another, whatever the arithmetic says.
+const SETTLE_MIN_POLL_MS: u64 = 5;
+
+/// How long after the input a view has to be quiet before "it has not moved" is
+/// believed.
+///
+/// Two equal samples alone are not enough, and this is the hole: the first sample
+/// is taken as soon as the input is complete, so an application that only starts
+/// repainting a poll or two later hands back two identical samples of the view as
+/// it was BEFORE the action — `stable`, `changed: false`, and the misleading check
+/// this slice exists to remove. So equality settles the view only once a change has
+/// been seen, or once the view has been this quiet since the input went out. An
+/// action that really changes nothing therefore costs this window, once.
+const SETTLE_QUIET_MS: u64 = 300;
+
+/// The check image's encoding, for the crop of a view. The full display stays PNG:
+/// these are the encodings a caller already got for each of the two, and nothing
+/// about image quality changes in this slice.
+const CHECK_JPEG_QUALITY: u8 = 85;
+
+/// What the action did, as far as its check is concerned: the view it was aimed
+/// in, where it landed, and the control it named when it named one.
+struct Acted<'a> {
+    /// The image or listing the action's target was read from. `None` for `type`,
+    /// `key` and `paste`, which act at the focus and name nothing.
+    named: Option<&'a Observation>,
+    /// The point the action really executed at, in global logical points.
+    executed: Option<(i32, i32)>,
+    /// The control it acted on, when it named one — the only thing a semantic
+    /// check has to read again.
+    element: Option<&'a ax::Entry>,
+}
+
+/// The frame a settle stopped on, and what it proved.
+struct Settled {
+    frame: image::RgbaImage,
+    hash: ViewHash,
+    settle: wire::Settle,
+}
+
+/// The evidence this action brings back, taken AFTER the input and reported on the
+/// receipt.
+///
+/// The display is a `None` for an accessibility action and resolved here only if an
+/// image is really wanted: a press needs no display, so refusing one because the
+/// screen is asleep would fail an action that would have worked — and a press
+/// through the AX API is exactly the action that still works when a capture does
+/// not.
+///
+/// Completion is latched before any of this (`input_complete`), so evidence that
+/// could not be obtained never turns `sent` into anything else.
+fn post(
+    request: &wire::Request,
+    display: Option<Display>,
+    gate: &Gate,
+    worker: &mut Worker,
+    acted: Acted<'_>,
+) -> Result<Value, Failure> {
+    match request.check {
+        wire::Check::None => {
+            gate.observed_check(wire::Checked {
+                kind: wire::Check::None,
+                settle: None,
+                changed: None,
+            });
+            Ok(json!({ "ok": true }))
+        }
+
+        wire::Check::Semantic => element_after(gate, worker, acted.element),
+
+        wire::Check::Image => check_image(request, display, gate, worker, acted),
+    }
+}
+
+/// The view the model acted in, settled and drawn on.
+///
+/// The rectangle is the one the action's own observation covers — its crop, or the
+/// rectangle a listing was read over — mapped back through the transform that
+/// observation was made with, so a check of a zoomed action is that zoom rather
+/// than a whole screen the model has to find its target in again. An action that
+/// named nothing gets the display.
+fn check_image(
+    request: &wire::Request,
+    display: Option<Display>,
+    gate: &Gate,
+    worker: &mut Worker,
+    acted: Acted<'_>,
+) -> Result<Value, Failure> {
+    let display = match display {
+        Some(display) => display,
+        None => target_display(&request.body)?,
+    };
+
+    // The transform before the first sample, because the rectangle the settle
+    // watches has to be the rectangle that is then encoded — and a transform is
+    // measured from a frame, so this is the one place a check may take a capture
+    // it does not keep (only on a display this process has never measured).
+    let geom = measured_geometry(&display, gate, worker)?;
+    let region = check_view(&geom, acted.named);
+    let before = acted.named.and_then(|observation| observation.view_hash);
+    let settled = settle_view(&display, &geom, &region, before, gate, worker)?;
+
+    // Evidence about the VIEW, not about the action: did what the model looked at
+    // change since the image it acted on. A listing carries no hash, and saying
+    // `false` there would answer a question nobody has evidence for.
+    let changed = before.and_then(|before| settled.hash.changed_from(&before));
+
+    let overlays = Overlays {
+        rulers: true,
+        marks: false,
+        annotate: acted
+            .executed
+            .map(|(lx, ly)| Annotate::Logical(lx as f32, ly as f32)),
+    };
+
+    let payload = capture_payload_encoded(
+        &display,
+        &settled.frame,
+        Requested::Exactly(region),
+        check_quality(&region, &geom),
+        overlays,
+        gate,
+        worker,
+    )?;
+
+    gate.observed_check(wire::Checked {
+        kind: wire::Check::Image,
+        settle: Some(settled.settle),
+        changed,
+    });
+
+    Ok(payload)
+}
+
+/// The rectangle a check image covers: the whole of the observation the action was
+/// aimed in, mapped back through the transform THAT image was made with.
+///
+/// Through `rect_through`, whose corners are edges and not pixel centres: the same
+/// rectangle mapped again and again must stay the same rectangle, and the centre
+/// convention made the view creep inwards over a run of checks.
+fn check_view(geom: &Geometry, named: Option<&Observation>) -> Region {
+    let Some(observation) = named else {
+        return Region::full(geom);
+    };
+
+    let whole = Region {
+        x: 0.0,
+        y: 0.0,
+        w: observation.sent_w as f64,
+        h: observation.sent_h as f64,
+    };
+
+    geometry::rect_through(&observation.geometry, &observation.region, &whole, geom)
+}
+
+/// PNG for the whole display, JPEG for a crop — decided by the rectangle itself, so
+/// an action aimed in a full-display image and one that named no image at all are
+/// encoded the same way because they show the same thing.
+fn check_quality(region: &Region, geom: &Geometry) -> Option<u8> {
+    if same_rect(region, &Region::full(geom)) {
+        None
+    } else {
+        Some(CHECK_JPEG_QUALITY)
+    }
+}
+
+/// Two rectangles of sent pixels, compared as the whole pixels they are drawn in.
+fn same_rect(a: &Region, b: &Region) -> bool {
+    let round = |region: &Region| {
+        (
+            region.x.round() as i64,
+            region.y.round() as i64,
+            region.w.round() as i64,
+            region.h.round() as i64,
+        )
+    };
+
+    round(a) == round(b)
+}
+
+/// Poll the crop until two consecutive samples are identical, then hand back the
+/// sample that proved it.
+///
+/// The frame that proved the view stable is the one encoded: capturing again after
+/// it would return a frame nobody has looked at, which is the whole defect this
+/// replaces. The cap is reported, never hidden — a caret, a spinner or a playing
+/// video reaches it every time, and `timeout` is an observation state rather than a
+/// reason to send the input again.
+///
+/// Sleeps go through the gate, so a pause during a settle returns at once: the
+/// action then answers `cancelled` with the input it dispatched reported truthfully
+/// and no evidence claimed.
+fn settle_view(
+    display: &Display,
+    geom: &Geometry,
+    region: &Region,
+    before: Option<ViewHash>,
+    gate: &Gate,
+    worker: &Worker,
+) -> Result<Settled, Failure> {
+    let crop = crop_rect(geom, region);
+    let started = gate.now_ms();
+    // Counted from the INPUT and not from the first look, because a display has to
+    // be resolved and may have to be measured in between. An action that never
+    // latched its completion dispatched nothing to wait on, so its window starts
+    // here.
+    let quiet_until = gate.input_completed_at().unwrap_or(started) + SETTLE_QUIET_MS;
+
+    let mut baseline: Option<ViewHash> = None;
+    let mut previous: Option<ViewHash> = None;
+    let mut seen_change = false;
+    let mut samples: u32 = 0;
+    let mut looked_at = started;
+
+    loop {
+        samples += 1;
+        if samples > 1 {
+            pace(gate, looked_at)?;
+        }
+
+        looked_at = gate.now_ms();
+        let frame = take_frame(display, gate, &worker.frames)?;
+        let hash = sample_hash(&frame, &crop, gate);
+
+        // What a change is measured FROM: the image the caller acted on when this
+        // sample is comparable with it — which is what catches a repaint that had
+        // already begun before the first look — and this first look otherwise,
+        // which is all an action naming no image has. Decided once.
+        let base = *baseline.get_or_insert(match before {
+            Some(before) if hash.changed_from(&before).is_some() => before,
+            _ => hash,
+        });
+        seen_change |= hash.changed_from(&base) == Some(true);
+
+        let settled = previous == Some(hash) && (seen_change || gate.now_ms() >= quiet_until);
+        let spent = gate.now_ms().saturating_sub(started);
+
+        if settled || spent >= SETTLE_CAP_MS || samples >= MAX_SETTLE_SAMPLES {
+            return Ok(Settled {
+                frame,
+                hash,
+                settle: if settled {
+                    wire::Settle::Stable
+                } else {
+                    wire::Settle::Timeout
+                },
+            });
+        }
+
+        previous = Some(hash);
+    }
+}
+
+/// Wait out the floor between two looks, and no longer: a capture that took 200 ms
+/// has already provided the gap, and sleeping a further 50 would be this process
+/// adding delay to a check it is meant to be shortening.
+fn pace(gate: &Gate, looked_at: u64) -> Result<(), Failure> {
+    let since = gate.now_ms().saturating_sub(looked_at);
+    let waited = gate.now_ms();
+
+    gate.sleep(SETTLE_POLL_MS.saturating_sub(since).max(SETTLE_MIN_POLL_MS))
+        .map_err(|refusal| refusal.code().to_string())?;
+    gate.record(Phase::Settle, gate.now_ms().saturating_sub(waited));
+
+    Ok(())
+}
+
+/// The control the action named, read again: what it is, what it calls itself,
+/// whether it will take input, and what it holds.
+///
+/// Never described as visual evidence and never a capture. A secure field's value
+/// is not read here any more than it is read anywhere else — it reads back masked,
+/// and not asking is a stronger guarantee than asking and discarding. Its LABEL is
+/// read like any other control's: what a password field calls itself is not what it
+/// holds.
+///
+/// `label` is here so a consumer can say WHICH control it re-read without keeping
+/// its own copy of a listing, and it is bounded and collapsed to one line at the
+/// source, exactly as a listing publishes it.
+///
+/// `present: false` is a control that no longer answers at all, which is itself
+/// worth knowing: a dialog that closed, a row that went away.
+fn element_after(
+    gate: &Gate,
+    worker: &Worker,
+    element: Option<&ax::Entry>,
+) -> Result<Value, Failure> {
+    let entry = element.ok_or_else(|| {
+        Failure::new(
+            "check_unsupported",
+            "a semantic check re-reads the control the action named, and this action named none"
+                .to_string(),
+        )
+    })?;
+
+    let handle = entry.element.handle();
+    let mut after = json!({ "present": false });
+
+    if let Some(role) = worker.ax.role(handle) {
+        after = json!({
+            "present": true,
+            "role": role,
+            "enabled": worker.ax.enabled(handle),
+        });
+
+        if let (Some(object), Some(label)) = (after.as_object_mut(), worker.ax.label(handle)) {
+            object.insert("label".to_string(), json!(label));
+        }
+        if let (false, Some(object), Some(value)) =
+            (entry.secure, after.as_object_mut(), worker.ax.value(handle))
+        {
+            object.insert("value".to_string(), json!(ax::bounded_value(value)));
+        }
+    }
+
+    gate.observed_check(wire::Checked {
+        kind: wire::Check::Semantic,
+        settle: None,
+        changed: None,
+    });
+
+    Ok(json!({ "ok": true, "element_after": after }))
 }
 
 // --- windows ----------------------------------------------------------------
@@ -2693,6 +3208,9 @@ fn windows(req: &Value, gate: &Gate, worker: &mut Worker) -> Result<Value, Failu
         geometry: geom,
         region: full,
         sent: crop_rect(&geom, &full).sent_dims(),
+        // A listing has no picture, so there is nothing for a later check to
+        // compare its view against.
+        view_hash: None,
         // A window is not a control: it has no accessibility reference to hand
         // out, and `elements` is what answers with those.
         elements: None,
@@ -2810,6 +3328,10 @@ fn elements(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result
         region,
         sent: (sent_w, sent_h),
         elements: listed,
+        // A listing has no picture, so there is nothing for a later check to
+        // compare its view against: `changed` is absent on such a check, never
+        // false.
+        view_hash: None,
     });
     name_observation(&mut payload, &observation);
 
@@ -3374,43 +3896,6 @@ fn inspect_at(_x: f32, _y: f32) -> Result<Value, String> {
 
 // --- helpers ----------------------------------------------------------------
 
-/// After a mutating action, include the post-action screen state when the request
-/// asked for it (`screenshot_after`). Always the FULL display (region: None) so the
-/// model sees the broader result of a zoomed action; it can re-zoom with an explicit
-/// `screenshot` if it needs detail.
-///
-/// B1: the check draws the EXECUTED point (the action's own coordinates — the drag
-/// destination for drags) into the image, so the caller SEES where the click landed
-/// relative to its target instead of only reading its own number echoed back. An
-/// unregioned action's coordinates are full-screen sent space — the same space this
-/// full-display check captures in. `rulers` is honored from the action request.
-fn post(
-    req: &Value,
-    display: &Display,
-    gate: &Gate,
-    worker: &mut Worker,
-    executed: Option<(i32, i32)>,
-) -> Result<Value, Failure> {
-    if wants_check_image(req) {
-        let overlays = Overlays {
-            rulers: req.get("rulers").and_then(Value::as_bool).unwrap_or(false),
-            marks: false,
-            annotate: executed.map(|(lx, ly)| Annotate::Logical(lx as f32, ly as f32)),
-        };
-        capture_payload_encoded(display, Requested::Full, None, overlays, gate, worker)
-    } else {
-        Ok(json!({ "ok": true }))
-    }
-}
-
-/// Did this request ask for the screen back afterwards? One reader, so the two
-/// call sites cannot disagree about whether a display is needed.
-fn wants_check_image(req: &Value) -> bool {
-    req.get("screenshot_after")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
 fn parse_point(req: &Value, field: &str) -> Result<Point, String> {
     serde_json::from_value(req.get(field).cloned().unwrap_or(Value::Null))
         .map_err(|_| format!("bad {field} point"))
@@ -3493,10 +3978,17 @@ mod tests {
     /// A worker over a given accessibility platform, so an action that acts on a
     /// control is driven against the recording one.
     fn worker_with(gate: &Gate, ax: Rc<dyn ax::Ax>) -> Worker {
+        frames_worker(gate, ax, Rc::new(Screen))
+    }
+
+    /// A worker over both injected platforms: the accessibility tree it reads, and
+    /// the screen it takes frames from.
+    fn frames_worker(gate: &Gate, ax: Rc<dyn ax::Ax>, frames: Rc<dyn Frames>) -> Worker {
         Worker {
             observations: Observations::new(&gate.envelope().sidecar_generation, gate.clock()),
             measured: Measured::new(),
             ax,
+            frames,
         }
     }
 
@@ -3522,6 +4014,11 @@ mod tests {
             mutation_seq: None,
             observation_id: body["observation_id"].as_str().map(str::to_string),
             element_ref: body["element_ref"].as_str().map(str::to_string),
+            check: match body["check"].as_str() {
+                Some("image") => wire::Check::Image,
+                Some("semantic") => wire::Check::Semantic,
+                _ => wire::Check::None,
+            },
         }
     }
 
@@ -3943,6 +4440,7 @@ mod tests {
             region,
             sent,
             elements: None,
+            view_hash: None,
         });
 
         (worker, observation)
@@ -4313,6 +4811,7 @@ mod tests {
             mutation_seq,
             observation_id: wire::addresses_an_image(action).then(|| "7c1e-1".to_string()),
             element_ref: wire::addresses_an_element(action).then(|| "e1".to_string()),
+            check: wire::Check::None,
         }
     }
 
@@ -4359,7 +4858,7 @@ mod tests {
         );
 
         // What the caller is told: input was dispatched and the action did not finish.
-        let receipt = wire::Receipt::derive(done.posted, false, false, done.timings);
+        let receipt = wire::Receipt::derive(done.posted, false, None, done.timings);
         assert_eq!(receipt.dispatch, wire::Dispatch::Partial);
 
         clock.disarm();
@@ -4666,6 +5165,7 @@ mod tests {
             geometry: geom,
             region,
             sent,
+            view_hash: None,
             elements: Some(Rc::new(ax::Elements::new(
                 FIXTURE_PID,
                 recorder.started_at(),
@@ -4909,6 +5409,7 @@ mod tests {
             region: observation.region,
             sent: (observation.sent_w, observation.sent_h),
             elements: None,
+            view_hash: None,
         });
         assert_ne!(image.id, observation.id);
 
@@ -5055,11 +5556,12 @@ mod tests {
         let (worker, observation) = worker_listing(&gate, &app);
 
         let request = at_element("left_click", &observation, "e1");
-        let listed = aim(&request, &observation, &worker).expect("a control to aim at");
+        let element = addressed_element(&request, &observation).expect("a listed control");
+        let listed = aim(&request, &observation, element, &worker).expect("a control to aim at");
         assert_eq!(listed, (140, 212), "the centre of the listed frame");
 
         app.change(0, |element| element.frame = frame_at(500.0, 600.0));
-        let moved = aim(&request, &observation, &worker).expect("still a control to aim at");
+        let moved = aim(&request, &observation, element, &worker).expect("still a control to aim");
         assert_eq!(moved, (540, 612), "the centre of where it is NOW");
     }
 
@@ -5218,4 +5720,1092 @@ mod tests {
     /// More than the whole walk budget for one node, so the second one cannot be
     /// reached.
     const WALK_COST_MS: u64 = ax::WALK_BUDGET_MS - 1;
+
+    // --- M42 slice 6: one action with its check, settled, and timed -----------
+    //
+    // The SCREEN is injected here, the way the accessibility tree is above: a test
+    // writes down what each look at the display answers, so which frame a settle
+    // keeps, how many looks it takes and what it then encodes are asserted rather
+    // than hoped for. Nothing captures, nothing sleeps and nothing is drawn on a
+    // real display, which is what lets these run on a host with no grant at all.
+
+    /// A clock a test moves. It advances on every sleep, and a scripted screen
+    /// advances it again for what each look costs, so both settle caps — the wall
+    /// clock and the sample count — are reachable without waiting for either.
+    struct StepClock {
+        ms: std::sync::atomic::AtomicU64,
+    }
+
+    impl StepClock {
+        fn new() -> Arc<StepClock> {
+            Arc::new(StepClock {
+                ms: std::sync::atomic::AtomicU64::new(0),
+            })
+        }
+
+        fn advance(&self, ms: u64) {
+            self.ms.fetch_add(ms, Ordering::SeqCst);
+        }
+    }
+
+    impl gate::Clock for StepClock {
+        fn now_ms(&self) -> u64 {
+            self.ms.load(Ordering::SeqCst)
+        }
+
+        fn now_ns(&self) -> u128 {
+            self.now_ms() as u128 * 1_000_000
+        }
+
+        fn sleep(&self, ms: u64) {
+            self.advance(ms);
+        }
+    }
+
+    /// A screen a test writes down, frame by frame: each look answers the next one
+    /// and the last one repeats, and each costs the clock what a real grab would.
+    struct ScriptedScreen {
+        frames: Vec<image::RgbaImage>,
+        taken: std::cell::Cell<usize>,
+        cost_ms: u64,
+        clock: Arc<StepClock>,
+    }
+
+    impl ScriptedScreen {
+        fn new(clock: &Arc<StepClock>, shades: &[u8], cost_ms: u64) -> Rc<ScriptedScreen> {
+            Rc::new(ScriptedScreen {
+                frames: shades.iter().map(|shade| shaded(*shade)).collect(),
+                taken: std::cell::Cell::new(0),
+                cost_ms,
+                clock: clock.clone(),
+            })
+        }
+
+        fn taken(&self) -> usize {
+            self.taken.get()
+        }
+    }
+
+    impl Frames for ScriptedScreen {
+        fn capture(&self, _display_id: u32) -> Result<image::RgbaImage, String> {
+            let taken = self.taken.get();
+            self.taken.set(taken + 1);
+            self.clock.advance(self.cost_ms);
+            Ok(self.frames[taken.min(self.frames.len() - 1)].clone())
+        }
+    }
+
+    /// The whole display, in one shade — so which frame was kept is readable off
+    /// the pixels the reply carries.
+    fn shaded(shade: u8) -> image::RgbaImage {
+        image::RgbaImage::from_pixel(
+            CHECK_DISPLAY_W,
+            CHECK_DISPLAY_H,
+            image::Rgba([shade, shade, shade, 255]),
+        )
+    }
+
+    const CHECK_DISPLAY_W: u32 = 400;
+    const CHECK_DISPLAY_H: u32 = 300;
+
+    /// A one-to-one display, so the transform is the identity on every host and a
+    /// test can read a rectangle in the reply as the rectangle it asked for.
+    fn check_display() -> Display {
+        Display {
+            facts: MonitorFacts {
+                x: 0,
+                y: 0,
+                width: CHECK_DISPLAY_W,
+                height: CHECK_DISPLAY_H,
+                scale_factor: 1.0,
+            },
+            id: 424_242,
+        }
+    }
+
+    fn check_geometry() -> Geometry {
+        let display = check_display();
+        let measured =
+            geometry::measure(&display.facts, CHECK_DISPLAY_W, CHECK_DISPLAY_H, Host::HERE)
+                .expect("a one-to-one frame");
+
+        Geometry::from_facts(&display.facts, measured, Host::HERE)
+    }
+
+    /// A worker over a scripted screen, with the display's transform already
+    /// measured — so nothing below takes a frame it did not ask for.
+    fn screen_worker(gate: &Gate, screen: &Rc<ScriptedScreen>) -> Worker {
+        let display = check_display();
+        let measured =
+            geometry::measure(&display.facts, CHECK_DISPLAY_W, CHECK_DISPLAY_H, Host::HERE)
+                .expect("a one-to-one frame");
+
+        let mut worker = frames_worker(gate, Rc::new(ax::Real::new()), screen.clone());
+        worker
+            .measured
+            .remember(display.id, &display.facts, measured);
+        worker
+    }
+
+    /// An action that has dispatched its input and is about to bring evidence back.
+    fn checking(action: &str, check: wire::Check) -> wire::Request {
+        let mut request = running(action, Some(1));
+        request.check = check;
+        request.observation_id = None;
+        request.element_ref = None;
+        request.body = json!({ "action": action });
+        request
+    }
+
+    /// One observation over a rectangle of the check display, minted the way a real
+    /// reply mints one: from a frame, with the hash of the crop it covers.
+    fn viewed(
+        worker: &mut Worker,
+        gate: &Gate,
+        shade: u8,
+        region: Region,
+    ) -> Result<Observation, Failure> {
+        let display = check_display();
+        let frame = shaded(shade);
+        let payload = capture_payload_encoded(
+            &display,
+            &frame,
+            Requested::Exactly(region),
+            None,
+            Overlays::default(),
+            gate,
+            worker,
+        )?;
+
+        let id = payload["observation_id"]
+            .as_str()
+            .expect("named")
+            .to_string();
+        Ok(worker
+            .observations
+            .resolve(&id)
+            .expect("just minted")
+            .clone())
+    }
+
+    fn crop_region(x: f64, y: f64, w: f64, h: f64) -> Region {
+        Region { x, y, w, h }
+    }
+
+    /// The shade of the image a reply carries, decoded from the bytes it really
+    /// sent — the only way to tell WHICH frame was encoded.
+    fn shade_of(payload: &Value) -> u8 {
+        let data = payload["data"].as_str().expect("an image");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .expect("base64");
+        let decoded = image::load_from_memory(&bytes).expect("an image this build encoded");
+        decoded.to_rgba8().get_pixel(1, 1).0[0]
+    }
+
+    fn idle_check_gate(clock: &Arc<StepClock>) -> Gate {
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        gate.admit(&checking("left_click", wire::Check::Image))
+            .expect("an idle gate admits");
+        gate
+    }
+
+    // The defect this slice exists for: the frame an action hands back used to be
+    // taken the instant the input left, before the application had repainted. The
+    // sample that proved the view stable is the one encoded, and nothing is
+    // captured after it.
+    #[test]
+    fn a_settle_keeps_the_frame_that_proved_the_view_stable() {
+        let clock = StepClock::new();
+        let gate = idle_check_gate(&clock);
+        // Moving, moving, then two looks that agree.
+        let screen = ScriptedScreen::new(&clock, &[10, 20, 30, 30, 40], 0);
+        let worker = screen_worker(&gate, &screen);
+        let geom = check_geometry();
+
+        let settled = settle_view(
+            &check_display(),
+            &geom,
+            &Region::full(&geom),
+            None,
+            &gate,
+            &worker,
+        )
+        .expect("a settle with nothing in its way");
+
+        assert_eq!(settled.settle, wire::Settle::Stable);
+        assert_eq!(screen.taken(), 4, "it stopped on the look that agreed");
+        assert_eq!(
+            settled.frame.get_pixel(1, 1).0[0],
+            30,
+            "the frame kept is the one that proved it, not a fresh one"
+        );
+    }
+
+    // A caret, a spinner or a playing video never agrees with itself. That is an
+    // observation state and not a reason to send the input again, so the cap is
+    // reported and the last sample is what comes back.
+    #[test]
+    fn a_view_that_never_settles_ends_at_the_sample_cap() {
+        let clock = StepClock::new();
+        let gate = idle_check_gate(&clock);
+        let shades: Vec<u8> = (0..60).collect();
+        let screen = ScriptedScreen::new(&clock, &shades, 0);
+        let worker = screen_worker(&gate, &screen);
+        let geom = check_geometry();
+
+        let settled = settle_view(
+            &check_display(),
+            &geom,
+            &Region::full(&geom),
+            None,
+            &gate,
+            &worker,
+        )
+        .expect("a settle that runs out of looks");
+
+        assert_eq!(settled.settle, wire::Settle::Timeout);
+        assert_eq!(screen.taken(), MAX_SETTLE_SAMPLES as usize);
+    }
+
+    // Both caps bind. On a machine whose captures are slow the wall clock is what
+    // runs out first, and a caller's own deadline is built on that promise.
+    #[test]
+    fn a_settle_whose_looks_are_slow_ends_at_the_wall_clock_cap() {
+        let clock = StepClock::new();
+        let gate = idle_check_gate(&clock);
+        let shades: Vec<u8> = (0..60).collect();
+        let screen = ScriptedScreen::new(&clock, &shades, 400);
+        let worker = screen_worker(&gate, &screen);
+        let geom = check_geometry();
+
+        let settled = settle_view(
+            &check_display(),
+            &geom,
+            &Region::full(&geom),
+            None,
+            &gate,
+            &worker,
+        )
+        .expect("a settle that runs out of time");
+
+        assert_eq!(settled.settle, wire::Settle::Timeout);
+        assert!(
+            screen.taken() < MAX_SETTLE_SAMPLES as usize,
+            "the clock ran out first, after {} looks",
+            screen.taken()
+        );
+        assert!(gate.now_ms() >= SETTLE_CAP_MS);
+    }
+
+    // A pause during a settle returns at once — and the truth it leaves behind is
+    // the one the whole receipt design is for: the input DID go out, and the
+    // evidence did not. Neither fact is allowed to stand in for the other.
+    #[test]
+    fn a_pause_during_a_settle_returns_at_once_with_the_input_still_sent() {
+        let clock = PauseOnSleep::new(1);
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        clock.arm(&gate);
+        let request = checking("left_click", wire::Check::Image);
+        gate.admit(&request).unwrap();
+
+        // The input landed and was latched before any of this.
+        gate.dispatch(Phase::Input, || ()).expect("input posted");
+        gate.input_complete();
+
+        let screen = ScriptedScreen::new(&StepClock::new(), &[10, 20, 30], 0);
+        let worker = screen_worker(&gate, &screen);
+
+        let refused = post(
+            &request,
+            Some(check_display()),
+            &gate,
+            &mut { worker },
+            nothing_named(),
+        )
+        .expect_err("a pause during the settle");
+        assert_eq!(refused.code, "cancelled");
+
+        let done = gate.finish();
+        let receipt = receipt(&request, &done, None).expect("a mutation earns one");
+        assert_eq!(receipt.dispatch, wire::Dispatch::Sent, "the input went out");
+        assert_eq!(receipt.effect, wire::Effect::Unknown);
+        assert!(
+            receipt.check.is_none(),
+            "evidence that could not be obtained is claimed by nobody"
+        );
+
+        clock.disarm();
+    }
+
+    // What an image check answers: the view the action was aimed in, the whole
+    // display when it named none, drawn on and named as an observation of its own.
+    #[test]
+    fn an_image_check_answers_the_whole_display_when_the_action_named_none() {
+        let clock = StepClock::new();
+        let gate = idle_check_gate(&clock);
+        let screen = ScriptedScreen::new(&clock, &[10, 10], 0);
+        let mut worker = screen_worker(&gate, &screen);
+        let request = checking("type", wire::Check::Image);
+
+        let payload = post(
+            &request,
+            Some(check_display()),
+            &gate,
+            &mut worker,
+            nothing_named(),
+        )
+        .expect("a check image");
+
+        assert_eq!(
+            payload["mime"],
+            json!("image/png"),
+            "the display is lossless"
+        );
+        assert_eq!(payload["width"], json!(CHECK_DISPLAY_W));
+        assert_eq!(payload["height"], json!(CHECK_DISPLAY_H));
+        assert_eq!(payload["observation_kind"], json!("image"));
+        assert!(payload["observation_id"].is_string(), "the check is a view");
+
+        let done = gate.finish();
+        let checked = done.check.expect("a check that ran says so");
+        assert_eq!(checked.kind, wire::Check::Image);
+        assert_eq!(checked.settle, Some(wire::Settle::Stable));
+        assert_eq!(
+            checked.changed, None,
+            "it named no image to compare against"
+        );
+    }
+
+    // A zoomed action gets its zoom back, not a whole screen it has to find its
+    // target in again — and that is what the second round trip used to buy.
+    #[test]
+    fn an_image_check_of_a_crop_is_that_crop() {
+        let clock = StepClock::new();
+        let gate = idle_check_gate(&clock);
+        let screen = ScriptedScreen::new(&clock, &[10, 10, 10], 0);
+        let mut worker = screen_worker(&gate, &screen);
+
+        let zoomed = viewed(
+            &mut worker,
+            &gate,
+            10,
+            crop_region(100.0, 60.0, 120.0, 90.0),
+        )
+        .expect("a crop to act in");
+        let request = checking("left_click", wire::Check::Image);
+
+        let payload = post(
+            &request,
+            Some(check_display()),
+            &gate,
+            &mut worker,
+            Acted {
+                named: Some(&zoomed),
+                executed: Some((150, 90)),
+                element: None,
+            },
+        )
+        .expect("a check image");
+
+        assert_eq!(payload["mime"], json!("image/jpeg"), "a crop is compressed");
+        assert_eq!(
+            payload["region"],
+            json!({ "x": 100, "y": 60, "w": 120, "h": 90 }),
+            "the rectangle the action was aimed in, mapped through its own transform"
+        );
+        assert_eq!(payload["width"], json!(120));
+    }
+
+    // `changed` is evidence about the VIEW: did what the model looked at move on
+    // since the image it acted on. Never a verdict on the action.
+    #[test]
+    fn a_check_says_whether_the_view_changed_since_the_image_acted_on() {
+        for (after, changed) in [(10, false), (200, true)] {
+            let clock = StepClock::new();
+            let gate = idle_check_gate(&clock);
+            let screen = ScriptedScreen::new(&clock, &[after, after], 0);
+            let mut worker = screen_worker(&gate, &screen);
+
+            let geom = check_geometry();
+            let acted_in =
+                viewed(&mut worker, &gate, 10, Region::full(&geom)).expect("an image to act in");
+            let request = checking("left_click", wire::Check::Image);
+
+            let payload = post(
+                &request,
+                Some(check_display()),
+                &gate,
+                &mut worker,
+                Acted {
+                    named: Some(&acted_in),
+                    executed: Some((10, 10)),
+                    element: None,
+                },
+            )
+            .expect("a check image");
+
+            // The whole of a full-display image, mapped back through its own
+            // transform, IS that display — so the check of an unzoomed action is
+            // the display, losslessly. A rectangle that crept even a pixel here
+            // would compress it as a crop and drift over a run of checks.
+            assert_eq!(payload["mime"], json!("image/png"));
+            assert_eq!(
+                payload["region"],
+                json!({ "x": 0, "y": 0, "w": CHECK_DISPLAY_W, "h": CHECK_DISPLAY_H })
+            );
+
+            let checked = gate.finish().check.expect("a check that ran");
+            assert_eq!(checked.changed, Some(changed), "shade {after}");
+        }
+    }
+
+    // A listing has no picture. Answering `false` there would claim the view had
+    // not moved on evidence nobody has, so the field is absent instead.
+    #[test]
+    fn a_view_read_from_a_listing_claims_nothing_about_changing() {
+        let clock = StepClock::new();
+        let gate = idle_check_gate(&clock);
+        let screen = ScriptedScreen::new(&clock, &[10, 10], 0);
+        let app = fixture_app();
+        let (mut worker, listing) = worker_listing(&gate, &app);
+        worker.frames = screen.clone();
+        let display = check_display();
+        let measured =
+            geometry::measure(&display.facts, CHECK_DISPLAY_W, CHECK_DISPLAY_H, Host::HERE)
+                .expect("a one-to-one frame");
+        worker
+            .measured
+            .remember(display.id, &display.facts, measured);
+
+        assert_eq!(listing.view_hash, None, "a listing keeps no hash");
+
+        let request = checking("press", wire::Check::Image);
+        post(
+            &request,
+            Some(display),
+            &gate,
+            &mut worker,
+            Acted {
+                named: Some(&listing),
+                executed: None,
+                element: None,
+            },
+        )
+        .expect("a check image over the rectangle the listing was read in");
+
+        let checked = gate.finish().check.expect("a check that ran");
+        assert_eq!(checked.changed, None);
+    }
+
+    // The receipt alone. Still said, because "no evidence was asked for" and "the
+    // evidence could not be obtained" are different answers.
+    #[test]
+    fn a_check_of_none_is_the_receipt_alone_and_still_says_so() {
+        let clock = StepClock::new();
+        let gate = idle_check_gate(&clock);
+        let screen = ScriptedScreen::new(&clock, &[10], 0);
+        let mut worker = screen_worker(&gate, &screen);
+        let request = checking("type", wire::Check::None);
+
+        let payload = post(
+            &request,
+            Some(check_display()),
+            &gate,
+            &mut worker,
+            nothing_named(),
+        )
+        .expect("a receipt-only action");
+
+        assert_eq!(payload, json!({ "ok": true }));
+        assert_eq!(screen.taken(), 0, "nothing was captured");
+
+        let done = gate.finish();
+        let checked = done.check.expect("a mutating success always says which");
+        assert_eq!(checked.kind, wire::Check::None);
+        assert_eq!(checked.settle, None);
+
+        let receipt = receipt(&request, &done, None).expect("a mutation earns one");
+        assert_eq!(
+            receipt.effect,
+            wire::Effect::Unknown,
+            "nothing was observed"
+        );
+    }
+
+    // A semantic check is the control read again — never a capture, and never a
+    // secure field's value, which is not read back anywhere in this build.
+    #[test]
+    fn a_semantic_check_reads_the_control_again_and_never_a_secure_value() {
+        let clock = StepClock::new();
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        let app = ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                ax::Scripted::field("Name", "ada", frame_at(100.0, 200.0)),
+                ax::Scripted::secure_field("Password", "hunter2", frame_at(100.0, 260.0)),
+            ],
+        );
+        let (mut worker, listing) = worker_listing(&gate, &app);
+        let screen = ScriptedScreen::new(&clock, &[10], 0);
+        worker.frames = screen.clone();
+
+        for (reference, expected) in [("e1", Some("ada")), ("e2", None)] {
+            let mut request = at_element("set_value", &listing, reference);
+            request.check = wire::Check::Semantic;
+            gate.admit(&request).expect("a fresh sequence");
+
+            let entry = element_in(&listing, &request).expect("a listed control");
+            let payload = post(
+                &request,
+                None,
+                &gate,
+                &mut worker,
+                Acted {
+                    named: Some(&listing),
+                    executed: None,
+                    element: Some(entry),
+                },
+            )
+            .expect("a semantic check");
+
+            let after = &payload["element_after"];
+            assert_eq!(after["present"], json!(true));
+            assert_eq!(after["role"], json!("AXTextField"));
+            assert_eq!(after["enabled"], json!(true));
+            // Which control was re-read, in the control's own words — so a consumer
+            // can say so without keeping a copy of the listing. A secure field has
+            // a label like any other: what it CALLS itself is not what it holds.
+            assert_eq!(
+                after["label"],
+                json!(if reference == "e1" {
+                    "Name"
+                } else {
+                    "Password"
+                })
+            );
+            assert_eq!(
+                after.get("value").and_then(Value::as_str),
+                expected,
+                "{reference}: a secure field's value is never read back"
+            );
+
+            let checked = gate.finish().check.expect("a check that ran");
+            assert_eq!(checked.kind, wire::Check::Semantic);
+            assert_eq!(checked.settle, None, "nothing was watched");
+        }
+
+        assert_eq!(screen.taken(), 0, "a semantic check captures nothing");
+    }
+
+    // A control that no longer answers at all is worth knowing about — a dialog
+    // that closed, a row that went away — and it is not a missing reply.
+    #[test]
+    fn a_semantic_check_of_a_control_that_went_away_says_so() {
+        let clock = StepClock::new();
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        let app = fixture_app();
+        let (mut worker, listing) = worker_listing(&gate, &app);
+        let mut request = at_element("press", &listing, "e1");
+        request.check = wire::Check::Semantic;
+        gate.admit(&request).expect("a fresh sequence");
+        let entry = element_in(&listing, &request).expect("a listed control");
+
+        app.vanish(0);
+
+        let payload = post(
+            &request,
+            None,
+            &gate,
+            &mut worker,
+            Acted {
+                named: Some(&listing),
+                executed: None,
+                element: Some(entry),
+            },
+        )
+        .expect("a semantic check of a control that is gone");
+
+        // Nothing but `present`: a control that does not answer its role does not
+        // answer its label either, and inventing one from a stale listing would be
+        // this build saying a control is there when it is not.
+        assert_eq!(payload["element_after"], json!({ "present": false }));
+    }
+
+    // The wait returns what satisfied it. It used to hash twice and then capture a
+    // THIRD frame, which could show something else again.
+    #[test]
+    fn a_wait_returns_the_frame_whose_hash_differed_and_takes_no_third_look() {
+        let clock = StepClock::new();
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        let screen = ScriptedScreen::new(&clock, &[10, 10, 200, 90], 0);
+        let mut worker = screen_worker(&gate, &screen);
+
+        let mut request = running("wait_for_change", None);
+        request.observation_id = None;
+        request.body = json!({ "action": "wait_for_change", "poll_ms": 50 });
+        gate.admit(&request).expect("read-only, always admitted");
+
+        let payload = wait_for_change_on(&check_display(), &request, &gate, &mut worker)
+            .expect("a view that changed");
+
+        assert_eq!(payload["changed"], json!(true));
+        assert_eq!(
+            screen.taken(),
+            3,
+            "the baseline, one look, and the one that differed"
+        );
+        assert_eq!(shade_of(&payload), 200, "the frame that satisfied the wait");
+    }
+
+    // A wait that times out returns its LAST sample, for the same reason: it is the
+    // frame the answer is about.
+    #[test]
+    fn a_wait_that_times_out_returns_its_last_sample() {
+        let clock = StepClock::new();
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        let screen = ScriptedScreen::new(&clock, &[10], 0);
+        let mut worker = screen_worker(&gate, &screen);
+
+        let mut request = running("wait_for_change", None);
+        request.observation_id = None;
+        request.body = json!({ "action": "wait_for_change", "poll_ms": 50, "timeout_ms": 1 });
+        gate.admit(&request).expect("read-only, always admitted");
+
+        let payload = wait_for_change_on(&check_display(), &request, &gate, &mut worker)
+            .expect("a view that never changed");
+
+        assert_eq!(payload["changed"], json!(false));
+        assert_eq!(shade_of(&payload), 10);
+    }
+
+    // The baseline is the hash kept with the image the caller named, so the wait is
+    // about the view that caller saw rather than about one taken after the fact.
+    #[test]
+    fn a_wait_compares_against_the_image_the_caller_named() {
+        let clock = StepClock::new();
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        let screen = ScriptedScreen::new(&clock, &[200], 0);
+        let mut worker = screen_worker(&gate, &screen);
+
+        let geom = check_geometry();
+        let seen = viewed(&mut worker, &gate, 10, Region::full(&geom)).expect("an image");
+        let took = screen.taken();
+
+        let mut request = running("wait_for_change", None);
+        request.observation_id = Some(seen.id.clone());
+        request.body = json!({
+            "action": "wait_for_change",
+            "observation_id": seen.id,
+            "region": { "x": 0, "y": 0, "w": CHECK_DISPLAY_W, "h": CHECK_DISPLAY_H },
+            "poll_ms": 50
+        });
+        gate.admit(&request).expect("read-only, always admitted");
+
+        let payload = wait_for_change_on(&check_display(), &request, &gate, &mut worker)
+            .expect("a view that changed");
+
+        assert_eq!(payload["changed"], json!(true));
+        assert_eq!(
+            screen.taken() - took,
+            1,
+            "the remembered hash is the baseline: one look answered the wait"
+        );
+    }
+
+    // The equality test the whole settle rests on. A hash that missed a one-pixel
+    // change would tell a settle the view had stopped moving while it had not, and
+    // would leave `wait_for_change` polling to its full timeout.
+    #[test]
+    fn one_pixel_flips_the_hash_and_an_identical_frame_does_not() {
+        let geom = check_geometry();
+        let crop = crop_rect(&geom, &Region::full(&geom));
+
+        let frame = shaded(10);
+        assert_eq!(
+            view_hash(&frame, &crop),
+            view_hash(&shaded(10), &crop),
+            "the same pixels are the same view"
+        );
+
+        let mut nudged = frame.clone();
+        nudged.put_pixel(
+            CHECK_DISPLAY_W - 1,
+            CHECK_DISPLAY_H - 1,
+            image::Rgba([10, 10, 11, 255]),
+        );
+        assert_ne!(
+            view_hash(&frame, &crop).pixels,
+            view_hash(&nudged, &crop).pixels,
+            "one pixel, one channel, at the far corner"
+        );
+    }
+
+    // Only the rows of the rectangle are read, so what is outside it cannot move
+    // the hash — which is what makes a crop's hash about that crop.
+    #[test]
+    fn a_hash_reads_its_own_rectangle_and_nothing_around_it() {
+        let geom = check_geometry();
+        let crop = crop_rect(&geom, &crop_region(100.0, 60.0, 120.0, 90.0));
+
+        let frame = shaded(10);
+        let mut outside = frame.clone();
+        outside.put_pixel(5, 5, image::Rgba([200, 200, 200, 255]));
+        assert_eq!(
+            view_hash(&frame, &crop),
+            view_hash(&outside, &crop),
+            "a pixel outside the rectangle is not part of this view"
+        );
+
+        let mut inside = frame.clone();
+        inside.put_pixel(150, 90, image::Rgba([200, 200, 200, 255]));
+        assert_ne!(
+            view_hash(&frame, &crop).pixels,
+            view_hash(&inside, &crop).pixels
+        );
+    }
+
+    // Two hashes of DIFFERENT rectangles are not two readings of one view. Calling
+    // them different would publish `changed: true` to a caller whose view nobody
+    // looked at twice, so the answer is that there is no answer.
+    #[test]
+    fn hashes_of_different_rectangles_are_not_comparable() {
+        let geom = check_geometry();
+        let frame = shaded(10);
+
+        let whole = view_hash(&frame, &crop_rect(&geom, &Region::full(&geom)));
+        let part = view_hash(
+            &frame,
+            &crop_rect(&geom, &crop_region(0.0, 0.0, 120.0, 90.0)),
+        );
+
+        assert_eq!(part.changed_from(&whole), None, "different rectangles");
+        assert_eq!(
+            whole.changed_from(&whole),
+            Some(false),
+            "the same view, twice"
+        );
+
+        // The same rectangle read out of a frame of another SIZE is not comparable
+        // either: the numbers mean something different in each.
+        let larger = image::RgbaImage::from_pixel(
+            CHECK_DISPLAY_W * 2,
+            CHECK_DISPLAY_H * 2,
+            image::Rgba([10, 10, 10, 255]),
+        );
+        let rescaled = view_hash(&larger, &crop_rect(&geom, &Region::full(&geom)));
+        assert_eq!(rescaled.changed_from(&whole), None, "another frame size");
+    }
+
+    // The measurement that decided the shape of `view_hash`, kept runnable so
+    // anyone can re-take it: `cargo test the_hash_costs -- --nocapture`.
+    //
+    // The first version hashed a 256x256 Triangle downscale of the crop, on the
+    // theory that an averaged thumbnail was more tolerant. It is not — a hash is an
+    // equality test, and a one-pixel change perturbs an averaged cell exactly as it
+    // perturbs a pixel — so the resize only added time, and on a real panel it
+    // added more than the capture it was waiting on.
+    #[test]
+    fn the_hash_costs_less_than_the_resize_it_replaced() {
+        // Noisy, not one flat colour: a real screen is, and a flat frame flatters
+        // both sides for the wrong reason (a resize of it is unnaturally
+        // cache-friendly). A cheap deterministic pattern, so the number is stable.
+        let mut panel = image::RgbaImage::new(3840, 1080);
+        let mut seed: u32 = 0x1234_5678;
+        for pixel in panel.pixels_mut() {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let [r, g, b, _] = seed.to_le_bytes();
+            *pixel = image::Rgba([r, g, b, 255]);
+        }
+
+        let crop = geometry::CropRect {
+            left_phys: 0.0,
+            top_phys: 0.0,
+            w_phys: 3840.0,
+            h_phys: 1080.0,
+        };
+
+        let started = std::time::Instant::now();
+        let hash = view_hash(&panel, &crop);
+        let rows_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        // The old path, whole: it COPIED the crop out of the frame and then resized
+        // that copy, so the copy of a full-display crop — 16 MB on this panel — is
+        // part of what went away.
+        let started = std::time::Instant::now();
+        let copied = crop_out(&panel, &crop);
+        let thumb =
+            image::imageops::resize(&copied, 256, 256, image::imageops::FilterType::Triangle);
+        let mut old = DefaultHasher::new();
+        old.write(thumb.as_raw());
+        let thumbnail_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        println!(
+            "3840x1080: raw rows in place {rows_ms:.1} ms, the copy-and-thumbnail it replaced \
+             {thumbnail_ms:.1} ms (hash {})",
+            old.finish()
+        );
+
+        // The measurement is the point, but the test still has to test something:
+        // the hash it produces is the one a settle will compare.
+        assert_eq!(hash.frame, (3840, 1080));
+        assert_eq!(hash.rect, (0, 0, 3840, 1080));
+    }
+
+    // What the owner's live run reads: four phases, measured on the one clock, with
+    // every frame grabbed counted as what it is.
+    #[test]
+    fn every_phase_of_a_check_is_measured() {
+        let clock = StepClock::new();
+        let gate = idle_check_gate(&clock);
+        let screen = ScriptedScreen::new(&clock, &[10, 20, 20], 7);
+        let mut worker = screen_worker(&gate, &screen);
+        let request = checking("type", wire::Check::Image);
+
+        gate.dispatch(Phase::Input, || clock.advance(3))
+            .expect("input posted");
+        gate.input_complete();
+
+        post(
+            &request,
+            Some(check_display()),
+            &gate,
+            &mut worker,
+            nothing_named(),
+        )
+        .expect("a check image");
+
+        let timings = gate.finish().timings;
+        assert_eq!(timings.input_ms, 3, "the dispatch itself");
+        assert_eq!(
+            timings.capture_ms,
+            3 * 7,
+            "every look, the settle's included"
+        );
+        assert_eq!(
+            timings.settle_ms,
+            2 * (SETTLE_POLL_MS - 7),
+            "two gaps, each the floor MINUS what the capture before it already took"
+        );
+    }
+
+    // The floor is between LOOKS. A capture that took longer than it has already
+    // provided the gap, and sleeping the full poll on top would be this process
+    // adding delay to the check it exists to shorten.
+    #[test]
+    fn a_slow_look_is_not_slept_on_top_of() {
+        for (cost, expected) in [(0, SETTLE_POLL_MS), (400, SETTLE_MIN_POLL_MS)] {
+            let clock = StepClock::new();
+            let gate = idle_check_gate(&clock);
+            gate.input_complete();
+            let screen = ScriptedScreen::new(&clock, &[10, 20, 20], cost);
+            let mut worker = screen_worker(&gate, &screen);
+
+            post(
+                &checking("type", wire::Check::Image),
+                Some(check_display()),
+                &gate,
+                &mut worker,
+                nothing_named(),
+            )
+            .expect("a check image");
+
+            assert_eq!(screen.taken(), 3, "cost {cost}");
+            assert_eq!(
+                gate.finish().timings.settle_ms,
+                2 * expected,
+                "cost {cost}: two gaps"
+            );
+        }
+    }
+
+    // THE hole two equal samples alone leave: the first look happens the instant the
+    // input is complete, so an application that starts repainting a poll later would
+    // hand back two identical samples of the view as it was BEFORE the action —
+    // `stable`, `changed: false`, and the misleading check this slice removes.
+    #[test]
+    fn a_repaint_that_starts_late_is_still_the_frame_that_comes_back() {
+        let clock = StepClock::new();
+        let gate = idle_check_gate(&clock);
+        gate.input_complete();
+        // Two looks at the view as it was, then the repaint.
+        let screen = ScriptedScreen::new(&clock, &[10, 10, 200, 200], 0);
+        let mut worker = screen_worker(&gate, &screen);
+
+        let geom = check_geometry();
+        let acted_in = viewed(&mut worker, &gate, 10, Region::full(&geom)).expect("an image");
+
+        let payload = post(
+            &checking("left_click", wire::Check::Image),
+            Some(check_display()),
+            &gate,
+            &mut worker,
+            Acted {
+                named: Some(&acted_in),
+                executed: Some((10, 10)),
+                element: None,
+            },
+        )
+        .expect("a check image");
+
+        assert_eq!(
+            shade_of(&payload),
+            200,
+            "the repainted view, not the old one"
+        );
+        assert_eq!(screen.taken(), 4);
+
+        let checked = gate.finish().check.expect("a check that ran");
+        assert_eq!(checked.settle, Some(wire::Settle::Stable));
+        assert_eq!(checked.changed, Some(true));
+    }
+
+    // Once a change HAS been seen, two equal looks settle it at once: an action
+    // whose effect is immediate pays nothing for the window above.
+    #[test]
+    fn a_change_already_seen_settles_without_waiting_out_the_quiet_window() {
+        let clock = StepClock::new();
+        let gate = idle_check_gate(&clock);
+        gate.input_complete();
+        let screen = ScriptedScreen::new(&clock, &[200, 200], 0);
+        let mut worker = screen_worker(&gate, &screen);
+
+        let geom = check_geometry();
+        let acted_in = viewed(&mut worker, &gate, 10, Region::full(&geom)).expect("an image");
+
+        post(
+            &checking("left_click", wire::Check::Image),
+            Some(check_display()),
+            &gate,
+            &mut worker,
+            Acted {
+                named: Some(&acted_in),
+                executed: Some((10, 10)),
+                element: None,
+            },
+        )
+        .expect("a check image");
+
+        assert_eq!(screen.taken(), 2, "the first look already differed");
+        assert!(
+            gate.now_ms() < SETTLE_QUIET_MS,
+            "it did not wait out the window: {} ms",
+            gate.now_ms()
+        );
+        assert_eq!(
+            gate.finish().check.expect("a check").settle,
+            Some(wire::Settle::Stable)
+        );
+    }
+
+    // And an action that really changes nothing pays the window, once — which is
+    // the price of the case above being trustworthy.
+    #[test]
+    fn a_view_that_never_changes_is_quiet_before_it_is_called_stable() {
+        let clock = StepClock::new();
+        let gate = idle_check_gate(&clock);
+        gate.input_complete();
+        let screen = ScriptedScreen::new(&clock, &[10, 10, 10, 10, 10, 10, 10, 10], 0);
+        let mut worker = screen_worker(&gate, &screen);
+
+        let geom = check_geometry();
+        let acted_in = viewed(&mut worker, &gate, 10, Region::full(&geom)).expect("an image");
+
+        post(
+            &checking("left_click", wire::Check::Image),
+            Some(check_display()),
+            &gate,
+            &mut worker,
+            Acted {
+                named: Some(&acted_in),
+                executed: Some((10, 10)),
+                element: None,
+            },
+        )
+        .expect("a check image");
+
+        assert!(
+            gate.now_ms() >= SETTLE_QUIET_MS,
+            "stable was not claimed before the window: {} ms",
+            gate.now_ms()
+        );
+
+        let checked = gate.finish().check.expect("a check that ran");
+        assert_eq!(checked.settle, Some(wire::Settle::Stable));
+        assert_eq!(
+            checked.changed,
+            Some(false),
+            "nothing moved, and it says so"
+        );
+    }
+
+    // Fermix reads "an image check was asked for, `dispatch` says `sent`, and the
+    // receipt carries no check" as "the evidence could not be obtained". That holds
+    // only while the check is the LAST thing an action does: a fallible step added
+    // between the latch and it would produce those same three facts for another
+    // reason. This reads the source, so such a step fails here rather than in a
+    // consumer's sentence.
+    #[test]
+    fn nothing_fallible_comes_between_the_latch_and_the_check() {
+        // The production half only: this test's own text names the latch too.
+        let source = include_str!("main.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("a production half");
+
+        // The accessibility actions report their own outcome, with their own error
+        // code, before the check. They are the only `?` allowed after the latch.
+        const ALLOWED: [&str; 1] = ["outcome.map_err(ax_failure)?;"];
+
+        let latch = concat!("gate.input_", "complete();");
+        let tails: Vec<&str> = source.split(latch).skip(1).collect();
+        assert_eq!(
+            tails.len(),
+            9,
+            "every action that dispatches input latches exactly once"
+        );
+
+        let mut allowed_seen = 0;
+        for tail in tails {
+            let body = tail
+                .split("\n}\n")
+                .next()
+                .expect("the rest of the function");
+            assert!(
+                body.contains("post(") || body.contains("read-only"),
+                "the check is what follows the latch: {body}"
+            );
+
+            // The check itself is fallible, and is what all of this is about.
+            for line in body
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.contains('?') && !line.contains("post("))
+            {
+                assert!(
+                    ALLOWED.contains(&line),
+                    "a fallible step between the latch and the check: {line}"
+                );
+                allowed_seen += 1;
+            }
+        }
+
+        assert_eq!(
+            allowed_seen,
+            ALLOWED.len() * 2,
+            "press and set_value, and nothing else, report an accessibility outcome"
+        );
+    }
+
+    // A clock that jumped must not put an absurd number on the wire.
+    #[test]
+    fn a_phase_is_clamped_to_a_ceiling_no_honest_action_reaches() {
+        let clock = StepClock::new();
+        let gate = idle_check_gate(&clock);
+
+        gate.record(Phase::Capture, u64::MAX);
+        gate.record(Phase::Capture, 5);
+
+        assert_eq!(gate.finish().timings.capture_ms, wire::MAX_TIMING_MS);
+    }
 }
