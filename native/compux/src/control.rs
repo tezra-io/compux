@@ -123,7 +123,8 @@ fn busy_frame(gate: &Gate, request: &Request) -> Value {
         &request.request_id,
         "busy",
         Some("another action is already running".to_string()),
-        refusal_receipt(&request.action),
+        refusal_receipt(&request.action)
+            .map(|receipt| receipt.addressing(request.observation_id.clone(), None)),
     )
 }
 
@@ -227,8 +228,10 @@ mod tests {
     #[test]
     fn a_second_request_is_refused_busy_with_a_receipt() {
         let (emitter, jobs, _) = drive(
-            "{\"type\":\"request\",\"request_id\":\"r1\",\"action\":\"left_click\",\"mutation_seq\":1}\n\
-             {\"type\":\"request\",\"request_id\":\"r2\",\"action\":\"left_click\",\"mutation_seq\":2}\n",
+            "{\"type\":\"request\",\"request_id\":\"r1\",\"action\":\"left_click\",\
+             \"observation_id\":\"7c1e-1\",\"mutation_seq\":1}\n\
+             {\"type\":\"request\",\"request_id\":\"r2\",\"action\":\"left_click\",\
+             \"observation_id\":\"7c1e-1\",\"mutation_seq\":2}\n",
         );
 
         assert_eq!(jobs.len(), 1, "only one fits the channel");
@@ -254,13 +257,15 @@ mod tests {
             session_generation: Some(1),
             authorization_generation: Some(1),
             mutation_seq: Some(1),
+            observation_id: Some("7c1e-1".to_string()),
         };
         gate.admit(&running).unwrap();
 
         let emitter = Emitter::capturing();
         let (tx, rx) = sync_channel(1); // the slot is EMPTY
         run(
-            "{\"type\":\"request\",\"request_id\":\"r2\",\"action\":\"left_click\",\"mutation_seq\":2}\n"
+            "{\"type\":\"request\",\"request_id\":\"r2\",\"action\":\"left_click\",\
+             \"observation_id\":\"7c1e-1\",\"mutation_seq\":2}\n"
                 .as_bytes(),
             &gate,
             &emitter,
@@ -280,7 +285,8 @@ mod tests {
     #[test]
     fn a_reserved_slice_three_field_is_refused_against_its_own_request_id() {
         let (emitter, jobs, _) = drive(
-            "{\"type\":\"request\",\"request_id\":\"r1\",\"action\":\"left_click\",\"target_id\":\"t1\"}\n",
+            "{\"type\":\"request\",\"request_id\":\"r1\",\"action\":\"left_click\",\
+             \"observation_id\":\"7c1e-1\",\"target_id\":\"t1\"}\n",
         );
 
         assert!(jobs.is_empty(), "it must never reach the worker");
@@ -288,6 +294,39 @@ mod tests {
         assert_eq!(frames[0]["request_id"], json!("r1"));
         assert_eq!(frames[0]["error"], json!("unknown_field"));
         assert_eq!(frames[0]["receipt"]["dispatch"], json!("not_sent"));
+    }
+
+    // A coordinate whose image is not named cannot be acted on safely, so it is
+    // refused HERE and never reaches the worker: no action downstream has to
+    // remember to check, and the caller is told nothing was sent.
+    #[test]
+    fn a_click_that_names_no_image_is_refused_before_the_worker_sees_it() {
+        let (emitter, jobs, _) = drive(
+            "{\"type\":\"request\",\"request_id\":\"r1\",\"action\":\"left_click\",\
+             \"x\":4,\"y\":9,\"mutation_seq\":1}\n",
+        );
+
+        assert!(jobs.is_empty(), "it must never reach the worker");
+        let frames = emitter.captured();
+        assert_eq!(frames[0]["request_id"], json!("r1"));
+        assert_eq!(frames[0]["error"], json!("observation_required"));
+        assert_eq!(frames[0]["receipt"]["dispatch"], json!("not_sent"));
+    }
+
+    // The same for a rectangle on a click: it is the shape this protocol replaced,
+    // and a caller still sending one learns that rather than having it ignored.
+    #[test]
+    fn a_region_on_a_click_is_refused_before_the_worker_sees_it() {
+        let (emitter, jobs, _) = drive(
+            "{\"type\":\"request\",\"request_id\":\"r1\",\"action\":\"left_click\",\
+             \"x\":4,\"y\":9,\"observation_id\":\"7c1e-1\",\
+             \"region\":{\"x\":0,\"y\":0,\"w\":10,\"h\":10},\"mutation_seq\":1}\n",
+        );
+
+        assert!(jobs.is_empty());
+        let frames = emitter.captured();
+        assert_eq!(frames[0]["error"], json!("unknown_field"));
+        assert!(frames[0]["detail"].as_str().unwrap().contains("region"));
     }
 
     // A protocol-6 line: refused, never served, in the ack family its sender reads
@@ -343,6 +382,10 @@ mod tests {
             0
         }
 
+        fn now_ns(&self) -> u128 {
+            0
+        }
+
         fn sleep(&self, ms: u64) {
             std::thread::sleep(std::time::Duration::from_millis(ms));
         }
@@ -363,6 +406,7 @@ mod tests {
             session_generation: Some(1),
             authorization_generation: Some(1),
             mutation_seq: None,
+            observation_id: None,
         };
         gate.admit(&request).unwrap();
 

@@ -68,7 +68,7 @@ defmodule Compux.TransportTest do
       transport = start!()
 
       assert {:ok, %{"ok" => true, "pong" => true}} =
-               Transport.request(transport, %{"action" => "screenshot"}, 2_000)
+               Transport.request(transport, %{"action" => "ping"}, 2_000)
 
       Transport.stop(transport)
     end
@@ -97,7 +97,7 @@ defmodule Compux.TransportTest do
       assert {:ok, first} = Transport.request(transport, %{"action" => "echo"}, 2_000)
       assert first["seen_mutation_seq"] == 1
 
-      assert {:ok, shot} = Transport.request(transport, %{"action" => "screenshot"}, 2_000)
+      assert {:ok, shot} = Transport.request(transport, %{"action" => "windows"}, 2_000)
       assert shot["seen_mutation_seq"] == nil
 
       assert {:ok, second} = Transport.request(transport, %{"action" => "echo"}, 2_000)
@@ -152,7 +152,7 @@ defmodule Compux.TransportTest do
       assert receipt["input_method"] == "foreground_hid"
       assert receipt["effect"] == "unknown", "nothing was captured, so nothing was observed"
 
-      assert {:ok, read} = Transport.request(transport, %{"action" => "screenshot"}, 2_000)
+      assert {:ok, read} = Transport.request(transport, %{"action" => "windows"}, 2_000)
       refute Map.has_key?(read, "receipt")
 
       Transport.stop(transport)
@@ -201,7 +201,7 @@ defmodule Compux.TransportTest do
                Transport.request(transport, %{"action" => "boom"}, 2_000)
 
       assert {:error, :sidecar_unavailable} =
-               Transport.request(transport, %{"action" => "screenshot"}, 2_000)
+               Transport.request(transport, %{"action" => "ping"}, 2_000)
 
       Transport.stop(transport)
     end
@@ -215,7 +215,7 @@ defmodule Compux.TransportTest do
       assert_receive {:compux_session_event, ^transport, %SessionEvent{kind: "request_deferred"}},
                      2_000
 
-      assert {:error, :busy} = Transport.request(transport, %{"action" => "screenshot"}, 1_000)
+      assert {:error, :busy} = Transport.request(transport, %{"action" => "ping"}, 1_000)
 
       Transport.control(transport, :pause, 2_000)
       Task.await(task, 5_000)
@@ -271,7 +271,7 @@ defmodule Compux.TransportTest do
       assert {:error, :control_unconfirmed} = Transport.control(transport, :pause, 200)
 
       assert {:error, :sidecar_unavailable} =
-               Transport.request(transport, %{"action" => "screenshot"}, 1_000)
+               Transport.request(transport, %{"action" => "ping"}, 1_000)
 
       Transport.stop(transport)
     end
@@ -384,7 +384,7 @@ defmodule Compux.TransportTest do
                Transport.request(transport, %{"action" => "unknown_id"}, 2_000)
 
       assert {:error, :sidecar_unavailable} =
-               Transport.request(transport, %{"action" => "screenshot"}, 1_000)
+               Transport.request(transport, %{"action" => "ping"}, 1_000)
 
       Transport.stop(transport)
     end
@@ -398,7 +398,7 @@ defmodule Compux.TransportTest do
                Transport.request(transport, %{"action" => "future_id"}, 2_000)
 
       assert {:error, :sidecar_unavailable} =
-               Transport.request(transport, %{"action" => "screenshot"}, 1_000)
+               Transport.request(transport, %{"action" => "ping"}, 1_000)
 
       Transport.stop(transport)
     end
@@ -473,7 +473,7 @@ defmodule Compux.TransportTest do
       assert {:error, {:timeout, 150}} =
                Transport.request(transport, %{"action" => "late"}, 150)
 
-      assert {:ok, response} = Transport.request(transport, %{"action" => "screenshot"}, 3_000)
+      assert {:ok, response} = Transport.request(transport, %{"action" => "ping"}, 3_000)
       assert response["pong"] == true
       refute Map.has_key?(response, "late")
 
@@ -497,7 +497,7 @@ defmodule Compux.TransportTest do
       assert flushed["flushed"] == true
       refute Map.has_key?(flushed, "stale")
 
-      assert {:ok, response} = Transport.request(transport, %{"action" => "screenshot"}, 3_000)
+      assert {:ok, response} = Transport.request(transport, %{"action" => "ping"}, 3_000)
       assert response["pong"] == true
 
       Transport.stop(transport)

@@ -49,10 +49,10 @@ defmodule Compux.FrameTest do
           request_id: "r1",
           args: %{"action" => "hello"},
           deadline_ms: 10_000,
-          protocol_version: 7
+          protocol_version: 8
         })
 
-      assert map["protocol_version"] == 7
+      assert map["protocol_version"] == 8
       refute Map.has_key?(map, "sidecar_generation")
       refute Map.has_key?(map, "session_generation")
       refute Map.has_key?(map, "authorization_generation")
@@ -173,12 +173,12 @@ defmodule Compux.FrameTest do
     test "a hello response keeps its protocol version and capabilities" do
       frame =
         decoded(
-          ~s({"type":"response","request_id":"r1","ok":true,"protocol_version":7,) <>
+          ~s({"type":"response","request_id":"r1","ok":true,"protocol_version":8,) <>
             ~s("sidecar_generation":"boot-a","compux_version":"0.9.2",) <>
             ~s("capabilities":{"controls":["pause"]}})
         )
 
-      assert frame.payload["protocol_version"] == 7
+      assert frame.payload["protocol_version"] == 8
       assert frame.payload["capabilities"] == %{"controls" => ["pause"]}
       refute Map.has_key?(frame.payload, "sidecar_generation")
       assert frame.sidecar_generation == "boot-a"
@@ -241,7 +241,7 @@ defmodule Compux.FrameTest do
     # them by family rather than have one stand in for a reply.
     test "computer-history ack and event decode as history, never as a response" do
       assert %History{type: "ack"} =
-               decoded(~s({"type":"ack","action":"observe_start","ok":true,"protocol_version":7}))
+               decoded(~s({"type":"ack","action":"observe_start","ok":true,"protocol_version":8}))
 
       assert %History{type: "event"} =
                decoded(~s({"type":"event","v":1,"ts":1,"seq":4,"kind":"observer.gap"}))
@@ -319,7 +319,7 @@ defmodule Compux.FrameTest do
     end
 
     test "the ack decodes as history, verbatim, envelope included" do
-      frame = decoded(~s({"type":"ack","action":"observe_start","ok":true,"protocol_version":7}))
+      frame = decoded(~s({"type":"ack","action":"observe_start","ok":true,"protocol_version":8}))
 
       assert %History{type: "ack"} = frame
 
@@ -327,7 +327,7 @@ defmodule Compux.FrameTest do
                "type" => "ack",
                "action" => "observe_start",
                "ok" => true,
-               "protocol_version" => 7
+               "protocol_version" => 8
              }
     end
 
@@ -336,7 +336,7 @@ defmodule Compux.FrameTest do
     test "a refused ack keeps its family and carries the reason" do
       frame =
         decoded(
-          ~s({"type":"ack","action":"observe_start","ok":false,"protocol_version":7,) <>
+          ~s({"type":"ack","action":"observe_start","ok":false,"protocol_version":8,) <>
             ~s("error":"screen recording permission is required"})
         )
 

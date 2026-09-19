@@ -71,7 +71,7 @@ defmodule Compux.PortDriverTest do
       {:ok, state} = PortDriver.start(binary_path: @fake)
 
       assert {:ok, %{"ok" => true, "pong" => true}} =
-               PortDriver.execute(state, %{"action" => "screenshot"})
+               PortDriver.execute(state, %{"action" => "ping"})
 
       assert :ok = PortDriver.stop(state)
     end
@@ -99,7 +99,7 @@ defmodule Compux.PortDriverTest do
       assert :ok = PortDriver.stop(state)
 
       assert {:error, :sidecar_unavailable} =
-               PortDriver.execute(state, %{"action" => "screenshot"})
+               PortDriver.execute(state, %{"action" => "ping"})
     end
   end
 

@@ -1,4 +1,4 @@
-//! The protocol-7 frames, as types. Pure: it neither reads nor writes a pipe.
+//! The protocol-8 frames, as types. Pure: it neither reads nor writes a pipe.
 //!
 //! Every line of the ACTION wire is one JSON object carrying a `type`. A request
 //! carries a `request_id` its response echoes, and — after the handshake — the
@@ -9,7 +9,7 @@
 //! ## Two rails, one framing, two reply families
 //!
 //! Computer history is a separate client with its own sidecar process and its own
-//! raw Port. Under protocol 7 it sends the SAME tagged `request` frames as the
+//! raw Port. Since protocol 7 it sends the SAME tagged `request` frames as the
 //! action wire — `{"type":"request","request_id":"o1","action":"observe_start",…}`
 //! — but it never sends `hello`, so its two requests carry no generations and no
 //! `mutation_seq`, and it reads the `ack` / `event` families, byte for byte as they
@@ -29,9 +29,40 @@
 
 use serde_json::{json, Map, Value};
 
-/// The reserved fields of slice 3. A request carrying one is refused, never
-/// silently run without the targeting it asked for.
-const RESERVED_FIELDS: [&str; 3] = ["observation_id", "target_id", "element_ref"];
+/// The fields reserved for a later slice. A request carrying one is refused, never
+/// silently run without the targeting it asked for. `observation_id` left this list
+/// at protocol 8, where it became the way every coordinate names its image.
+const RESERVED_FIELDS: [&str; 2] = ["target_id", "element_ref"];
+
+/// The actions whose coordinates are pixels in an image the caller was handed.
+/// Each names that image with `observation_id`; none takes a `region`, because the
+/// rectangle belongs to the image, not to the action. Drag names one image for
+/// both of its points.
+const ADDRESSED_ACTIONS: [&str; 7] = [
+    "left_click",
+    "right_click",
+    "double_click",
+    "mouse_move",
+    "left_click_drag",
+    "scroll",
+    "inspect",
+];
+
+/// The actions that PRODUCE coordinates. `region` stays theirs, and an
+/// `observation_id` beside it says which image the rectangle was read in; with
+/// none it is read in a full-display image, which is the space `windows` answers
+/// in. Two spaces, both exact — not a recovery path.
+const VIEWING_ACTIONS: [&str; 3] = ["screenshot", "elements", "wait_for_change"];
+
+/// Does this action address a point in an image it must name?
+pub fn addresses_an_image(action: &str) -> bool {
+    ADDRESSED_ACTIONS.contains(&action)
+}
+
+/// Does this action take an `observation_id` at all?
+pub fn takes_an_observation(action: &str) -> bool {
+    addresses_an_image(action) || VIEWING_ACTIONS.contains(&action)
+}
 
 /// One request line the sidecar will read. The Elixir transport refuses to write
 /// a larger one; this is the same bound on the reading side, so a line neither
@@ -140,6 +171,10 @@ pub struct Request {
     pub session_generation: Option<u64>,
     pub authorization_generation: Option<u64>,
     pub mutation_seq: Option<u64>,
+    /// The image this request's coordinates were read in. Required of the actions
+    /// that address a point, optional on the ones that produce coordinates, refused
+    /// on the rest — all decided in `parse`, so no action function can forget it.
+    pub observation_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -241,7 +276,7 @@ pub fn parse(line: &str) -> Result<Inbound, ParseFailure> {
 /// capturer reads the version integer in that ack and reports the mismatch
 /// against this sidecar, rather than waiting out a handshake nothing will answer.
 fn untagged(value: &Value) -> ParseFailure {
-    let detail = "protocol 7 needs a tagged frame; this line has no type".to_string();
+    let detail = "this wire needs a tagged frame; this line has no type".to_string();
 
     match value.get("action").and_then(Value::as_str) {
         Some(action) => ParseFailure {
@@ -276,9 +311,22 @@ fn parse_request(value: &Value) -> Result<Inbound, ParseFailure> {
         });
     }
 
+    let observation_id = match addressing(value, &action) {
+        Ok(id) => id,
+        Err((error, detail)) => {
+            return Err(ParseFailure {
+                error,
+                detail,
+                reply: Reply::Response(request_id),
+                action: Some(action),
+            })
+        }
+    };
+
     Ok(Inbound::Request(Request {
         request_id,
         action,
+        observation_id,
         sidecar_generation: value
             .get("sidecar_generation")
             .and_then(Value::as_str)
@@ -290,6 +338,66 @@ fn parse_request(value: &Value) -> Result<Inbound, ParseFailure> {
         mutation_seq: value.get("mutation_seq").and_then(Value::as_u64),
         body: value.clone(),
     }))
+}
+
+/// Which image this request's coordinates belong to, decided before the action
+/// runs. The three answers are the whole addressing rule:
+///
+///   * an action that ADDRESSES a point must name its image and may not describe
+///     one — a `region` there is the defect this protocol replaces, a rectangle
+///     copied from a previous reply and applied to a transform that has moved on;
+///   * an action that PRODUCES coordinates may name one, and its `region` is then
+///     read in that image;
+///   * anything else reads no coordinates, so naming an image is a request this
+///     build cannot honour and is refused rather than ignored.
+fn addressing(value: &Value, action: &str) -> Result<Option<String>, (&'static str, String)> {
+    let named = match value.get("observation_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+        Some(_other) => {
+            return Err((
+                "observation_required",
+                "observation_id must be a non-empty string naming the image these \
+                 coordinates were read in"
+                    .to_string(),
+            ))
+        }
+    };
+
+    if !takes_an_observation(action) {
+        return match named {
+            None => Ok(None),
+            Some(_) => Err((
+                "unknown_field",
+                format!("{action} reads no coordinates, so it takes no observation_id"),
+            )),
+        };
+    }
+
+    if !addresses_an_image(action) {
+        return Ok(named);
+    }
+
+    if value.get("region").is_some() {
+        return Err((
+            "unknown_field",
+            format!(
+                "region is not accepted on {action}: its coordinates are pixels in the image \
+                 named by observation_id, which carries its own rectangle"
+            ),
+        ));
+    }
+
+    match named {
+        Some(id) => Ok(Some(id)),
+        None => Err((
+            "observation_required",
+            format!(
+                "{action} needs observation_id: the id of the image its coordinates were \
+                 read in"
+            ),
+        )),
+    }
 }
 
 fn parse_control(value: &Value) -> Result<Inbound, ParseFailure> {
@@ -333,6 +441,47 @@ fn request_id(value: &Value) -> Result<String, ParseFailure> {
             "malformed_frame",
             "request_id must be 1 to 64 printable ASCII bytes".to_string(),
         ))
+    }
+}
+
+// --- failures ----------------------------------------------------------------
+
+/// What an action failed with: the wire's `error` code, and the sentence that goes
+/// beside it when the code alone cannot carry the fact.
+///
+/// Most failures are a code and nothing else, which is why `From<String>` exists
+/// and every function that only ever produces one keeps its `Result<_, String>`.
+/// The ones that need more — a point and the size of the image it missed, two
+/// capture dimensions that cannot both be right — carry a `detail`, because
+/// "capture_geometry_mismatch" on its own tells an operator nothing and folding the
+/// numbers into the code would make every failure its own code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    pub code: String,
+    pub detail: Option<String>,
+}
+
+impl Failure {
+    pub fn new(code: &str, detail: String) -> Failure {
+        Failure {
+            code: code.to_string(),
+            detail: Some(detail),
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(code: String) -> Failure {
+        Failure { code, detail: None }
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(code: &str) -> Failure {
+        Failure {
+            code: code.to_string(),
+            detail: None,
+        }
     }
 }
 
@@ -390,11 +539,16 @@ pub struct Timings {
     pub capture_ms: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Receipt {
     pub dispatch: Dispatch,
     pub effect: Effect,
     pub timings: Timings,
+    /// The image the action's coordinates were read in, and the one it handed back
+    /// afterwards. Together they are the audit trail of a click: what it aimed at,
+    /// and what the caller may aim at next.
+    pub observation_id_before: Option<String>,
+    pub observation_id_after: Option<String>,
 }
 
 impl Receipt {
@@ -415,11 +569,22 @@ impl Receipt {
                 Effect::Unknown
             },
             timings,
+            observation_id_before: None,
+            observation_id_after: None,
         }
     }
 
-    fn to_value(self) -> Value {
-        json!({
+    /// Name the images this action read from and produced. Separate from `derive`
+    /// because a refusal has a before and no after, and the derivation knows about
+    /// neither.
+    pub fn addressing(mut self, before: Option<String>, after: Option<String>) -> Receipt {
+        self.observation_id_before = before;
+        self.observation_id_after = after;
+        self
+    }
+
+    fn into_value(self) -> Value {
+        let mut receipt = json!({
             "dispatch": self.dispatch.as_str(),
             "effect": self.effect.as_str(),
             "input_method": "foreground_hid",
@@ -428,7 +593,20 @@ impl Receipt {
                 "settle": self.timings.settle_ms,
                 "capture": self.timings.capture_ms,
             }
-        })
+        });
+
+        if let Some(object) = receipt.as_object_mut() {
+            for (key, id) in [
+                ("observation_id_before", self.observation_id_before),
+                ("observation_id_after", self.observation_id_after),
+            ] {
+                if let Some(id) = id {
+                    object.insert(key.to_string(), json!(id));
+                }
+            }
+        }
+
+        receipt
     }
 }
 
@@ -458,7 +636,7 @@ pub fn response(
     frame.insert("ok".into(), json!(true));
     envelope.stamp(&mut frame);
     if let Some(receipt) = receipt {
-        frame.insert("receipt".into(), receipt.to_value());
+        frame.insert("receipt".into(), receipt.into_value());
     }
 
     Value::Object(frame)
@@ -484,7 +662,7 @@ pub fn error_response(
         frame.insert("detail".into(), json!(detail));
     }
     if let Some(receipt) = receipt {
-        frame.insert("receipt".into(), receipt.to_value());
+        frame.insert("receipt".into(), receipt.into_value());
     }
 
     Value::Object(frame)
@@ -536,8 +714,8 @@ mod tests {
     #[test]
     fn a_request_keeps_its_own_arguments_in_the_body() {
         let line = r#"{"type":"request","request_id":"r7","action":"left_click","x":4,"y":9,
-            "deadline_ms":30000,"sidecar_generation":"boot-1","session_generation":1,
-            "authorization_generation":3,"mutation_seq":12}"#;
+            "observation_id":"7c1e-12","deadline_ms":30000,"sidecar_generation":"boot-1",
+            "session_generation":1,"authorization_generation":3,"mutation_seq":12}"#;
 
         let Ok(Inbound::Request(request)) = parse(line) else {
             panic!("not a request");
@@ -547,14 +725,85 @@ mod tests {
         assert_eq!(request.mutation_seq, Some(12));
         assert_eq!(request.authorization_generation, Some(3));
         assert_eq!(request.sidecar_generation.as_deref(), Some("boot-1"));
+        assert_eq!(request.observation_id.as_deref(), Some("7c1e-12"));
         // The action functions read their arguments straight off the body.
         assert_eq!(request.body["x"], json!(4));
+    }
+
+    // Every coordinate names the image it was read in. An action that addresses a
+    // point without one is refused BEFORE the worker sees it, because there is no
+    // safe thing to do with a coordinate whose space is unknown.
+    #[test]
+    fn an_addressed_action_must_name_its_image() {
+        for action in ADDRESSED_ACTIONS {
+            let line = format!(
+                r#"{{"type":"request","request_id":"r1","action":"{action}","x":4,"y":9}}"#
+            );
+            let failure = parse(&line).expect_err("no image named");
+            assert_eq!(failure.error, "observation_required");
+            assert_eq!(failure.reply, Reply::Response("r1".to_string()));
+            assert_eq!(failure.action.as_deref(), Some(action));
+            assert!(failure.detail.contains(action), "{}", failure.detail);
+        }
+    }
+
+    // A rectangle on a click is the defect this protocol replaces: one copied from
+    // a previous reply, applied to a transform that has since moved. It is refused
+    // by name rather than ignored, so a caller that still sends one learns why.
+    #[test]
+    fn an_addressed_action_refuses_a_region() {
+        for action in ADDRESSED_ACTIONS {
+            let line = format!(
+                r#"{{"type":"request","request_id":"r1","action":"{action}","x":4,"y":9,
+                   "observation_id":"7c1e-1","region":{{"x":0,"y":0,"w":10,"h":10}}}}"#
+            );
+            let failure = parse(&line).expect_err("a region is not accepted here");
+            assert_eq!(failure.error, "unknown_field");
+            assert!(failure.detail.contains("region"), "{}", failure.detail);
+        }
+    }
+
+    #[test]
+    fn a_viewing_action_takes_a_region_with_or_without_an_image() {
+        for action in VIEWING_ACTIONS {
+            let with = format!(
+                r#"{{"type":"request","request_id":"r1","action":"{action}",
+                   "observation_id":"7c1e-1","region":{{"x":0,"y":0,"w":10,"h":10}}}}"#
+            );
+            let Ok(Inbound::Request(request)) = parse(&with) else {
+                panic!("{action} must take both");
+            };
+            assert_eq!(request.observation_id.as_deref(), Some("7c1e-1"));
+
+            let without = format!(r#"{{"type":"request","request_id":"r1","action":"{action}"}}"#);
+            let Ok(Inbound::Request(request)) = parse(&without) else {
+                panic!("{action} must take neither");
+            };
+            assert_eq!(request.observation_id, None);
+        }
+    }
+
+    // `windows` answers in the full-display space and reads nothing, so an image id
+    // on it is a request this build cannot honour — refused, not ignored.
+    #[test]
+    fn an_action_that_reads_no_coordinates_refuses_an_image() {
+        let line = r#"{"type":"request","request_id":"r1","action":"windows",
+            "observation_id":"7c1e-1"}"#;
+        let failure = parse(line).expect_err("windows names no image");
+        assert_eq!(failure.error, "unknown_field");
+
+        let empty = r#"{"type":"request","request_id":"r1","action":"left_click","x":1,"y":2,
+            "observation_id":""}"#;
+        assert_eq!(
+            parse(empty).expect_err("an empty id names nothing").error,
+            "observation_required"
+        );
     }
 
     #[test]
     fn hello_carries_a_protocol_version_and_no_generations() {
         let line = r#"{"type":"request","request_id":"r1","action":"hello",
-            "protocol_version":7,"deadline_ms":10000}"#;
+            "protocol_version":8,"deadline_ms":10000}"#;
 
         let Ok(Inbound::Request(request)) = parse(line) else {
             panic!("not a request");
@@ -587,7 +836,7 @@ mod tests {
     // do. Running the action anyway would act on the wrong thing while looking
     // like it obeyed.
     #[test]
-    fn a_reserved_slice_three_field_is_refused_by_name() {
+    fn a_reserved_later_slice_field_is_refused_by_name() {
         for field in RESERVED_FIELDS {
             let line = format!(
                 r#"{{"type":"request","request_id":"r1","action":"left_click","{field}":"x"}}"#
@@ -598,6 +847,11 @@ mod tests {
             assert_eq!(failure.action.as_deref(), Some("left_click"));
             assert!(failure.detail.contains(field), "{}", failure.detail);
         }
+
+        assert!(
+            !RESERVED_FIELDS.contains(&"observation_id"),
+            "observation_id is the addressing field now, not a reservation"
+        );
     }
 
     #[test]
@@ -795,6 +1049,29 @@ mod tests {
             Receipt::derive(true, true, false, t).effect,
             Effect::Unknown
         );
+    }
+
+    // What a click aimed at and what it handed back. Present only when there is
+    // one: a keystroke names no image, and a refusal has no after.
+    #[test]
+    fn a_receipt_names_the_images_on_both_sides_of_the_action() {
+        let receipt = Receipt::derive(true, true, true, Timings::default())
+            .addressing(Some("7c1e-12".to_string()), Some("7c1e-13".to_string()));
+        let frame = response(&envelope(), "r1", json!({"ok": true}), Some(receipt));
+
+        assert_eq!(frame["receipt"]["observation_id_before"], json!("7c1e-12"));
+        assert_eq!(frame["receipt"]["observation_id_after"], json!("7c1e-13"));
+
+        let refused = Receipt::derive(false, false, false, Timings::default())
+            .addressing(Some("7c1e-12".to_string()), None);
+        let frame = error_response(&envelope(), "r1", "paused", None, Some(refused));
+
+        assert_eq!(frame["receipt"]["observation_id_before"], json!("7c1e-12"));
+        assert!(frame["receipt"].get("observation_id_after").is_none());
+
+        let plain = Receipt::derive(true, true, false, Timings::default());
+        let frame = response(&envelope(), "r1", json!({"ok": true}), Some(plain));
+        assert!(frame["receipt"].get("observation_id_before").is_none());
     }
 
     #[test]

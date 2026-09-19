@@ -89,8 +89,13 @@ impl Refusal {
 
 /// Monotonic milliseconds and a sleep, injected so the gate's cadence and its
 /// measured timings are asserted rather than waited on.
+///
+/// `now_ns` is the same clock at the resolution the wire reports an observation's
+/// age in; it is one reading, not two, so an expiry and a published timestamp can
+/// never disagree about when a frame was taken.
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
+    fn now_ns(&self) -> u128;
     fn sleep(&self, ms: u64);
 }
 
@@ -115,6 +120,10 @@ impl Default for SystemClock {
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
         self.origin.elapsed().as_millis() as u64
+    }
+
+    fn now_ns(&self) -> u128 {
+        self.origin.elapsed().as_nanos()
     }
 
     fn sleep(&self, ms: u64) {
@@ -198,6 +207,13 @@ impl Gate {
 
     pub fn now_ms(&self) -> u64 {
         self.clock.now_ms()
+    }
+
+    /// The process's one clock, for the worker's own bounded state. Sharing it
+    /// rather than taking a second reading means an observation's age and the
+    /// timings on its receipt are measured against the same origin.
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        self.clock.clone()
     }
 
     // A poisoned gate means a thread panicked holding it. Recovering the guard is
@@ -601,6 +617,10 @@ mod tests {
             self.now.load(Ordering::SeqCst)
         }
 
+        fn now_ns(&self) -> u128 {
+            self.now_ms() as u128 * 1_000_000
+        }
+
         fn sleep(&self, ms: u64) {
             self.slept.lock().unwrap().push(ms);
             self.now.fetch_add(ms, Ordering::SeqCst);
@@ -625,6 +645,7 @@ mod tests {
             } else {
                 None
             },
+            observation_id: None,
         }
     }
 

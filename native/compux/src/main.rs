@@ -7,13 +7,14 @@
 //!
 //! Coordinate model (the #1 "clicks land offset" risk — read carefully):
 //!   * A screenshot is the target display captured at PHYSICAL pixels, then
-//!     downscaled so its long edge is <= `MAX_EDGE`. The model sees that
-//!     downscaled image and sends click coordinates in ITS pixel space.
-//!   * Synthetic input (enigo) uses the display's LOGICAL points. So a click at
-//!     `(x, y)` in the sent image maps to logical `origin + (x, y) / k` where
-//!     `k = sent_dim / logical_dim`. `logical = physical / scale_factor`.
-//!   * v1 drives ONE display (the configured index, default primary). Multi-
-//!     display origins are passed through but need on-device verification.
+//!     downscaled to fit the sent budgets. The model sees that downscaled image
+//!     and sends click coordinates in ITS pixel space.
+//!   * Every reply that hands out coordinates therefore names the image they are
+//!     in (`observation_id`), and every action that sends coordinates back names
+//!     one. The transform is stored with the image and used as stored; nothing
+//!     re-derives it from a rectangle the caller repeated. `mod geometry` owns
+//!     the arithmetic and `mod observation` owns the table.
+//!   * v1 drives ONE display (the configured index, default primary).
 //!
 //! Runtime behavior must be verified on a real machine with the macOS TCC grants
 //! (Screen Recording and Accessibility). It never panics the request loop — every
@@ -35,7 +36,12 @@ use serde_json::{json, Value};
 use xcap::Monitor;
 
 use gate::{Gate, Gated, Phase, SystemClock};
+use geometry::{
+    crop_rect, sent_scale, to_logical, to_sent, Geometry, Host, Measured, MonitorFacts, Region,
+};
 use held::Platform as _;
+use observation::{Kind, Observation, Observations};
+use wire::Failure;
 
 /// Capture mode (MILESTONE_32 §8.4a): the AXObserver/CFRunLoop event-push engine +
 /// the serialized `Emitter`. Isolated from the request/response core here.
@@ -45,8 +51,15 @@ mod capture;
 /// sequence posts through, so nothing this process presses can outlive the action.
 mod held;
 
-/// The protocol-7 frames as types: line parsing, the outbound builders, receipts.
+/// The protocol-8 frames as types: line parsing, the outbound builders, receipts.
 mod wire;
+
+/// Display geometry and the one coordinate transform, pure and platform-injected.
+mod geometry;
+
+/// The images and coordinate lists handed out, and the transform each was made
+/// with — so a click is mapped by the geometry its picture was taken with.
+mod observation;
 
 /// The admission gate: generations, the `mutation_seq` high-water mark, the pause
 /// barrier, and the cancellation checkpoints every paced sequence reads.
@@ -54,29 +67,6 @@ mod gate;
 
 /// The control reader thread, which owns stdin so the sidecar listens while it acts.
 mod control;
-
-/// Long-edge cap for a sent screenshot (design §5: oversized captures 400 on
-/// Anthropic and ground worse).
-const MAX_EDGE: u32 = 1366;
-
-/// Pixel-area budget for a sent screenshot (M28 B5). The long-edge cap alone
-/// punishes extreme aspect ratios: a 3840x1080 super-ultrawide got the same
-/// budget as 16:9 but only 384px tall — unreadable, which forced the model to
-/// live in magnified crops (and grid-switch errors). A sent image may use
-/// whichever budget grants MORE pixels, never upscaled: 16:9 keeps exactly
-/// 1366x768, 32:9 recovers ~1931x543, and any capture that fits the long edge
-/// today still ships at native resolution.
-const MAX_AREA: u32 = MAX_EDGE * 768;
-
-/// The sent-image downscale `kz <= 1` fitting `w x h` physical pixels into the
-/// budgets: the looser of the long-edge and area rules, capped at native. One
-/// formula for full captures and crops, so the two can never diverge.
-fn budget_scale(w: f32, h: f32) -> f32 {
-    let long = w.max(h).max(1.0);
-    let edge = (MAX_EDGE as f32 / long).min(1.0);
-    let area = (MAX_AREA as f32 / (w * h).max(1.0)).sqrt();
-    edge.max(area).min(1.0)
-}
 
 /// Wire-compatibility version. MUST match `Compux.Protocol.protocol_version/0`.
 /// Bumped ONLY on a wire-incompatible change; reported in the `hello` handshake so
@@ -112,7 +102,16 @@ fn budget_scale(w: f32, h: f32) -> f32 {
 /// have used as an argument of their own since v2. Computer history keeps its
 /// `ack` and `event` families byte for byte; only this integer inside the ack
 /// moves. See `mod wire`.
-const PROTOCOL_VERSION: u32 = 7;
+///
+/// v8 (M42 slice 3): every reply that hands out coordinates names the image they
+/// are in, and every action that sends coordinates back names one. A pointer action
+/// or `inspect` carries `observation_id` and no `region`; `screenshot`, `elements`
+/// and `wait_for_change` keep `region` and may name the image it was read in. The
+/// transform is stored with the image and used as stored, so nothing re-derives it
+/// from a rectangle a caller repeated — and it is built from a ratio MEASURED on
+/// the frame that was really captured rather than assumed from the display mode.
+/// See `mod observation` and `mod geometry`.
+const PROTOCOL_VERSION: u32 = 8;
 
 /// The capture-stall self-reap (EX_TEMPFAIL), and NOTHING else.
 ///
@@ -327,11 +326,26 @@ fn boot_generation() -> String {
     format!("boot-{}-{}", std::process::id(), capture::now_ms())
 }
 
+/// Everything the action worker owns that is neither on the wire nor in the gate:
+/// the images handed out and the transform each was made with, and the pixels per
+/// point measured on each display. One thread reads and writes both, one request
+/// at a time, so neither is locked — and nothing else may take a reference to
+/// them, which is the invariant that keeps it that way.
+struct Worker {
+    observations: Observations,
+    measured: Measured,
+}
+
 /// The serial action worker. One request at a time, to completion, on this thread.
 fn run_worker(jobs: mpsc::Receiver<control::Job>, gate: &Gate, emitter: &capture::Emitter) {
+    let mut worker = Worker {
+        observations: Observations::new(&gate.envelope().sidecar_generation, gate.clock()),
+        measured: Measured::new(),
+    };
+
     for job in jobs {
         let control::Job::Action(request) = job;
-        let frame = serve(&request, gate, emitter);
+        let frame = serve(&request, gate, emitter, &mut worker);
 
         // One JSON line per reply. A write failure means the parent is gone.
         if emitter.emit_line(&frame.to_string()).is_err() {
@@ -352,18 +366,23 @@ fn run_worker(jobs: mpsc::Receiver<control::Job>, gate: &Gate, emitter: &capture
 }
 
 /// Admit, run, and answer one request.
-fn serve(request: &wire::Request, gate: &Gate, emitter: &capture::Emitter) -> Value {
+fn serve(
+    request: &wire::Request,
+    gate: &Gate,
+    emitter: &capture::Emitter,
+    worker: &mut Worker,
+) -> Value {
     if let Err(refusal) = gate.admit(request) {
         return wire::error_response(
             gate.envelope(),
             &request.request_id,
             refusal.code(),
             Some(refusal.detail().to_string()),
-            receipt(request, false, false, false, wire::Timings::default()),
+            receipt(request, false, false, false, wire::Timings::default(), None),
         );
     }
 
-    let outcome = handle(request, gate, emitter);
+    let outcome = handle(request, gate, emitter, worker);
     let done = gate.finish();
     reply(request, gate, outcome, done)
 }
@@ -372,7 +391,7 @@ fn serve(request: &wire::Request, gate: &Gate, emitter: &capture::Emitter) -> Va
 fn reply(
     request: &wire::Request,
     gate: &Gate,
-    outcome: Result<Value, String>,
+    outcome: Result<Value, Failure>,
     done: gate::Dispatched,
 ) -> Value {
     // The capture verbs answer in the computer-history `ack` family, byte for byte
@@ -380,7 +399,7 @@ fn reply(
     if wire::answers_with_ack(&request.action) {
         return match outcome {
             Ok(ack) => ack,
-            Err(message) => observe_ack(&request.action, false, Some(message)),
+            Err(failure) => observe_ack(&request.action, false, Some(failure.code)),
         };
     }
 
@@ -389,17 +408,25 @@ fn reply(
             // An after-image is whatever the action actually produced, never what
             // it was asked to produce: `data` is present only when a capture ran.
             let after_image = payload.get("data").is_some();
+            // The image this action handed back, when it handed one back — read
+            // off the payload for the same reason: what was produced, not what was
+            // asked for.
+            let after = payload
+                .get("observation_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let receipt = receipt(
                 request,
                 done.posted,
                 done.input_complete,
                 after_image,
                 done.timings,
+                after,
             );
             wire::response(gate.envelope(), &request.request_id, payload, receipt)
         }
 
-        Err(message) => {
+        Err(failure) => {
             // `input_complete`, not `false`: the post-action check image is taken
             // INSIDE the action, so a click whose every event landed and whose own
             // screenshot then failed dispatched `sent`. Calling that `partial` would
@@ -410,6 +437,7 @@ fn reply(
                 done.input_complete,
                 false,
                 done.timings,
+                None,
             );
             // Every refusal that reaches here was cancelled (a pause sets both
             // flags), so a refusal code only ever lands in `detail` and never
@@ -418,10 +446,10 @@ fn reply(
             let (code, detail) = if done.cancelled {
                 (
                     "cancelled".to_string(),
-                    Some(message).filter(|message| message != "cancelled"),
+                    Some(failure.code).filter(|code| code != "cancelled"),
                 )
             } else {
-                (message, None)
+                (failure.code, failure.detail)
             };
             wire::error_response(gate.envelope(), &request.request_id, &code, detail, receipt)
         }
@@ -436,14 +464,13 @@ fn receipt(
     input_complete: bool,
     after_image: bool,
     timings: wire::Timings,
+    after: Option<String>,
 ) -> Option<wire::Receipt> {
     if wire::carries_mutation_seq(&request.action) {
-        Some(wire::Receipt::derive(
-            posted,
-            input_complete,
-            after_image,
-            timings,
-        ))
+        Some(
+            wire::Receipt::derive(posted, input_complete, after_image, timings)
+                .addressing(request.observation_id.clone(), after),
+        )
     } else {
         None
     }
@@ -453,7 +480,8 @@ fn handle(
     request: &wire::Request,
     gate: &Gate,
     emitter: &capture::Emitter,
-) -> Result<Value, String> {
+    worker: &mut Worker,
+) -> Result<Value, Failure> {
     let req = &request.body;
 
     match request.action.as_str() {
@@ -469,23 +497,74 @@ fn handle(
         // missing frame type.
         "observe_start" => Ok(observe_start(req, emitter)),
         "observe_stop" => Ok(observe_stop()),
-        "screenshot" => screenshot(req, gate),
-        "mouse_move" => mouse_move(req, gate),
-        "left_click" => click(req, gate, Button::Left, 1),
-        "right_click" => click(req, gate, Button::Right, 1),
-        "double_click" => click(req, gate, Button::Left, 2),
-        "left_click_drag" => drag(req, gate),
-        "scroll" => scroll(req, gate),
-        "type" => type_text(req, gate),
-        "key" => key_chord(req, gate),
+        "screenshot" => screenshot(request, gate, worker),
+        "mouse_move" => mouse_move(request, gate, worker),
+        "left_click" => click(request, gate, worker, Button::Left, 1),
+        "right_click" => click(request, gate, worker, Button::Right, 1),
+        "double_click" => click(request, gate, worker, Button::Left, 2),
+        "left_click_drag" => drag(request, gate, worker),
+        "scroll" => scroll(request, gate, worker),
+        "type" => type_text(req, gate, worker),
+        "key" => key_chord(req, gate, worker),
         "wait" => wait(req, gate),
-        "inspect" => inspect(req),
-        "wait_for_change" => wait_for_change(req, gate),
-        "paste" => paste(req, gate),
-        "elements" => elements(req, gate),
-        "windows" => windows(req),
-        other => Err(format!("unknown action: {other}")),
+        "inspect" => inspect(request, worker),
+        "wait_for_change" => wait_for_change(request, gate, worker),
+        "paste" => paste(req, gate, worker),
+        "elements" => elements(request, gate, worker),
+        "windows" => windows(req, gate, worker),
+        other => Err(format!("unknown action: {other}").into()),
     }
+}
+
+// --- addressing: which image a request's coordinates are in ------------------
+
+/// The image an action's coordinates were read in, taken out of the table.
+///
+/// The parse layer has already guaranteed there is an id, so what is left is the
+/// two ways a stored transform can go wrong, and they are checked in this order on
+/// purpose: what is pure first, what needs the OS second.
+///
+/// Copied rather than borrowed, so the action that follows can go on to mint its
+/// own check image into the same table.
+fn observed(request: &wire::Request, worker: &Worker) -> Result<Observation, Failure> {
+    let id = request
+        .observation_id
+        .as_deref()
+        .ok_or_else(|| Failure::from("observation_required"))?;
+
+    let observation = worker.observations.resolve(id).map_err(refused)?.clone();
+
+    Ok(observation)
+}
+
+/// A point the model read off that image, mapped to the global logical point enigo
+/// takes. A point outside the image is refused and never clamped onto an edge: it
+/// was read wrong, probably off a different image, and clamping turns that into a
+/// click on whatever happens to sit at the boundary.
+fn point_in(observation: &Observation, x: f64, y: f64) -> Result<(i32, i32), Failure> {
+    observation.contains(x, y).map_err(refused)?;
+
+    Ok(to_logical(&observation.geometry, &observation.region, x, y))
+}
+
+/// The display that image was made on, proven to still be the display in front of
+/// us. Reads what the OS says — bounds, origin, mode scale, id — which needs no
+/// capture, and refuses on any difference: a click computed from a geometry that
+/// has since moved lands somewhere nobody chose.
+fn same_display(observation: &Observation, req: &Value) -> Result<Display, Failure> {
+    let display = target_display(req)?;
+
+    if observation.matches_display(display.id, &display.facts) {
+        Ok(display)
+    } else {
+        Err(refused(observation::Refusal::Stale))
+    }
+}
+
+/// Every one of these is `dispatch: not_sent` — nothing was done — and each says
+/// what to do next in its own words.
+fn refused(refusal: observation::Refusal) -> Failure {
+    Failure::new(refusal.code(), refusal.detail())
 }
 
 // --- capture control (MILESTONE_32 §8.4a, NOT model actions) -----------------
@@ -526,7 +605,7 @@ fn observe_ack(action: &str, ok: bool, error: Option<String>) -> Value {
 /// consumer refuse a sidecar whose `protocol_version` its compiled-in encoder does
 /// not speak (the two-pin drift guard). `compux_version` is diagnostic; `actions`
 /// is the model-facing verb set (probe/hello are operational, excluded).
-fn hello() -> Result<Value, String> {
+fn hello() -> Result<Value, Failure> {
     Ok(json!({
         "ok": true,
         "protocol_version": PROTOCOL_VERSION,
@@ -537,10 +616,16 @@ fn hello() -> Result<Value, String> {
             "wait_for_change", "paste", "elements", "windows"
         ],
         // Listed only because this build really has them: one foreground HID input
-        // method, and the three controls the gate implements.
+        // method, the three controls the gate implements, and the bounds of the
+        // observation table — a caller mirrors those numbers to know which ids it
+        // may still address before it asks.
         "capabilities": {
             "input_methods": ["foreground_hid"],
             "controls": ["pause", "resume", "release"],
+            "observations": {
+                "max": observation::MAX_OBSERVATIONS,
+                "ttl_ms": observation::TTL_MS,
+            },
         },
     }))
 }
@@ -553,7 +638,7 @@ fn hello() -> Result<Value, String> {
 /// posting an event — the only reliable way to detect the silent-drop state where
 /// capture works but synthetic input is discarded. Surfaced by the consumer's
 /// diagnostics (a doctor/setup surface); the model never calls this.
-fn probe() -> Result<Value, String> {
+fn probe() -> Result<Value, Failure> {
     Ok(json!({
         "ok": true,
         "platform": std::env::consts::OS,
@@ -573,7 +658,7 @@ fn probe() -> Result<Value, String> {
 /// variants RAISE the system dialog. The prompts are async, so the returned booleans
 /// are the pre-response snapshot (typically `false` on first call) — the consumer
 /// re-runs `probe` after the user approves. No-op on Linux (no TCC).
-fn request_permissions(_req: &Value) -> Result<Value, String> {
+fn request_permissions(_req: &Value) -> Result<Value, Failure> {
     Ok(json!({
         "ok": true,
         "platform": std::env::consts::OS,
@@ -826,81 +911,19 @@ fn input_control_ok() -> bool {
     false
 }
 
-// --- display geometry -------------------------------------------------------
+// --- display selection ------------------------------------------------------
 
-/// Display geometry, separated from the OS `Monitor` handle so the coordinate math
-/// is pure and unit-testable (a `Monitor` cannot be constructed off a real screen).
-struct Geometry {
-    /// physical capture pixels
-    phys_w: u32,
-    phys_h: u32,
-    /// logical points (physical / scale_factor)
-    logical_w: f32,
-    logical_h: f32,
-    /// logical top-left origin in the global desktop space
-    origin_x: f32,
-    origin_y: f32,
-    scale_factor: f32,
-}
-
+/// A display, as the OS describes it. The geometry is NOT here: it depends on the
+/// pixels-per-point ratio, which is measured from a capture (see `mod geometry`),
+/// so it is built per action from these facts and a measurement.
 struct Display {
-    geom: Geometry,
+    facts: MonitorFacts,
     /// The monitor's stable id (CGDirectDisplayID on macOS). Capture and the
     /// asleep check both re-resolve the monitor by THIS (never by list index),
     /// so a mid-action display change fails typed instead of rebinding to a
     /// different physical monitor. The xcap `Monitor` handle isn't `Send` and
     /// isn't held past geometry read — the id is all a later capture needs.
     id: u32,
-}
-
-/// A zoom rectangle in full-display SENT-image pixel space — the coordinates the
-/// model reads off a normal screenshot. Absent on a request → the whole display.
-#[derive(Clone, Copy)]
-struct Region {
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-}
-
-impl Region {
-    /// The region spanning the entire full-display sent image.
-    fn full(geom: &Geometry) -> Region {
-        let k = sent_scale(geom);
-        Region {
-            x: 0.0,
-            y: 0.0,
-            w: (geom.logical_w * k) as f64,
-            h: (geom.logical_h * k) as f64,
-        }
-    }
-}
-
-/// A physical crop of the display plus the scale used to send it. Built once from a
-/// region and shared by capture and the inverse coordinate map, so the two can never
-/// disagree — the #1 "clicks land offset" bug class.
-struct CropRect {
-    left_phys: f32,
-    top_phys: f32,
-    w_phys: f32,
-    h_phys: f32,
-}
-
-impl CropRect {
-    /// Downscale to fit the sent budgets (`budget_scale`); never upscale
-    /// (`kz <= 1`). A small crop is therefore sent at native physical
-    /// resolution — that is the zoom.
-    fn sent_scale(&self) -> f32 {
-        budget_scale(self.w_phys, self.h_phys)
-    }
-
-    fn sent_dims(&self) -> (u32, u32) {
-        let kz = self.sent_scale();
-        (
-            (self.w_phys * kz).round().max(1.0) as u32,
-            (self.h_phys * kz).round().max(1.0) as u32,
-        )
-    }
 }
 
 /// Pick the requested monitor, distinguishing "no display is capturable at all"
@@ -922,6 +945,9 @@ fn select_monitor(monitors: Vec<Monitor>, index: usize) -> Result<Monitor, Strin
         .ok_or_else(|| format!("display {index} not found"))
 }
 
+/// What the OS says about the requested display, right now. Cheap — it enumerates
+/// monitors and reads their numbers, and takes no capture — which is what lets the
+/// staleness check run before every addressed action.
 fn target_display(req: &Value) -> Result<Display, String> {
     let index = req.get("display").and_then(Value::as_u64).unwrap_or(0) as usize;
     let monitors = Monitor::all().map_err(|e| format!("enumerate displays: {e}"))?;
@@ -929,41 +955,62 @@ fn target_display(req: &Value) -> Result<Display, String> {
 
     // xcap 0.4 returns the monitor geometry as `Result`s — unwrap each loudly so a
     // capture-backend hiccup surfaces as a clean action error, never a wrong click.
-    let scale_factor = monitor
-        .scale_factor()
-        .map_err(|e| format!("scale_factor: {e}"))?
-        .max(1.0);
-    let phys_w = monitor.width().map_err(|e| format!("display width: {e}"))?;
-    let phys_h = monitor
-        .height()
-        .map_err(|e| format!("display height: {e}"))?;
-    let origin_x = monitor.x().map_err(|e| format!("display origin x: {e}"))?;
-    let origin_y = monitor.y().map_err(|e| format!("display origin y: {e}"))?;
-    let id = monitor.id().map_err(|e| format!("display id: {e}"))?;
-
-    let geom = Geometry {
-        logical_w: phys_w as f32 / scale_factor,
-        logical_h: phys_h as f32 / scale_factor,
-        origin_x: origin_x as f32 / scale_factor,
-        origin_y: origin_y as f32 / scale_factor,
-        scale_factor,
-        phys_w,
-        phys_h,
+    let facts = MonitorFacts {
+        x: monitor.x().map_err(|e| format!("display origin x: {e}"))?,
+        y: monitor.y().map_err(|e| format!("display origin y: {e}"))?,
+        width: monitor.width().map_err(|e| format!("display width: {e}"))?,
+        height: monitor
+            .height()
+            .map_err(|e| format!("display height: {e}"))?,
+        scale_factor: monitor
+            .scale_factor()
+            .map_err(|e| format!("scale_factor: {e}"))?
+            .max(1.0),
     };
 
-    Ok(Display { geom, id })
+    Ok(Display {
+        facts,
+        id: monitor.id().map_err(|e| format!("display id: {e}"))?,
+    })
 }
 
-/// The full-display "sent scale" `k`: sent pixels per LOGICAL point for a full
-/// screenshot. The full image is the PHYSICAL display downscaled to fit the sent
-/// budgets (`budget_scale` → `kz_full`), so `k = sent_dim / logical_dim = kz_full *
-/// scale_factor`. Region coordinates are read off that sent image, so `crop_rect` /
-/// `Region::full` MUST use this physical-derived `k`. A logical-derived `k` diverges
-/// whenever the logical long edge already fits the budget but the physical one does
-/// not (e.g. a 13" Retina at 2560x1600@2x → 1280x800 logical) and mislocates region
-/// zooms — the #1 offset bug.
-fn sent_scale(geom: &Geometry) -> f32 {
-    budget_scale(geom.phys_w as f32, geom.phys_h as f32) * geom.scale_factor
+/// The transform for a display that is about to hand out coordinates WITHOUT
+/// capturing an image (`windows`, `elements`).
+///
+/// It needs a real measurement and the only honest source of one is a real capture,
+/// so a display whose CURRENT configuration nothing has captured is measured here
+/// with one frame that is thrown away. Guessing it from the display mode is exactly
+/// the assumption this slice removed — and remembering it against the display's id
+/// alone would be the same assumption one mode change later, so the memo is keyed on
+/// the facts it was measured under.
+fn measured_geometry(
+    display: &Display,
+    gate: &Gate,
+    worker: &mut Worker,
+) -> Result<Geometry, Failure> {
+    if let Some(measured) = worker.measured.get(display.id, &display.facts) {
+        return Ok(Geometry::from_facts(&display.facts, measured, Host::HERE));
+    }
+
+    ensure_display_awake(display)?;
+    let image = timed_capture(display, gate)?;
+    measure_geometry(display, &image, worker)
+}
+
+/// Build the display's transform from a frame that was really captured, and
+/// remember it for the replies that hand out coordinates without one.
+fn measure_geometry(
+    display: &Display,
+    image: &image::RgbaImage,
+    worker: &mut Worker,
+) -> Result<Geometry, Failure> {
+    let measured = geometry::measure(&display.facts, image.width(), image.height(), Host::HERE)
+        .map_err(|detail| Failure::new("capture_geometry_mismatch", detail))?;
+
+    worker
+        .measured
+        .remember(display.id, &display.facts, measured);
+    Ok(Geometry::from_facts(&display.facts, measured, Host::HERE))
 }
 
 fn parse_region(req: &Value) -> Result<Option<Region>, String> {
@@ -989,65 +1036,38 @@ fn region_field(value: &Value, key: &str) -> Result<f64, String> {
         .ok_or_else(|| format!("region.{key} is missing or not a number"))
 }
 
-fn region_or_full(geom: &Geometry, requested: Option<Region>) -> Region {
-    requested.unwrap_or_else(|| Region::full(geom))
-}
-
-/// The physical crop for a region (or the whole display when the region spans it).
-/// `region` is in full-display SENT-image pixels; convert through the full-display
-/// sent scale `k` to logical, then to physical, clamped to the display bounds.
-fn crop_rect(geom: &Geometry, region: &Region) -> CropRect {
-    let k = sent_scale(geom);
-    let sf = geom.scale_factor;
-    // Clamp left/top in-bounds (an out-of-range region can't produce a degenerate or
-    // out-of-image crop); width/height then fill the remaining space, min 1px.
-    let max_left = (geom.phys_w as f32 - 1.0).max(0.0);
-    let max_top = (geom.phys_h as f32 - 1.0).max(0.0);
-    let left = (region.x as f32 / k * sf).clamp(0.0, max_left);
-    let top = (region.y as f32 / k * sf).clamp(0.0, max_top);
-    let w = (region.w as f32 / k * sf)
-        .min(geom.phys_w as f32 - left)
-        .max(1.0);
-    let h = (region.h as f32 / k * sf)
-        .min(geom.phys_h as f32 - top)
-        .max(1.0);
-    CropRect {
-        left_phys: left,
-        top_phys: top,
-        w_phys: w,
-        h_phys: h,
-    }
-}
-
-/// Map a coordinate from the last sent image to a global LOGICAL point for enigo.
+/// The rectangle a VIEWING action is asking for, in the full-display sent pixels of
+/// the geometry in force now.
 ///
-/// One convention for full and zoomed views: a full screenshot is a region spanning
-/// the whole sent image, so this reduces to `origin + (x,y)/k` there. With a region
-/// the image is a physical crop downscaled by `kz`; the inverse adds the crop's
-/// logical offset. Capture and this share `crop_rect`, so they cannot disagree.
-fn to_logical(geom: &Geometry, region: &Region, x: f64, y: f64) -> (i32, i32) {
-    let crop = crop_rect(geom, region);
-    let kz = crop.sent_scale();
-    let lx = geom.origin_x + (crop.left_phys + (x as f32) / kz) / geom.scale_factor;
-    let ly = geom.origin_y + (crop.top_phys + (y as f32) / kz) / geom.scale_factor;
-    (lx.round() as i32, ly.round() as i32)
-}
+/// Three cases, and none of them is a recovery path for another. With no `region`
+/// it is the whole display, and an image named beside no rectangle has nothing to
+/// qualify — it is accepted and unused rather than refused, because a caller that
+/// names its image on every request is doing the right thing. With a `region` and
+/// no image named, the rectangle is read in a full-display image, which is the
+/// space `windows` answers in. With both, it is read in THAT image and mapped
+/// through the transform that image was made with — so a caller can zoom into a
+/// crop of a crop without ever doing arithmetic of its own.
+fn viewing_region(
+    request: &wire::Request,
+    geom: &Geometry,
+    worker: &Worker,
+) -> Result<Region, Failure> {
+    let Some(rect) = parse_region(&request.body)? else {
+        return Ok(Region::full(geom));
+    };
 
-/// Inverse of `to_logical`: a global LOGICAL point → the sent-image coordinate for
-/// `region`, or None when it falls outside the sent image. Used by `elements` to
-/// place accessibility frames back onto the coordinates the model reads.
-fn to_sent(geom: &Geometry, region: &Region, lx: f64, ly: f64) -> Option<(i64, i64)> {
-    let crop = crop_rect(geom, region);
-    let kz = crop.sent_scale();
-    let sf = geom.scale_factor;
-    let sx = ((lx as f32 - geom.origin_x) * sf - crop.left_phys) * kz;
-    let sy = ((ly as f32 - geom.origin_y) * sf - crop.top_phys) * kz;
-    let (sw, sh) = crop.sent_dims();
-    if sx < 0.0 || sy < 0.0 || sx > sw as f32 || sy > sh as f32 {
-        None
-    } else {
-        Some((sx.round() as i64, sy.round() as i64))
-    }
+    let Some(id) = request.observation_id.as_deref() else {
+        return Ok(rect);
+    };
+
+    let observation = worker.observations.resolve(id).map_err(refused)?;
+
+    Ok(geometry::rect_through(
+        &observation.geometry,
+        &observation.region,
+        &rect,
+        geom,
+    ))
 }
 
 // --- overlay drawing (M28 B1/B2/B3) ------------------------------------------
@@ -1236,16 +1256,29 @@ mod overlay {
 
 // --- screenshot -------------------------------------------------------------
 
-fn screenshot(req: &Value, gate: &Gate) -> Result<Value, String> {
+fn screenshot(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
+    let req = &request.body;
     let display = target_display(req)?;
-    let region = parse_region(req)?;
     capture_payload_encoded(
         &display,
-        region,
+        Requested::Region(request),
         parse_jpeg_quality(req)?,
         parse_overlays(req)?,
         gate,
+        worker,
     )
+}
+
+/// What a capture is being asked to cover. An action's check image is always the
+/// FULL display — the model has just changed something and needs the broader
+/// result — while a `screenshot` carries the request whose `region` says which
+/// rectangle of it, and whose `observation_id` says which image that rectangle was
+/// read in. `wait_for_change` has resolved its rectangle already, because it needs
+/// one before it starts polling.
+enum Requested<'a> {
+    Full,
+    Region(&'a wire::Request),
+    Exactly(Region),
 }
 
 /// Grounding-integrity overlays for one capture (M28), all drawn on the SENT
@@ -1256,7 +1289,19 @@ fn screenshot(req: &Value, gate: &Gate) -> Result<Value, String> {
 struct Overlays {
     rulers: bool,
     marks: bool,
-    annotate: Option<(i32, i32)>,
+    annotate: Option<Annotate>,
+}
+
+/// Where to draw the executed-point marker, in the one space its sender knows it
+/// in. A `screenshot` names a point in the image it is asking for. An action's
+/// check image names the point the action really executed at, which it knows as a
+/// LOGICAL point — the image the model read the coordinate in may be a crop, and
+/// the check is always the whole display, so the marker would otherwise be drawn
+/// at the crop's numbers on the full screen.
+#[derive(Clone, Copy)]
+enum Annotate {
+    Sent(i32, i32),
+    Logical(f32, f32),
 }
 
 fn parse_overlays(req: &Value) -> Result<Overlays, String> {
@@ -1274,7 +1319,7 @@ fn parse_overlays(req: &Value) -> Result<Overlays, String> {
                 .get("y")
                 .and_then(Value::as_f64)
                 .ok_or("annotate_point.y is missing or not a number")?;
-            Some((x.round() as i32, y.round() as i32))
+            Some(Annotate::Sent(x.round() as i32, y.round() as i32))
         }
     };
 
@@ -1428,27 +1473,38 @@ fn encode_image(
     }
 }
 
+/// One capture, timed the way the receipt reports it: measured, never estimated.
+fn timed_capture(display: &Display, gate: &Gate) -> Result<image::RgbaImage, String> {
+    let started = gate.now_ms();
+    let image = capture_display_image(display.id)?;
+    gate.record(Phase::Capture, gate.now_ms().saturating_sub(started));
+    Ok(image)
+}
+
 fn capture_payload_encoded(
     display: &Display,
-    requested: Option<Region>,
+    requested: Requested<'_>,
     jpeg_quality: Option<u8>,
     overlays: Overlays,
     gate: &Gate,
-) -> Result<Value, String> {
+    worker: &mut Worker,
+) -> Result<Value, Failure> {
     ensure_display_awake(display)?;
-    let geom = &display.geom;
-    let region = region_or_full(geom, requested);
-    let crop = crop_rect(geom, &region);
-    let (sent_w, sent_h) = crop.sent_dims();
 
-    // The capture is the slow half of a check image, and the receipt reports it as
-    // measured rather than estimated.
-    let capture_started = gate.now_ms();
-    let image = capture_display_image(display.id)?;
-    gate.record(
-        Phase::Capture,
-        gate.now_ms().saturating_sub(capture_started),
-    );
+    // The frame comes FIRST, because the transform is built from it: how many
+    // pixels the OS answers per point is a fact about the image, not about the
+    // display mode. A frame that cannot be explained that way fails the action
+    // here, before any of it is handed out as coordinates.
+    let image = timed_capture(display, gate)?;
+    let geom = measure_geometry(display, &image, worker)?;
+
+    let region = match requested {
+        Requested::Full => Region::full(&geom),
+        Requested::Exactly(region) => region,
+        Requested::Region(request) => viewing_region(request, &geom, worker)?,
+    };
+    let crop = crop_rect(&geom, &region);
+    let (sent_w, sent_h) = crop.sent_dims();
 
     // Crop to the region's physical rect, then downscale to the sent size. The
     // model's coordinates live in this (sent) space; `to_logical` inverts it.
@@ -1474,11 +1530,20 @@ fn capture_payload_encoded(
         overlay::rulers(&mut resized);
     }
     let marks = if overlays.marks {
-        Some(collect_marks(geom, &region, &mut resized, gate))
+        Some(collect_marks(&geom, &region, &mut resized, gate))
     } else {
         None
     };
-    if let Some((ax, ay)) = overlays.annotate {
+    let annotate = match overlays.annotate {
+        None => None,
+        Some(Annotate::Sent(x, y)) => Some((x, y)),
+        // Placed through THIS image's own transform, so the marker lands where the
+        // action landed even when the coordinate was read on a crop.
+        Some(Annotate::Logical(lx, ly)) => {
+            to_sent(&geom, &region, lx as f64, ly as f64).map(|(x, y)| (x as i32, y as i32))
+        }
+    };
+    if let Some((ax, ay)) = annotate {
         overlay::executed_point(&mut resized, ax, ay);
     }
 
@@ -1505,7 +1570,7 @@ fn capture_payload_encoded(
     // The cursor's position in this image's coordinates, when it falls inside the
     // captured region — useful for drag/hover reasoning. Absent if off-region.
     if let (Some((cursor_x, cursor_y)), Some(object)) =
-        (cursor_point(geom, &region), payload.as_object_mut())
+        (cursor_point(&geom, &region), payload.as_object_mut())
     {
         object.insert(
             "cursor".to_string(),
@@ -1525,7 +1590,42 @@ fn capture_payload_encoded(
         }
     }
 
+    // This image is now the space the caller's next coordinates are in, marks
+    // included, so it is minted and named before it leaves.
+    let observation = worker.observations.mint(
+        Kind::Image,
+        display.id,
+        display.facts,
+        geom,
+        region,
+        (sent_w, sent_h),
+    );
+    name_observation(&mut payload, &observation);
+
     Ok(payload)
+}
+
+/// Say which image a reply's coordinates are in, the same three fields on every
+/// reply that hands any out (plus the frame counter, for the ones that are a
+/// picture). `width`, `height`, `region`, `scale`, `origin` and `physical` keep
+/// their own meanings beside these.
+fn name_observation(payload: &mut Value, observation: &Observation) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+
+    object.insert("observation_id".to_string(), json!(observation.id));
+    object.insert(
+        "observation_kind".to_string(),
+        json!(observation.kind.as_str()),
+    );
+    object.insert(
+        "captured_at_monotonic_ns".to_string(),
+        json!(observation.captured_at_monotonic_ns),
+    );
+    if let Some(frame_seq) = observation.frame_seq {
+        object.insert("frame_seq".to_string(), json!(frame_seq));
+    }
 }
 
 /// The badge cap keeps a marked image readable — a dense tree can expose
@@ -1624,11 +1724,12 @@ fn modifiers(req: &Value) -> Vec<Key> {
         .unwrap_or_default()
 }
 
-fn mouse_move(req: &Value, gate: &Gate) -> Result<Value, String> {
-    let display = target_display(req)?;
-    let region = region_or_full(&display.geom, parse_region(req)?);
+fn mouse_move(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
+    let req = &request.body;
     let (x, y) = coords(req)?;
-    let (lx, ly) = to_logical(&display.geom, &region, x, y);
+    let observation = observed(request, worker)?;
+    let (lx, ly) = point_in(&observation, x, y)?;
+    same_display(&observation, req)?;
     // Read-only on the wire and still the human's pointer, so it goes through the
     // gate like every other input and a pause stops it.
     let mut platform = Gated::new(gate, held::Real::default());
@@ -1642,11 +1743,18 @@ fn mouse_move(req: &Value, gate: &Gate) -> Result<Value, String> {
     Ok(json!({ "ok": true }))
 }
 
-fn click(req: &Value, gate: &Gate, button: Button, count: u32) -> Result<Value, String> {
-    let display = target_display(req)?;
-    let region = region_or_full(&display.geom, parse_region(req)?);
+fn click(
+    request: &wire::Request,
+    gate: &Gate,
+    worker: &mut Worker,
+    button: Button,
+    count: u32,
+) -> Result<Value, Failure> {
+    let req = &request.body;
     let (x, y) = coords(req)?;
-    let (lx, ly) = to_logical(&display.geom, &region, x, y);
+    let observation = observed(request, worker)?;
+    let (lx, ly) = point_in(&observation, x, y)?;
+    let display = same_display(&observation, req)?;
     let mods = modifiers(req);
 
     // A local, not a temporary: enigo's own `Drop` paces the events it posted, and
@@ -1656,7 +1764,7 @@ fn click(req: &Value, gate: &Gate, button: Button, count: u32) -> Result<Value, 
     click_seq(&mut platform, lx, ly, button, count, &mods)?;
     gate.input_complete();
 
-    post(req, &display, gate)
+    post(req, &display, gate, worker, Some((lx, ly)))
 }
 
 /// The click itself, over the injected platform: warp, settle, hold the modifiers,
@@ -1692,20 +1800,25 @@ const DRAG_STEP_MS: u64 = 20;
 const DRAG_GRAB_MS: u64 = 60;
 const DRAG_DROP_MS: u64 = 50;
 
-fn drag(req: &Value, gate: &Gate) -> Result<Value, String> {
-    let display = target_display(req)?;
-    let region = region_or_full(&display.geom, parse_region(req)?);
+fn drag(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
+    let req = &request.body;
     let from: Point = parse_point(req, "from")?;
     let to: Point = parse_point(req, "to")?;
-    let (fx, fy) = to_logical(&display.geom, &region, from.x, from.y);
-    let (tx, ty) = to_logical(&display.geom, &region, to.x, to.y);
+    // One image for both points: a drag whose ends were read off different
+    // screenshots is a drag across two coordinate spaces.
+    let observation = observed(request, worker)?;
+    let (fx, fy) = point_in(&observation, from.x, from.y)?;
+    let (tx, ty) = point_in(&observation, to.x, to.y)?;
+    let display = same_display(&observation, req)?;
 
     // A local for the same reason as `click`: enigo's pacing runs on its drop.
     let mut platform = Gated::new(gate, held::Real::default());
     drag_seq(&mut platform, fx, fy, tx, ty)?;
     gate.input_complete();
 
-    post(req, &display, gate)
+    // The drag DESTINATION is what the check image marks: that is where the action
+    // ended and the place the model has to judge.
+    post(req, &display, gate, worker, Some((tx, ty)))
 }
 
 /// The drag itself, over the injected platform. Everything from the press to the
@@ -1761,18 +1874,19 @@ fn drag_through<P: held::Platform>(
     Ok(())
 }
 
-fn scroll(req: &Value, gate: &Gate) -> Result<Value, String> {
-    let display = target_display(req)?;
-    let region = region_or_full(&display.geom, parse_region(req)?);
+fn scroll(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
+    let req = &request.body;
     let (x, y) = coords(req)?;
-    let (lx, ly) = to_logical(&display.geom, &region, x, y);
+    let observation = observed(request, worker)?;
+    let (lx, ly) = point_in(&observation, x, y)?;
+    let display = same_display(&observation, req)?;
     let amount = req.get("amount").and_then(Value::as_i64).unwrap_or(3) as i32;
     let (axis, length) = match req.get("direction").and_then(Value::as_str) {
         Some("up") => (Axis::Vertical, -amount),
         Some("down") => (Axis::Vertical, amount),
         Some("left") => (Axis::Horizontal, -amount),
         Some("right") => (Axis::Horizontal, amount),
-        other => return Err(format!("bad scroll direction: {other:?}")),
+        other => return Err(format!("bad scroll direction: {other:?}").into()),
     };
 
     // One call with the repeat count inside it, so there is no loop of ours to
@@ -1783,10 +1897,10 @@ fn scroll(req: &Value, gate: &Gate) -> Result<Value, String> {
     platform.scroll(length, axis)?;
     gate.input_complete();
 
-    post(req, &display, gate)
+    post(req, &display, gate, worker, Some((lx, ly)))
 }
 
-fn type_text(req: &Value, gate: &Gate) -> Result<Value, String> {
+fn type_text(req: &Value, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let text = req
         .get("text")
         .and_then(Value::as_str)
@@ -1798,10 +1912,11 @@ fn type_text(req: &Value, gate: &Gate) -> Result<Value, String> {
     let mut platform = Gated::new(gate, held::Real::default());
     platform.text(text)?;
     gate.input_complete();
-    post(req, &target_display(req)?, gate)
+    // Typing executes at the focus, not at a coordinate: nothing to mark.
+    post(req, &target_display(req)?, gate, worker, None)
 }
 
-fn key_chord(req: &Value, gate: &Gate) -> Result<Value, String> {
+fn key_chord(req: &Value, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let chord = req
         .get("chord")
         .and_then(Value::as_str)
@@ -1818,7 +1933,7 @@ fn key_chord(req: &Value, gate: &Gate) -> Result<Value, String> {
     key_chord_seq(&mut platform, &mods, main)?;
     gate.input_complete();
 
-    post(req, &target_display(req)?, gate)
+    post(req, &target_display(req)?, gate, worker, None)
 }
 
 /// The chord itself, over the injected platform. This was the one sequence that
@@ -1836,7 +1951,7 @@ fn key_chord_seq<P: held::Platform>(
     })
 }
 
-fn wait(req: &Value, gate: &Gate) -> Result<Value, String> {
+fn wait(req: &Value, gate: &Gate) -> Result<Value, Failure> {
     // Clamped like every other blocking verb: the wire is one-request-one-response,
     // so an unbounded sleep would hold the whole session hostage to one argument.
     let ms = req
@@ -1857,9 +1972,17 @@ fn wait(req: &Value, gate: &Gate) -> Result<Value, String> {
 /// the resulting screenshot plus a `changed` flag. Each poll captures the frame
 /// (xcap has no sub-region capture) and diffs an AVERAGED thumbnail hash of the
 /// region; the poll budget is bounded by the caller's protocol.
-fn wait_for_change(req: &Value, gate: &Gate) -> Result<Value, String> {
+fn wait_for_change(
+    request: &wire::Request,
+    gate: &Gate,
+    worker: &mut Worker,
+) -> Result<Value, Failure> {
+    let req = &request.body;
     let display = target_display(req)?;
-    let region = region_or_full(&display.geom, parse_region(req)?);
+    // The rectangle is resolved once, before the first baseline, so every poll and
+    // the frame that ends the wait all watch the same patch of screen.
+    let geom = measured_geometry(&display, gate, worker)?;
+    let region = viewing_region(request, &geom, worker)?;
     let timeout_ms = req
         .get("timeout_ms")
         .and_then(Value::as_u64)
@@ -1871,13 +1994,13 @@ fn wait_for_change(req: &Value, gate: &Gate) -> Result<Value, String> {
         .unwrap_or(250)
         .max(1);
 
-    let baseline = region_hash(&display, &region)?;
+    let baseline = region_hash(&display, &geom, &region)?;
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
     loop {
         gate.sleep(poll_ms)
             .map_err(|refusal| refusal.code().to_string())?;
-        let changed = region_hash(&display, &region)? != baseline;
+        let changed = region_hash(&display, &geom, &region)? != baseline;
         if changed || Instant::now() >= deadline {
             // The returned frame becomes the caller's coordinate view, so it
             // carries the same `rulers` grid an explicit screenshot would.
@@ -1886,8 +2009,14 @@ fn wait_for_change(req: &Value, gate: &Gate) -> Result<Value, String> {
                 marks: false,
                 annotate: None,
             };
-            let mut payload =
-                capture_payload_encoded(&display, Some(region), None, overlays, gate)?;
+            let mut payload = capture_payload_encoded(
+                &display,
+                Requested::Exactly(region),
+                None,
+                overlays,
+                gate,
+                worker,
+            )?;
             if let Some(object) = payload.as_object_mut() {
                 object.insert("changed".to_string(), json!(changed));
             }
@@ -1900,9 +2029,8 @@ fn wait_for_change(req: &Value, gate: &Gate) -> Result<Value, String> {
 /// Triangle (not Nearest) folds every source pixel into a cell, so a small change
 /// still perturbs the hash instead of landing between sample points and being
 /// missed — a miss would block `wait_for_change` to its full timeout.
-fn region_hash(display: &Display, region: &Region) -> Result<u64, String> {
+fn region_hash(display: &Display, geom: &Geometry, region: &Region) -> Result<u64, String> {
     ensure_display_awake(display)?;
-    let geom = &display.geom;
     let crop = crop_rect(geom, region);
     let image = capture_display_image(display.id)?;
     let cropped = image::imageops::crop_imm(
@@ -1959,13 +2087,13 @@ fn human_idle_ms() -> Result<u64, String> {
 /// Report ms since the last input event. Operational (a policy-support probe), NOT a
 /// model action — excluded from `hello`'s advertised verbs like `probe`.
 #[cfg(target_os = "macos")]
-fn idle_ms() -> Result<Value, String> {
+fn idle_ms() -> Result<Value, Failure> {
     Ok(json!({ "ok": true, "idle_ms": human_idle_ms()? }))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn idle_ms() -> Result<Value, String> {
-    Err("idle detection is only supported on macOS".to_string())
+fn idle_ms() -> Result<Value, Failure> {
+    Err("idle detection is only supported on macOS".into())
 }
 
 /// Block until the human has been idle for `idle_ms` (default 1000), bounded by
@@ -1974,7 +2102,7 @@ fn idle_ms() -> Result<Value, String> {
 /// the human still active. Reuses the `wait_for_change` bounded-poll idiom so a
 /// consumer can schedule input into a human-idle gap.
 #[cfg(target_os = "macos")]
-fn wait_for_idle(req: &Value, gate: &Gate) -> Result<Value, String> {
+fn wait_for_idle(req: &Value, gate: &Gate) -> Result<Value, Failure> {
     let idle_target = req.get("idle_ms").and_then(Value::as_u64).unwrap_or(1_000);
     let timeout_ms = req
         .get("timeout_ms")
@@ -2002,13 +2130,13 @@ fn wait_for_idle(req: &Value, gate: &Gate) -> Result<Value, String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn wait_for_idle(_req: &Value, _gate: &Gate) -> Result<Value, String> {
-    Err("idle detection is only supported on macOS".to_string())
+fn wait_for_idle(_req: &Value, _gate: &Gate) -> Result<Value, Failure> {
+    Err("idle detection is only supported on macOS".into())
 }
 
 /// Paste `text` via the clipboard + the platform paste chord — fast and
 /// unicode-safe for long strings that char-by-char typing would stall on.
-fn paste(req: &Value, gate: &Gate) -> Result<Value, String> {
+fn paste(req: &Value, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let text = req
         .get("text")
         .and_then(Value::as_str)
@@ -2020,7 +2148,7 @@ fn paste(req: &Value, gate: &Gate) -> Result<Value, String> {
     paste_seq(&mut platform, text)?;
     gate.input_complete();
 
-    post(req, &target_display(req)?, gate)
+    post(req, &target_display(req)?, gate, worker, None)
 }
 
 /// Let the pasteboard write settle before the paste keystroke.
@@ -2068,17 +2196,32 @@ const MAX_WINDOWS: usize = 40;
 /// typical browser window).
 ///
 /// Returning a ready-made `region` — rather than raw window geometry — is the whole
-/// point: the caller pastes it straight into `screenshot`/click and rides the
-/// EXISTING, proven region transform. No second coordinate system is introduced, so
-/// this cannot reintroduce the region-offset class of bug.
+/// point: the caller pastes it straight into `screenshot` and rides the EXISTING,
+/// proven region transform. No second coordinate system is introduced, so this
+/// cannot reintroduce the region-offset class of bug.
 ///
-/// READ-ONLY: pure metadata — no capture, no input.
-fn windows(req: &Value) -> Result<Value, String> {
+/// READ-ONLY: pure metadata and no input — but it hands out coordinates, so it
+/// mints an observation, and on a display nothing has captured yet that costs one
+/// frame to measure the transform those coordinates are in.
+fn windows(req: &Value, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let display = target_display(req)?;
-    let full = Region::full(&display.geom);
-    let mut listed = window_entries(&display.geom, &full)?;
+    let geom = measured_geometry(&display, gate, worker)?;
+    let full = Region::full(&geom);
+    let mut listed = window_entries(&geom, &full)?;
     listed.truncate(MAX_WINDOWS);
-    Ok(json!({ "ok": true, "windows": listed }))
+
+    let mut payload = json!({ "ok": true, "windows": listed });
+    let observation = worker.observations.mint(
+        Kind::Semantic,
+        display.id,
+        display.facts,
+        geom,
+        full,
+        crop_rect(&geom, &full).sent_dims(),
+    );
+    name_observation(&mut payload, &observation);
+
+    Ok(payload)
 }
 
 fn window_entries(geom: &Geometry, full: &Region) -> Result<Vec<Value>, String> {
@@ -2168,14 +2311,32 @@ fn logical_bounds_to_region(
 
 /// Enumerate interactive accessibility elements (role + label + a click point in
 /// screenshot coordinates) so the model can target by element, not raw pixels.
-fn elements(req: &Value, gate: &Gate) -> Result<Value, String> {
-    let display = target_display(req)?;
-    let region = region_or_full(&display.geom, parse_region(req)?);
-    elements_for(&display.geom, &region, gate)
+///
+/// The click points are pixels in an image that is never sent, so this mints a
+/// `semantic` observation and names it: the coordinates are in the same space a
+/// `screenshot` of that region would be, and the model addresses them the same way.
+fn elements(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
+    let display = target_display(&request.body)?;
+    let geom = measured_geometry(&display, gate, worker)?;
+    let region = viewing_region(request, &geom, worker)?;
+    let mut payload = elements_for(&geom, &region, gate)?;
+
+    let (sent_w, sent_h) = crop_rect(&geom, &region).sent_dims();
+    let observation = worker.observations.mint(
+        Kind::Semantic,
+        display.id,
+        display.facts,
+        geom,
+        region,
+        (sent_w, sent_h),
+    );
+    name_observation(&mut payload, &observation);
+
+    Ok(payload)
 }
 
 #[cfg(target_os = "macos")]
-fn elements_for(geom: &Geometry, region: &Region, gate: &Gate) -> Result<Value, String> {
+fn elements_for(geom: &Geometry, region: &Region, gate: &Gate) -> Result<Value, Failure> {
     let (nodes, ax_activation) = interactive_in_view(geom, region, gate);
 
     let items: Vec<Value> = nodes
@@ -2513,22 +2674,23 @@ fn attempt_note(attempt: &Result<&'static str, String>) -> String {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn elements_for(_geom: &Geometry, _region: &Region, _gate: &Gate) -> Result<Value, String> {
-    Err("element enumeration is only supported on macOS".to_string())
+fn elements_for(_geom: &Geometry, _region: &Region, _gate: &Gate) -> Result<Value, Failure> {
+    Err("element enumeration is only supported on macOS".into())
 }
 
 // --- accessibility (inspect) ------------------------------------------------
 
-/// Report the accessibility element under a (screenshot-space) point: its role and
-/// label. READ-ONLY — a grounding/judgment aid (confirm what control is there before
-/// a consequential click), not a gate. Coordinates map through the same region
-/// transform as input, so the model can inspect a zoomed point too.
-fn inspect(req: &Value) -> Result<Value, String> {
-    let display = target_display(req)?;
-    let region = region_or_full(&display.geom, parse_region(req)?);
-    let (x, y) = coords(req)?;
-    let (lx, ly) = to_logical(&display.geom, &region, x, y);
-    inspect_at(lx as f32, ly as f32)
+/// Report the accessibility element under a point of the image it names: its role
+/// and label. READ-ONLY — a grounding/judgment aid (confirm what control is there
+/// before a consequential click), not a gate. It addresses a point exactly as a
+/// click does, through the transform its image was made with, so what it reports
+/// is what a click at that coordinate would reach.
+fn inspect(request: &wire::Request, worker: &Worker) -> Result<Value, Failure> {
+    let (x, y) = coords(&request.body)?;
+    let observation = observed(request, worker)?;
+    let (lx, ly) = point_in(&observation, x, y)?;
+    same_display(&observation, &request.body)?;
+    Ok(inspect_at(lx as f32, ly as f32)?)
 }
 
 #[cfg(target_os = "macos")]
@@ -3017,7 +3179,13 @@ mod ax {
 /// relative to its target instead of only reading its own number echoed back. An
 /// unregioned action's coordinates are full-screen sent space — the same space this
 /// full-display check captures in. `rulers` is honored from the action request.
-fn post(req: &Value, display: &Display, gate: &Gate) -> Result<Value, String> {
+fn post(
+    req: &Value,
+    display: &Display,
+    gate: &Gate,
+    worker: &mut Worker,
+    executed: Option<(i32, i32)>,
+) -> Result<Value, Failure> {
     if req
         .get("screenshot_after")
         .and_then(Value::as_bool)
@@ -3026,23 +3194,12 @@ fn post(req: &Value, display: &Display, gate: &Gate) -> Result<Value, String> {
         let overlays = Overlays {
             rulers: req.get("rulers").and_then(Value::as_bool).unwrap_or(false),
             marks: false,
-            annotate: executed_point_of(req),
+            annotate: executed.map(|(lx, ly)| Annotate::Logical(lx as f32, ly as f32)),
         };
-        capture_payload_encoded(display, None, None, overlays, gate)
+        capture_payload_encoded(display, Requested::Full, None, overlays, gate, worker)
     } else {
         Ok(json!({ "ok": true }))
     }
-}
-
-/// The point a pointer action executed at, from its own request: `to` for drags,
-/// top-level x/y otherwise; None for keyboard/uncoordinated actions.
-fn executed_point_of(req: &Value) -> Option<(i32, i32)> {
-    let (x, y) = if let Some(to) = req.get("to") {
-        (to.get("x")?.as_f64()?, to.get("y")?.as_f64()?)
-    } else {
-        (req.get("x")?.as_f64()?, req.get("y")?.as_f64()?)
-    };
-    Some((x.round() as i32, y.round() as i32))
 }
 
 fn parse_point(req: &Value, field: &str) -> Result<Point, String> {
@@ -3115,24 +3272,40 @@ mod tests {
 
     /// A failed action as its payload, so a dispatch test can assert on one shape
     /// whether the host had a display or not.
-    fn err_payload(message: String) -> Value {
-        json!({ "ok": false, "error": message })
+    fn err_payload(failure: Failure) -> Value {
+        json!({ "ok": false, "error": failure.code })
+    }
+
+    /// A worker with an empty table, for a test that drives one action directly.
+    fn idle_worker(gate: &Gate) -> Worker {
+        Worker {
+            observations: Observations::new(&gate.envelope().sidecar_generation, gate.clock()),
+            measured: Measured::new(),
+        }
     }
 
     /// Run one action through the real dispatch table, as the worker does.
-    fn dispatch(body: Value) -> Result<Value, String> {
+    fn dispatch(body: Value) -> Result<Value, Failure> {
         let gate = Gate::new("boot-test".to_string(), Arc::new(SystemClock::new()));
-        let request = wire::Request {
+        let mut worker = idle_worker(&gate);
+        let request = request_for(&body);
+
+        handle(&request, &gate, &capture::Emitter::new(), &mut worker)
+    }
+
+    /// The frame the reader would have parsed for this body, addressing included —
+    /// so a dispatch test exercises the same shape a real request arrives in.
+    fn request_for(body: &Value) -> wire::Request {
+        wire::Request {
             request_id: "r1".to_string(),
             action: body["action"].as_str().unwrap_or_default().to_string(),
-            body,
+            body: body.clone(),
             sidecar_generation: None,
             session_generation: None,
             authorization_generation: None,
             mutation_seq: None,
-        };
-
-        handle(&request, &gate, &capture::Emitter::new())
+            observation_id: body["observation_id"].as_str().map(str::to_string),
+        }
     }
 
     // The drag path's geometry is what makes an interpolated drag land exactly:
@@ -3178,138 +3351,6 @@ mod tests {
             select_monitor(Vec::new(), 4).err(),
             Some("no_active_display".to_string())
         );
-    }
-
-    // Retina reference display: 2880x1800 physical, 2x scale -> 1440x900 logical,
-    // origin (0,0). Geometry is constructible without a real Monitor, so the
-    // coordinate math (the #1 offset-bug class) is unit-tested here, not on-device.
-    fn retina_geom() -> Geometry {
-        Geometry {
-            phys_w: 2880,
-            phys_h: 1800,
-            logical_w: 1440.0,
-            logical_h: 900.0,
-            origin_x: 0.0,
-            origin_y: 0.0,
-            scale_factor: 2.0,
-        }
-    }
-
-    #[test]
-    fn full_screenshot_mapping_matches_the_simple_formula() {
-        // A full screenshot is a region spanning the whole sent image, so the unified
-        // map must reduce to the original `origin + (x,y)/k`.
-        let g = retina_geom();
-        let region = Region::full(&g);
-        let k = sent_scale(&g);
-        let (lx, ly) = to_logical(&g, &region, 683.0, 450.0);
-        assert_eq!(lx, (683.0_f32 / k).round() as i32);
-        assert_eq!(ly, (450.0_f32 / k).round() as i32);
-    }
-
-    #[test]
-    fn region_zoom_corners_map_back_into_the_region() {
-        let g = retina_geom();
-        let k = sent_scale(&g);
-        // The lower-right quadrant, expressed in full-display sent pixels.
-        let region = Region {
-            x: (720.0 * k) as f64,
-            y: (450.0 * k) as f64,
-            w: (720.0 * k) as f64,
-            h: (450.0 * k) as f64,
-        };
-
-        // Top-left of the zoomed image is the region origin in logical points.
-        assert_eq!(to_logical(&g, &region, 0.0, 0.0), (720, 450));
-
-        // Bottom-right of the zoomed image is the region's far corner.
-        let crop = crop_rect(&g, &region);
-        let (sw, sh) = crop.sent_dims();
-        let (lx, ly) = to_logical(&g, &region, sw as f64, sh as f64);
-        assert!((lx - 1440).abs() <= 2, "lx={lx}");
-        assert!((ly - 900).abs() <= 2, "ly={ly}");
-    }
-
-    // `elements` maps AX frames back through `to_sent`, so a click point is only as
-    // accurate as `to_sent` inverting `to_logical`. Round-trip a grid of sent points:
-    // sent -> logical -> sent must return the origin (within double-rounding slack).
-    #[test]
-    fn to_sent_inverts_to_logical_full_screen() {
-        let g = retina_geom();
-        let region = Region::full(&g);
-        for (sx, sy) in [(0.0_f64, 0.0_f64), (683.0, 450.0), (1200.0, 700.0)] {
-            let (lx, ly) = to_logical(&g, &region, sx, sy);
-            let (rx, ry) = to_sent(&g, &region, lx as f64, ly as f64).expect("in bounds");
-            assert!((rx - sx as i64).abs() <= 2, "x: sent={sx} back={rx}");
-            assert!((ry - sy as i64).abs() <= 2, "y: sent={sy} back={ry}");
-        }
-    }
-
-    #[test]
-    fn to_sent_inverts_to_logical_in_a_zoomed_region() {
-        let g = retina_geom();
-        let k = sent_scale(&g);
-        let region = Region {
-            x: (720.0 * k) as f64,
-            y: (450.0 * k) as f64,
-            w: (720.0 * k) as f64,
-            h: (450.0 * k) as f64,
-        };
-        let crop = crop_rect(&g, &region);
-        let (sw, sh) = crop.sent_dims();
-        for (sx, sy) in [(0.0_f64, 0.0_f64), ((sw / 2) as f64, (sh / 2) as f64)] {
-            let (lx, ly) = to_logical(&g, &region, sx, sy);
-            let (rx, ry) = to_sent(&g, &region, lx as f64, ly as f64).expect("in region");
-            // Zoom magnifies, so a logical i32 rounding is worth >1 sent px — allow 3.
-            assert!((rx - sx as i64).abs() <= 3, "x: sent={sx} back={rx}");
-            assert!((ry - sy as i64).abs() <= 3, "y: sent={sy} back={ry}");
-        }
-    }
-
-    #[test]
-    fn to_sent_round_trips_with_nonzero_origin_and_physical_mismatch() {
-        let mut g = macbook_air_geom();
-        g.origin_x = 1440.0;
-        g.origin_y = 100.0;
-        let region = Region::full(&g);
-        let crop = crop_rect(&g, &region);
-        let (sw, sh) = crop.sent_dims();
-        let (sx, sy) = ((sw as f64) / 3.0, (sh as f64) / 3.0);
-        let (lx, ly) = to_logical(&g, &region, sx, sy);
-        let (rx, ry) = to_sent(&g, &region, lx as f64, ly as f64).expect("in bounds");
-        assert!((rx - sx as i64).abs() <= 2, "x: sent={sx} back={rx}");
-        assert!((ry - sy as i64).abs() <= 2, "y: sent={sy} back={ry}");
-    }
-
-    #[test]
-    fn to_sent_is_none_outside_the_sent_image() {
-        let g = retina_geom();
-        let region = Region::full(&g);
-        // Left of / above the display origin, and past the far edge.
-        assert_eq!(to_sent(&g, &region, -100.0, 10.0), None);
-        assert_eq!(
-            to_sent(
-                &g,
-                &region,
-                g.logical_w as f64 + 100.0,
-                g.logical_h as f64 + 100.0
-            ),
-            None
-        );
-    }
-
-    // 13" Retina: 2560x1600 physical, 2x -> 1280x800 logical. logical_long (1280) <=
-    // MAX_EDGE < phys_long (2560) — the regime a logical-derived sent scale got wrong.
-    fn macbook_air_geom() -> Geometry {
-        Geometry {
-            phys_w: 2560,
-            phys_h: 1600,
-            logical_w: 1280.0,
-            logical_h: 800.0,
-            origin_x: 0.0,
-            origin_y: 0.0,
-            scale_factor: 2.0,
-        }
     }
 
     /// The display the window listing exists for: 3840x1080 at 1x, where a full
@@ -3506,74 +3547,6 @@ mod tests {
         assert!(!ax::attribute_rejected(0));
     }
 
-    // --- M28 B5: the area budget ---------------------------------------------
-
-    /// The incident display: a pure long-edge cap sent 1366x384 (unreadable);
-    /// the area budget recovers ~1931x543 — same pixel count as 1366x768.
-    #[test]
-    fn ultrawide_full_view_uses_the_area_budget() {
-        let g = ultrawide_geom();
-        let region = Region::full(&g);
-        let crop = crop_rect(&g, &region);
-        let (sw, sh) = crop.sent_dims();
-
-        assert_eq!((sw, sh), (1931, 543), "sent dims");
-        assert!(
-            sw > MAX_EDGE,
-            "the long edge may exceed MAX_EDGE under the area rule"
-        );
-        assert!(
-            sw * sh <= MAX_AREA + sw,
-            "within the area budget (rounding slack)"
-        );
-
-        // The center of the sent image still maps to the display center.
-        let (lx, ly) = to_logical(&g, &region, (sw as f64) / 2.0, (sh as f64) / 2.0);
-        assert!((lx - 1920).abs() <= 2, "lx={lx}");
-        assert!((ly - 540).abs() <= 2, "ly={ly}");
-    }
-
-    /// A 16:9 display is the budget's fixed point: 1366x768 exactly, as before.
-    #[test]
-    fn sixteen_nine_full_view_is_unchanged_by_the_area_budget() {
-        let g = Geometry {
-            phys_w: 1920,
-            phys_h: 1080,
-            logical_w: 1920.0,
-            logical_h: 1080.0,
-            origin_x: 0.0,
-            origin_y: 0.0,
-            scale_factor: 1.0,
-        };
-        let crop = crop_rect(&g, &Region::full(&g));
-        assert_eq!(crop.sent_dims(), (1366, 768));
-    }
-
-    /// A crop that fits the long edge ships native — the incident's 1355x959
-    /// region crop (1.30MP) must NOT be shrunk by the area rule; the looser
-    /// budget wins. This is the regression a pure-area budget would introduce.
-    #[test]
-    fn a_crop_that_fits_the_long_edge_stays_native() {
-        let crop = CropRect {
-            left_phys: 64.7,
-            top_phys: 30.9,
-            w_phys: 1355.0,
-            h_phys: 959.0,
-        };
-        assert!((crop.sent_scale() - 1.0).abs() < f32::EPSILON);
-        assert_eq!(crop.sent_dims(), (1355, 959));
-    }
-
-    /// Retina 16:10 (2880x1800): the edge rule (0.474) beats the area rule
-    /// (0.450) — behavior identical to the pure long-edge cap.
-    #[test]
-    fn retina_full_view_keeps_the_long_edge_budget() {
-        let g = retina_geom();
-        let crop = crop_rect(&g, &Region::full(&g));
-        let (sw, _sh) = crop.sent_dims();
-        assert_eq!(sw, MAX_EDGE);
-    }
-
     #[test]
     fn a_window_is_clipped_to_the_display_it_overlaps() {
         let g = ultrawide_geom();
@@ -3637,41 +3610,6 @@ mod tests {
             response["windows"].is_array() || response["ok"] == json!(false),
             "expected a window list or a typed error: {response}"
         );
-    }
-
-    #[test]
-    fn full_mapping_is_correct_when_logical_fits_but_physical_does_not() {
-        // The full sent image is the PHYSICAL display downscaled (1366 wide), NOT the
-        // logical one left at 1.0. A click read off it must map to the logical center,
-        // and Region::full's coordinate space must equal the real sent dims.
-        let g = macbook_air_geom();
-        let region = Region::full(&g);
-
-        let crop = crop_rect(&g, &region);
-        let (sw, sh) = crop.sent_dims();
-
-        // sent_scale is sent_dim/logical_dim — not a clamped 1.0.
-        let k = sent_scale(&g);
-        assert!((k - sw as f32 / g.logical_w).abs() < 0.01, "k={k} sw={sw}");
-
-        // Region::full's reported width equals the actual sent width (the canary that
-        // a logical-derived scale would break: it would report 1280, not ~1366).
-        assert_eq!(region.w.round() as u32, sw);
-        assert!(sw > 1300 && sw <= MAX_EDGE, "sw={sw}");
-
-        // The center of the sent image maps to the logical center (640, 400).
-        let (lx, ly) = to_logical(&g, &region, (sw as f64) / 2.0, (sh as f64) / 2.0);
-        assert!((lx - 640).abs() <= 2, "lx={lx}");
-        assert!((ly - 400).abs() <= 2, "ly={ly}");
-    }
-
-    #[test]
-    fn mapping_respects_a_nonzero_display_origin() {
-        // A secondary display offset to the right: sent (0,0) is that display's origin.
-        let mut g = retina_geom();
-        g.origin_x = 1440.0;
-        let region = Region::full(&g);
-        assert_eq!(to_logical(&g, &region, 0.0, 0.0).0, 1440);
     }
 
     // --- M28 B1/B2/B3: overlay placement ------------------------------------
@@ -3750,6 +3688,108 @@ mod tests {
             .unwrap()
             .iter()
             .any(|a| a == "screenshot"));
+
+        // The bounds of the observation table are capabilities, so a caller mirrors
+        // the same numbers instead of hard-coding a guess at them.
+        assert_eq!(
+            v["capabilities"]["observations"],
+            json!({ "max": observation::MAX_OBSERVATIONS, "ttl_ms": observation::TTL_MS })
+        );
+    }
+
+    // --- M42 slice 3: a coordinate names the image it was read in ------------
+
+    /// A worker holding one image of a display that is not this machine's, so the
+    /// refusals that come BEFORE any display read are testable on a host with no
+    /// screen at all.
+    fn worker_holding_an_image(gate: &Gate) -> (Worker, Observation) {
+        let mut worker = idle_worker(gate);
+        let facts = MonitorFacts {
+            x: 0,
+            y: 0,
+            width: 1512,
+            height: 982,
+            scale_factor: 2.0,
+        };
+        let measured = geometry::Measurement {
+            frame_w: 3024,
+            frame_h: 1964,
+            pixels_per_point: 2.0,
+        };
+        let geom = Geometry::from_facts(&facts, measured, Host::MacOs);
+        let region = Region::full(&geom);
+        let sent = crop_rect(&geom, &region).sent_dims();
+        let observation = worker
+            .observations
+            .mint(Kind::Image, 424_242, facts, geom, region, sent);
+
+        (worker, observation)
+    }
+
+    // Every one of these is the same promise: nothing was sent. The model is told
+    // which of them happened because the next move differs — look again, or read
+    // the coordinate again.
+    #[test]
+    fn a_click_that_names_no_image_this_process_holds_is_refused_and_sends_nothing() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let (mut worker, observation) = worker_holding_an_image(&gate);
+
+        let mut request = running("left_click", Some(1));
+        request.body = json!({"action": "left_click", "x": 4, "y": 9});
+        request.observation_id = Some("nobody-1".to_string());
+
+        let frame = serve(&request, &gate, &capture::Emitter::new(), &mut worker);
+        assert_eq!(frame["error"], json!("unknown_observation"));
+        assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"));
+        assert_eq!(frame["receipt"]["observation_id_before"], json!("nobody-1"));
+        assert!(frame["detail"]
+            .as_str()
+            .unwrap()
+            .contains("fresh screenshot"));
+
+        // A point past the edge of the image it DOES hold: refused, never clamped
+        // onto the edge, and the sentence says how big that image was.
+        let outside = point_in(&observation, observation.sent_w as f64, 10.0)
+            .expect_err("one pixel past the right edge");
+        assert_eq!(outside.code, "point_outside_observation");
+        assert!(outside
+            .detail
+            .unwrap()
+            .contains(&format!("{}x{}", observation.sent_w, observation.sent_h)));
+
+        // And the last pixel inside it maps, so the bound is exclusive at the top
+        // and inclusive at the bottom, once.
+        assert!(point_in(&observation, (observation.sent_w - 1) as f64, 0.0).is_ok());
+    }
+
+    // A frame that cannot be explained fails the action rather than being clicked
+    // through, and it carries both sizes: an operator reading the trace has to be
+    // able to see which two numbers disagreed.
+    #[test]
+    fn a_capture_that_does_not_match_its_display_fails_with_both_sizes() {
+        let facts = MonitorFacts {
+            x: 0,
+            y: 0,
+            width: 1512,
+            height: 982,
+            scale_factor: 2.0,
+        };
+
+        let detail = geometry::measure(&facts, 2268, 1473, Host::MacOs)
+            .expect_err("1.5 pixels per point is neither the mode's 2 nor 1");
+        let failure = Failure::new("capture_geometry_mismatch", detail);
+
+        assert_eq!(failure.code, "capture_geometry_mismatch");
+        let detail = failure.detail.unwrap();
+        for number in [
+            "frame 2268x1473",
+            "display 1512x982 points",
+            "mode scale 2.0000",
+            "1.5000 across",
+            "1.5000 down",
+        ] {
+            assert!(detail.contains(number), "{number} missing from: {detail}");
+        }
     }
 
     // idle_ms / wait_for_idle are OPERATIONAL (policy-support), never advertised as
@@ -4023,6 +4063,10 @@ mod tests {
             0
         }
 
+        fn now_ns(&self) -> u128 {
+            0
+        }
+
         fn sleep(&self, _ms: u64) {
             let nth = self
                 .sleeps
@@ -4045,6 +4089,7 @@ mod tests {
             session_generation: Some(1),
             authorization_generation: Some(1),
             mutation_seq,
+            observation_id: wire::addresses_an_image(action).then(|| "7c1e-1".to_string()),
         }
     }
 
@@ -4133,7 +4178,7 @@ mod tests {
 
         let outcome = wait(&json!({"ms": 20_000}), &gate);
 
-        assert_eq!(outcome, Err("cancelled".to_string()));
+        assert_eq!(outcome, Err(Failure::from("cancelled")));
         clock.disarm();
     }
 
@@ -4147,7 +4192,12 @@ mod tests {
         let mut request = running("left_click", Some(1));
         request.authorization_generation = Some(paused.authorization_generation);
 
-        let frame = serve(&request, &gate, &capture::Emitter::new());
+        let frame = serve(
+            &request,
+            &gate,
+            &capture::Emitter::new(),
+            &mut idle_worker(&gate),
+        );
 
         assert_eq!(frame["type"], json!("response"));
         assert_eq!(frame["request_id"], json!("r1"));
@@ -4168,7 +4218,12 @@ mod tests {
         request.session_generation = None;
         request.authorization_generation = None;
 
-        let frame = serve(&request, &gate, &capture::Emitter::new());
+        let frame = serve(
+            &request,
+            &gate,
+            &capture::Emitter::new(),
+            &mut idle_worker(&gate),
+        );
 
         assert_eq!(frame["ok"], json!(true));
         assert_eq!(frame["protocol_version"], json!(PROTOCOL_VERSION));
@@ -4210,7 +4265,7 @@ mod tests {
         let done = gate.finish();
 
         // ... and then `post` failed on its own capture.
-        let frame = reply(&request, &gate, Err("capture_stalled".to_string()), done);
+        let frame = reply(&request, &gate, Err(Failure::from("capture_stalled")), done);
 
         assert_eq!(frame["ok"], json!(false));
         assert_eq!(frame["error"], json!("capture_stalled"));
@@ -4219,6 +4274,55 @@ mod tests {
             json!("sent"),
             "the input landed; only the check did not"
         );
+    }
+
+    // The same shape for the one refusal that can only arise AFTER the click: the
+    // check image is captured inside the action, after `gate.input_complete()`, so
+    // a frame that cannot be explained fails an action whose input has already
+    // landed. `dispatch: sent` with `error: capture_geometry_mismatch` is therefore
+    // a real combination, and a caller's sentence for that code may not claim
+    // nothing was sent. The numbers ride in `detail`, because that refusal has to
+    // be diagnosable from a bug report with nothing else in it.
+    #[test]
+    fn a_geometry_mismatch_on_the_check_image_still_reports_the_click_as_sent() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let request = running("left_click", Some(1));
+        gate.admit(&request).unwrap();
+
+        let mut platform = Gated::new(&gate, Recorder::new(None));
+        click_seq(&mut platform, 10, 20, Button::Left, 1, &[]).unwrap();
+        gate.input_complete();
+        let done = gate.finish();
+
+        let facts = MonitorFacts {
+            x: 0,
+            y: 0,
+            width: 1512,
+            height: 982,
+            scale_factor: 2.0,
+        };
+        let detail = geometry::measure(&facts, 2268, 1473, Host::MacOs)
+            .expect_err("1.5 pixels per point is neither the mode's 2 nor 1");
+        let frame = reply(
+            &request,
+            &gate,
+            Err(Failure::new("capture_geometry_mismatch", detail)),
+            done,
+        );
+
+        assert_eq!(frame["ok"], json!(false));
+        assert_eq!(frame["error"], json!("capture_geometry_mismatch"));
+        assert_eq!(
+            frame["receipt"]["dispatch"],
+            json!("sent"),
+            "the click landed before the check image was taken"
+        );
+
+        let detail = frame["detail"].as_str().expect("the numbers");
+        assert!(detail.contains("frame 2268x1473"), "{detail}");
+        assert!(detail.contains("display 1512x982 points"), "{detail}");
+        assert!(detail.contains("mode scale 2.0000"), "{detail}");
+        assert!(detail.contains("1.5000 across"), "{detail}");
     }
 
     // The complement, so the latch cannot simply be "always sent": a sequence that
@@ -4234,7 +4338,7 @@ mod tests {
         // the sequence failed here, so nothing latched
         let done = gate.finish();
 
-        let frame = reply(&request, &gate, Err("click: refused".to_string()), done);
+        let frame = reply(&request, &gate, Err(Failure::from("click: refused")), done);
 
         assert_eq!(frame["receipt"]["dispatch"], json!("partial"));
     }
@@ -4249,7 +4353,12 @@ mod tests {
         request.session_generation = None;
         request.authorization_generation = None;
 
-        let frame = serve(&request, &gate, &capture::Emitter::new());
+        let frame = serve(
+            &request,
+            &gate,
+            &capture::Emitter::new(),
+            &mut idle_worker(&gate),
+        );
 
         assert_eq!(frame["type"], json!("ack"));
         assert_eq!(frame["action"], json!("observe_stop"));

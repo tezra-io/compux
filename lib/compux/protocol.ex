@@ -64,7 +64,20 @@ defmodule Compux.Protocol do
   # ORDER, so the desync class — a late frame answering the next action — is gone;
   # `hello` is itself a request now, and its response returns the sidecar's boot
   # generation and a `capabilities` map. `Compux.Frame` owns the shapes.
-  @protocol_version 7
+  #
+  # v8 (M42 slice 3, observation identity): every reply that hands the caller
+  # coordinates names the image they were read from (`observation_id`), and every
+  # coordinate sent back names that image. An action that ADDRESSES a point
+  # (`left_click`, `right_click`, `double_click`, `mouse_move`, `left_click_drag`,
+  # `scroll`, `inspect`) carries `observation_id` and no `region`: the sidecar
+  # stores the transform with the image and uses it as stored, so nothing
+  # re-derives it from a rectangle the caller echoed back. An action that PRODUCES
+  # an image or a list of coordinates (`screenshot`, `elements`, `wait_for_change`)
+  # keeps `region` and may name an observation beside it, and the rectangle is then
+  # read in THAT image's pixels. Refusing `region` on a click is the wire change
+  # that cannot be additive, so the version bumps and the handshake refuses the
+  # pairing.
+  @protocol_version 8
 
   @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows)
 
@@ -76,6 +89,16 @@ defmodule Compux.Protocol do
   # mutations would put a sequence number and a receipt on a permission probe.
   @read_only ~w(screenshot mouse_move wait inspect wait_for_change elements windows
                 probe idle_ms wait_for_idle hello)
+  # v8: the actions whose coordinates are pixels in an image the caller was handed.
+  # Each one names that image with `observation_id` and takes no `region` — the
+  # rectangle is the sidecar's to remember, and a caller that echoes one back is
+  # the defect this replaces.
+  @addressed ~w(left_click right_click double_click mouse_move left_click_drag scroll inspect)
+
+  # The actions that PRODUCE coordinates. `region` stays theirs; an `observation_id`
+  # beside it says which image the rectangle is read in.
+  @viewing ~w(screenshot elements wait_for_change)
+
   @modifiers ~w(cmd ctrl alt shift)
   @scroll_directions ~w(up down left right)
   @max_type_bytes 10_000
@@ -109,13 +132,62 @@ defmodule Compux.Protocol do
   @spec validate(map()) :: {:ok, map()} | {:error, String.t()}
   def validate(params) when is_map(params) do
     case Map.get(params, "action") do
-      action when action in @actions -> validate_action(action, params)
-      nil -> {:error, "missing required field: action"}
-      other -> {:error, "unknown action: #{inspect(other)}"}
+      action when action in @actions ->
+        with :ok <- check_addressing(action, params),
+             {:ok, request} <- validate_action(action, params) do
+          {:ok, put_observation(request, Map.get(params, "observation_id"))}
+        end
+
+      nil ->
+        {:error, "missing required field: action"}
+
+      other ->
+        {:error, "unknown action: #{inspect(other)}"}
     end
   end
 
   def validate(_other), do: {:error, "action params must be a map"}
+
+  # v8: which image a coordinate was read from, checked before the action's own
+  # arguments, because an action that names the wrong image cannot be fixed by
+  # having valid ones.
+  defp check_addressing(action, params) when action in @addressed do
+    cond do
+      not observation?(params) ->
+        {:error,
+         "#{action} requires observation_id: the id of the image its coordinates were read from"}
+
+      Map.has_key?(params, "region") ->
+        {:error,
+         "region is not accepted on #{action}: its coordinates are pixels in the image named " <>
+           "by observation_id, which carries its own rectangle"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp check_addressing(action, params) when action in @viewing do
+    if Map.has_key?(params, "observation_id") and not observation?(params),
+      do: {:error, "observation_id must be a non-empty string"},
+      else: :ok
+  end
+
+  defp check_addressing(action, params) do
+    if Map.has_key?(params, "observation_id"),
+      do: {:error, "#{action} takes no observation_id — it reads no coordinates"},
+      else: :ok
+  end
+
+  defp observation?(params) do
+    case Map.get(params, "observation_id") do
+      id when is_binary(id) and id != "" -> true
+      _other -> false
+    end
+  end
+
+  defp put_observation(request, nil), do: request
+  defp put_observation(request, id), do: Map.put(request, "observation_id", id)
 
   # This module validates and classifies; it no longer writes a line. `encode_request/1`
   # produced the UNTAGGED protocol-6 shape, which a protocol-7 sidecar refuses —
@@ -146,21 +218,18 @@ defmodule Compux.Protocol do
     with {:ok, x} <- coord(params, "x"),
          {:ok, y} <- coord(params, "y"),
          {:ok, modifiers} <- opt_modifiers(params),
-         {:ok, display} <- opt_display(params),
-         {:ok, region} <- opt_region(params) do
+         {:ok, display} <- opt_display(params) do
       request = %{"action" => action, "x" => x, "y" => y}
       request = if modifiers == [], do: request, else: Map.put(request, "modifiers", modifiers)
-      {:ok, put_region(put_display(request, display), region)}
+      {:ok, put_display(request, display)}
     end
   end
 
   defp validate_action("inspect", params) do
     with {:ok, x} <- coord(params, "x"),
          {:ok, y} <- coord(params, "y"),
-         {:ok, display} <- opt_display(params),
-         {:ok, region} <- opt_region(params) do
-      request = put_display(%{"action" => "inspect", "x" => x, "y" => y}, display)
-      {:ok, put_region(request, region)}
+         {:ok, display} <- opt_display(params) do
+      {:ok, put_display(%{"action" => "inspect", "x" => x, "y" => y}, display)}
     end
   end
 
@@ -219,10 +288,8 @@ defmodule Compux.Protocol do
   defp validate_action("left_click_drag", params) do
     with {:ok, from} <- point(params, "from"),
          {:ok, to} <- point(params, "to"),
-         {:ok, display} <- opt_display(params),
-         {:ok, region} <- opt_region(params) do
-      request = put_display(%{"action" => "left_click_drag", "from" => from, "to" => to}, display)
-      {:ok, put_region(request, region)}
+         {:ok, display} <- opt_display(params) do
+      {:ok, put_display(%{"action" => "left_click_drag", "from" => from, "to" => to}, display)}
     end
   end
 
@@ -231,8 +298,7 @@ defmodule Compux.Protocol do
          {:ok, y} <- coord(params, "y"),
          {:ok, direction} <- scroll_direction(params),
          {:ok, amount} <- positive(params, "amount"),
-         {:ok, display} <- opt_display(params),
-         {:ok, region} <- opt_region(params) do
+         {:ok, display} <- opt_display(params) do
       request = %{
         "action" => "scroll",
         "x" => x,
@@ -241,7 +307,7 @@ defmodule Compux.Protocol do
         "amount" => amount
       }
 
-      {:ok, put_region(put_display(request, display), region)}
+      {:ok, put_display(request, display)}
     end
   end
 
@@ -278,7 +344,7 @@ defmodule Compux.Protocol do
   defp coord(params, key) do
     case Map.get(params, key) do
       value when is_integer(value) and value >= 0 -> {:ok, value}
-      _other -> {:error, "#{key} must be a non-negative integer (screenshot pixel space)"}
+      _other -> {:error, "#{key} must be a non-negative integer (pixels in the named image)"}
     end
   end
 
@@ -371,9 +437,10 @@ defmodule Compux.Protocol do
   defp maybe_put(request, _key, nil), do: request
   defp maybe_put(request, key, value), do: Map.put(request, key, value)
 
-  # A zoom rectangle in the full-screenshot pixel space — the coordinates the model
-  # reads off a normal screenshot. Passing the same `region` on a `screenshot` and the
-  # follow-up click maps the click back through the crop.
+  # A zoom rectangle, read in the image named by `observation_id` or — with none —
+  # in the full-display image. It is accepted only by the actions that PRODUCE an
+  # image or a list of coordinates; an action that addresses a point names its image
+  # instead, so no rectangle is ever copied from one request into the next.
   # Opt into JPEG for this capture. Absent = PNG, the lossless default for reading
   # fine UI text; a BULK periodic caller (a continuous screen feed) sets it, because
   # a full-desktop PNG is an order of magnitude larger and saturates the uplink at
@@ -410,7 +477,7 @@ defmodule Compux.Protocol do
   defp region_error do
     {:error,
      "region must be an object with non-negative integer x,y and positive integer w,h " <>
-       "(in the full-screenshot pixel space)"}
+       "(pixels in the image named by observation_id, or the full-display image with none)"}
   end
 
   defp put_region(request, nil), do: request

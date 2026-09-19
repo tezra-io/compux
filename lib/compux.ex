@@ -14,9 +14,18 @@ defmodule Compux do
 
       {:ok, cu}   = Compux.start()
       {:ok, shot} = Compux.screenshot(cu, region: {0, 0, 400, 300})
-      :ok         = Compux.click(cu, {120, 80}, button: :left, modifiers: [:cmd])
-      {:ok, el}   = Compux.inspect(cu, {120, 80})
+      :ok         = Compux.click(cu, {120, 80}, observation_id: shot["observation_id"])
+      {:ok, el}   = Compux.inspect(cu, {120, 80}, observation_id: shot["observation_id"])
       :ok         = Compux.stop(cu)
+
+  ## Coordinates name their image
+
+  Every reply that hands you coordinates carries an `observation_id`, and every
+  call that sends coordinates back names the image they were read from. The
+  sidecar keeps the transform with the image, so a click is mapped by the geometry
+  the picture was taken with — never by a rectangle the caller repeated. The
+  actions that address a point therefore take `:observation_id` and no `:region`;
+  the actions that produce an image or a list of coordinates take both.
 
   ## The version handshake
 
@@ -100,8 +109,9 @@ defmodule Compux do
     do: run(cu, put_opts(%{"action" => "screenshot"}, opts), opts)
 
   @doc """
-  Click at a screenshot-space coordinate. `:button` is `:left` (default), `:right`,
-  or `:double`; other opts: `:modifiers`, `:display`, `:region`, `:screenshot_after`.
+  Click at a pixel of the image named by `:observation_id`. `:button` is `:left`
+  (default), `:right`, or `:double`; other opts: `:modifiers`, `:display`,
+  `:screenshot_after`.
   """
   @spec click(t(), coord(), keyword()) :: response()
   def click(%__MODULE__{} = cu, {x, y}, opts \\ []) do
@@ -109,16 +119,16 @@ defmodule Compux do
       %{"action" => click_action(Keyword.get(opts, :button, :left)), "x" => x, "y" => y}
       |> maybe_put("modifiers", modifiers(opts))
 
-    run(cu, put_opts(params, opts), opts)
+    run(cu, put_addressed(params, opts), opts)
   end
 
-  @doc "Move the pointer to a screenshot-space coordinate (read-only, no post-shot)."
+  @doc "Move the pointer to a pixel of the named image (read-only, no post-shot)."
   @spec move(t(), coord(), keyword()) :: response()
   def move(%__MODULE__{} = cu, {x, y}, opts \\ []) do
     params =
       maybe_put(%{"action" => "mouse_move", "x" => x, "y" => y}, "modifiers", modifiers(opts))
 
-    run(cu, put_opts(params, opts), opts)
+    run(cu, put_addressed(params, opts), opts)
   end
 
   @doc "Scroll `amount` steps in `:up`/`:down`/`:left`/`:right` at a coordinate."
@@ -132,10 +142,10 @@ defmodule Compux do
       "amount" => amount
     }
 
-    run(cu, put_opts(params, opts), opts)
+    run(cu, put_addressed(params, opts), opts)
   end
 
-  @doc "Press-drag from one screenshot-space coordinate to another."
+  @doc "Press-drag from one pixel of the named image to another."
   @spec drag(t(), coord(), coord(), keyword()) :: response()
   def drag(%__MODULE__{} = cu, {fx, fy}, {tx, ty}, opts \\ []) do
     params = %{
@@ -144,7 +154,7 @@ defmodule Compux do
       "to" => %{"x" => tx, "y" => ty}
     }
 
-    run(cu, put_opts(params, opts), opts)
+    run(cu, put_addressed(params, opts), opts)
   end
 
   @doc "Type a unicode string at the current focus."
@@ -163,13 +173,12 @@ defmodule Compux do
     do: run(cu, %{"action" => "wait", "ms" => ms}, [])
 
   @doc """
-  Report the accessibility element under a screenshot-space coordinate (role,
-  title, description, value). Read-only; macOS only. Shadows `Kernel.inspect/2`.
+  Report the accessibility element under a pixel of the named image (role, title,
+  description, value). Read-only; macOS only. Shadows `Kernel.inspect/2`.
   """
   @spec inspect(t(), coord(), keyword()) :: response()
   def inspect(%__MODULE__{} = cu, {x, y}, opts \\ []) do
-    params = put_display(%{"action" => "inspect", "x" => x, "y" => y}, opts)
-    run(cu, put_region(params, opts), opts)
+    run(cu, put_addressed(%{"action" => "inspect", "x" => x, "y" => y}, opts), opts)
   end
 
   @doc """
@@ -182,6 +191,7 @@ defmodule Compux do
       %{"action" => "wait_for_change"}
       |> put_display(opts)
       |> put_region(opts)
+      |> put_observation(opts)
       |> maybe_put("timeout_ms", Keyword.get(opts, :timeout_ms))
       |> maybe_put("poll_ms", Keyword.get(opts, :poll_ms))
 
@@ -195,7 +205,10 @@ defmodule Compux do
   """
   @spec elements(t(), keyword()) :: response()
   def elements(%__MODULE__{} = cu, opts \\ []) do
-    run(cu, put_region(put_display(%{"action" => "elements"}, opts), opts), opts)
+    params =
+      %{"action" => "elements"} |> put_display(opts) |> put_region(opts) |> put_observation(opts)
+
+    run(cu, params, opts)
   end
 
   @doc """
@@ -326,7 +339,20 @@ defmodule Compux do
   end
 
   defp put_opts(params, opts),
-    do: params |> put_display(opts) |> put_region(opts) |> put_jpeg_quality(opts)
+    do:
+      params
+      |> put_display(opts)
+      |> put_region(opts)
+      |> put_observation(opts)
+      |> put_jpeg_quality(opts)
+
+  # An action that ADDRESSES a point names its image and takes no rectangle: the
+  # sidecar holds the transform that image was made with.
+  defp put_addressed(params, opts),
+    do: params |> put_display(opts) |> put_observation(opts)
+
+  defp put_observation(params, opts),
+    do: maybe_put(params, "observation_id", Keyword.get(opts, :observation_id))
 
   defp put_jpeg_quality(params, opts),
     do: maybe_put(params, "jpeg_quality", Keyword.get(opts, :jpeg_quality))

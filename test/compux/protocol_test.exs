@@ -3,6 +3,23 @@ defmodule Compux.ProtocolTest do
 
   alias Compux.Protocol
 
+  # A valid request for one of the actions that address a point in a named image,
+  # so a test can remove exactly the field it is about.
+  defp addressed_params(action) do
+    base = %{"action" => action, "observation_id" => "7c1e-12"}
+
+    case action do
+      "left_click_drag" ->
+        Map.merge(base, %{"from" => %{"x" => 1, "y" => 2}, "to" => %{"x" => 3, "y" => 4}})
+
+      "scroll" ->
+        Map.merge(base, %{"x" => 1, "y" => 2, "direction" => "down", "amount" => 3})
+
+      _pointer ->
+        Map.merge(base, %{"x" => 1, "y" => 2})
+    end
+  end
+
   describe "protocol_version/0" do
     test "is a positive integer" do
       assert is_integer(Protocol.protocol_version())
@@ -120,39 +137,129 @@ defmodule Compux.ProtocolTest do
   describe "validate/1 — clicks and inspect" do
     for action <- ~w(left_click right_click double_click mouse_move inspect) do
       test "#{action} requires x and y" do
-        assert {:error, _} = Protocol.validate(%{"action" => unquote(action)})
+        assert {:error, _} =
+                 Protocol.validate(%{"action" => unquote(action), "observation_id" => "7c1e-1"})
 
         assert {:ok, req} =
-                 Protocol.validate(%{"action" => unquote(action), "x" => 10, "y" => 20})
+                 Protocol.validate(%{
+                   "action" => unquote(action),
+                   "x" => 10,
+                   "y" => 20,
+                   "observation_id" => "7c1e-1"
+                 })
 
         assert req["x"] == 10 and req["y"] == 20
       end
     end
 
     test "a click carries modifiers when present" do
-      params = %{"action" => "left_click", "x" => 1, "y" => 2, "modifiers" => ["cmd", "shift"]}
+      params = %{
+        "action" => "left_click",
+        "x" => 1,
+        "y" => 2,
+        "modifiers" => ["cmd", "shift"],
+        "observation_id" => "7c1e-1"
+      }
+
       assert {:ok, req} = Protocol.validate(params)
       assert req["modifiers"] == ["cmd", "shift"]
     end
 
     test "a click rejects an unknown modifier" do
-      params = %{"action" => "left_click", "x" => 1, "y" => 2, "modifiers" => ["hyper"]}
+      params = %{
+        "action" => "left_click",
+        "x" => 1,
+        "y" => 2,
+        "modifiers" => ["hyper"],
+        "observation_id" => "7c1e-1"
+      }
+
       assert {:error, _} = Protocol.validate(params)
     end
 
     test "negative coordinates are rejected" do
-      assert {:error, _} = Protocol.validate(%{"action" => "left_click", "x" => -1, "y" => 2})
+      assert {:error, _} =
+               Protocol.validate(%{
+                 "action" => "left_click",
+                 "x" => -1,
+                 "y" => 2,
+                 "observation_id" => "7c1e-1"
+               })
+    end
+  end
+
+  # v8: a coordinate names the image it was read from. An action that addresses a
+  # point carries `observation_id` and no `region`; an action that PRODUCES an
+  # image takes both, and `region` then means "in the image that id names".
+  describe "validate/1 — addressing (v8)" do
+    for action <-
+          ~w(left_click right_click double_click mouse_move inspect left_click_drag scroll) do
+      test "#{action} carries the observation it was read from" do
+        assert {:ok, req} = Protocol.validate(addressed_params(unquote(action)))
+        assert req["observation_id"] == "7c1e-12"
+      end
+
+      test "#{action} without an observation_id is refused" do
+        params = Map.delete(addressed_params(unquote(action)), "observation_id")
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "observation_id"
+      end
+
+      test "#{action} refuses a region — the image is named, not described" do
+        params =
+          Map.put(
+            addressed_params(unquote(action)),
+            "region",
+            %{"x" => 0, "y" => 0, "w" => 10, "h" => 10}
+          )
+
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "region"
+      end
+
+      test "#{action} refuses an observation_id that is not a non-empty string" do
+        for bad <- ["", 7, nil] do
+          params = Map.put(addressed_params(unquote(action)), "observation_id", bad)
+          assert {:error, _} = Protocol.validate(params)
+        end
+      end
+    end
+
+    for action <- ~w(screenshot elements wait_for_change) do
+      test "#{action} takes an observation_id beside its region" do
+        params = %{
+          "action" => unquote(action),
+          "observation_id" => "7c1e-12",
+          "region" => %{"x" => 0, "y" => 0, "w" => 10, "h" => 10}
+        }
+
+        assert {:ok, req} = Protocol.validate(params)
+        assert req["observation_id"] == "7c1e-12"
+        assert req["region"]["w"] == 10
+      end
+
+      test "#{action} still works with neither" do
+        assert {:ok, req} = Protocol.validate(%{"action" => unquote(action)})
+        refute Map.has_key?(req, "observation_id")
+      end
+    end
+
+    test "windows names no observation — it is what produces them" do
+      assert {:error, _} =
+               Protocol.validate(%{"action" => "windows", "observation_id" => "7c1e-12"})
     end
   end
 
   describe "validate/1 — drag/scroll/type/key/wait" do
     test "left_click_drag needs from/to points" do
-      assert {:error, _} = Protocol.validate(%{"action" => "left_click_drag"})
+      assert {:error, _} =
+               Protocol.validate(%{"action" => "left_click_drag", "observation_id" => "7c1e-1"})
 
       params = %{
         "action" => "left_click_drag",
         "from" => %{"x" => 0, "y" => 0},
-        "to" => %{"x" => 5, "y" => 5}
+        "to" => %{"x" => 5, "y" => 5},
+        "observation_id" => "7c1e-1"
       }
 
       assert {:ok, req} = Protocol.validate(params)
@@ -160,10 +267,26 @@ defmodule Compux.ProtocolTest do
     end
 
     test "scroll needs a valid direction and a positive amount" do
-      bad = %{"action" => "scroll", "x" => 0, "y" => 0, "direction" => "sideways", "amount" => 3}
+      bad = %{
+        "action" => "scroll",
+        "x" => 0,
+        "y" => 0,
+        "direction" => "sideways",
+        "amount" => 3,
+        "observation_id" => "7c1e-1"
+      }
+
       assert {:error, _} = Protocol.validate(bad)
 
-      ok = %{"action" => "scroll", "x" => 0, "y" => 0, "direction" => "down", "amount" => 3}
+      ok = %{
+        "action" => "scroll",
+        "x" => 0,
+        "y" => 0,
+        "direction" => "down",
+        "amount" => 3,
+        "observation_id" => "7c1e-1"
+      }
+
       assert {:ok, req} = Protocol.validate(ok)
       assert req["direction"] == "down" and req["amount"] == 3
     end

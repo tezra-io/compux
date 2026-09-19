@@ -58,11 +58,11 @@ Sanity-check the wire without starting a session (the binary reads stdin, so it 
 given a line — never run it with no input, it will simply wait):
 
 ```sh
-printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":7,"deadline_ms":10000}\n' \
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":8,"deadline_ms":10000}\n' \
   | COMPUX_DISCLAIMED=1 "$SIDE/compux"
 ```
 
-It must report `"protocol_version":7`. **Every line into this sidecar is a tagged frame
+It must report `"protocol_version":8`. **Every line into this sidecar is a tagged frame
 now** — a request carries a `type` and a `request_id`, and an untagged protocol-6 line
 is refused rather than served. That is why the `printf` above looks nothing like the one
 this document carried when it was written against protocol 6.
@@ -324,17 +324,20 @@ modifier down, no button held, and the clipboard still holding the owner's own t
   The binary is `native/compux/target/release/compux` — call it `$CX` below. No
   daemon, no Fermix and no model is needed for any step here.
 * **Every step drives the sidecar through the small script below, not through a bare
-  `printf`.** Under protocol 7 an action request must carry the boot identity the
-  sidecar minted at start-up, and the only way to learn it is to say `hello` first on
-  the same process. One `printf` cannot do that, so `cx.py` says hello, then sends
-  each action you give it as a tagged frame and prints the reply.
+  `printf`.** An action request must carry the boot identity the sidecar minted at
+  start-up, and the only way to learn it is to say `hello` first on the same process.
+  Since protocol 8 an action that addresses a point must also name the IMAGE that
+  point was read in, and only a screenshot can mint one. One `printf` can do neither,
+  so `cx.py` says hello, takes a screenshot before any action that needs an image,
+  then sends each action you give it as a tagged frame and prints the reply.
 * `COMPUX_DISCLAIMED=1` makes the sidecar skip its TCC self-disclaim re-exec, so it
   runs under the **launching terminal's** Accessibility grant. Without that variable
   it re-execs into its own (unsigned, brand-new) identity, which has no grant — which
-  step 3 uses on purpose.
-* **Coordinates are sent-screenshot pixels**, not physical ones: the space of a
-  capture whose long edge is at most 1366. Pick a point over empty desktop; it does
-  not have to be precise for any step here.
+  step 3 uses on purpose. The terminal needs **Screen Recording** too now, because
+  every step that clicks takes a screenshot first to have an image to aim at.
+* **Coordinates are pixels in the image the action names** — the screenshot the
+  script takes for it, whose long edge is at most 1366, not physical pixels. Pick a
+  point over empty desktop; it does not have to be precise for any step here.
 * Nothing below writes to `~/.fermix*` or to any database, and nothing needs the
   `dev_local` sidecar to be replaced. Do that only if you also want to check the
   actions through the assistant.
@@ -351,35 +354,61 @@ import json, os, subprocess, sys
 side = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                         env=os.environ.copy(), text=True, bufsize=1)
 
+seq = [1]
+
 def send(frame):
     side.stdin.write(json.dumps(frame) + "\n")
     side.stdin.flush()
 
 def recv():
-    return json.loads(side.stdout.readline())
+    reply = json.loads(side.stdout.readline())
+    if "data" in reply:                      # an image, abbreviated so this is readable
+        reply["data"] = "<%d base64 bytes>" % len(reply["data"])
+    return reply
 
 send({"type": "request", "request_id": "r1", "action": "hello",
-      "protocol_version": 7, "deadline_ms": 10000})
+      "protocol_version": 8, "deadline_ms": 10000})
 hello = recv()
 print("hello   ", json.dumps(hello))
 
 envelope = {"sidecar_generation": hello["sidecar_generation"],
             "session_generation": 1, "authorization_generation": 1}
 
-for n, argument in enumerate(sys.argv[2:], start=2):
-    frame = {"type": "request", "request_id": "r%d" % n, "deadline_ms": 30000,
-             "mutation_seq": n - 1}
+def act(body):
+    seq[0] += 1
+    frame = {"type": "request", "request_id": "r%d" % seq[0], "deadline_ms": 30000,
+             "mutation_seq": seq[0] - 1}
     frame.update(envelope)
-    frame.update(json.loads(argument))
+    frame.update(body)
     send(frame)
-    print("action  ", json.dumps(recv()))
+    return recv()
+
+# A coordinate is pixels in the image you name, so every action that addresses a
+# point needs one — and only a screenshot mints one. This takes a fresh screenshot
+# before each such action rather than reusing one, so no step can fail on an image
+# that expired while you were reading.
+ADDRESSED = {"left_click", "right_click", "double_click", "mouse_move",
+             "left_click_drag", "scroll", "inspect"}
+
+for argument in sys.argv[2:]:
+    body = json.loads(argument)
+    if body.get("action") in ADDRESSED and "observation_id" not in body:
+        shot = act({"action": "screenshot"})
+        print("image   ", json.dumps(shot))
+        body["observation_id"] = shot.get("observation_id")
+    print("action  ", json.dumps(act(body)))
 
 side.stdin.close()
 PYEOF
 ```
 
 The first line it prints is always the handshake, and it must say
-`"protocol_version": 7`. If it does not, the binary is not the one you just built.
+`"protocol_version": 8`, with a `capabilities.observations` of
+`{"max": 3, "ttl_ms": 30000}`. If it does not, the binary is not the one you just
+built. Every `image` line names the screenshot the action after it is aimed at. If
+that line reads `"ok": false`, the sidecar could not capture — the launching
+terminal needs **Screen Recording** as well as Accessibility — and the action after
+it is refused `observation_required` for that reason and no other.
 
 ## 1. The success paths still land (30 seconds, fails fastest)
 
@@ -404,8 +433,11 @@ COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX" \
 pbpaste; echo
 ```
 
-Each action line must answer `"ok": true`, and each carries a `receipt` whose
-`dispatch` reads `sent` — that is the sidecar saying the input reached the screen. The click must click where a cmd-shift-click would;
+The click and the drag each print an `image` line first — the screenshot their
+coordinates are read in, which the script takes for them — and the paste none,
+because it addresses no point. Each action line must answer `"ok": true`, and each
+carries a `receipt` whose `dispatch` reads `sent` — that is the sidecar saying the
+input reached the screen. The click must click where a cmd-shift-click would;
 the drag must actually drag the icon (not demote to a click and leave it where it
 was — that is the interpolated path and its dwell, unchanged here); `pasted by
 compux` must appear in the document and `pbpaste` must print `the owner clipboard`.
@@ -423,11 +455,11 @@ The disclaim re-exec runs on every launch and now reports a failed spawn attribu
 check the disclaimed path too, since step 1 skipped it:
 
 ```sh
-printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":7,"deadline_ms":10000}\n' \
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":8,"deadline_ms":10000}\n' \
   | "$CX"; echo "exit=$?"
 ```
 
-It must print the hello frame with `"protocol_version":7` and `exit=0`. An exit in
+It must print the hello frame with `"protocol_version":8` and `exit=0`. An exit in
 the 70s here is a disclaim failure and the
 stderr line above it names which step; report the number. There is no way to provoke
 `posix_spawnattr_setflags` failing on a healthy machine, so 77 itself is proved by
@@ -577,8 +609,9 @@ click without it.
 # Live check — the protocol-7 wire and Pause (M42 slice 2)
 
 The wire itself is proved here, and more than by unit tests: this session drove the
-BUILT sidecar through the REAL `Compux.Transport` end to end — handshake at 7 with a
-boot generation, a `pause` acknowledged in 19 ms while a 20-second `wait` was
+BUILT sidecar through the REAL `Compux.Transport` end to end — the handshake with a
+boot generation (at 7 then; slice 3 has since moved it to 8, and the commands below
+say 8 because that is what this tree speaks), a `pause` acknowledged in 19 ms while a 20-second `wait` was
 running and naming it in `in_flight_request_id`, that wait ending `cancelled`, a
 click refused `paused` with a `not_sent` receipt, a click at the revoked generation
 refused `stale_generation`, `resume`, and a clean stop. So the two halves agree on
@@ -594,9 +627,9 @@ moved under it. In the order that fails fastest.
 * Install the built sidecar under `dev_local` exactly as §1 of the browser-capture
   check above describes (stop the daemon first, atomic replace, compare the
   sha256). `COMPUX_BUILD` does not affect it.
-* **Fermix must be on the matching branch.** Protocol 7 is an exact-version
-  handshake with no legacy mode: a protocol-6 Fermix against this sidecar refuses
-  at `hello` and computer history degrades with a protocol mismatch. That is the
+* **Fermix must be on the matching branch.** The handshake is exact-version with
+  no legacy mode: a Fermix on any other protocol refuses at `hello` and computer
+  history degrades with a protocol mismatch. That is the
   design working, not a fault to report.
 * `CX=/Users/sujshe/projects/compux/native/compux/target/release/compux` for the
   two steps that drive the binary directly.
@@ -604,13 +637,13 @@ moved under it. In the order that fails fastest.
 ## 1. The handshake, before any daemon (10 seconds)
 
 ```sh
-printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":7,"deadline_ms":10000}\n' \
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":8,"deadline_ms":10000}\n' \
   | COMPUX_DISCLAIMED=1 "$CX"
 ```
 
-One line back, `"type":"response"`, `"request_id":"r1"`, `"protocol_version":7`, a
-`"sidecar_generation"` that starts `boot-`, and a `"capabilities"` object listing
-`foreground_hid` and the three controls. A different `protocol_version` means the
+One line back, `"type":"response"`, `"request_id":"r1"`, `"protocol_version":8`, a
+`"sidecar_generation"` that starts `boot-`, a `"capabilities"` object listing
+`foreground_hid`, the three controls and `"observations":{"max":3,"ttl_ms":30000}`. A different `protocol_version` means the
 installed binary is not the one you just built — fix that before anything else.
 
 ## 2. The daemon comes up and an action still lands
@@ -651,15 +684,15 @@ means the control reader is not on its own thread.
 
 ## 5. Computer history still records after the version bump
 
-The capture rail moved to protocol 7 with the rest of the wire, so re-run §4 of the
+The capture rail moves with the rest of the wire, so re-run §4 of the
 browser-capture check above (type a sentence into Notes, then read the
 `computer_history_events` rows back). There must be a `field.value` row carrying it.
 
 If capture does not start, the console names why. Two refusals mean different
 things and only one is a bug:
 
-* `protocol_mismatch ... sidecar: 7` — a protocol-6 Fermix against this sidecar.
-  Expected; fix the pairing.
+* `protocol_mismatch ... sidecar: 8` — a Fermix on an older protocol against this
+  sidecar. Expected; fix the pairing.
 * `observe_start_refused` — the sidecar accepted the frame and declined to start,
   which is the Accessibility grant, not the version.
 
@@ -681,3 +714,189 @@ things and only one is a bug:
   typing has ended is the failure — it is what gets this sidecar killed mid-type.
 * **A SIGKILLed sidecar still releases nothing** — unchanged from the held-input
   check above.
+
+---
+
+# Live check — observation identity and geometry (M42 slice 3)
+
+This slice fixed a coordinate defect nobody here can see. On a display at 2x, the
+old constructor read the display's width in POINTS into its PHYSICAL width and then
+halved the already-logical bounds and origin: the model saw and could reach only the
+top-left quarter of the screen, and every click on a second display landed on the
+display next door. At 1x — the only panel this machine has — every one of those is
+the identity, which is why it has never shown.
+
+So the geometry is now built from a ratio MEASURED on the frame that was really
+captured, not from the display mode, and both answers a capture API can give (the
+backing scale, or 1x) map correctly. The unit tests prove both worlds and both
+origins. **What only a real Retina panel and a real second display can prove is
+which world this machine is in, and that a click lands where the model looked.**
+
+The other half is addressing: every reply that hands out coordinates names its
+image, and every action that sends coordinates back names one. That part was proved
+in this session against the built sidecar — `observation_required` on a click with
+no id, `unknown_observation` on a made-up one, `unknown_field` on a click carrying a
+`region`, each with a `not_sent` receipt — so the steps below are only what needs a
+screen.
+
+Expected outcome in one line: on a Retina display, in EVERY scaled mode it offers,
+the model sees the WHOLE screen and a click lands where it looked, full screen and
+zoomed; the same beside a display of a different backing scale, including one placed
+left of or above the main one; changing the display between a screenshot and a click
+is refused rather than relocated; and an image older than thirty seconds is refused
+while a fresh one works.
+
+The refusal to watch for is `capture_geometry_mismatch`. It is deliberately
+fail-closed — a wrong click is worse than a refusal — and its `detail` line carries
+every number that went into the decision, so it is a complete bug report on its own.
+Steps 2 and 3 are the two configurations most likely to produce one.
+
+## 0. Preconditions
+
+* The sidecar built from this branch, installed under `dev_local` exactly as §1 of
+  the browser-capture check describes (stop the daemon first, atomic replace,
+  compare the sha256), and Fermix on the matching branch — the handshake is
+  exact-version.
+* **A Retina display.** Any MacBook panel will do; the owner's 3840x1080 desktop
+  panel is 1x, where the whole defect is the identity, so §1 and §2 prove nothing on
+  it. Run those on the laptop's own screen. §4 to §7 are true on any display.
+* For §3, both displays at once, and at least one arrangement with the second one
+  placed to the LEFT of or ABOVE the main one, which is what gives it a negative
+  origin.
+* `CX=/Users/sujshe/projects/compux/native/compux/target/release/compux` and the
+  `/tmp/cx.py` from the held-input check above, which now takes a screenshot before
+  any action that addresses a point.
+
+## 1. The whole screen, and a click that lands (the defect, fails fastest)
+
+Ask the assistant for a screenshot of the Retina display and look at it.
+
+* **It must show the whole screen.** The old code sent the top-left quarter and said
+  nothing was wrong, because the click map agreed with it: the model simply lived in
+  a quarter of the desktop. A screenshot that shows a quarter here means this fix
+  did not take.
+* No `capture_geometry_mismatch` anywhere in the reply or the console — see §2 for
+  what to do if there is one.
+* Then ask it to click something small and unambiguous near a CORNER of that screen
+  (a menu-bar item at the top right, the Dock's last icon). It must land on that
+  thing. A click that lands at half its coordinates, or a quarter of the way in, is
+  the defect in the other direction and is worth reporting with the screenshot.
+* Ask it to zoom into a region and click something inside the zoomed image. That
+  must land too: the crop's transform is the one stored with the crop.
+
+## 2. Every scaled mode of that display
+
+This is the configuration most likely to trip the new rule, and the one no test here
+can reach. A Retina panel is normally run SCALED — System Settings → Displays offers
+"More Space" and "Larger Text" beside the default — and each of those is a different
+number of points over the same physical panel. The helper measures the ratio from
+the frame it actually captured, so each mode should simply measure differently.
+
+For **each** setting Displays offers on that panel, including the default and both
+extremes, take a screenshot and write down three numbers from the reply: the image's
+`width`x`height`, the `physical` width and height, and `scale`. Then click something
+near a corner.
+
+* Every mode must show the whole screen and land its click.
+* **If `capture_geometry_mismatch` fires, that IS the bug report.** Its `detail` line
+  carries the frame's size, the display's size in points, the mode's backing scale
+  and both measured ratios — copy it verbatim along with the mode you had selected.
+  Computer use refusing there is the design working, not a crash: the helper found a
+  frame it cannot explain and would rather refuse than click somewhere nobody chose.
+  Everything else in Fermix keeps working; only computer use on that display stops.
+* A mode that answers `scale` 1 on a Retina panel is not a fault either — it means
+  the capture came back at 1x, which this code handles. Write it down; it is the one
+  fact nobody has yet observed.
+
+## 3. Two displays with DIFFERENT backing scales
+
+The pairing that breaks assumptions: a 1x external monitor beside a Retina panel.
+Each display is measured on its own, so neither's ratio may leak into the other.
+
+Do it in both arrangements, because which display is "main" changes the origins:
+
+1. Retina panel main, 1x external to the RIGHT.
+2. 1x external main, Retina panel to the right — and then, once, with the second
+   display placed to the LEFT of or ABOVE the main one, so its origin goes negative.
+
+In each arrangement, for **each** display: a full screenshot (whole screen, no
+mismatch) and a click near a corner. The click must land on the display it was read
+from. This is the case the old code got most wrong: the origin was halved, so a
+click meant for the second display landed somewhere on the first.
+
+If `capture_geometry_mismatch` fires on one display and not the other, say which —
+the `detail` names the display's size in points, which identifies it.
+
+## 4. The image is named, and the name is what a click carries
+
+Drive the sidecar directly, with TextEdit or Finder in front:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX" '{"action":"left_click","x":400,"y":300}'
+```
+
+* The `image` line carries `"observation_id"` (four characters, a dash, a counter,
+  e.g. `7c1e-1`), `"observation_kind": "image"`, a `frame_seq` and a
+  `captured_at_monotonic_ns`.
+* The `action` line is `"ok": true`, and its `receipt` names
+  `"observation_id_before"` — the image the click was aimed at.
+* A point past the edge of that image is refused rather than clamped onto it:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX" '{"action":"mouse_move","x":99999,"y":10}'
+```
+
+  must answer `"error": "point_outside_observation"` with the image's size in the
+  detail, and the pointer must not move at all.
+
+## 5. The view does not walk
+
+Ask the assistant to do several mutating actions in a row in one app — click, type,
+click, scroll, click — without asking for a fresh screenshot in between. Fermix
+re-derives its view from its own last image after each one.
+
+The check images must stay on the same view: no drift left or right, no edge
+creeping in, no strip of the screen sliding out. A view that walks a pixel or two
+per action is the defect the fixed-point test in `geometry.rs` now pins, and seeing
+it here means the test is measuring something narrower than reality.
+
+## 6. Changing the display between a screenshot and a click
+
+Ask for a screenshot. Before the next action, change the display arrangement — drag
+one display in System Settings, or change its resolution or its scaled mode. Then
+ask for a click on something in that screenshot.
+
+* It must be refused with `stale_observation` and `geometry_changed`, and nothing
+  may be clicked. A click that happens anyway has been computed from a geometry that
+  no longer exists, which is the failure this refusal is for.
+* A fresh screenshot and the same click must then work — and on a display whose
+  MODE you just changed, that fresh screenshot is also what re-measures it. Ask for
+  `windows` or an element list right after, and its coordinates must agree with the
+  new screenshot rather than the old mode: a click on a listed window must land on
+  that window.
+
+## 7. Thirty seconds
+
+Ask for a screenshot, then wait more than thirty seconds doing nothing, then ask for
+a click on something in it.
+
+* `expired_observation`, nothing clicked, and the sentence tells the model to look
+  again. Then a fresh screenshot and the same click must work.
+* Worth noting how often this costs a turn in ordinary use. The 30 s bound was
+  chosen against 227 recorded actions (p95 20 s, about 1.3% over 30 s); if it bites
+  more often than that in practice, the number is the thing to change.
+
+## 8. What this check still cannot prove
+
+* **Which world this machine is in.** The measurement is read from the frame, so the
+  code does not care whether the capture answers at the backing scale or at 1x — but
+  nobody has yet seen which one macOS gives here. If §1 and §2 pass, both are
+  handled; the `scale` field in the screenshot reply says which one it was, and that
+  is the number to write down.
+* **That a pixel is exactly the right pixel.** `to_logical` rounds to a whole logical
+  point because that is all enigo takes, so on a crop magnified past the point grid
+  the finest aim is one point, not one image pixel. A click landing a pixel or two
+  off the centre of a small target is that bound, not a defect.
+* **Three displays, or a display hot-plugged mid-action.** The staleness check reads
+  what the OS says before every addressed action, so it should refuse rather than
+  misfire, but no test here has a third panel to prove it.

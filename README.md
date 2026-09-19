@@ -6,8 +6,9 @@ by a crash-isolated Rust sidecar spawned over a Port — **not** a NIF.
 ```elixir
 {:ok, cu}   = Compux.start()
 {:ok, shot} = Compux.screenshot(cu, region: {0, 0, 800, 600})
-:ok         = Compux.click(cu, {120, 80}, button: :left, modifiers: [:cmd])
-{:ok, el}   = Compux.inspect(cu, {120, 80})   # accessibility element under a point (macOS)
+image       = shot["observation_id"]
+:ok         = Compux.click(cu, {120, 80}, observation_id: image, modifiers: [:cmd])
+{:ok, el}   = Compux.inspect(cu, {120, 80}, observation_id: image)
 :ok         = Compux.stop(cu)
 ```
 
@@ -23,8 +24,9 @@ executable, and Elixir owns it over stdin/stdout with a line-framed JSON protoco
 The split:
 
 - **`compux` (the library)** owns the *mechanism* — the wire protocol
-  (`Compux.Protocol`), the Port plumbing (`Compux.PortDriver`), the coordinate math
-  (Retina physical-vs-logical, region zoom), and the ergonomic API (`Compux`).
+  (`Compux.Protocol`), the Port plumbing (`Compux.PortDriver`) and the ergonomic
+  API (`Compux`). The coordinate math and the images it applies to live in the
+  sidecar, which is the only side that can measure a display.
 - **The caller** owns the *policy* — when an action is allowed, confirmation, and
   telemetry. `compux` makes no such decisions; it returns `{:ok, _} | {:error, _}`.
 
@@ -36,8 +38,29 @@ unicode-safe for long text), `key` (chords like `"cmd+shift+4"`, incl. `f1`–`f
 `wait`, `wait_for_change` (block until the screen changes, then return the new
 frame), `inspect` (the accessibility element under a point), and `elements` (the
 interactive accessibility elements with a click point each — target by element, not
-raw pixels). Every coordinate is in the screenshot's pixel space; a `:region` zooms
-capture *and* the click mapping through one shared crop, so clicks can't land offset.
+raw pixels).
+
+## Coordinates name their image
+
+Every reply that hands you coordinates carries an `observation_id`, and every call
+that sends coordinates back names the image they were read in. The sidecar keeps
+the transform with the image and uses it as stored, so a click is mapped by the
+geometry the picture was taken with — never by a rectangle the caller repeated, and
+never by one it forgot.
+
+So the actions split in two. `screenshot`, `elements` and `wait_for_change` PRODUCE
+coordinates: they take a `:region`, optionally read in an image you name, and each
+answers with an id of its own. `left_click`, `right_click`, `double_click`,
+`mouse_move`, `left_click_drag`, `scroll` and `inspect` ADDRESS a point: each takes
+an `:observation_id` and no `:region`.
+
+The sidecar keeps the last three images for thirty seconds (the numbers are in the
+handshake's `capabilities.observations`). Past that, or on an id it never minted,
+or after the display has moved or changed mode, the action is refused with
+`expired_observation`, `unknown_observation` or `stale_observation` and nothing is
+dispatched — take a fresh screenshot and read the coordinates again. A point
+outside the image it names is `point_outside_observation`, never clamped onto an
+edge.
 
 ## The version handshake
 
@@ -106,9 +129,11 @@ never read.
 ## Status
 
 Alpha (`0.x`). The coordinate math is unit-tested (including the Retina
-physical-vs-logical regression); the wire protocol, handshake, and capture paths are
-verified on-device. Input-injection landing and `inspect` roles need per-machine
-verification with the grants in place.
+physical-vs-logical regression, at both the backing scale and 1x); the wire
+protocol, handshake, and capture paths are verified on-device. Input-injection
+landing and `inspect` roles need per-machine verification with the grants in place,
+and the Retina and second-display geometry needs a machine that has one —
+`LIVE_CHECK.md` says what such a run must show.
 
 ## License
 
