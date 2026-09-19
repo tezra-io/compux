@@ -389,12 +389,28 @@ fn reply(
             // An after-image is whatever the action actually produced, never what
             // it was asked to produce: `data` is present only when a capture ran.
             let after_image = payload.get("data").is_some();
-            let receipt = receipt(request, done.posted, true, after_image, done.timings);
+            let receipt = receipt(
+                request,
+                done.posted,
+                done.input_complete,
+                after_image,
+                done.timings,
+            );
             wire::response(gate.envelope(), &request.request_id, payload, receipt)
         }
 
         Err(message) => {
-            let receipt = receipt(request, done.posted, false, false, done.timings);
+            // `input_complete`, not `false`: the post-action check image is taken
+            // INSIDE the action, so a click whose every event landed and whose own
+            // screenshot then failed dispatched `sent`. Calling that `partial` would
+            // have Fermix report `unknown` where the truth is performed-unverified.
+            let receipt = receipt(
+                request,
+                done.posted,
+                done.input_complete,
+                false,
+                done.timings,
+            );
             // Every refusal that reaches here was cancelled (a pause sets both
             // flags), so a refusal code only ever lands in `detail` and never
             // stands in for the action's own error. A detail that merely repeats
@@ -417,14 +433,14 @@ fn reply(
 fn receipt(
     request: &wire::Request,
     posted: bool,
-    completed: bool,
+    input_complete: bool,
     after_image: bool,
     timings: wire::Timings,
 ) -> Option<wire::Receipt> {
     if wire::carries_mutation_seq(&request.action) {
         Some(wire::Receipt::derive(
             posted,
-            completed,
+            input_complete,
             after_image,
             timings,
         ))
@@ -1621,6 +1637,7 @@ fn mouse_move(req: &Value, gate: &Gate) -> Result<Value, String> {
     // is now here", and a posted move alone leaves that pending (hover would land on
     // whatever the pointer had not left yet).
     platform.settle(lx, ly)?;
+    gate.input_complete();
     // read-only: no post-action screenshot
     Ok(json!({ "ok": true }))
 }
@@ -1637,6 +1654,7 @@ fn click(req: &Value, gate: &Gate, button: Button, count: u32) -> Result<Value, 
     // move that pacing sleep in front of the screenshot.
     let mut platform = Gated::new(gate, held::Real::default());
     click_seq(&mut platform, lx, ly, button, count, &mods)?;
+    gate.input_complete();
 
     post(req, &display, gate)
 }
@@ -1685,6 +1703,7 @@ fn drag(req: &Value, gate: &Gate) -> Result<Value, String> {
     // A local for the same reason as `click`: enigo's pacing runs on its drop.
     let mut platform = Gated::new(gate, held::Real::default());
     drag_seq(&mut platform, fx, fy, tx, ty)?;
+    gate.input_complete();
 
     post(req, &display, gate)
 }
@@ -1762,6 +1781,7 @@ fn scroll(req: &Value, gate: &Gate) -> Result<Value, String> {
     platform.move_mouse(lx, ly)?;
     platform.settle(lx, ly)?;
     platform.scroll(length, axis)?;
+    gate.input_complete();
 
     post(req, &display, gate)
 }
@@ -1777,6 +1797,7 @@ fn type_text(req: &Value, gate: &Gate) -> Result<Value, String> {
     // timing in ways only a live check could qualify.
     let mut platform = Gated::new(gate, held::Real::default());
     platform.text(text)?;
+    gate.input_complete();
     post(req, &target_display(req)?, gate)
 }
 
@@ -1795,6 +1816,7 @@ fn key_chord(req: &Value, gate: &Gate) -> Result<Value, String> {
     // A local for the same reason as `click`: enigo's pacing runs on its drop.
     let mut platform = Gated::new(gate, held::Real::default());
     key_chord_seq(&mut platform, &mods, main)?;
+    gate.input_complete();
 
     post(req, &target_display(req)?, gate)
 }
@@ -1996,6 +2018,7 @@ fn paste(req: &Value, gate: &Gate) -> Result<Value, String> {
     // the clipboard handle lived this long too.
     let mut platform = Gated::new(gate, held::Real::default());
     paste_seq(&mut platform, text)?;
+    gate.input_complete();
 
     post(req, &target_display(req)?, gate)
 }
@@ -4169,6 +4192,51 @@ mod tests {
             frame.get("receipt").is_none(),
             "hello is read-only and earns no receipt"
         );
+    }
+
+    // F2: the post-action check image is taken INSIDE the action, so an action can
+    // land every one of its events and then fail on its own screenshot. Reporting
+    // that as `partial` would have Fermix call it `unknown`, when the truth is that
+    // the click happened and only the verification did not.
+    #[test]
+    fn a_click_whose_own_check_image_failed_still_reports_the_input_as_sent() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let request = running("left_click", Some(1));
+        gate.admit(&request).unwrap();
+
+        let mut platform = Gated::new(&gate, Recorder::new(None));
+        click_seq(&mut platform, 10, 20, Button::Left, 1, &[]).unwrap();
+        gate.input_complete(); // exactly where `click` latches it, before `post`
+        let done = gate.finish();
+
+        // ... and then `post` failed on its own capture.
+        let frame = reply(&request, &gate, Err("capture_stalled".to_string()), done);
+
+        assert_eq!(frame["ok"], json!(false));
+        assert_eq!(frame["error"], json!("capture_stalled"));
+        assert_eq!(
+            frame["receipt"]["dispatch"],
+            json!("sent"),
+            "the input landed; only the check did not"
+        );
+    }
+
+    // The complement, so the latch cannot simply be "always sent": a sequence that
+    // stopped part way is still `partial`.
+    #[test]
+    fn a_click_that_stopped_part_way_still_reports_partial() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let request = running("left_click", Some(1));
+        gate.admit(&request).unwrap();
+
+        let mut platform = Gated::new(&gate, Recorder::new(None));
+        platform.move_mouse(10, 20).unwrap();
+        // the sequence failed here, so nothing latched
+        let done = gate.finish();
+
+        let frame = reply(&request, &gate, Err("click: refused".to_string()), done);
+
+        assert_eq!(frame["receipt"]["dispatch"], json!("partial"));
     }
 
     // The capture rail answers in its own family, with no envelope and no id, so

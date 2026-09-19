@@ -50,6 +50,50 @@ defmodule Compux.PortTest do
     end
   end
 
+  # The computer-history capturer owns a raw Port and writes its own lines, so
+  # THIS is where a regression to the protocol-6 shape would land. The sidecar
+  # refuses a typeless line and answers in the `ack` family naming its own
+  # version — the one vocabulary a protocol-6 client can read, so it reports a
+  # mismatch instead of waiting out a handshake nothing will answer
+  # (`wire::untagged` -> `Reply::CaptureAck`).
+  describe "a raw Port writing the old shape" do
+    test "a typeless line is refused with an ack naming the sidecar's version" do
+      {:ok, handle} = SidecarPort.open(binary_path: @fake)
+      port = handle.port
+
+      Elixir.Port.command(port, ~s({"action":"observe_start","params":{"apps":[]}}\n))
+
+      assert_receive {^port, {:data, {:eol, line}}}, 2_000
+      assert {:ok, %Compux.Frame.History{type: "ack"} = frame} = Compux.Frame.decode(line)
+      assert frame.payload["ok"] == false
+      assert frame.payload["action"] == "observe_start"
+      assert frame.payload["protocol_version"] == Compux.Protocol.protocol_version()
+      assert frame.payload["error"] =~ "tagged frame"
+
+      SidecarPort.kill(handle)
+    end
+
+    test "the tagged frame this library writes is answered normally" do
+      {:ok, handle} = SidecarPort.open(binary_path: @fake)
+      port = handle.port
+
+      {:ok, line} =
+        Compux.Frame.encode(%Compux.Frame.Request{
+          request_id: "o1",
+          args: %{"action" => "observe_start", "params" => %{"apps" => []}}
+        })
+
+      Elixir.Port.command(port, line)
+
+      assert_receive {^port, {:data, {:eol, reply}}}, 2_000
+
+      assert {:ok, %Compux.Frame.Response{request_id: "o1", ok: true}} =
+               Compux.Frame.decode(reply)
+
+      SidecarPort.kill(handle)
+    end
+  end
+
   describe "kill/1" do
     test "ends the OS process, not just the pipes" do
       {:ok, handle} = SidecarPort.open(binary_path: @fake)

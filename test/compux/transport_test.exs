@@ -44,6 +44,15 @@ defmodule Compux.TransportTest do
                Transport.start_link(binary_path: "/no/such/compux")
     end
 
+    # The hello response comes through the sidecar's ordinary envelope, so it
+    # already states the session generation every later frame will carry.
+    test "reads the session generation the sidecar will stamp on every frame" do
+      transport = start!()
+      assert {:ok, echo} = Transport.request(transport, %{"action" => "echo"}, 2_000)
+      assert echo["seen_sidecar_generation"] == "boot-test"
+      Transport.stop(transport)
+    end
+
     # Asking again is answered from the handshake rather than by spending a
     # second round trip on a value that cannot change without a reboot.
     test "a second hello is answered from the identity already read" do
@@ -129,14 +138,49 @@ defmodule Compux.TransportTest do
       Transport.stop(transport)
     end
 
-    test "a successful mutation carries its receipt" do
+    # The fixture derives the receipt the way the sidecar does — off the request's
+    # own `mutation_seq`, with an after-image only when the payload really has
+    # `data` — so EVERY mutating success in this suite carries one. A library
+    # change that dropped or rewrote receipts now fails broadly, not in one test.
+    test "a mutating success carries its receipt and a read-only one carries none" do
       transport = start!()
 
       assert {:ok, %{"receipt" => receipt}} =
-               Transport.request(transport, %{"action" => "receipt"}, 2_000)
+               Transport.request(transport, %{"action" => "echo"}, 2_000)
 
       assert receipt["dispatch"] == "sent"
+      assert receipt["input_method"] == "foreground_hid"
+      assert receipt["effect"] == "unknown", "nothing was captured, so nothing was observed"
+
+      assert {:ok, read} = Transport.request(transport, %{"action" => "screenshot"}, 2_000)
+      refute Map.has_key?(read, "receipt")
+
+      Transport.stop(transport)
+    end
+
+    test "an after-image makes the effect not_observed" do
+      transport = start!()
+
+      assert {:ok, %{"receipt" => receipt, "data" => "AAA"}} =
+               Transport.request(transport, %{"action" => "capture"}, 2_000)
+
       assert receipt["effect"] == "not_observed"
+
+      Transport.stop(transport)
+    end
+
+    # Deliberately NOT this library's rule. The receipt is a fact the transport
+    # carries; what a missing one MEANS is policy, and Fermix already treats it as
+    # a protocol fault. Enforcing it in both layers would put one rule in two
+    # repositories, and refusing here would destroy the response of an action that
+    # already ran — the one thing this wire must never do. So the absence reaches
+    # the caller visibly and unaltered, and the caller adjudicates.
+    test "a mutating success with no receipt reaches the caller unaltered" do
+      transport = start!()
+
+      assert {:ok, payload} = Transport.request(transport, %{"action" => "no_receipt"}, 2_000)
+      assert payload["ok"] == true
+      refute Map.has_key?(payload, "receipt")
 
       Transport.stop(transport)
     end
@@ -202,12 +246,21 @@ defmodule Compux.TransportTest do
       Transport.stop(transport)
     end
 
-    test "the acknowledged authority generation rides on the next request" do
+    # The gate counts, one per control, from its own initial 1 — so the value is
+    # evidence that a control was applied, not a constant the transport could
+    # have invented.
+    test "the acknowledged authority generation counts and rides on the next request" do
       transport = start!()
-      assert {:ok, _ack} = Transport.control(transport, :pause, 2_000)
+
+      assert {:ok, %{authorization_generation: 2}} = Transport.control(transport, :pause, 2_000)
 
       assert {:ok, echo} = Transport.request(transport, %{"action" => "echo"}, 2_000)
       assert echo["seen_authorization_generation"] == 2
+
+      assert {:ok, %{authorization_generation: 3}} = Transport.control(transport, :resume, 2_000)
+
+      assert {:ok, echo} = Transport.request(transport, %{"action" => "echo"}, 2_000)
+      assert echo["seen_authorization_generation"] == 3
 
       Transport.stop(transport)
     end
@@ -324,7 +377,7 @@ defmodule Compux.TransportTest do
   end
 
   describe "frames that poison the transport" do
-    test "a response naming a request nobody sent" do
+    test "a response whose id is not even our shape" do
       transport = start!()
 
       assert {:error, {:unknown_request_id, "r-nobody-sent-this"}} =
@@ -332,6 +385,31 @@ defmodule Compux.TransportTest do
 
       assert {:error, :sidecar_unavailable} =
                Transport.request(transport, %{"action" => "screenshot"}, 1_000)
+
+      Transport.stop(transport)
+    end
+
+    # Our shape, our prefix — and a number this transport has not reached, so it
+    # cannot be a request of ours that ended. It never existed.
+    test "a response naming an id above anything we have minted" do
+      transport = start!()
+
+      assert {:error, {:unknown_request_id, "r9999"}} =
+               Transport.request(transport, %{"action" => "future_id"}, 2_000)
+
+      assert {:error, :sidecar_unavailable} =
+               Transport.request(transport, %{"action" => "screenshot"}, 1_000)
+
+      Transport.stop(transport)
+    end
+
+    # The capture verbs answer in the `ack` family and the transport must never
+    # send one, so an ack arriving here means the wire is not what we think.
+    test "an interleaved computer-history ack is refused too" do
+      transport = start!()
+
+      assert {:error, {:unexpected_frame, :ack}} =
+               Transport.request(transport, %{"action" => "history_ack"}, 2_000)
 
       Transport.stop(transport)
     end
@@ -374,11 +452,13 @@ defmodule Compux.TransportTest do
       Transport.stop(transport)
     end
 
+    # Sixteen 64-byte fragments are 1024 bytes, exactly the cap and not over it;
+    # only the 40-byte tail crosses the boundary. Counting it is the difference.
     test "a frame over the response cap, counted on the final fragment" do
-      transport = start!(line_bytes: 64, max_response_bytes: 256)
+      transport = start!(line_bytes: 64, max_response_bytes: 1_024)
 
       assert {:error, :sidecar_response_too_large} =
-               Transport.request(transport, %{"action" => "oversize", "bytes" => 320}, 2_000)
+               Transport.request(transport, %{"action" => "oversize", "bytes" => 1_065}, 2_000)
 
       Transport.stop(transport)
     end
@@ -396,6 +476,29 @@ defmodule Compux.TransportTest do
       assert {:ok, response} = Transport.request(transport, %{"action" => "screenshot"}, 3_000)
       assert response["pong"] == true
       refute Map.has_key?(response, "late")
+
+      Transport.stop(transport)
+    end
+
+    # The rule is the counter, not a list. An earlier version remembered the last
+    # 16 abandoned ids, so the 17th timeout evicted the oldest and its eventual
+    # reply looked like a frame from nowhere — a healthy transport poisoned by its
+    # own past. Twenty requests are left to time out here, well past that bound,
+    # and every one of their late replies must still be recognised as ours.
+    test "many timeouts do not turn a late reply into a protocol violation" do
+      transport = start!()
+
+      for _ <- 1..20 do
+        assert {:error, {:timeout, 30}} =
+                 Transport.request(transport, %{"action" => "stash"}, 30)
+      end
+
+      assert {:ok, flushed} = Transport.request(transport, %{"action" => "flush_stash"}, 3_000)
+      assert flushed["flushed"] == true
+      refute Map.has_key?(flushed, "stale")
+
+      assert {:ok, response} = Transport.request(transport, %{"action" => "screenshot"}, 3_000)
+      assert response["pong"] == true
 
       Transport.stop(transport)
     end

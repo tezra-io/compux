@@ -186,16 +186,17 @@ defmodule Compux.ProtocolTest do
     end
   end
 
-  describe "encode_request/1" do
-    test "encode appends a newline and stays valid JSON" do
-      line = Protocol.encode_request(%{"action" => "screenshot"})
-      assert String.ends_with?(line, "\n")
-      assert {:ok, %{"action" => "screenshot"}} = Jason.decode(String.trim(line))
+  # One wire format means one encoder and one decoder, and neither is here any
+  # more. `encode_request/1` wrote the UNTAGGED protocol-6 line a protocol-7
+  # sidecar refuses; `decode_response/1` called any `ok: true` map a response, so
+  # an `ack` or an `event` could stand in for an action's reply. Both live in
+  # `Compux.Frame` now, which is what every caller uses.
+  describe "the protocol neither encodes nor decodes a frame" do
+    test "encode_request/1 is gone" do
+      refute function_exported?(Protocol, :encode_request, 1)
     end
 
-    # Decoding lives in `Compux.Frame` now: a reader that called any `ok: true`
-    # map a response let an `ack` or an `event` stand in for an action's reply.
-    test "the protocol no longer decodes responses" do
+    test "decode_response/1 is gone" do
       refute function_exported?(Protocol, :decode_response, 1)
     end
   end

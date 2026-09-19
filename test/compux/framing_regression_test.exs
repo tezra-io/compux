@@ -39,21 +39,32 @@ defmodule Compux.FramingRegressionTest do
            "fragments renewed the deadline: the 300 ms call took #{div(elapsed_us, 1000)} ms"
   end
 
-  # The fixture answers with a single 320-byte response against a 256-byte cap and a
-  # 64-byte line limit: four 64-byte `:noeol` fragments, then the `:eol` tail. The
-  # old loop counted only `:noeol` bytes, so the final fragment was free and an
-  # over-cap frame was decoded and returned as a success.
+  # The arithmetic is the whole test. Against a 1024-byte cap and a 64-byte line
+  # limit, a 1064-byte frame arrives as sixteen 64-byte `:noeol` fragments —
+  # 1024 bytes, EXACTLY the cap and so not over it — and then a 40-byte `:eol`
+  # tail. Only counting that tail crosses the boundary, and the old loop never
+  # did: it summed `:noeol` bytes alone, so the last fragment was free and an
+  # over-cap frame was decoded and returned as a success. The 1000-byte case has
+  # the same fragment shape and sits under the cap, so the two differ ONLY in
+  # whether the tail tips the total.
+  #
+  # (The original red run used 256/320, the same shape an octave down. The
+  # constants moved when the fixture's `hello` grew to its faithful 271 bytes,
+  # which a 256-byte cap refuses before any test can start.)
   test "the final fragment counts toward the response cap" do
     {:ok, state} =
       PortDriver.start(
         binary_path: @fake,
         timeout: 2_000,
         line_bytes: 64,
-        max_response_bytes: 256
+        max_response_bytes: 1_024
       )
 
+    assert {:ok, %{"ok" => true}} =
+             PortDriver.execute(state, %{"action" => "oversize", "bytes" => 1_001})
+
     assert {:error, :sidecar_response_too_large} =
-             PortDriver.execute(state, %{"action" => "oversize", "bytes" => 320})
+             PortDriver.execute(state, %{"action" => "oversize", "bytes" => 1_065})
 
     PortDriver.stop(state)
   end

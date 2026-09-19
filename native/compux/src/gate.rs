@@ -2,17 +2,32 @@
 //!
 //! One mutex owns the generations, the pause flag, the `mutation_seq` high-water
 //! mark and the identity of the request in flight. [`Gate::admit`] takes it to
-//! decide, and [`Gate::dispatch`] takes it again **across the final check and the
-//! native call itself**. That second part is the whole design: a check followed by
-//! an unguarded event post has a window where a pause installs between the two and
-//! the event goes out anyway, after the ack said it would not.
+//! decide, and the dispatch primitives take it again to post.
+//!
+//! ## The invariant, exactly
+//!
+//! **For every post that is ONE EVENT — a key, a button, a pointer move, a drag
+//! step, a settle — the final check and the post share the mutex** ([`Gate::dispatch`]).
+//! That is the whole design: a check followed by an unguarded event post has a
+//! window where a pause installs between the two and the event goes out anyway,
+//! after the acknowledgement said it would not.
+//!
+//! **`type` and `scroll` are each a single platform call that can run for seconds**
+//! — `Protocol` caps typed text at 10,000 bytes and enigo posts it in chunks — so
+//! for those two the check and the mark are under the mutex and the CALL IS NOT
+//! ([`Gate::dispatch_long`]). This is reported, not hidden, and it is the lesser of
+//! two evils: holding the mutex across them would block the control reader past the
+//! library's five-second control budget, and an unacknowledged control poisons the
+//! transport and SIGKILLs this process in the middle of the typing it was trying to
+//! stop.
 //!
 //! What a pause promises is therefore precise, and no larger: **no dispatch that
-//! has not started can escape it.** A call already inside the window server may
-//! still land, so the acknowledgement names that request in `in_flight_request_id`
-//! rather than pretending it stopped. Everything slower than one event post — a
-//! sleep, a poll, a capture — runs OUTSIDE the mutex and reads the cancellation
-//! flag at a 25 ms cadence, so a control never waits on it.
+//! has not started can escape it.** A call already under way may still land, so the
+//! acknowledgement names that request in `in_flight_request_id` rather than
+//! pretending it stopped — and because the mark happens under the mutex BEFORE the
+//! long call begins, that naming is never a guess. Everything slower than one event
+//! post — a sleep, a poll, a capture, and these two calls — runs outside the mutex,
+//! so a control never waits on it.
 //!
 //! Cleanup is not dispatch. A release of a key this process is holding is allowed
 //! through a closed gate, because refusing it would be the gate itself stranding a
@@ -119,6 +134,9 @@ pub struct Acknowledged {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Dispatched {
     pub posted: bool,
+    /// Whether the INPUT SEQUENCE ran to its end, which is not the same as the
+    /// action succeeding: the post-action check image comes after it.
+    pub input_complete: bool,
     pub cancelled: bool,
     pub timings: Timings,
 }
@@ -126,6 +144,7 @@ pub struct Dispatched {
 struct InFlight {
     request_id: String,
     posted: bool,
+    input_complete: bool,
     timings: Timings,
 }
 
@@ -209,15 +228,18 @@ impl Gate {
             if state.paused && crate::wire::touches_input(&request.action) {
                 return Err(Refusal::Paused);
             }
-        }
 
-        if let Some(seq) = request.mutation_seq {
-            state.mutation_high_water = seq;
+            // Inside the guard, so the invariant is structural: nothing ungated can
+            // move a sequence number it was never checked against.
+            if let Some(seq) = request.mutation_seq {
+                state.mutation_high_water = seq;
+            }
         }
 
         state.in_flight = Some(InFlight {
             request_id: request.request_id.clone(),
             posted: false,
+            input_complete: false,
             timings: Timings::default(),
         });
         self.cancelled.store(false, Ordering::SeqCst);
@@ -252,31 +274,58 @@ impl Gate {
         }
     }
 
-    /// The final check and the native call, under one mutex.
+    /// One event: the final check and the post, under one mutex.
     ///
-    /// Everything that reaches the window server comes through here, which is what
-    /// makes both the pause and the receipt truthful: the gate, not the action's
-    /// name, is what knows whether input was posted.
+    /// Everything that reaches the window server comes through here or through
+    /// [`Gate::dispatch_long`], which is what makes both the pause and the receipt
+    /// truthful: the gate, not the action's name, is what knows whether input was
+    /// posted.
     pub fn dispatch<T>(&self, phase: Phase, call: impl FnOnce() -> T) -> Result<T, Refusal> {
         let mut state = self.lock();
+        Self::check(&state, &self.cancelled)?;
 
-        if self.cancelled.load(Ordering::SeqCst) {
+        let started = self.clock.now_ms();
+        let outcome = call();
+        let elapsed = self.clock.now_ms().saturating_sub(started);
+        mark(&mut state, phase, elapsed);
+
+        Ok(outcome)
+    }
+
+    /// One platform call that can run for seconds: the check and the mark under the
+    /// mutex, the call OUTSIDE it.
+    ///
+    /// Only `type` and `scroll` come through here, and only because each is a
+    /// single call with no loop of ours inside it. The mark is what keeps the
+    /// acknowledgement honest: a pause landing after it is answered at once and
+    /// names this request in `in_flight_request_id`, which is already what the
+    /// design says about a call under way. Holding the mutex instead would make the
+    /// control reader wait out the typing, which is how an unacknowledged control
+    /// gets this process killed mid-type.
+    pub fn dispatch_long<T>(&self, phase: Phase, call: impl FnOnce() -> T) -> Result<T, Refusal> {
+        {
+            let mut state = self.lock();
+            Self::check(&state, &self.cancelled)?;
+            // Marked BEFORE the call, so no window exists in which this process is
+            // typing and the gate does not know it.
+            mark(&mut state, phase, 0);
+        }
+
+        let started = self.clock.now_ms();
+        let outcome = call();
+        self.record(phase, self.clock.now_ms().saturating_sub(started));
+
+        Ok(outcome)
+    }
+
+    fn check(state: &State, cancelled: &AtomicBool) -> Result<(), Refusal> {
+        if cancelled.load(Ordering::SeqCst) {
             return Err(Refusal::Cancelled);
         }
         if state.paused {
             return Err(Refusal::Paused);
         }
-
-        let started = self.clock.now_ms();
-        let outcome = call();
-        let elapsed = self.clock.now_ms().saturating_sub(started);
-
-        if let Some(in_flight) = state.in_flight.as_mut() {
-            in_flight.posted = true;
-            add_timing(&mut in_flight.timings, phase, elapsed);
-        }
-
-        Ok(outcome)
+        Ok(())
     }
 
     /// Time spent in a call that is not input — a capture — recorded for the
@@ -286,6 +335,24 @@ impl Gate {
         if let Some(in_flight) = state.in_flight.as_mut() {
             add_timing(&mut in_flight.timings, phase, ms);
         }
+    }
+
+    /// The input sequence finished. Latched HERE rather than derived from the
+    /// action's overall result, because the post-action check image is taken after
+    /// it: a click whose every event landed and whose own screenshot then failed
+    /// dispatched `sent`, not `partial`.
+    pub fn input_complete(&self) {
+        let mut state = self.lock();
+        if let Some(in_flight) = state.in_flight.as_mut() {
+            in_flight.input_complete = true;
+        }
+    }
+
+    /// Is a request in flight? The reader asks before it hands over another, so a
+    /// second action is refused now rather than queued behind work whose screen has
+    /// moved on.
+    pub fn is_busy(&self) -> bool {
+        self.lock().in_flight.is_some()
     }
 
     /// One cancellation check. Atomics only: no mutex, so a 25 ms cadence costs
@@ -319,11 +386,13 @@ impl Gate {
         match state.in_flight.take() {
             Some(in_flight) => Dispatched {
                 posted: in_flight.posted,
+                input_complete: in_flight.input_complete,
                 cancelled,
                 timings: in_flight.timings,
             },
             None => Dispatched {
                 posted: false,
+                input_complete: false,
                 cancelled,
                 timings: Timings::default(),
             },
@@ -385,6 +454,14 @@ impl Gate {
     #[cfg(test)]
     fn paused(&self) -> bool {
         self.lock().paused
+    }
+}
+
+/// Record that a post happened, and what it cost. Both under the caller's lock.
+fn mark(state: &mut State, phase: Phase, ms: u64) {
+    if let Some(in_flight) = state.in_flight.as_mut() {
+        in_flight.posted = true;
+        add_timing(&mut in_flight.timings, phase, ms);
     }
 }
 
@@ -456,10 +533,11 @@ impl<P: Platform> Platform for Gated<'_, P> {
     }
 
     /// One call with the repeat count inside it: admitted at the gate, and not
-    /// interruptible after that, because there is no loop of ours to check.
+    /// interruptible after that, because there is no loop of ours to check. The
+    /// mutex is released before the call, so a pause is answered while it runs.
     fn scroll(&mut self, length: i32, axis: Axis) -> Result<(), String> {
         let Gated { gate, inner } = self;
-        gated(gate.dispatch(Phase::Input, || inner.scroll(length, axis)))
+        gated(gate.dispatch_long(Phase::Input, || inner.scroll(length, axis)))
     }
 
     /// One `text` call with no loop of ours, so it too is checked here and not
@@ -467,7 +545,7 @@ impl<P: Platform> Platform for Gated<'_, P> {
     /// check could qualify.
     fn text(&mut self, text: &str) -> Result<(), String> {
         let Gated { gate, inner } = self;
-        gated(gate.dispatch(Phase::Input, || inner.text(text)))
+        gated(gate.dispatch_long(Phase::Input, || inner.text(text)))
     }
 
     /// The checkpoint site of every sequence that paces itself. A cancelled sleep
@@ -799,6 +877,170 @@ mod tests {
         assert_eq!(platform.key(Key::Meta, Direction::Release), Ok(()));
         assert_eq!(platform.button(Button::Left, Direction::Release), Ok(()));
         assert_eq!(platform.set_clipboard_text("restored"), Ok(()));
+    }
+
+    /// A platform whose `text` blocks until it is released, so a control can be
+    /// timed against a call that is genuinely in progress rather than one that has
+    /// merely been asked for.
+    struct BlockingText {
+        entered: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    fn raise(flag: &(Mutex<bool>, std::sync::Condvar)) {
+        *flag.0.lock().unwrap() = true;
+        flag.1.notify_all();
+    }
+
+    fn await_flag(flag: &(Mutex<bool>, std::sync::Condvar)) {
+        let mut set = flag.0.lock().unwrap();
+        while !*set {
+            set = flag.1.wait(set).unwrap();
+        }
+    }
+
+    impl Platform for BlockingText {
+        fn text(&mut self, _text: &str) -> Result<(), String> {
+            raise(&self.entered);
+            await_flag(&self.release);
+            Ok(())
+        }
+
+        fn key(&mut self, _key: Key, _direction: Direction) -> Result<(), String> {
+            Ok(())
+        }
+        fn button(&mut self, _button: Button, _direction: Direction) -> Result<(), String> {
+            Ok(())
+        }
+        fn move_mouse(&mut self, _x: i32, _y: i32) -> Result<(), String> {
+            Ok(())
+        }
+        fn settle(&mut self, _x: i32, _y: i32) -> Result<(), String> {
+            Ok(())
+        }
+        fn drag_step(&mut self, _x: i32, _y: i32) -> Result<(), String> {
+            Ok(())
+        }
+        fn scroll(&mut self, _length: i32, _axis: Axis) -> Result<(), String> {
+            Ok(())
+        }
+        fn sleep(&mut self, _ms: u64) -> Result<(), String> {
+            Ok(())
+        }
+        fn clipboard_text(&mut self) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        fn set_clipboard_text(&mut self, _text: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    // The slice's headline, at the one call that could defeat it. Typing 10,000
+    // bytes is seconds of a single platform call; if the gate's mutex were held
+    // across it, the control reader would wait the typing out, blow the library's
+    // five-second control budget, and be SIGKILLed in the middle of the very thing
+    // it was trying to stop.
+    #[test]
+    fn a_control_is_acknowledged_while_a_long_type_call_is_running() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        gate.admit(&request("type")).unwrap();
+
+        let entered = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+        let typing = {
+            let gate = gate.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            std::thread::spawn(move || {
+                let mut platform = Gated::new(&gate, BlockingText { entered, release });
+                platform.text("a string long enough to take a while")
+            })
+        };
+
+        await_flag(&entered); // the call is now genuinely in progress
+
+        let (answered, answers) = std::sync::mpsc::channel();
+        let control_gate = gate.clone();
+        std::thread::spawn(move || {
+            let _ = answered.send(control_gate.control(ControlAction::Pause, None));
+        });
+        let outcome = answers.recv_timeout(std::time::Duration::from_secs(2));
+
+        // Release and join BEFORE asserting, so a failure reports rather than hangs.
+        raise(&release);
+        assert_eq!(typing.join().unwrap(), Ok(()));
+
+        let ack = outcome.expect("a control must be answered while a long call runs");
+        assert!(ack.ok);
+        assert_eq!(
+            ack.in_flight_request_id.as_deref(),
+            Some("r1"),
+            "and it must name the call that is still running"
+        );
+    }
+
+    // The mark is what makes that acknowledgement honest: it happens under the
+    // mutex BEFORE the long call starts, so there is no instant in which this
+    // process is typing and the gate does not know it.
+    #[test]
+    fn a_long_call_is_marked_as_posted_before_it_begins() {
+        let (gate, clock) = gate();
+        gate.admit(&request("type")).unwrap();
+
+        gate.dispatch_long(Phase::Input, || clock.sleep(400))
+            .unwrap();
+
+        let done = gate.finish();
+        assert!(done.posted);
+        assert_eq!(done.timings.input_ms, 400);
+    }
+
+    #[test]
+    fn a_long_call_is_refused_by_a_closed_gate_like_any_other() {
+        let (gate, _) = gate();
+        gate.admit(&request("type")).unwrap();
+        gate.control(ControlAction::Pause, None);
+
+        let mut posts = 0;
+        assert_eq!(
+            gate.dispatch_long(Phase::Input, || posts += 1),
+            Err(Refusal::Cancelled)
+        );
+        assert_eq!(posts, 0);
+    }
+
+    // The completion latch: it is the INPUT sequence finishing, not the action
+    // succeeding, because the post-action check image is taken after it.
+    #[test]
+    fn completion_is_latched_by_the_input_sequence_not_by_the_action() {
+        let (unlatched, _) = gate();
+        unlatched.admit(&request("left_click")).unwrap();
+        unlatched.dispatch(Phase::Input, || ()).unwrap();
+        assert!(
+            !unlatched.finish().input_complete,
+            "posting is not finishing"
+        );
+
+        let (latched, _) = gate();
+        latched.admit(&request("left_click")).unwrap();
+        latched.dispatch(Phase::Input, || ()).unwrap();
+        latched.input_complete();
+        assert!(latched.finish().input_complete);
+    }
+
+    // What the reader asks before handing over a second request. The channel
+    // cannot answer this: its slot is empty the moment the worker picks a job up.
+    #[test]
+    fn the_gate_knows_a_request_is_in_flight() {
+        let (gate, _) = gate();
+        assert!(!gate.is_busy());
+
+        gate.admit(&request("left_click")).unwrap();
+        assert!(gate.is_busy(), "the worker is running one");
+
+        gate.finish();
+        assert!(!gate.is_busy());
     }
 
     #[test]

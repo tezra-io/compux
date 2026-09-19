@@ -14,20 +14,40 @@ defmodule Compux.Transport do
     * **The 16 MiB frame cap is counted on every fragment**, the last one
       included.
     * **A reply reaches the request that asked for it**, by `request_id`. A
-      response that arrives after its deadline is dropped by id and can never be
-      paired with a later request — the desync class this wire exists to retire.
+      response that arrives after its deadline is dropped and can never be paired
+      with a later request — the desync class this wire exists to retire.
     * **One request in flight.** A second answers `{:error, :busy}`. Controls are
       admitted regardless, so Pause is answerable while an action runs.
     * **Every outstanding call is completed** when the sidecar exits, when a
       frame poisons the transport, and when it is stopped. Nothing is left to
       time out on its own.
 
-  What poisons it: an unknown frame tag, a malformed frame, a response naming a
-  request nobody sent, a generation that is not ours, an over-cap frame, and a
-  control whose acknowledgement never came. A poisoned transport completes
-  everything outstanding with a typed error, ends the sidecar, and answers
-  `{:error, :sidecar_unavailable}` from then on. It does not reconnect — the
-  owner starts a new one, which is recovery, never a replay of the last action.
+  What poisons it: an unknown frame tag, a malformed frame, a frame naming a
+  request this transport never sent, a generation that is not ours, an over-cap
+  frame, and a control whose acknowledgement never came. A poisoned transport
+  completes everything outstanding with a typed error, ends the sidecar, and
+  answers `{:error, :sidecar_unavailable}` from then on. It does not reconnect —
+  the owner starts a new one, which is recovery, never a replay of the last
+  action.
+
+  ## Stale versus unknown
+
+  A frame that names nothing outstanding is one of two very different things, and
+  the counter tells them apart:
+
+    * every id this transport writes is `r<n>` or `c<n>` drawn from ONE monotonic
+      counter, so a well-formed id **below** the counter that is not outstanding
+      can only be a request of ours that already ended — a reply that lost its
+      race with its own deadline. It is **dropped and logged**, never paired with
+      the request that comes next;
+    * an id **at or above** the counter, or one that is not that shape at all, is
+      an id this transport never minted. Nothing it could answer exists, so it is
+      a genuine protocol violation and it **poisons**.
+
+  The counter is the whole record: nothing is remembered per request. An earlier
+  version kept a bounded list of timed-out ids, which meant that after enough
+  timeouts the oldest id was evicted and its eventual late reply looked like a
+  frame from nowhere — a healthy transport poisoned by its own past.
 
   It is started linked to its caller, so the Port still dies with its owner, and
   it traps exits so the OS process is reaped rather than merely orphaned.
@@ -94,10 +114,10 @@ defmodule Compux.Transport do
   # a couple of controls can be meaningful at once; this is the hard ceiling.
   @max_pending_controls 8
 
-  # Ids of requests whose deadline fired. A response naming one is dropped rather
-  # than treated as an unknown id. Bounded because only one request is ever in
-  # flight, so this can only grow one entry per abandoned request.
-  @max_abandoned 16
+  # Every id this transport writes: one prefix, one monotonic number, no padding.
+  # `next_id` is the next unused number, which makes the counter itself the record
+  # of what was ever minted — see `finished?/2`.
+  @minted_id ~r/\A[rc]([1-9]\d*)\z/
 
   # Both sides start here and the sidecar's gate owns every later value, which it
   # publishes in each `control_ack`.
@@ -124,7 +144,6 @@ defmodule Compux.Transport do
     mutation_seq: 0,
     next_id: 1,
     pending_controls: %{},
-    abandoned: [],
     acc: [],
     acc_size: 0
   ]
@@ -506,15 +525,38 @@ defmodule Compux.Transport do
     do: handshake_response(state, response)
 
   defp route_response(state, response) do
-    cond do
-      pending_request?(state, response.request_id) -> answer_request(state, response)
-      response.request_id in state.abandoned -> drop_late(state, response.request_id)
-      true -> poison(state, {:unknown_request_id, response.request_id})
-    end
+    if pending_request?(state, response.request_id),
+      do: answer_request(state, response),
+      else: unmatched(state, response.request_id)
   end
 
   defp pending_request?(%__MODULE__{pending_request: %{id: id}}, id), do: true
   defp pending_request?(_state, _id), do: false
+
+  # A frame naming nothing outstanding is one of two very different things, and
+  # the counter tells them apart without keeping a list of anything.
+  defp unmatched(state, request_id) do
+    if finished?(state, request_id),
+      do: drop_finished(state, request_id),
+      else: poison(state, {:unknown_request_id, request_id})
+  end
+
+  # Ours, and already over. Every id this transport writes is `r<n>` or `c<n>`
+  # from ONE counter, so a well-formed id below the counter that is not
+  # outstanding can only be a request of ours that already ended — a reply that
+  # lost its race with its own deadline. It is dropped, never paired with the
+  # request that comes next.
+  defp finished?(state, request_id) do
+    case Regex.run(@minted_id, request_id) do
+      [_whole, digits] -> String.to_integer(digits) < state.next_id
+      nil -> false
+    end
+  end
+
+  defp drop_finished(state, request_id) do
+    Logger.warning("compux: dropped a late frame for #{request_id}, a request that already ended")
+    state
+  end
 
   defp answer_request(state, response) do
     if generations_match?(state, response),
@@ -532,17 +574,10 @@ defmodule Compux.Transport do
   defp response_result(%Frame.Response{ok: true, payload: payload}), do: {:ok, payload}
   defp response_result(%Frame.Response{payload: payload}), do: {:error, {:action_failed, payload}}
 
-  # The request it belongs to already gave up. It is dropped by id and forgotten,
-  # so it can never be handed to the request that comes next.
-  defp drop_late(state, request_id) do
-    Logger.warning("compux: dropped a late response for the abandoned request #{request_id}")
-    %{state | abandoned: List.delete(state.abandoned, request_id)}
-  end
-
   defp route_ack(state, ack) do
     case Map.fetch(state.pending_controls, ack.request_id) do
       {:ok, pending} -> answer_control(state, pending, ack)
-      :error -> poison(state, {:unknown_request_id, ack.request_id})
+      :error -> unmatched(state, ack.request_id)
     end
   end
 
@@ -619,6 +654,20 @@ defmodule Compux.Transport do
 
   defp adopt_identity(state, %Frame.Response{sidecar_generation: boot} = response)
        when is_binary(boot) and boot != "" do
+    # The hello response comes through the sidecar's ordinary envelope, so it
+    # already states the session generation every later frame will carry. Reading
+    # it HERE turns a disagreement into a named handshake refusal, instead of a
+    # `stale_generation` poison on the first real action of a session that looked
+    # healthy.
+    if response.session_generation == state.session_generation,
+      do: ready(state, response, boot),
+      else: fail_handshake(state, session_mismatch(state, response))
+  end
+
+  defp adopt_identity(state, response),
+    do: fail_handshake(state, {:invalid_sidecar_generation, response.sidecar_generation})
+
+  defp ready(state, response, boot) do
     state = %{
       state
       | phase: :ready,
@@ -629,8 +678,10 @@ defmodule Compux.Transport do
     settle_handshake(state, :ok)
   end
 
-  defp adopt_identity(state, response),
-    do: fail_handshake(state, {:invalid_sidecar_generation, response.sidecar_generation})
+  defp session_mismatch(state, response) do
+    {:session_generation_mismatch,
+     %{library: state.session_generation, sidecar: response.session_generation}}
+  end
 
   defp fail_handshake(state, reason) do
     Logger.error("compux: the sidecar handshake failed: #{inspect(reason)}")
@@ -652,9 +703,11 @@ defmodule Compux.Transport do
   defp request_deadline(%__MODULE__{pending_request: %{id: id, kind: :hello}} = state, id),
     do: fail_handshake(state, {:timeout, state.handshake_timeout_ms})
 
+  # Nothing is recorded about the abandoned id: it stays below the counter for
+  # the life of the transport, which is what makes its late reply recognisable.
   defp request_deadline(%__MODULE__{pending_request: %{id: id} = pending} = state, id) do
     GenServer.reply(pending.from, {:error, {:timeout, Deadline.budget_ms(pending.deadline)}})
-    %{state | pending_request: nil, abandoned: remember_abandoned(state.abandoned, id)}
+    %{state | pending_request: nil}
   end
 
   defp request_deadline(state, _id), do: state
@@ -673,8 +726,6 @@ defmodule Compux.Transport do
     state = %{state | pending_controls: Map.delete(state.pending_controls, id)}
     poison(state, {:control_unconfirmed, id})
   end
-
-  defp remember_abandoned(abandoned, id), do: Enum.take([id | abandoned], @max_abandoned)
 
   defp cancel_timer(nil), do: :ok
   defp cancel_timer(timer), do: Process.cancel_timer(timer)

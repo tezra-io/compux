@@ -41,7 +41,7 @@ to the old image, and a copy-in-place can be read half-written.
 
 ```sh
 SIDE=/Users/sujshe/projects/fermix-plugins/.dev-local/computer_use_sidecar/bin/macos-aarch64
-BUILT=/private/tmp/claude-501/-Users-sujshe-projects-fermix/666930c4-2ed9-4663-93f8-142cee19f495/scratchpad/compux-v11/native/compux/target/release/compux
+BUILT=/Users/sujshe/projects/compux/native/compux/target/release/compux
 
 # Keep the FIRST known-good binary, and never overwrite that backup on a re-run.
 [ -e "$SIDE/compux.bak" ] || cp -p "$SIDE/compux" "$SIDE/compux.bak"
@@ -49,22 +49,23 @@ BUILT=/private/tmp/claude-501/-Users-sujshe-projects-fermix/666930c4-2ed9-4663-9
 # Atomic replace: copy beside the target, then rename over it.
 cp "$BUILT" "$SIDE/compux.new" && mv -f "$SIDE/compux.new" "$SIDE/compux"
 
-# The installed binary must be exactly the one that passed the gates.
+# The installed binary must be exactly the one that passed the gates: the two
+# lines must print the SAME hash as each other.
 shasum -a 256 "$BUILT" "$SIDE/compux"
-# both lines must read:
-# f063e0fbaac89b7b3de75f2d2eb7737d545f111f7f1db50d2fb51134c2d97db7
 ```
 
 Sanity-check the wire without starting a session (the binary reads stdin, so it must be
 given a line — never run it with no input, it will simply wait):
 
 ```sh
-printf '{"action":"hello"}\n' | COMPUX_DISCLAIMED=1 "$SIDE/compux"
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":7,"deadline_ms":10000}\n' \
+  | COMPUX_DISCLAIMED=1 "$SIDE/compux"
 ```
 
-It must report `"protocol_version":6`. 0.9.0 adds no action: `browser.navigated` and the
-browser context on `field.value` are additive event fields on the existing push wire, so
-the pairing with the pinned Fermix side is unchanged.
+It must report `"protocol_version":7`. **Every line into this sidecar is a tagged frame
+now** — a request carries a `type` and a `request_id`, and an untagged protocol-6 line
+is refused rather than served. That is why the `printf` above looks nothing like the one
+this document carried when it was written against protocol 6.
 
 ## 2. Start the dev daemon and watch its console
 
@@ -321,9 +322,12 @@ modifier down, no button held, and the clipboard still holding the owner's own t
 
 * **Build the sidecar from this branch**: `cd native/compux && cargo build --release`.
   The binary is `native/compux/target/release/compux` — call it `$CX` below. No
-  daemon, no Fermix and no model is needed for any step here: the sidecar reads one
-  JSON line on stdin and answers one on stdout, which is the smallest instrument that
-  can show this behaviour.
+  daemon, no Fermix and no model is needed for any step here.
+* **Every step drives the sidecar through the small script below, not through a bare
+  `printf`.** Under protocol 7 an action request must carry the boot identity the
+  sidecar minted at start-up, and the only way to learn it is to say `hello` first on
+  the same process. One `printf` cannot do that, so `cx.py` says hello, then sends
+  each action you give it as a tagged frame and prints the reply.
 * `COMPUX_DISCLAIMED=1` makes the sidecar skip its TCC self-disclaim re-exec, so it
   runs under the **launching terminal's** Accessibility grant. Without that variable
   it re-execs into its own (unsigned, brand-new) identity, which has no grant — which
@@ -337,7 +341,45 @@ modifier down, no button held, and the clipboard still holding the owner's own t
 
 ```sh
 CX=/Users/sujshe/projects/compux/native/compux/target/release/compux
+
+cat > /tmp/cx.py <<'PYEOF'
+import json, os, subprocess, sys
+
+# The environment is passed through UNCHANGED, so `COMPUX_DISCLAIMED=1 python3 …`
+# runs the sidecar under this terminal's Accessibility grant and plain `python3 …`
+# makes it re-exec into its own ungranted identity. Step 3 needs the second.
+side = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        env=os.environ.copy(), text=True, bufsize=1)
+
+def send(frame):
+    side.stdin.write(json.dumps(frame) + "\n")
+    side.stdin.flush()
+
+def recv():
+    return json.loads(side.stdout.readline())
+
+send({"type": "request", "request_id": "r1", "action": "hello",
+      "protocol_version": 7, "deadline_ms": 10000})
+hello = recv()
+print("hello   ", json.dumps(hello))
+
+envelope = {"sidecar_generation": hello["sidecar_generation"],
+            "session_generation": 1, "authorization_generation": 1}
+
+for n, argument in enumerate(sys.argv[2:], start=2):
+    frame = {"type": "request", "request_id": "r%d" % n, "deadline_ms": 30000,
+             "mutation_seq": n - 1}
+    frame.update(envelope)
+    frame.update(json.loads(argument))
+    send(frame)
+    print("action  ", json.dumps(recv()))
+
+side.stdin.close()
+PYEOF
 ```
+
+The first line it prints is always the handshake, and it must say
+`"protocol_version": 7`. If it does not, the binary is not the one you just built.
 
 ## 1. The success paths still land (30 seconds, fails fastest)
 
@@ -348,20 +390,22 @@ bring it to the front.
 ```sh
 # A modified click. The modifiers are now released in the REVERSE of the order they
 # were pressed, which is the one ordering difference in the whole change.
-printf '{"action":"left_click","x":400,"y":300,"modifiers":["cmd","shift"]}\n' \
-  | COMPUX_DISCLAIMED=1 "$CX"
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX" \
+  '{"action":"left_click","x":400,"y":300,"modifiers":["cmd","shift"]}'
 
 # A drag. Pick two points over a Finder window with an icon under `from`.
-printf '{"action":"left_click_drag","from":{"x":400,"y":300},"to":{"x":520,"y":380}}\n' \
-  | COMPUX_DISCLAIMED=1 "$CX"
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX" \
+  '{"action":"left_click_drag","from":{"x":400,"y":300},"to":{"x":520,"y":380}}'
 
 # A paste, with the owner's own clipboard put back afterwards.
 printf 'the owner clipboard' | pbcopy
-printf '{"action":"paste","text":"pasted by compux"}\n' | COMPUX_DISCLAIMED=1 "$CX"
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX" \
+  '{"action":"paste","text":"pasted by compux"}'
 pbpaste; echo
 ```
 
-Each must answer `{"ok":true}`. The click must click where a cmd-shift-click would;
+Each action line must answer `"ok": true`, and each carries a `receipt` whose
+`dispatch` reads `sent` — that is the sidecar saying the input reached the screen. The click must click where a cmd-shift-click would;
 the drag must actually drag the icon (not demote to a click and leave it where it
 was — that is the interpolated path and its dwell, unchanged here); `pasted by
 compux` must appear in the document and `pbpaste` must print `the owner clipboard`.
@@ -379,11 +423,12 @@ The disclaim re-exec runs on every launch and now reports a failed spawn attribu
 check the disclaimed path too, since step 1 skipped it:
 
 ```sh
-printf '{"action":"hello"}\n' | "$CX"; echo "exit=$?"
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":7,"deadline_ms":10000}\n' \
+  | "$CX"; echo "exit=$?"
 ```
 
-It must print the hello frame with `"protocol_version":6` and `exit=0` (R0 changes no
-wire field and no version). An exit in the 70s here is a disclaim failure and the
+It must print the hello frame with `"protocol_version":7` and `exit=0`. An exit in
+the 70s here is a disclaim failure and the
 stderr line above it names which step; report the number. There is no way to provoke
 `posix_spawnattr_setflags` failing on a healthy machine, so 77 itself is proved by
 the unit gate (`no_disclaim_exit_code_collides_with_the_capture_stall`) and not here.
@@ -400,11 +445,12 @@ identity, which holds no Accessibility grant:
 
 ```sh
 printf 'the owner clipboard' | pbcopy
-printf '{"action":"paste","text":"pasted by compux"}\n' | "$CX"; echo "exit=$?"
+python3 /tmp/cx.py "$CX" '{"action":"paste","text":"pasted by compux"}'
 pbpaste; echo
 ```
 
-* The reply must be `{"ok":false,"error":"init input: ..."}` — the keystroke never
+* The action line must read `"ok": false` with `"error": "init input: ..."` and a
+  `receipt` whose `dispatch` is `not_sent` — the keystroke never
   reached the desktop. A stderr line above it reads `compux: Key(Meta) was NOT
   released: init input: ...`: the guard recorded the modifier before posting it (it
   has to — a call can fail after the event is already out) and could not lift it
@@ -412,11 +458,21 @@ pbpaste; echo
   the reply, so the action's own error names the one thing that actually went wrong.
 * `pbpaste` must print **`the owner clipboard`**. This is the assertion. Before this
   change it printed `pasted by compux` and the owner's text was gone for good.
-* If the reply is `{"ok":true}` instead, this identity happens to already hold an
-  Accessibility grant and the step proved nothing. Force the refusal another way:
-  System Settings → Privacy & Security → Accessibility, switch the entry for your
-  terminal OFF, quit and reopen it, and repeat the command **with**
-  `COMPUX_DISCLAIMED=1`. Switch it back on afterwards.
+* If the action line reads `"ok": true` instead, this identity happens to already
+  hold an Accessibility grant and the step proved nothing. There is a fallback, and
+  it takes away a grant you use every day, so do it deliberately:
+
+  1. System Settings → Privacy & Security → Accessibility, switch the entry for your
+     **terminal** OFF. Quit and reopen the terminal so the change is observed.
+  2. Re-run the two commands above **with** `COMPUX_DISCLAIMED=1` and read the same
+     two assertions.
+  3. **Switch that entry back ON immediately, before doing anything else**, quit and
+     reopen the terminal again, and confirm it is on: the entry must show a filled
+     toggle in that same list. A terminal left without its Accessibility grant
+     silently breaks every later step of this document and a good deal else besides.
+
+  Step 6 asks you to confirm this a second time at the end, because the moment to
+  discover a grant is still off is not three days from now.
 
 ## 4. A failed click leaves no modifier down (throwaway build)
 
@@ -440,17 +496,19 @@ Only the click verbs go through `Direction::Click`, so a drag is untouched by it
 `cargo build --release`, then, with TextEdit in front and a document focused:
 
 ```sh
-printf '{"action":"left_click","x":400,"y":300,"modifiers":["cmd","shift"]}\n' \
-  | COMPUX_DISCLAIMED=1 "$CX"
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX" \
+  '{"action":"left_click","x":400,"y":300,"modifiers":["cmd","shift"]}'
 ```
 
-* The reply must be `{"ok":false,"error":"provoked"}`.
+* The action line must read `"ok": false` with `"error": "provoked"`.
 * **Now type a letter into the document, with your hand off every modifier.** It must
   type the letter. If it fires a shortcut (or selects to the end of the line), Command
   or Shift is still down — that is the defect, and it is what the old code did on
   every failed click. Recover by physically tapping each of Command and Shift once.
 * Run it again with `"modifiers":["cmd","shift","alt","ctrl"]` and type again. All
   four must be up.
+* The `receipt` on that refusal reads `"dispatch": "partial"`: the modifiers reached
+  the screen and the click did not.
 
 ## 5. A failed drag leaves no button held (same throwaway build)
 
@@ -472,11 +530,12 @@ externs are now unused, which is the patch doing its job and not a problem. Then
 over a Finder window with an icon under `from`:
 
 ```sh
-printf '{"action":"left_click_drag","from":{"x":400,"y":300},"to":{"x":520,"y":380}}\n' \
-  | COMPUX_DISCLAIMED=1 "$CX"
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX" \
+  '{"action":"left_click_drag","from":{"x":400,"y":300},"to":{"x":520,"y":380}}'
 ```
 
-* The reply must be `{"ok":false,"error":"provoked"}`.
+* The action line must read `"ok": false` with `"error": "provoked"` and a `receipt`
+  whose `dispatch` is `partial` — the press landed and the drag did not finish.
 * **Then move the pointer around with your hand, touching nothing.** Nothing may be
   dragged and no rubber-band selection may appear. If the desktop is dragging the
   icon or drawing a selection rectangle with you, the left button is still down —
@@ -493,6 +552,11 @@ cd /Users/sujshe/projects/compux && git diff --stat native/compux/src/held.rs
 That must report **no** change once you have undone the step-4 and step-5 patches.
 Then `cargo build --release` once more, so no provoked binary is left on disk, and
 re-run step 1 to confirm the clean build still works.
+
+Finally, **if step 3 had you switch your terminal's Accessibility grant off, confirm
+it is back on**: System Settings → Privacy & Security → Accessibility, the entry for
+your terminal, filled toggle. Step 1 passing again is the practical proof — it cannot
+click without it.
 
 ## 7. What this check still cannot prove
 
@@ -605,8 +669,15 @@ things and only one is a bug:
   acknowledgement names that request rather than claiming it stopped; if the very
   last event of a drag lands after your `/pause`, that is the documented promise,
   not a defect.
-* **`type` and `scroll` are not interruptible.** Each is a single call with its
-  repeat count inside it, so they are checked at the gate before dispatch and not
-  during. A pause sent mid-`type` stops the NEXT action, not that one.
+* **`type` and `scroll` are not interruptible, but they no longer make the sidecar
+  deaf.** Each is a single platform call with no loop of ours inside it, so it is
+  checked at the gate before dispatch and not during: a pause sent mid-`type` stops
+  the NEXT action, not that one. What it DOES do immediately is answer — the gate's
+  mutex is released before the call begins, so the acknowledgement comes back at once
+  and names the typing in `in_flight_request_id`. Worth confirming by hand: ask the
+  assistant to type a long paragraph somewhere harmless and send `/pause` while it is
+  going. The reply must come back straight away and name the action; the typing then
+  finishes, and the next action is refused. A `/pause` that only answers once the
+  typing has ended is the failure — it is what gets this sidecar killed mid-type.
 * **A SIGKILLed sidecar still releases nothing** — unchanged from the held-input
   check above.

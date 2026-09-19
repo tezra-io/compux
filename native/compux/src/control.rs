@@ -77,15 +77,32 @@ fn acknowledge(gate: &Gate, emitter: &Emitter, control: &Control) {
     ));
 }
 
-/// Hand the request to the worker, or refuse it `busy`. One in flight: a second
-/// request is never queued behind the first, because a queued action would run
-/// against a screen that has moved on since its caller asked for it.
+/// Hand the request to the worker, or refuse it `busy`.
+///
+/// One in flight, and it takes BOTH checks to mean that. The channel alone does
+/// not: with a slot free and the worker already running a job, a second request
+/// would be accepted and then run against a screen that has moved on — the queued
+/// action this refusal exists to prevent. The gate alone does not either: between
+/// the reader handing a job over and the worker admitting it, the gate is still
+/// idle. So the gate answers "the worker is running one" and the full slot answers
+/// "the worker has not picked one up yet", and together they leave only the few
+/// instructions between `recv` returning and `admit` — a window the library's own
+/// one-in-flight rule means a real client never reaches.
+///
+/// A rendezvous channel was the other candidate and is worse: `try_send` would
+/// then fail whenever the worker is between jobs rather than blocked in `recv`, so
+/// an idle sidecar would refuse perfectly good requests after every action.
 fn offer(
     gate: &Gate,
     emitter: &Emitter,
     worker: &SyncSender<Job>,
     request: Request,
 ) -> Result<(), ()> {
+    if gate.is_busy() {
+        emitter.emit_frame(&busy_frame(gate, &request));
+        return Ok(());
+    }
+
     match worker.try_send(Job::Action(request)) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(Job::Action(request))) => {
@@ -219,6 +236,43 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["request_id"], json!("r2"));
         assert_eq!(frames[0]["ok"], json!(false));
+        assert_eq!(frames[0]["error"], json!("busy"));
+        assert_eq!(frames[0]["receipt"]["dispatch"], json!("not_sent"));
+    }
+
+    // F4: the channel cannot answer this on its own. Its slot is empty the moment
+    // the worker picks a job up, so without the gate a second request would be
+    // accepted and then run against a screen that has moved on.
+    #[test]
+    fn a_request_is_refused_busy_while_the_worker_is_already_running_one() {
+        let gate = gate();
+        let running = wire::Request {
+            request_id: "r1".to_string(),
+            action: "left_click".to_string(),
+            body: json!({}),
+            sidecar_generation: Some("boot-1".to_string()),
+            session_generation: Some(1),
+            authorization_generation: Some(1),
+            mutation_seq: Some(1),
+        };
+        gate.admit(&running).unwrap();
+
+        let emitter = Emitter::capturing();
+        let (tx, rx) = sync_channel(1); // the slot is EMPTY
+        run(
+            "{\"type\":\"request\",\"request_id\":\"r2\",\"action\":\"left_click\",\"mutation_seq\":2}\n"
+                .as_bytes(),
+            &gate,
+            &emitter,
+            tx,
+        );
+
+        assert!(
+            rx.try_iter().next().is_none(),
+            "nothing may be handed over while one is in flight"
+        );
+        let frames = emitter.captured();
+        assert_eq!(frames[0]["request_id"], json!("r2"));
         assert_eq!(frames[0]["error"], json!("busy"));
         assert_eq!(frames[0]["receipt"]["dispatch"], json!("not_sent"));
     }

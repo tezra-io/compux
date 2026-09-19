@@ -117,17 +117,10 @@ defmodule Compux.Protocol do
 
   def validate(_other), do: {:error, "action params must be a map"}
 
-  @doc """
-  Encode an untagged request map to a single JSON line.
-
-  This is the raw line writer the computer-history push consumer uses for its own
-  `observe_start` / `observe_stop` control actions, which keep their v6 shapes.
-  The action wire does not come through here — `Compux.Frame` encodes a tagged,
-  correlated `request` frame, and `Compux.Transport` is the only thing that
-  writes one.
-  """
-  @spec encode_request(map()) :: binary()
-  def encode_request(request) when is_map(request), do: Jason.encode!(request) <> "\n"
+  # This module validates and classifies; it no longer writes a line. `encode_request/1`
+  # produced the UNTAGGED protocol-6 shape, which a protocol-7 sidecar refuses —
+  # one wire format means one encoder, and that is `Compux.Frame.encode/1`, for
+  # the action wire and the computer-history connection alike.
 
   defp validate_action("screenshot", params) do
     with {:ok, display} <- opt_display(params),
