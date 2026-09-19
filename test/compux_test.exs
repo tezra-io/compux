@@ -194,4 +194,28 @@ defmodule CompuxTest do
       assert :ok = Compux.stop(cu)
     end
   end
+
+  # The facade over the REAL driver, transport and a real Port. The stub above
+  # proves the request building; this proves the handshake, the correlated wire
+  # and the teardown actually fit together.
+  describe "over the production driver" do
+    @fake Path.expand("support/fake_sidecar.pl", __DIR__)
+
+    test "handshakes, acts and stops against a real Port" do
+      assert {:ok, cu} = Compux.start(binary_path: @fake)
+
+      info = Compux.info(cu)
+      assert info.protocol_version == Compux.protocol_version()
+      assert info.sidecar_generation == "boot-test"
+      assert info.capabilities["controls"] == ["pause", "resume", "release"]
+
+      assert {:ok, %{"ok" => true, "pong" => true}} = Compux.screenshot(cu)
+      assert :ok = Compux.stop(cu)
+    end
+
+    test "refuses a sidecar on another protocol version" do
+      assert {:error, {:protocol_mismatch, %{sidecar: 1}}} =
+               Compux.start(binary_path: @fake, env: [{~c"FAKE_PROTOCOL_VERSION", ~c"1"}])
+    end
+  end
 end

@@ -50,10 +50,32 @@ defmodule Compux.Protocol do
   # browser context (`browser_id`/`window_ref`/`tab_ref`/`host`/`private_state`) on
   # `field.value`, both ADDITIVE fields on that same push wire, and accepts-and-ignores
   # the retired `sites` key of `observe_start` — no control action changed.
-  @protocol_version 6
+  #
+  # v7 (M42 slice 2, transport and control): the action wire becomes TAGGED and
+  # CORRELATED. Every line now carries a `type` (`request`, `response`, `control`,
+  # `control_ack`, `session_event`, beside computer-history's unchanged `ack` and
+  # `event`), every request a `request_id` the response echoes, and — after the
+  # handshake — the `sidecar_generation`, `session_generation` and
+  # `authorization_generation` a frame belongs to. A mutating request also carries
+  # an increasing `mutation_seq`, and its response carries a `receipt` saying
+  # whether input was dispatched. The caller's remaining budget rides as
+  # `deadline_ms`, deliberately NOT `timeout_ms`, which two actions have used as
+  # an argument of their own since v2. Requests and responses no longer pair by
+  # ORDER, so the desync class — a late frame answering the next action — is gone;
+  # `hello` is itself a request now, and its response returns the sidecar's boot
+  # generation and a `capabilities` map. `Compux.Frame` owns the shapes.
+  @protocol_version 7
 
   @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows)
-  @read_only ~w(screenshot mouse_move wait inspect wait_for_change elements windows)
+
+  # Read-only in both senses the wire needs: a consumer may auto-run one without a
+  # confirmation step, and it dispatches no input, so it carries no `mutation_seq`
+  # and earns no receipt. The operational verbs sit here too — `probe`, `idle_ms`,
+  # `wait_for_idle` and `hello` are not model actions (they are absent from
+  # `@actions`), but they change nothing on the screen and classifying them as
+  # mutations would put a sequence number and a receipt on a permission probe.
+  @read_only ~w(screenshot mouse_move wait inspect wait_for_change elements windows
+                probe idle_ms wait_for_idle hello)
   @modifiers ~w(cmd ctrl alt shift)
   @scroll_directions ~w(up down left right)
   @max_type_bytes 10_000
@@ -95,34 +117,17 @@ defmodule Compux.Protocol do
 
   def validate(_other), do: {:error, "action params must be a map"}
 
-  @doc "Encode a validated request to a single JSON line for the sidecar's stdin."
+  @doc """
+  Encode an untagged request map to a single JSON line.
+
+  This is the raw line writer the computer-history push consumer uses for its own
+  `observe_start` / `observe_stop` control actions, which keep their v6 shapes.
+  The action wire does not come through here — `Compux.Frame` encodes a tagged,
+  correlated `request` frame, and `Compux.Transport` is the only thing that
+  writes one.
+  """
   @spec encode_request(map()) :: binary()
   def encode_request(request) when is_map(request), do: Jason.encode!(request) <> "\n"
-
-  @doc """
-  Decode one sidecar response line. A success carries `ok: true`; a failure
-  carries `ok: false` + `error`. Anything else (or invalid JSON) fails loud so a
-  malformed sidecar can never look like a successful action.
-  """
-  @spec decode_response(binary()) :: {:ok, map()} | {:error, String.t()}
-  def decode_response(line) when is_binary(line) do
-    case Jason.decode(String.trim(line)) do
-      {:ok, %{"ok" => true} = resp} ->
-        {:ok, resp}
-
-      {:ok, %{"ok" => false, "error" => error}} ->
-        {:error, to_string(error)}
-
-      {:ok, %{"error" => error}} ->
-        {:error, to_string(error)}
-
-      {:ok, other} ->
-        {:error, "malformed sidecar response: #{inspect(other)}"}
-
-      {:error, %Jason.DecodeError{} = error} ->
-        {:error, "invalid JSON from sidecar: #{Exception.message(error)}"}
-    end
-  end
 
   defp validate_action("screenshot", params) do
     with {:ok, display} <- opt_display(params),

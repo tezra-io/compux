@@ -507,3 +507,106 @@ re-run step 1 to confirm the clean build still works.
   in the action's own error.
 * **The three remaining sequences that hold nothing** (`mouse_move`, `scroll`,
   `type`) were not changed and hold no key or button to leak.
+
+---
+
+# Live check — the protocol-7 wire and Pause (M42 slice 2)
+
+The wire itself is proved here, and more than by unit tests: this session drove the
+BUILT sidecar through the REAL `Compux.Transport` end to end — handshake at 7 with a
+boot generation, a `pause` acknowledged in 19 ms while a 20-second `wait` was
+running and naming it in `in_flight_request_id`, that wait ending `cancelled`, a
+click refused `paused` with a `not_sent` receipt, a click at the revoked generation
+refused `stale_generation`, `resume`, and a clean stop. So the two halves agree on
+the wire, and none of the steps below is about that.
+
+What is left is everything that needs a real desktop and a real daemon: that a
+pause stops input the human can SEE stopping, that the button and the modifiers are
+up afterwards, and that the computer-history rail still records after the version
+moved under it. In the order that fails fastest.
+
+## 0. Preconditions
+
+* Install the built sidecar under `dev_local` exactly as §1 of the browser-capture
+  check above describes (stop the daemon first, atomic replace, compare the
+  sha256). `COMPUX_BUILD` does not affect it.
+* **Fermix must be on the matching branch.** Protocol 7 is an exact-version
+  handshake with no legacy mode: a protocol-6 Fermix against this sidecar refuses
+  at `hello` and computer history degrades with a protocol mismatch. That is the
+  design working, not a fault to report.
+* `CX=/Users/sujshe/projects/compux/native/compux/target/release/compux` for the
+  two steps that drive the binary directly.
+
+## 1. The handshake, before any daemon (10 seconds)
+
+```sh
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":7,"deadline_ms":10000}\n' \
+  | COMPUX_DISCLAIMED=1 "$CX"
+```
+
+One line back, `"type":"response"`, `"request_id":"r1"`, `"protocol_version":7`, a
+`"sidecar_generation"` that starts `boot-`, and a `"capabilities"` object listing
+`foreground_hid` and the three controls. A different `protocol_version` means the
+installed binary is not the one you just built — fix that before anything else.
+
+## 2. The daemon comes up and an action still lands
+
+Start the dev daemon and ask the assistant for something that uses the computer:
+a screenshot, then a click on something harmless. Both must work exactly as they
+did. A `sidecar_unavailable` or a handshake refusal in the console means the
+pinned Fermix and this sidecar disagree on the version — see preconditions.
+
+## 3. `/pause` during a long drag stops it part way and releases the button
+
+This is the step the whole slice exists for, and the one no test here can reach.
+
+Ask the assistant to drag something across a window that takes a moment — a file
+from one Finder window to another, a slider, a piece on a board — and while it is
+moving, send `/pause`.
+
+* The reply must say it is paused, and **name the action that was still running**
+  (that is `in_flight_request_id` reaching the surface).
+* The dragged object must stop **part way**, not snap to its destination and not
+  return to its origin.
+* **Then move the pointer with your hand, touching nothing.** Nothing may be
+  dragged and no selection rectangle may appear. If the desktop is still dragging,
+  the left button was left down — that is the failure this slice must not have, and
+  it is worth reporting with whatever the assistant said.
+* Ask for another click while still paused. It must be refused, and the refusal
+  must say paused rather than fail as a timeout.
+* `/resume`, then click again: it must work. A click that stays refused after a
+  resume means the authorization generation did not move.
+
+## 4. `/pause` during a `wait` returns at once
+
+Ask for something that makes the assistant wait (a "wait ten seconds and then look
+again" flow), and `/pause` two seconds in. The pause must be acknowledged
+immediately — not after the wait finishes — and the waiting action must end
+reporting that it was cancelled. A pause that only answers when the wait is over
+means the control reader is not on its own thread.
+
+## 5. Computer history still records after the version bump
+
+The capture rail moved to protocol 7 with the rest of the wire, so re-run §4 of the
+browser-capture check above (type a sentence into Notes, then read the
+`computer_history_events` rows back). There must be a `field.value` row carrying it.
+
+If capture does not start, the console names why. Two refusals mean different
+things and only one is a bug:
+
+* `protocol_mismatch ... sidecar: 7` — a protocol-6 Fermix against this sidecar.
+  Expected; fix the pairing.
+* `observe_start_refused` — the sidecar accepted the frame and declined to start,
+  which is the Accessibility grant, not the version.
+
+## 6. What this check still cannot prove
+
+* **A pause cannot retract a call already inside the window server.** The
+  acknowledgement names that request rather than claiming it stopped; if the very
+  last event of a drag lands after your `/pause`, that is the documented promise,
+  not a defect.
+* **`type` and `scroll` are not interruptible.** Each is a single call with its
+  repeat count inside it, so they are checked at the gate before dispatch and not
+  during. A pause sent mid-`type` stops the NEXT action, not that one.
+* **A SIGKILLed sidecar still releases nothing** — unchanged from the held-input
+  check above.

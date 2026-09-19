@@ -21,18 +21,21 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufRead};
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use enigo::{Axis, Button, Coordinate, Enigo, Key, Keyboard, Mouse, Settings};
+use enigo::{Axis, Button, Enigo, Key, Mouse, Settings};
 use image::ImageEncoder as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use xcap::Monitor;
+
+use gate::{Gate, Gated, Phase, SystemClock};
+use held::Platform as _;
 
 /// Capture mode (MILESTONE_32 §8.4a): the AXObserver/CFRunLoop event-push engine +
 /// the serialized `Emitter`. Isolated from the request/response core here.
@@ -41,6 +44,16 @@ mod capture;
 /// Held synthetic input: the press registry and the `Platform` seam every input
 /// sequence posts through, so nothing this process presses can outlive the action.
 mod held;
+
+/// The protocol-7 frames as types: line parsing, the outbound builders, receipts.
+mod wire;
+
+/// The admission gate: generations, the `mutation_seq` high-water mark, the pause
+/// barrier, and the cancellation checkpoints every paced sequence reads.
+mod gate;
+
+/// The control reader thread, which owns stdin so the sidecar listens while it acts.
+mod control;
 
 /// Long-edge cap for a sent screenshot (design §5: oversized captures 400 on
 /// Anthropic and ground worse).
@@ -87,7 +100,19 @@ fn budget_scale(w: f32, h: f32) -> f32 {
 /// context on `field.value` are ADDITIVE fields on that same push wire, and the
 /// retired `sites` key of `observe_start` is accepted and ignored — no control
 /// action changed, so neither side needs a new minimum.
-const PROTOCOL_VERSION: u32 = 6;
+///
+/// v7 (M42 slice 2): the action wire becomes TAGGED and CORRELATED. Every line
+/// carries a `type`; every request a `request_id` its response echoes, and, after
+/// the handshake, the generations it belongs to. Requests and responses no longer
+/// pair by ORDER, which retires the desync class where one late frame answered
+/// every later question. A mutating request carries an increasing `mutation_seq`
+/// and its response a `receipt` saying whether input was dispatched; `control` and
+/// `control_ack` make Pause a confirmed barrier rather than a hope. The caller's
+/// remaining budget rides as `deadline_ms`, NOT `timeout_ms`, which two actions
+/// have used as an argument of their own since v2. Computer history keeps its
+/// `ack` and `event` families byte for byte; only this integer inside the ack
+/// moves. See `mod wire`.
+const PROTOCOL_VERSION: u32 = 7;
 
 /// The capture-stall self-reap (EX_TEMPFAIL), and NOTHING else.
 ///
@@ -259,29 +284,57 @@ fn main() {
     #[cfg(target_os = "macos")]
     disclaim::become_responsible();
 
-    // One serialized writer shared by the request loop and the capture observer
-    // thread (§8.4a): every response, ack, and event frame goes through `emitter`
-    // so a multi-write screenshot line and an unsolicited event can never split
-    // each other.
+    // One serialized writer shared by the control reader, the action worker and
+    // the capture observer thread (§8.4a): every response, acknowledgement, ack
+    // and event frame goes through `emitter`, so two writers can never split each
+    // other's line.
     let emitter = capture::Emitter::new();
-    let stdin = io::stdin();
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
+    // One gate for the process. The reader flips it; the worker is admitted
+    // through it. Both hold the same handle, which is what makes a pause a
+    // barrier rather than a request to stop soon.
+    let gate = Gate::new(boot_generation(), Arc::new(SystemClock::new()));
 
-        let response = match serde_json::from_str::<Value>(&line) {
-            Ok(req) => handle(&req, &emitter),
-            Err(e) => err(format!("invalid request JSON: {e}")),
-        };
+    // Capacity one: a second request while one is in flight is refused `busy` by
+    // the reader, never queued behind work whose screen has moved on.
+    let (to_worker, jobs) = mpsc::sync_channel::<control::Job>(1);
 
-        // One JSON line per response. A write failure means the parent is gone.
-        if emitter.emit_line(&response.to_string()).is_err() {
+    // The reader owns stdin on its own thread, so a control is heard and answered
+    // while the worker is inside a wait, a poll or an accessibility settle.
+    {
+        let gate = gate.clone();
+        let emitter = emitter.clone();
+        thread::spawn(move || control::run(io::stdin().lock(), &gate, &emitter, to_worker));
+    }
+
+    // The action worker runs on the MAIN thread: input stays where it runs today,
+    // and AppKit will want this thread in a later slice.
+    run_worker(jobs, &gate, &emitter);
+
+    // Every sender is gone, so stdin reached EOF: the owning Port closed. Tear down any live
+    // capture observer, then switch OFF any accessibility attribute this process
+    // switched on (B4), so one enumeration never leaves the user's browser in an
+    // altered AX mode. Best-effort: a SIGKILLed sidecar skips this, and the next
+    // activation is idempotent.
+    capture::stop();
+    #[cfg(target_os = "macos")]
+    ax::clear_activations();
+}
+
+/// A fresh identity per boot, so a frame minted by an earlier sidecar can never be
+/// taken for one of ours. The pid alone would not do it — pids are reused.
+fn boot_generation() -> String {
+    format!("boot-{}-{}", std::process::id(), capture::now_ms())
+}
+
+/// The serial action worker. One request at a time, to completion, on this thread.
+fn run_worker(jobs: mpsc::Receiver<control::Job>, gate: &Gate, emitter: &capture::Emitter) {
+    for job in jobs {
+        let control::Job::Action(request) = job;
+        let frame = serve(&request, gate, emitter);
+
+        // One JSON line per reply. A write failure means the parent is gone.
+        if emitter.emit_line(&frame.to_string()).is_err() {
             break;
         }
 
@@ -296,24 +349,102 @@ fn main() {
             std::process::exit(EXIT_CAPTURE_STALLED);
         }
     }
-
-    // stdin EOF: the owning Port closed — the session is over. Tear down any live
-    // capture observer, then switch OFF any accessibility attribute this process
-    // switched on (B4), so one enumeration never leaves the user's browser in an
-    // altered AX mode. Best-effort: a SIGKILLed sidecar skips this, and the next
-    // activation is idempotent.
-    capture::stop();
-    #[cfg(target_os = "macos")]
-    ax::clear_activations();
 }
 
-fn handle(req: &Value, emitter: &capture::Emitter) -> Value {
-    let action = req.get("action").and_then(Value::as_str).unwrap_or("");
-    let result = match action {
+/// Admit, run, and answer one request.
+fn serve(request: &wire::Request, gate: &Gate, emitter: &capture::Emitter) -> Value {
+    if let Err(refusal) = gate.admit(request) {
+        return wire::error_response(
+            gate.envelope(),
+            &request.request_id,
+            refusal.code(),
+            Some(refusal.detail().to_string()),
+            receipt(request, false, false, false, wire::Timings::default()),
+        );
+    }
+
+    let outcome = handle(request, gate, emitter);
+    let done = gate.finish();
+    reply(request, gate, outcome, done)
+}
+
+/// Turn what the action did into the frame that reports it.
+fn reply(
+    request: &wire::Request,
+    gate: &Gate,
+    outcome: Result<Value, String>,
+    done: gate::Dispatched,
+) -> Value {
+    // The capture verbs answer in the computer-history `ack` family, byte for byte
+    // as they did at protocol 6. Their client reads that shape and nothing else.
+    if wire::answers_with_ack(&request.action) {
+        return match outcome {
+            Ok(ack) => ack,
+            Err(message) => observe_ack(&request.action, false, Some(message)),
+        };
+    }
+
+    match outcome {
+        Ok(payload) => {
+            // An after-image is whatever the action actually produced, never what
+            // it was asked to produce: `data` is present only when a capture ran.
+            let after_image = payload.get("data").is_some();
+            let receipt = receipt(request, done.posted, true, after_image, done.timings);
+            wire::response(gate.envelope(), &request.request_id, payload, receipt)
+        }
+
+        Err(message) => {
+            let receipt = receipt(request, done.posted, false, false, done.timings);
+            // Every refusal that reaches here was cancelled (a pause sets both
+            // flags), so a refusal code only ever lands in `detail` and never
+            // stands in for the action's own error. A detail that merely repeats
+            // the code is dropped: it would tell an operator nothing.
+            let (code, detail) = if done.cancelled {
+                (
+                    "cancelled".to_string(),
+                    Some(message).filter(|message| message != "cancelled"),
+                )
+            } else {
+                (message, None)
+            };
+            wire::error_response(gate.envelope(), &request.request_id, &code, detail, receipt)
+        }
+    }
+}
+
+/// A receipt rides every action that is not read-only, refusals included: "no
+/// input was sent" is exactly the fact a caller needs before it retries.
+fn receipt(
+    request: &wire::Request,
+    posted: bool,
+    completed: bool,
+    after_image: bool,
+    timings: wire::Timings,
+) -> Option<wire::Receipt> {
+    if wire::carries_mutation_seq(&request.action) {
+        Some(wire::Receipt::derive(
+            posted,
+            completed,
+            after_image,
+            timings,
+        ))
+    } else {
+        None
+    }
+}
+
+fn handle(
+    request: &wire::Request,
+    gate: &Gate,
+    emitter: &capture::Emitter,
+) -> Result<Value, String> {
+    let req = &request.body;
+
+    match request.action.as_str() {
         "hello" => hello(),
         "probe" => probe(),
         "idle_ms" => idle_ms(),
-        "wait_for_idle" => wait_for_idle(req),
+        "wait_for_idle" => wait_for_idle(req, gate),
         "request_permissions" => request_permissions(req),
         // Capture control verbs (MILESTONE_32 §8.4a) — NOT model actions, excluded
         // from `hello`. They return a type-discriminated `ack` frame (even on
@@ -322,27 +453,22 @@ fn handle(req: &Value, emitter: &capture::Emitter) -> Value {
         // missing frame type.
         "observe_start" => Ok(observe_start(req, emitter)),
         "observe_stop" => Ok(observe_stop()),
-        "screenshot" => screenshot(req),
-        "mouse_move" => mouse_move(req),
-        "left_click" => click(req, Button::Left, 1),
-        "right_click" => click(req, Button::Right, 1),
-        "double_click" => click(req, Button::Left, 2),
-        "left_click_drag" => drag(req),
-        "scroll" => scroll(req),
-        "type" => type_text(req),
-        "key" => key_chord(req),
-        "wait" => wait(req),
+        "screenshot" => screenshot(req, gate),
+        "mouse_move" => mouse_move(req, gate),
+        "left_click" => click(req, gate, Button::Left, 1),
+        "right_click" => click(req, gate, Button::Right, 1),
+        "double_click" => click(req, gate, Button::Left, 2),
+        "left_click_drag" => drag(req, gate),
+        "scroll" => scroll(req, gate),
+        "type" => type_text(req, gate),
+        "key" => key_chord(req, gate),
+        "wait" => wait(req, gate),
         "inspect" => inspect(req),
-        "wait_for_change" => wait_for_change(req),
-        "paste" => paste(req),
-        "elements" => elements(req),
+        "wait_for_change" => wait_for_change(req, gate),
+        "paste" => paste(req, gate),
+        "elements" => elements(req, gate),
         "windows" => windows(req),
         other => Err(format!("unknown action: {other}")),
-    };
-
-    match result {
-        Ok(value) => value,
-        Err(message) => err(message),
     }
 }
 
@@ -378,10 +504,6 @@ fn observe_ack(action: &str, ok: bool, error: Option<String>) -> Value {
     ack
 }
 
-fn err(message: String) -> Value {
-    json!({ "ok": false, "error": message })
-}
-
 // --- hello (version handshake, NOT a model action) --------------------------
 
 /// Identity + wire-version handshake performed once by `Compux.start/1`. Lets the
@@ -398,6 +520,12 @@ fn hello() -> Result<Value, String> {
             "left_click_drag", "scroll", "type", "key", "wait", "inspect",
             "wait_for_change", "paste", "elements", "windows"
         ],
+        // Listed only because this build really has them: one foreground HID input
+        // method, and the three controls the gate implements.
+        "capabilities": {
+            "input_methods": ["foreground_hid"],
+            "controls": ["pause", "resume", "release"],
+        },
     }))
 }
 
@@ -1092,7 +1220,7 @@ mod overlay {
 
 // --- screenshot -------------------------------------------------------------
 
-fn screenshot(req: &Value) -> Result<Value, String> {
+fn screenshot(req: &Value, gate: &Gate) -> Result<Value, String> {
     let display = target_display(req)?;
     let region = parse_region(req)?;
     capture_payload_encoded(
@@ -1100,6 +1228,7 @@ fn screenshot(req: &Value) -> Result<Value, String> {
         region,
         parse_jpeg_quality(req)?,
         parse_overlays(req)?,
+        gate,
     )
 }
 
@@ -1288,6 +1417,7 @@ fn capture_payload_encoded(
     requested: Option<Region>,
     jpeg_quality: Option<u8>,
     overlays: Overlays,
+    gate: &Gate,
 ) -> Result<Value, String> {
     ensure_display_awake(display)?;
     let geom = &display.geom;
@@ -1295,7 +1425,14 @@ fn capture_payload_encoded(
     let crop = crop_rect(geom, &region);
     let (sent_w, sent_h) = crop.sent_dims();
 
+    // The capture is the slow half of a check image, and the receipt reports it as
+    // measured rather than estimated.
+    let capture_started = gate.now_ms();
     let image = capture_display_image(display.id)?;
+    gate.record(
+        Phase::Capture,
+        gate.now_ms().saturating_sub(capture_started),
+    );
 
     // Crop to the region's physical rect, then downscale to the sent size. The
     // model's coordinates live in this (sent) space; `to_logical` inverts it.
@@ -1321,7 +1458,7 @@ fn capture_payload_encoded(
         overlay::rulers(&mut resized);
     }
     let marks = if overlays.marks {
-        Some(collect_marks(geom, &region, &mut resized))
+        Some(collect_marks(geom, &region, &mut resized, gate))
     } else {
         None
     };
@@ -1388,8 +1525,13 @@ struct MarksInfo {
 }
 
 #[cfg(target_os = "macos")]
-fn collect_marks(geom: &Geometry, region: &Region, img: &mut image::RgbaImage) -> MarksInfo {
-    let (nodes, ax_activation) = interactive_in_view(geom, region);
+fn collect_marks(
+    geom: &Geometry,
+    region: &Region,
+    img: &mut image::RgbaImage,
+    gate: &Gate,
+) -> MarksInfo {
+    let (nodes, ax_activation) = interactive_in_view(geom, region, gate);
     let truncated = nodes.len().saturating_sub(MAX_MARKS);
 
     let mut entries = Vec::new();
@@ -1407,7 +1549,12 @@ fn collect_marks(geom: &Geometry, region: &Region, img: &mut image::RgbaImage) -
 }
 
 #[cfg(not(target_os = "macos"))]
-fn collect_marks(_geom: &Geometry, _region: &Region, _img: &mut image::RgbaImage) -> MarksInfo {
+fn collect_marks(
+    _geom: &Geometry,
+    _region: &Region,
+    _img: &mut image::RgbaImage,
+    _gate: &Gate,
+) -> MarksInfo {
     MarksInfo {
         entries: Vec::new(),
         ax_activation: Some("marks are only supported on macOS".to_string()),
@@ -1461,23 +1608,24 @@ fn modifiers(req: &Value) -> Vec<Key> {
         .unwrap_or_default()
 }
 
-fn mouse_move(req: &Value) -> Result<Value, String> {
+fn mouse_move(req: &Value, gate: &Gate) -> Result<Value, String> {
     let display = target_display(req)?;
     let region = region_or_full(&display.geom, parse_region(req)?);
     let (x, y) = coords(req)?;
     let (lx, ly) = to_logical(&display.geom, &region, x, y);
-    let mut e = enigo()?;
-    e.move_mouse(lx, ly, Coordinate::Abs)
-        .map_err(|e| format!("move: {e}"))?;
+    // Read-only on the wire and still the human's pointer, so it goes through the
+    // gate like every other input and a pause stops it.
+    let mut platform = Gated::new(gate, held::Real::default());
+    platform.move_mouse(lx, ly)?;
     // Same settle as the acting verbs: this action's entire promise is "the pointer
     // is now here", and a posted move alone leaves that pending (hover would land on
     // whatever the pointer had not left yet).
-    pointer::settle(lx, ly)?;
+    platform.settle(lx, ly)?;
     // read-only: no post-action screenshot
     Ok(json!({ "ok": true }))
 }
 
-fn click(req: &Value, button: Button, count: u32) -> Result<Value, String> {
+fn click(req: &Value, gate: &Gate, button: Button, count: u32) -> Result<Value, String> {
     let display = target_display(req)?;
     let region = region_or_full(&display.geom, parse_region(req)?);
     let (x, y) = coords(req)?;
@@ -1487,10 +1635,10 @@ fn click(req: &Value, button: Button, count: u32) -> Result<Value, String> {
     // A local, not a temporary: enigo's own `Drop` paces the events it posted, and
     // it ran after the check image before. Inlining this into the call below would
     // move that pacing sleep in front of the screenshot.
-    let mut platform = held::Real::default();
+    let mut platform = Gated::new(gate, held::Real::default());
     click_seq(&mut platform, lx, ly, button, count, &mods)?;
 
-    post(req, &display)
+    post(req, &display, gate)
 }
 
 /// The click itself, over the injected platform: warp, settle, hold the modifiers,
@@ -1526,7 +1674,7 @@ const DRAG_STEP_MS: u64 = 20;
 const DRAG_GRAB_MS: u64 = 60;
 const DRAG_DROP_MS: u64 = 50;
 
-fn drag(req: &Value) -> Result<Value, String> {
+fn drag(req: &Value, gate: &Gate) -> Result<Value, String> {
     let display = target_display(req)?;
     let region = region_or_full(&display.geom, parse_region(req)?);
     let from: Point = parse_point(req, "from")?;
@@ -1535,10 +1683,10 @@ fn drag(req: &Value) -> Result<Value, String> {
     let (tx, ty) = to_logical(&display.geom, &region, to.x, to.y);
 
     // A local for the same reason as `click`: enigo's pacing runs on its drop.
-    let mut platform = held::Real::default();
+    let mut platform = Gated::new(gate, held::Real::default());
     drag_seq(&mut platform, fx, fy, tx, ty)?;
 
-    post(req, &display)
+    post(req, &display, gate)
 }
 
 /// The drag itself, over the injected platform. Everything from the press to the
@@ -1556,11 +1704,11 @@ fn drag_seq<P: held::Platform>(
         input.settle(fx, fy)?;
         input.press_button(Button::Left)?;
         // Let the press register (and the target arm its drag) before moving.
-        input.sleep(DRAG_GRAB_MS);
+        input.sleep(DRAG_GRAB_MS)?;
         drag_through(input, &drag_path(fx, fy, tx, ty, DRAG_STEPS))?;
         input.settle(tx, ty)?;
         // Dwell at the destination so the drop is observed where it happens.
-        input.sleep(DRAG_DROP_MS);
+        input.sleep(DRAG_DROP_MS)?;
         Ok(())
     })
 }
@@ -1588,13 +1736,13 @@ fn drag_through<P: held::Platform>(
 ) -> Result<(), String> {
     for &(x, y) in path {
         input.drag_step(x, y)?;
-        input.sleep(DRAG_STEP_MS);
+        input.sleep(DRAG_STEP_MS)?;
     }
 
     Ok(())
 }
 
-fn scroll(req: &Value) -> Result<Value, String> {
+fn scroll(req: &Value, gate: &Gate) -> Result<Value, String> {
     let display = target_display(req)?;
     let region = region_or_full(&display.geom, parse_region(req)?);
     let (x, y) = coords(req)?;
@@ -1608,26 +1756,31 @@ fn scroll(req: &Value) -> Result<Value, String> {
         other => return Err(format!("bad scroll direction: {other:?}")),
     };
 
-    let mut e = enigo()?;
-    e.move_mouse(lx, ly, Coordinate::Abs)
-        .map_err(|e| format!("move: {e}"))?;
-    pointer::settle(lx, ly)?;
-    e.scroll(length, axis).map_err(|e| format!("scroll: {e}"))?;
+    // One call with the repeat count inside it, so there is no loop of ours to
+    // check: it is admitted at the gate and is not interruptible after that.
+    let mut platform = Gated::new(gate, held::Real::default());
+    platform.move_mouse(lx, ly)?;
+    platform.settle(lx, ly)?;
+    platform.scroll(length, axis)?;
 
-    post(req, &display)
+    post(req, &display, gate)
 }
 
-fn type_text(req: &Value) -> Result<Value, String> {
+fn type_text(req: &Value, gate: &Gate) -> Result<Value, String> {
     let text = req
         .get("text")
         .and_then(Value::as_str)
         .ok_or("missing text")?;
-    let mut e = enigo()?;
-    e.text(text).map_err(|e| format!("type: {e}"))?;
-    post(req, &target_display(req)?)
+    // A single `text` call with no loop of ours, so it cannot honour a 25 ms
+    // checkpoint and this slice does not pretend it can: it is checked at the gate
+    // before dispatch and not inside. Chunking the string would change typing
+    // timing in ways only a live check could qualify.
+    let mut platform = Gated::new(gate, held::Real::default());
+    platform.text(text)?;
+    post(req, &target_display(req)?, gate)
 }
 
-fn key_chord(req: &Value) -> Result<Value, String> {
+fn key_chord(req: &Value, gate: &Gate) -> Result<Value, String> {
     let chord = req
         .get("chord")
         .and_then(Value::as_str)
@@ -1640,10 +1793,10 @@ fn key_chord(req: &Value) -> Result<Value, String> {
     let main = named_key(key_name).ok_or_else(|| format!("unknown key: {key_name}"))?;
 
     // A local for the same reason as `click`: enigo's pacing runs on its drop.
-    let mut platform = held::Real::default();
+    let mut platform = Gated::new(gate, held::Real::default());
     key_chord_seq(&mut platform, &mods, main)?;
 
-    post(req, &target_display(req)?)
+    post(req, &target_display(req)?, gate)
 }
 
 /// The chord itself, over the injected platform. This was the one sequence that
@@ -1661,7 +1814,7 @@ fn key_chord_seq<P: held::Platform>(
     })
 }
 
-fn wait(req: &Value) -> Result<Value, String> {
+fn wait(req: &Value, gate: &Gate) -> Result<Value, String> {
     // Clamped like every other blocking verb: the wire is one-request-one-response,
     // so an unbounded sleep would hold the whole session hostage to one argument.
     let ms = req
@@ -1669,7 +1822,10 @@ fn wait(req: &Value) -> Result<Value, String> {
         .and_then(Value::as_u64)
         .unwrap_or(0)
         .min(MAX_WAIT_FOR_IDLE_MS);
-    thread::sleep(Duration::from_millis(ms));
+    // Sliced at the checkpoint cadence, so a pause during a long wait returns at
+    // once instead of running the argument out.
+    gate.sleep(ms)
+        .map_err(|refusal| refusal.code().to_string())?;
     Ok(json!({ "ok": true }))
 }
 
@@ -1679,7 +1835,7 @@ fn wait(req: &Value) -> Result<Value, String> {
 /// the resulting screenshot plus a `changed` flag. Each poll captures the frame
 /// (xcap has no sub-region capture) and diffs an AVERAGED thumbnail hash of the
 /// region; the poll budget is bounded by the caller's protocol.
-fn wait_for_change(req: &Value) -> Result<Value, String> {
+fn wait_for_change(req: &Value, gate: &Gate) -> Result<Value, String> {
     let display = target_display(req)?;
     let region = region_or_full(&display.geom, parse_region(req)?);
     let timeout_ms = req
@@ -1697,7 +1853,8 @@ fn wait_for_change(req: &Value) -> Result<Value, String> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
     loop {
-        thread::sleep(Duration::from_millis(poll_ms));
+        gate.sleep(poll_ms)
+            .map_err(|refusal| refusal.code().to_string())?;
         let changed = region_hash(&display, &region)? != baseline;
         if changed || Instant::now() >= deadline {
             // The returned frame becomes the caller's coordinate view, so it
@@ -1707,7 +1864,8 @@ fn wait_for_change(req: &Value) -> Result<Value, String> {
                 marks: false,
                 annotate: None,
             };
-            let mut payload = capture_payload_encoded(&display, Some(region), None, overlays)?;
+            let mut payload =
+                capture_payload_encoded(&display, Some(region), None, overlays, gate)?;
             if let Some(object) = payload.as_object_mut() {
                 object.insert("changed".to_string(), json!(changed));
             }
@@ -1794,7 +1952,7 @@ fn idle_ms() -> Result<Value, String> {
 /// the human still active. Reuses the `wait_for_change` bounded-poll idiom so a
 /// consumer can schedule input into a human-idle gap.
 #[cfg(target_os = "macos")]
-fn wait_for_idle(req: &Value) -> Result<Value, String> {
+fn wait_for_idle(req: &Value, gate: &Gate) -> Result<Value, String> {
     let idle_target = req.get("idle_ms").and_then(Value::as_u64).unwrap_or(1_000);
     let timeout_ms = req
         .get("timeout_ms")
@@ -1816,18 +1974,19 @@ fn wait_for_idle(req: &Value) -> Result<Value, String> {
         if Instant::now() >= deadline {
             return Ok(json!({ "ok": true, "idle": false, "idle_ms": idle }));
         }
-        thread::sleep(Duration::from_millis(poll_ms));
+        gate.sleep(poll_ms)
+            .map_err(|refusal| refusal.code().to_string())?;
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn wait_for_idle(_req: &Value) -> Result<Value, String> {
+fn wait_for_idle(_req: &Value, _gate: &Gate) -> Result<Value, String> {
     Err("idle detection is only supported on macOS".to_string())
 }
 
 /// Paste `text` via the clipboard + the platform paste chord — fast and
 /// unicode-safe for long strings that char-by-char typing would stall on.
-fn paste(req: &Value) -> Result<Value, String> {
+fn paste(req: &Value, gate: &Gate) -> Result<Value, String> {
     let text = req
         .get("text")
         .and_then(Value::as_str)
@@ -1835,10 +1994,10 @@ fn paste(req: &Value) -> Result<Value, String> {
 
     // A local for the same reason as `click`: enigo's pacing runs on its drop, and
     // the clipboard handle lived this long too.
-    let mut platform = held::Real::default();
+    let mut platform = Gated::new(gate, held::Real::default());
     paste_seq(&mut platform, text)?;
 
-    post(req, &target_display(req)?)
+    post(req, &target_display(req)?, gate)
 }
 
 /// Let the pasteboard write settle before the paste keystroke.
@@ -1851,7 +2010,7 @@ const PASTE_SETTLE_MS: u64 = 50;
 fn paste_seq<P: held::Platform>(platform: &mut P, text: &str) -> Result<(), String> {
     held::guarded(platform, |input| {
         input.take_clipboard(text)?;
-        input.sleep(PASTE_SETTLE_MS);
+        input.sleep(PASTE_SETTLE_MS)?;
         input.press_keys(&[paste_modifier()])?;
         input.click_key(Key::Unicode('v'))
     })
@@ -1986,15 +2145,15 @@ fn logical_bounds_to_region(
 
 /// Enumerate interactive accessibility elements (role + label + a click point in
 /// screenshot coordinates) so the model can target by element, not raw pixels.
-fn elements(req: &Value) -> Result<Value, String> {
+fn elements(req: &Value, gate: &Gate) -> Result<Value, String> {
     let display = target_display(req)?;
     let region = region_or_full(&display.geom, parse_region(req)?);
-    elements_for(&display.geom, &region)
+    elements_for(&display.geom, &region, gate)
 }
 
 #[cfg(target_os = "macos")]
-fn elements_for(geom: &Geometry, region: &Region) -> Result<Value, String> {
-    let (nodes, ax_activation) = interactive_in_view(geom, region);
+fn elements_for(geom: &Geometry, region: &Region, gate: &Gate) -> Result<Value, String> {
+    let (nodes, ax_activation) = interactive_in_view(geom, region, gate);
 
     let items: Vec<Value> = nodes
         .iter()
@@ -2252,7 +2411,11 @@ const AX_SETTLE_POLLS: u32 = 5;
 /// Every outcome lands in the note — which app was read, what activation did,
 /// how long the tree took — so no result is silent about its cause.
 #[cfg(target_os = "macos")]
-fn interactive_in_view(geom: &Geometry, region: &Region) -> (Vec<ViewNode>, Option<String>) {
+fn interactive_in_view(
+    geom: &Geometry,
+    region: &Region,
+    gate: &Gate,
+) -> (Vec<ViewNode>, Option<String>) {
     let candidates = match window_candidates(geom) {
         Ok(candidates) => candidates,
         Err(reason) => return (Vec::new(), Some(reason)),
@@ -2278,7 +2441,14 @@ fn interactive_in_view(geom: &Geometry, region: &Region) -> (Vec<ViewNode>, Opti
 
     let attempt = ax::activate_accessibility(target.pid);
     for poll in 1..=AX_SETTLE_POLLS {
-        thread::sleep(Duration::from_millis(AX_SETTLE_POLL_MS));
+        // Up to 1.5 seconds, reached from `elements` AND from any `marks: true`
+        // screenshot, so it is a checkpoint site: a pause during a check image
+        // stops waiting for a tree the caller no longer wants. Read-only, so it
+        // answers with an empty set and a note rather than a cancelled action.
+        if gate.sleep(AX_SETTLE_POLL_MS).is_err() {
+            let note = format!("{}: cancelled while the tree settled", target.app);
+            return (Vec::new(), Some(note));
+        }
         let (again, again_total) = in_view_nodes(target.pid, geom, region);
         let waited = u64::from(poll) * AX_SETTLE_POLL_MS;
         if !again.is_empty() {
@@ -2320,7 +2490,7 @@ fn attempt_note(attempt: &Result<&'static str, String>) -> String {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn elements_for(_geom: &Geometry, _region: &Region) -> Result<Value, String> {
+fn elements_for(_geom: &Geometry, _region: &Region, _gate: &Gate) -> Result<Value, String> {
     Err("element enumeration is only supported on macOS".to_string())
 }
 
@@ -2824,7 +2994,7 @@ mod ax {
 /// relative to its target instead of only reading its own number echoed back. An
 /// unregioned action's coordinates are full-screen sent space — the same space this
 /// full-display check captures in. `rulers` is honored from the action request.
-fn post(req: &Value, display: &Display) -> Result<Value, String> {
+fn post(req: &Value, display: &Display, gate: &Gate) -> Result<Value, String> {
     if req
         .get("screenshot_after")
         .and_then(Value::as_bool)
@@ -2835,7 +3005,7 @@ fn post(req: &Value, display: &Display) -> Result<Value, String> {
             marks: false,
             annotate: executed_point_of(req),
         };
-        capture_payload_encoded(display, None, None, overlays)
+        capture_payload_encoded(display, None, None, overlays, gate)
     } else {
         Ok(json!({ "ok": true }))
     }
@@ -2914,6 +3084,33 @@ mod tests {
 
     use crate::held::{sweep_injected_failures, Call, Recorder, CLIPBOARD_RESTORE_DWELL_MS};
     use enigo::Direction;
+
+    /// A gate with nothing in flight, for a test that drives one function directly.
+    fn idle_gate() -> Gate {
+        Gate::new("boot-test".to_string(), Arc::new(SystemClock::new()))
+    }
+
+    /// A failed action as its payload, so a dispatch test can assert on one shape
+    /// whether the host had a display or not.
+    fn err_payload(message: String) -> Value {
+        json!({ "ok": false, "error": message })
+    }
+
+    /// Run one action through the real dispatch table, as the worker does.
+    fn dispatch(body: Value) -> Result<Value, String> {
+        let gate = Gate::new("boot-test".to_string(), Arc::new(SystemClock::new()));
+        let request = wire::Request {
+            request_id: "r1".to_string(),
+            action: body["action"].as_str().unwrap_or_default().to_string(),
+            body,
+            sidecar_generation: None,
+            session_generation: None,
+            authorization_generation: None,
+            mutation_seq: None,
+        };
+
+        handle(&request, &gate, &capture::Emitter::new())
+    }
 
     // The drag path's geometry is what makes an interpolated drag land exactly:
     // the LAST point must BE the destination (a rounded near-miss would drop the
@@ -3405,7 +3602,7 @@ mod tests {
     // window list OR a typed display error both pass — "unknown action" never does.
     #[test]
     fn handle_dispatches_windows() {
-        let response = handle(&json!({ "action": "windows" }), &capture::Emitter::new());
+        let response = dispatch(json!({ "action": "windows" })).unwrap_or_else(err_payload);
 
         let unknown = response["error"]
             .as_str()
@@ -3554,7 +3751,7 @@ mod tests {
     // protocol_version — the frame the consumer's handshake reads (never err()).
     #[test]
     fn observe_stop_returns_an_ack_frame() {
-        let ack = handle(&json!({"action": "observe_stop"}), &capture::Emitter::new());
+        let ack = dispatch(json!({"action": "observe_stop"})).expect("an ack is always ok");
         assert_eq!(ack["type"], json!("ack"));
         assert_eq!(ack["action"], json!("observe_stop"));
         assert_eq!(ack["ok"], json!(true));
@@ -3574,7 +3771,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn wait_for_idle_zero_target_returns_immediately_idle() {
-        let v = wait_for_idle(&json!({"idle_ms": 0, "timeout_ms": 500})).unwrap();
+        let v = wait_for_idle(&json!({"idle_ms": 0, "timeout_ms": 500}), &idle_gate()).unwrap();
         assert_eq!(v["ok"], json!(true));
         assert_eq!(v["idle"], json!(true));
     }
@@ -3588,6 +3785,7 @@ mod tests {
     fn wait_for_idle_times_out_when_target_unreachable() {
         let v = wait_for_idle(
             &json!({"idle_ms": 9_000_000_000_000u64, "timeout_ms": 50, "poll_ms": 10}),
+            &idle_gate(),
         )
         .unwrap();
         assert_eq!(v["ok"], json!(true));
@@ -3598,7 +3796,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn handle_dispatches_idle_ms() {
-        let v = handle(&json!({"action": "idle_ms"}), &capture::Emitter::new());
+        let v = dispatch(json!({"action": "idle_ms"})).expect("idle_ms answers");
         assert_eq!(v["ok"], json!(true));
         assert!(v["idle_ms"].as_u64().is_some());
     }
@@ -3607,7 +3805,7 @@ mod tests {
     #[test]
     fn idle_detection_is_macos_only_off_macos() {
         assert!(idle_ms().is_err());
-        assert!(wait_for_idle(&json!({})).is_err());
+        assert!(wait_for_idle(&json!({}), &idle_gate()).is_err());
     }
 
     // 75 is a MEANING, not a number: Fermix reads it as a clean capture-stall
@@ -3761,5 +3959,236 @@ mod tests {
         sweep_injected_failures(None, |platform| {
             key_chord_seq(platform, &[Key::Meta, Key::Shift, Key::Alt], Key::Tab)
         });
+    }
+
+    // --- cancellation: a pause that lands INSIDE a running sequence -----------
+    //
+    // The gate's own tests prove the barrier; these prove what the barrier does to
+    // a sequence that is already part way through one — which is the half a caller
+    // feels, because it is the half that decides whether the left button is still
+    // down when the drag stops.
+
+    /// A clock that installs a pause on the Nth sleep, so a cancellation lands at a
+    /// known point inside a sequence rather than at a hopeful wall-clock moment.
+    struct PauseOnSleep {
+        at: u64,
+        sleeps: std::sync::atomic::AtomicU64,
+        gate: std::sync::Mutex<Option<Gate>>,
+    }
+
+    impl PauseOnSleep {
+        fn new(at: u64) -> Arc<PauseOnSleep> {
+            Arc::new(PauseOnSleep {
+                at,
+                sleeps: std::sync::atomic::AtomicU64::new(0),
+                gate: std::sync::Mutex::new(None),
+            })
+        }
+
+        fn arm(self: &Arc<Self>, gate: &Gate) {
+            *self.gate.lock().unwrap() = Some(gate.clone());
+        }
+
+        /// Breaks the clock <-> gate cycle the arming makes, so the test leaks nothing.
+        fn disarm(self: &Arc<Self>) {
+            *self.gate.lock().unwrap() = None;
+        }
+    }
+
+    impl gate::Clock for PauseOnSleep {
+        fn now_ms(&self) -> u64 {
+            0
+        }
+
+        fn sleep(&self, _ms: u64) {
+            let nth = self
+                .sleeps
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if nth == self.at {
+                if let Some(gate) = self.gate.lock().unwrap().as_ref() {
+                    gate.control(wire::ControlAction::Pause, None);
+                }
+            }
+        }
+    }
+
+    fn running(action: &str, mutation_seq: Option<u64>) -> wire::Request {
+        wire::Request {
+            request_id: "r1".to_string(),
+            action: action.to_string(),
+            body: json!({}),
+            sidecar_generation: Some("boot-1".to_string()),
+            session_generation: Some(1),
+            authorization_generation: Some(1),
+            mutation_seq,
+        }
+    }
+
+    // The live check the owner cannot be asked to trust to luck: a pause during a
+    // long drag stops it PART WAY and the left button comes back up. Before the
+    // gate there was no way to stop it at all; the danger of stopping it badly is
+    // a desktop left dragging.
+    #[test]
+    fn a_pause_part_way_through_a_drag_stops_it_and_releases_the_button() {
+        // Sleeps: three slices of the 60 ms grab, then one per path step. The
+        // fifth lands inside the second step, so the drag is genuinely mid-path.
+        let clock = PauseOnSleep::new(5);
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        clock.arm(&gate);
+        gate.admit(&running("left_click_drag", Some(1))).unwrap();
+
+        let mut platform = Gated::new(&gate, Recorder::new(None));
+        let outcome = drag_seq(&mut platform, 10, 20, 50, 60);
+        let done = gate.finish();
+
+        assert_eq!(outcome, Err("cancelled".to_string()));
+        assert!(done.posted, "input did reach the screen before the pause");
+        assert!(done.cancelled);
+
+        let calls = &platform.inner().calls;
+        let presses = calls
+            .iter()
+            .filter(|call| matches!(call, Call::Button(_, Direction::Press)))
+            .count();
+        let releases = calls
+            .iter()
+            .filter(|call| matches!(call, Call::Button(_, Direction::Release)))
+            .count();
+        let steps = calls
+            .iter()
+            .filter(|call| matches!(call, Call::DragStep(..)))
+            .count();
+
+        assert_eq!(presses, 1);
+        assert_eq!(releases, 1, "the left button must not be left down");
+        assert!(
+            steps > 0 && steps < DRAG_STEPS as usize,
+            "the drag must stop part way, not before it started or after it ended: {steps}"
+        );
+
+        // What the caller is told: input was dispatched and the action did not finish.
+        let receipt = wire::Receipt::derive(done.posted, false, false, done.timings);
+        assert_eq!(receipt.dispatch, wire::Dispatch::Partial);
+
+        clock.disarm();
+    }
+
+    // A cancelled paste has two things to put back, and the clipboard is the one
+    // the operator notices: their own text must survive being interrupted.
+    #[test]
+    fn a_pause_during_a_paste_releases_the_modifier_and_restores_the_clipboard() {
+        let clock = PauseOnSleep::new(1); // the pasteboard settle, before the keystroke
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        clock.arm(&gate);
+        gate.admit(&running("paste", Some(1))).unwrap();
+
+        let mut platform = Gated::new(&gate, Recorder::new(Some("the owner clipboard")));
+        let outcome = paste_seq(&mut platform, "pasted by compux");
+        let done = gate.finish();
+
+        assert_eq!(outcome, Err("cancelled".to_string()));
+        assert!(done.cancelled);
+        assert_eq!(
+            platform.inner().clipboard.as_deref(),
+            Some("the owner clipboard"),
+            "a cancelled paste must not keep the user's clipboard"
+        );
+        assert!(platform.inner().down.is_empty(), "nothing may be left held");
+
+        clock.disarm();
+    }
+
+    // Every wait this sidecar owns returns at its next checkpoint rather than
+    // running its argument out, and says which one it was.
+    #[test]
+    fn a_pause_during_a_wait_returns_at_once() {
+        let clock = PauseOnSleep::new(1);
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        clock.arm(&gate);
+        gate.admit(&running("wait", None)).unwrap();
+
+        let outcome = wait(&json!({"ms": 20_000}), &gate);
+
+        assert_eq!(outcome, Err("cancelled".to_string()));
+        clock.disarm();
+    }
+
+    // The worker's own answer, end to end: admit, run, refuse, report. A paused
+    // click never reaches the screen and says so in one word the caller can act on.
+    #[test]
+    fn a_paused_click_is_refused_with_a_receipt_that_says_nothing_was_sent() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let paused = gate.control(wire::ControlAction::Pause, None);
+
+        let mut request = running("left_click", Some(1));
+        request.authorization_generation = Some(paused.authorization_generation);
+
+        let frame = serve(&request, &gate, &capture::Emitter::new());
+
+        assert_eq!(frame["type"], json!("response"));
+        assert_eq!(frame["request_id"], json!("r1"));
+        assert_eq!(frame["ok"], json!(false));
+        assert_eq!(frame["error"], json!("paused"));
+        assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"));
+        assert_eq!(frame["sidecar_generation"], json!("boot-1"));
+        assert_eq!(frame["session_generation"], json!(1));
+    }
+
+    // The handshake, through the worker: the one response that names the version,
+    // carries the boot identity, and never carries an authorization generation.
+    #[test]
+    fn the_handshake_answers_with_this_boot_and_this_version() {
+        let gate = Gate::new("boot-xyz".to_string(), Arc::new(SystemClock::new()));
+        let mut request = running("hello", None);
+        request.sidecar_generation = None;
+        request.session_generation = None;
+        request.authorization_generation = None;
+
+        let frame = serve(&request, &gate, &capture::Emitter::new());
+
+        assert_eq!(frame["ok"], json!(true));
+        assert_eq!(frame["protocol_version"], json!(PROTOCOL_VERSION));
+        assert_eq!(frame["sidecar_generation"], json!("boot-xyz"));
+        assert_eq!(frame["session_generation"], json!(1));
+        assert_eq!(frame["compux_version"], json!(env!("CARGO_PKG_VERSION")));
+        assert!(frame["actions"].is_array());
+        assert_eq!(
+            frame["capabilities"]["input_methods"],
+            json!(["foreground_hid"])
+        );
+        assert_eq!(
+            frame["capabilities"]["controls"],
+            json!(["pause", "resume", "release"])
+        );
+        assert!(
+            frame.get("authorization_generation").is_none(),
+            "the gate publishes that in an acknowledgement, never here"
+        );
+        assert!(
+            frame.get("receipt").is_none(),
+            "hello is read-only and earns no receipt"
+        );
+    }
+
+    // The capture rail answers in its own family, with no envelope and no id, so
+    // the one client that reads it keeps working unchanged.
+    #[test]
+    fn a_capture_verb_answers_in_the_ack_family_at_this_version() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let mut request = running("observe_stop", None);
+        request.sidecar_generation = None;
+        request.session_generation = None;
+        request.authorization_generation = None;
+
+        let frame = serve(&request, &gate, &capture::Emitter::new());
+
+        assert_eq!(frame["type"], json!("ack"));
+        assert_eq!(frame["action"], json!("observe_stop"));
+        assert_eq!(frame["ok"], json!(true));
+        assert_eq!(frame["protocol_version"], json!(PROTOCOL_VERSION));
+        assert!(frame.get("request_id").is_none());
+        assert!(frame.get("sidecar_generation").is_none());
+        assert!(frame.get("receipt").is_none());
     }
 }

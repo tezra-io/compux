@@ -28,7 +28,7 @@
 //! tested with no OS call at all — the same injected-sink seam `capture::Emitter`'s
 //! buffer already uses for the event wire.
 
-use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse};
+use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse};
 
 /// Dwell before putting the user's clipboard back, so the restore does not race the
 /// target application's read of the paste we just triggered.
@@ -56,8 +56,15 @@ pub trait Platform {
     /// One intermediate point of a drag, as the platform's drag motion.
     fn drag_step(&mut self, x: i32, y: i32) -> Result<(), String>;
 
-    /// Block this thread. Injected so pacing is asserted, not waited on, in tests.
-    fn sleep(&mut self, ms: u64);
+    /// Post a scroll. One call with a repeat count inside it, not a loop of ours.
+    fn scroll(&mut self, length: i32, axis: Axis) -> Result<(), String>;
+
+    /// Enter a string. One call with no loop of ours, so it has no checkpoint.
+    fn text(&mut self, text: &str) -> Result<(), String>;
+
+    /// Block this thread. Injected so pacing is asserted, not waited on, in tests
+    /// — and fallible, because this is where a cancelled sequence finds out.
+    fn sleep(&mut self, ms: u64) -> Result<(), String>;
 
     /// The clipboard's current text. `Ok(None)` is "nothing text-shaped to save";
     /// `Err` is "the clipboard itself is unavailable".
@@ -153,8 +160,19 @@ impl Platform for Real {
             .map_err(|e| format!("drag: {e}"))
     }
 
-    fn sleep(&mut self, ms: u64) {
+    fn scroll(&mut self, length: i32, axis: Axis) -> Result<(), String> {
+        self.input()?
+            .scroll(length, axis)
+            .map_err(|e| format!("scroll: {e}"))
+    }
+
+    fn text(&mut self, text: &str) -> Result<(), String> {
+        self.input()?.text(text).map_err(|e| format!("type: {e}"))
+    }
+
+    fn sleep(&mut self, ms: u64) -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_millis(ms));
+        Ok(())
     }
 
     fn clipboard_text(&mut self) -> Result<Option<String>, String> {
@@ -270,8 +288,8 @@ impl<'a, P: Platform> Guard<'a, P> {
         self.platform.drag_step(x, y)
     }
 
-    pub fn sleep(&mut self, ms: u64) {
-        self.platform.sleep(ms);
+    pub fn sleep(&mut self, ms: u64) -> Result<(), String> {
+        self.platform.sleep(ms)
     }
 
     /// Put `text` on the clipboard and take responsibility for putting the user's
@@ -309,7 +327,9 @@ impl<'a, P: Platform> Guard<'a, P> {
         }
 
         if let Some(prior) = self.clipboard_restore.take() {
-            self.platform.sleep(CLIPBOARD_RESTORE_DWELL_MS);
+            // Cleanup, so the dwell is best-effort: a cancelled sequence skips the
+            // wait and puts the clipboard back at once, which is what we want.
+            let _ = self.platform.sleep(CLIPBOARD_RESTORE_DWELL_MS);
             if let Err(reason) = self.platform.set_clipboard_text(&prior) {
                 // Reported, never returned: the action itself landed, and failing it
                 // here would have the caller paste the text a second time.
@@ -367,6 +387,8 @@ pub enum Call {
     Settle(i32, i32),
     DragStep(i32, i32),
     Sleep(u64),
+    Scroll(i32, Axis),
+    Text(String),
     ClipboardRead,
     ClipboardWrite(String),
 }
@@ -456,8 +478,17 @@ impl Platform for Recorder {
         self.step(Call::DragStep(x, y))
     }
 
-    fn sleep(&mut self, ms: u64) {
+    fn scroll(&mut self, length: i32, axis: Axis) -> Result<(), String> {
+        self.step(Call::Scroll(length, axis))
+    }
+
+    fn text(&mut self, text: &str) -> Result<(), String> {
+        self.step(Call::Text(text.to_string()))
+    }
+
+    fn sleep(&mut self, ms: u64) -> Result<(), String> {
         self.calls.push(Call::Sleep(ms));
+        Ok(())
     }
 
     fn clipboard_text(&mut self) -> Result<Option<String>, String> {

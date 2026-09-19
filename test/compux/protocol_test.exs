@@ -30,6 +30,16 @@ defmodule Compux.ProtocolTest do
       refute Protocol.read_only?("type")
       refute Protocol.read_only?("paste")
     end
+
+    # The same list decides whether a request carries a `mutation_seq` and earns a
+    # receipt, so the operational verbs have to be in it: a permission probe is
+    # not a mutation, and sequencing one would put a receipt on it.
+    test "the operational verbs are read-only too, though they are not model actions" do
+      for action <- ~w(probe idle_ms wait_for_idle hello) do
+        assert Protocol.read_only?(action), "#{action} dispatches no input"
+        refute action in Protocol.actions(), "#{action} is not a model verb"
+      end
+    end
   end
 
   describe "validate/1 — structure" do
@@ -176,31 +186,17 @@ defmodule Compux.ProtocolTest do
     end
   end
 
-  describe "encode_request/1 and decode_response/1" do
+  describe "encode_request/1" do
     test "encode appends a newline and stays valid JSON" do
       line = Protocol.encode_request(%{"action" => "screenshot"})
       assert String.ends_with?(line, "\n")
       assert {:ok, %{"action" => "screenshot"}} = Jason.decode(String.trim(line))
     end
 
-    test "decodes an ok response" do
-      assert {:ok, %{"ok" => true, "data" => "x"}} =
-               Protocol.decode_response(~s({"ok":true,"data":"x"}))
-    end
-
-    test "decodes a failure response to its error reason" do
-      assert {:error, "no_active_display"} =
-               Protocol.decode_response(~s({"ok":false,"error":"no_active_display"}))
-    end
-
-    test "a malformed shape fails loud" do
-      assert {:error, "malformed sidecar response: " <> _} =
-               Protocol.decode_response(~s({"weird":1}))
-    end
-
-    test "invalid JSON fails loud" do
-      assert {:error, "invalid JSON from sidecar: " <> _} =
-               Protocol.decode_response("{not json")
+    # Decoding lives in `Compux.Frame` now: a reader that called any `ok: true`
+    # map a response let an `ack` or an `event` stand in for an action's reply.
+    test "the protocol no longer decodes responses" do
+      refute function_exported?(Protocol, :decode_response, 1)
     end
   end
 

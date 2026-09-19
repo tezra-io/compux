@@ -65,7 +65,12 @@ defmodule Compux do
     end
   end
 
-  @doc "The sidecar's reported identity (`:protocol_version`, `:compux_version`, `:actions`)."
+  @doc """
+  The sidecar's reported identity: `:protocol_version`, `:compux_version`,
+  `:actions`, the `:sidecar_generation` this boot minted, and the `:capabilities`
+  it advertises (`input_methods`, `controls`). A capability is listed only if the
+  build really has it, so this is what a caller reads before offering one.
+  """
   @spec info(t()) :: map()
   def info(%__MODULE__{info: info}), do: info
 
@@ -303,7 +308,9 @@ defmodule Compux do
     %{
       protocol_version: Map.get(identity, "protocol_version"),
       compux_version: Map.get(identity, "compux_version"),
-      actions: Map.get(identity, "actions", [])
+      actions: Map.get(identity, "actions", []),
+      sidecar_generation: Map.get(identity, "sidecar_generation"),
+      capabilities: Map.get(identity, "capabilities", %{})
     }
   end
 
