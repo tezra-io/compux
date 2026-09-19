@@ -436,6 +436,35 @@ pub fn to_sent(geom: &Geometry, region: &Region, lx: f64, ly: f64) -> Option<(i6
     }
 }
 
+/// A rectangle given in global LOGICAL points, expressed in one image's own sent
+/// pixels.
+///
+/// What `elements` publishes a control's `bounds` in, so every number in that
+/// reply lives in ONE space — the image the reply names — rather than a caller
+/// having to know that the click point is in sent pixels and the frame is in
+/// points. Slice 3 took the second coordinate space off the wire; this is what
+/// keeps it off.
+///
+/// Maps EDGES, not pixel centres, for the reason [`rect_through`] does: a
+/// control's frame is a rectangle on the screen rather than a set of pixels, and
+/// the centre convention would shrink it by half a pixel at every edge.
+///
+/// **Not clipped to the image.** A control whose click point is in view can still
+/// have a frame that runs past an edge, and a caller reading a negative `x` there
+/// learns something true; clamping would tell it the control is smaller than it is.
+pub fn sent_rect(geom: &Geometry, region: &Region, x: f64, y: f64, w: f64, h: f64) -> Region {
+    let crop = crop_rect(geom, region);
+    let kz = f64::from(crop.sent_scale());
+    let sf = f64::from(geom.scale_factor);
+
+    Region {
+        x: ((x - f64::from(geom.origin_x)) * sf - f64::from(crop.left_phys)) * kz,
+        y: ((y - f64::from(geom.origin_y)) * sf - f64::from(crop.top_phys)) * kz,
+        w: w * sf * kz,
+        h: h * sf * kz,
+    }
+}
+
 /// A rectangle read in ONE observation's image, expressed in the full-display sent
 /// pixels of the geometry in force now.
 ///
@@ -1082,5 +1111,53 @@ mod tests {
         let full = Region::full(&g);
         let straight = rect_through(&g, &full, &rect, &g);
         assert!(straight.x < placed.x - 10.0, "{straight:?} vs {placed:?}");
+    }
+
+    // A control's frame reaches the wire in the SAME pixels as the click point
+    // beside it: one reply, one coordinate space. The click point is the frame's
+    // centre through `to_sent`, so the two must agree by construction.
+    #[test]
+    fn a_frame_and_its_click_point_land_in_the_same_space() {
+        let g = geom(&retina_facts(), (3024, 1964));
+        let full = Region::full(&g);
+
+        // A control at logical (400, 300), 80 by 24 points.
+        let bounds = sent_rect(&g, &full, 400.0, 300.0, 80.0, 24.0);
+        let (cx, cy) = to_sent(&g, &full, 440.0, 312.0).expect("its centre is in view");
+
+        assert!(
+            (bounds.x + bounds.w / 2.0 - cx as f64).abs() <= 1.0,
+            "the click point must sit at the middle of the bounds: {bounds:?} vs {cx}"
+        );
+        assert!(
+            (bounds.y + bounds.h / 2.0 - cy as f64).abs() <= 1.0,
+            "{bounds:?} vs {cy}"
+        );
+
+        // It is a rectangle on the screen, so its width survives the mapping: at
+        // 2x on a 1366-wide budget, 80 points is 80 * 2 * (1366/3024) sent pixels.
+        let expected = 80.0 * 2.0 * (crop_rect(&g, &full).sent_scale() as f64);
+        assert!((bounds.w - expected).abs() < 1.0, "{bounds:?}");
+    }
+
+    // A control whose click point is in view can still run past an edge, and the
+    // caller reading a negative x there learns something true. Clamping would say
+    // the control is smaller than it is, which is worse than saying where it goes.
+    #[test]
+    fn a_frame_that_runs_past_an_edge_is_not_clamped() {
+        let g = geom(&ultrawide_facts(), (3840, 1080));
+        let crop = Region {
+            x: 400.0,
+            y: 100.0,
+            w: 600.0,
+            h: 400.0,
+        };
+
+        let bounds = sent_rect(&g, &crop, 0.0, 0.0, 200.0, 50.0);
+        assert!(
+            bounds.x < 0.0,
+            "it starts to the left of this crop: {bounds:?}"
+        );
+        assert!(bounds.w > 0.0);
     }
 }

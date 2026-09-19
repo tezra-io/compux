@@ -58,11 +58,11 @@ Sanity-check the wire without starting a session (the binary reads stdin, so it 
 given a line — never run it with no input, it will simply wait):
 
 ```sh
-printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":8,"deadline_ms":10000}\n' \
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":9,"deadline_ms":10000}\n' \
   | COMPUX_DISCLAIMED=1 "$SIDE/compux"
 ```
 
-It must report `"protocol_version":8`. **Every line into this sidecar is a tagged frame
+It must report `"protocol_version":9`. **Every line into this sidecar is a tagged frame
 now** — a request carries a `type` and a `request_id`, and an untagged protocol-6 line
 is refused rather than served. That is why the `printf` above looks nothing like the one
 this document carried when it was written against protocol 6.
@@ -327,9 +327,18 @@ modifier down, no button held, and the clipboard still holding the owner's own t
   `printf`.** An action request must carry the boot identity the sidecar minted at
   start-up, and the only way to learn it is to say `hello` first on the same process.
   Since protocol 8 an action that addresses a point must also name the IMAGE that
-  point was read in, and only a screenshot can mint one. One `printf` can do neither,
-  so `cx.py` says hello, takes a screenshot before any action that needs an image,
-  then sends each action you give it as a tagged frame and prints the reply.
+  point was read in, and since protocol 9 an action addressed at a CONTROL must name
+  the `elements` reply that listed it. Only a screenshot or an `elements` can mint
+  one. A single `printf` can do none of that, so `cx.py` says hello, takes whichever
+  of the two an action needs before sending it, then sends each action you give it
+  as a tagged frame and prints the reply.
+* **One sidecar, many actions.** The observation table is PER PROCESS, so an id
+  from an earlier run of the script can never resolve in a later one — it answers
+  `unknown_observation`, which is a different fact from the `stale_element` some
+  steps below are checking for. So `cx.py` also reads actions from stdin, one JSON
+  object per line, and keeps the same sidecar for all of them. Any step that spans
+  more than one action (listing then pressing, relaunching an app in between) uses
+  that form, and every such step below says so.
 * `COMPUX_DISCLAIMED=1` makes the sidecar skip its TCC self-disclaim re-exec, so it
   runs under the **launching terminal's** Accessibility grant. Without that variable
   it re-execs into its own (unsigned, brand-new) identity, which has no grant — which
@@ -367,7 +376,7 @@ def recv():
     return reply
 
 send({"type": "request", "request_id": "r1", "action": "hello",
-      "protocol_version": 8, "deadline_ms": 10000})
+      "protocol_version": 9, "deadline_ms": 10000})
 hello = recv()
 print("hello   ", json.dumps(hello))
 
@@ -383,32 +392,51 @@ def act(body):
     send(frame)
     return recv()
 
-# A coordinate is pixels in the image you name, so every action that addresses a
-# point needs one — and only a screenshot mints one. This takes a fresh screenshot
-# before each such action rather than reusing one, so no step can fail on an image
-# that expired while you were reading.
+# A coordinate is pixels in the image you name and a reference is a control in the
+# list you name, so every addressed action needs one of the two — and only a
+# screenshot or an `elements` mints one. This takes a fresh one before each such
+# action rather than reusing it, so no step can fail on an observation that expired
+# while you were reading.
 ADDRESSED = {"left_click", "right_click", "double_click", "mouse_move",
-             "left_click_drag", "scroll", "inspect"}
+             "left_click_drag", "scroll", "inspect", "press", "set_value"}
+
+def run(body):
+    if body.get("action") in ADDRESSED and "observation_id" not in body:
+        # A control is named in an `elements` reply; a point, in a screenshot.
+        if "element_ref" in body:
+            listed = act({"action": "elements"})
+            print("elements", json.dumps(listed))
+            body["observation_id"] = listed.get("observation_id")
+        else:
+            shot = act({"action": "screenshot"})
+            print("image   ", json.dumps(shot))
+            body["observation_id"] = shot.get("observation_id")
+    print("action  ", json.dumps(act(body)))
 
 for argument in sys.argv[2:]:
-    body = json.loads(argument)
-    if body.get("action") in ADDRESSED and "observation_id" not in body:
-        shot = act({"action": "screenshot"})
-        print("image   ", json.dumps(shot))
-        body["observation_id"] = shot.get("observation_id")
-    print("action  ", json.dumps(act(body)))
+    run(json.loads(argument))
+
+# Then keep reading from stdin, so a sequence of actions shares ONE sidecar — and
+# therefore one observation table. Type a JSON object per line and press return;
+# ctrl-D ends the session. Run it with </dev/null to skip this entirely.
+if sys.stdin.isatty():
+    print("ready  (one JSON action per line, ctrl-D to finish)")
+for line in sys.stdin:
+    line = line.strip()
+    if line:
+        run(json.loads(line))
 
 side.stdin.close()
 PYEOF
 ```
 
 The first line it prints is always the handshake, and it must say
-`"protocol_version": 8`, with a `capabilities.observations` of
+`"protocol_version": 9`, with a `capabilities.observations` of
 `{"max": 3, "ttl_ms": 30000}`. If it does not, the binary is not the one you just
-built. Every `image` line names the screenshot the action after it is aimed at. If
-that line reads `"ok": false`, the sidecar could not capture — the launching
-terminal needs **Screen Recording** as well as Accessibility — and the action after
-it is refused `observation_required` for that reason and no other.
+built. Every `image` or `elements` line names the reply the action after it is
+aimed at. If that line reads `"ok": false`, the sidecar could not capture — the
+launching terminal needs **Screen Recording** as well as Accessibility — and the
+action after it is refused `observation_required` for that reason and no other.
 
 ## 1. The success paths still land (30 seconds, fails fastest)
 
@@ -455,11 +483,11 @@ The disclaim re-exec runs on every launch and now reports a failed spawn attribu
 check the disclaimed path too, since step 1 skipped it:
 
 ```sh
-printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":8,"deadline_ms":10000}\n' \
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":9,"deadline_ms":10000}\n' \
   | "$CX"; echo "exit=$?"
 ```
 
-It must print the hello frame with `"protocol_version":8` and `exit=0`. An exit in
+It must print the hello frame with `"protocol_version":9` and `exit=0`. An exit in
 the 70s here is a disclaim failure and the
 stderr line above it names which step; report the number. There is no way to provoke
 `posix_spawnattr_setflags` failing on a healthy machine, so 77 itself is proved by
@@ -637,13 +665,14 @@ moved under it. In the order that fails fastest.
 ## 1. The handshake, before any daemon (10 seconds)
 
 ```sh
-printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":8,"deadline_ms":10000}\n' \
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":9,"deadline_ms":10000}\n' \
   | COMPUX_DISCLAIMED=1 "$CX"
 ```
 
-One line back, `"type":"response"`, `"request_id":"r1"`, `"protocol_version":8`, a
+One line back, `"type":"response"`, `"request_id":"r1"`, `"protocol_version":9`, a
 `"sidecar_generation"` that starts `boot-`, a `"capabilities"` object listing
-`foreground_hid`, the three controls and `"observations":{"max":3,"ttl_ms":30000}`. A different `protocol_version` means the
+`["foreground_hid","ax"]`, the three controls and
+`"observations":{"max":3,"ttl_ms":30000}`. A different `protocol_version` means the
 installed binary is not the one you just built — fix that before anything else.
 
 ## 2. The daemon comes up and an action still lands
@@ -900,3 +929,317 @@ a click on something in it.
 * **Three displays, or a display hot-plugged mid-action.** The staleness check reads
   what the OS says before every addressed action, so it should refuse rather than
   misfire, but no test here has a third panel to prove it.
+
+---
+
+# Live check — semantic references and accessibility actions (M42 slice 4)
+
+This slice gives every control a NAME. `elements` now answers what each control
+is, what it holds, whether it is enabled, what it can do, whether its value can be
+set, where it is, a short path of ancestor labels, and an `element_ref` the next
+action can use. Two actions address a control instead of a point — `press` and
+`set_value` — and a click may be addressed by reference too, in which case the
+helper reads the control's bounds again at the moment it acts.
+
+None of that moves the pointer, and that is the claim only a real machine can
+test. Everything about REFUSING is already proved against the built helper in this
+session (`observation_required`, `element_required`, `unknown_observation`,
+`addressing_conflict`, `unknown_field` on `target_id`), and the revalidation, the
+retain/release balance and the receipts are unit-tested against a scripted
+application. **What needs a screen is whether a press actually presses, and
+whether it leaves the person's keyboard alone while it does.**
+
+Expected outcome in one line: with the fixture app in front and the person typing
+continuously into TextEdit, `press` changes the fixture's state file, moves no
+pointer, drops and inserts no character in TextEdit, and reports
+`foreground_changed: false`; `set_value` verifies on a text field and does not on
+a secure one; a disabled button is refused; relaunching the fixture makes every
+old reference `stale_element`; and the support matrix at the end has a row per
+control family the owner actually ran.
+
+## 0. Preconditions
+
+* The sidecar built from this branch, installed under `dev_local` exactly as §1 of
+  the browser-capture check describes (stop the daemon first, atomic replace,
+  compare the sha256), and Fermix on the matching branch — the handshake is
+  exact-version.
+* `CX=/Users/sujshe/projects/compux/native/compux/target/release/compux` and the
+  `/tmp/cx.py` above, which now takes an `elements` reply before any action that
+  names a control.
+* **The fixture application**, which is what gives these steps an answer that does
+  not come from a picture:
+
+```sh
+cd /Users/sujshe/projects/compux
+./scripts/build_fixture_app.sh /tmp/FixtureApp
+
+# The recording path, with no window and no grant: this must exit 0 before you
+# trust anything the file says later.
+/tmp/FixtureApp --self-test --state-file /tmp/fixture.json ; echo "exit=$?"
+
+# Then the real thing. Leave it running, in front, for §1 to §5.
+rm -f /tmp/fixture.json
+/tmp/FixtureApp --state-file /tmp/fixture.json &
+```
+
+  `--self-test` drives the handlers in process. It shows no window and posts no
+  input, so it proves the recording path without a window server or an
+  Accessibility grant; the steps below are the half that needs both.
+* **TextEdit open with an empty document, and your hands on the keyboard.** Steps
+  1 and 2 ask you to keep typing while the helper acts. That is the test: an
+  accessibility action must not take the focus, and the only way to see that it
+  did is to lose a character.
+* `watch -n1 cat /tmp/fixture.json` in a second terminal, or just `cat` it after
+  each step. Every step below says which event it should add.
+
+## 1. The list names things (fails fastest)
+
+With the fixture app frontmost:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX" '{"action":"elements"}'
+```
+
+* Every element carries `element_ref` (`e1`, `e2`, …), `role`, `label`, `enabled`,
+  `actions`, `settable`, `bounds` and the click point `x`,`y`. A reply whose
+  `element_ref` and `actions` are missing EVERYWHERE is one that could not read the
+  target application's start time, so it offers no references rather than ones that
+  would be refused the moment they were used — the controls are still listed with
+  their click points. Report that if you see it; it should not happen on a healthy
+  machine.
+* **All four "Save" buttons are listed, and their `path` differs** — `Document`
+  and `Sidebar` in AppKit, `Draft` and `Archive` in SwiftUI. Two identical labels
+  that cannot be told apart is the failure this field exists to prevent; if any
+  pair has equal or empty paths, say so and paste both entries. The SwiftUI pair
+  is the one to watch: a hosting view with no group of its own publishes no
+  ancestor label at all, and every control under it collapses to the window title.
+* Every SwiftUI control's `path` should name `SwiftUI`, as every AppKit one names
+  `AppKit`. If the SwiftUI column's paths are all empty, that box is not
+  publishing itself and the comparison between the two halves is not meaningful.
+* The buttons list `"actions": ["press"]` and `"settable": false`; the text field
+  lists `"actions": []` and `"settable": true`. Nothing is inferred from a role —
+  if a button reports `settable: true` here, that is the application saying so.
+* The DISABLED button is listed with `"enabled": false`, not omitted.
+* The secure field is listed, and it carries **no `value`** while the ordinary
+  text field carries the text it holds.
+* A `truncated` key means the walk stopped early (`"nodes"`, `"depth"` or
+  `"time"`). On this window it should be absent. On a large application it may
+  not be, and that is the number worth writing down.
+
+## 2. A press presses, and takes nothing from you
+
+Keep typing into TextEdit — a steady stream of the same letter is easiest to
+check. From the other terminal, press the fixture's AppKit button by reference:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX" '{"action":"press","element_ref":"e1"}'
+```
+
+The script takes a fresh `elements` for that press and prints it, so the reference
+it resolves is one from THAT listing — which is why this single-argument form is
+safe even though §1 ran in a different sidecar. Read the `elements` line it prints
+to see which control you just named; if it is not the one you meant, run the
+interactive form and press a reference you picked yourself:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX"
+{"action":"elements"}
+{"action":"press","observation_id":"<the id it printed>","element_ref":"e4"}
+```
+
+* `"ok": true`, `receipt.input_method` is `"ax"`, `receipt.dispatch` is `"sent"`,
+  `receipt.effect` is `"not_observed"` and **`receipt.foreground_changed` is
+  `false`**. If that last field is ABSENT, the accessibility API would not say
+  which application was in front, either before or after — the helper leaves the
+  question unanswered rather than guessing `false`. Note it: your eyes on TextEdit
+  are then the only evidence for that row of the matrix.
+* `/tmp/fixture.json` gains one event: `{"control":"appkit.button","action":"press"}`.
+* **The pointer did not move.** Watch it. A press that warps the cursor is this
+  slice failing.
+* **TextEdit lost nothing.** No dropped letter, no letter arriving in another
+  window, no focus ring moving. If a character went missing, note which control
+  it was and mark that family `failed` in the matrix.
+
+Repeat for each control family of the fixture, in BOTH toolkit groups (the AppKit
+column and the SwiftUI column), and note what the state file records:
+
+| Control | Ask for | The file should record | Recorded by |
+|---|---|---|---|
+| button | `press` | `press` | the control's own action |
+| checkbox | `press` | `toggle` with `on` | its value, watched |
+| pop-up button | `press` | the menu opens (no event until you pick) | its value, watched |
+| text field | `set_value` | `set_value` with your text | its value, watched |
+| secure field | `set_value` | `set_value` with a `length` and no text | its value, watched |
+| disabled button | `press` | **nothing** — see §4 | the action, which must not run |
+
+**Why two mechanisms, and what a silence means.** A press really runs the
+control's action: `AXPress` on an AppKit button goes through `performClick:`. A
+value set does NOT — `AXUIElementSetAttributeValue(AXValue)` writes the string and
+sends nothing — so the AppKit half SAMPLES its controls four times a second and
+records a value that changed, however it changed. The SwiftUI half cannot be
+sampled from outside, so its controls use bindings whose setter records.
+
+That difference matters when a cell comes back empty. An AppKit value that does
+not appear in the file within a second means the value never reached the control.
+A SwiftUI value that does not appear may instead mean SwiftUI did not route the
+accessibility setter through its binding — a real limitation of that toolkit, and
+exactly the kind of thing the matrix exists to record. Say which of the two you
+saw; the reply's own `verified` flag settles it, because it is a read-back of the
+control rather than of the file.
+
+The pop-up is the one to watch for a foreground change: opening a menu is exactly
+the kind of thing that takes the front. If `foreground_changed` comes back `true`
+there, that is a truthful report, not a bug — record it in the matrix.
+
+## 3. `set_value` verifies, and a secure field cannot
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX" \
+  '{"action":"set_value","element_ref":"e3","value":"written by compux"}'
+```
+
+(Again, `e3` is whatever the `elements` line the script prints calls the field you
+mean. The references are numbered in walk order and that order is the
+application's, not this document's.)
+
+* On the TEXT field: `"ok": true`, `"verified": true`, `receipt.effect` is
+  `"verified"`, and `"value"` echoes what the field now holds. The text is visible
+  in the window, and the state file records it.
+* On the SECURE field: `"ok": true`, `"verified": false`, `receipt.effect` is
+  `"not_observed"`, and **there is no `value` on the reply at all**. The state
+  file records a `length` and no text. A secure field reads back masked, so it can
+  never verify — that is the design, not a failure.
+* On a BUTTON (not settable): `ax_action_unsupported`, `receipt.dispatch` is
+  `"not_sent"`, and the sentence tells you to type or paste instead. Nothing is
+  typed, nothing is clicked, and the state file gains no event.
+* Every refusal so far carries `"dispatch": "not_sent"`. **On a machine with no
+  Accessibility grant at all, so does every attempted press**: the platform answers
+  that the API is disabled, which means nothing left the helper, and the receipt
+  must say so rather than `sent`. Worth one deliberate run with the grant revoked.
+
+## 4. The refusals, on real controls
+
+Each of these must add NOTHING to the state file. Check it after every one.
+
+* **A disabled button**: `press` on it answers `element_disabled` with
+  `dispatch: not_sent`. If the file gains an `appkit.disabled_button` event, a
+  press reached a control that said it was disabled — report that; the handler is
+  there precisely so it cannot happen silently.
+* **A control that cannot be pressed by name**: `press` on the text field answers
+  `ax_action_unsupported` and says to click it instead. **The helper must not
+  click it.** Nothing in the file, nothing in the window.
+* **A stale reference.** This one needs ONE sidecar across the whole sequence: an
+  id from a second run of the script was never minted by that process and answers
+  `unknown_observation`, which proves nothing about staleness. Start the script
+  with no arguments and type the lines:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX"
+# then, at the prompt:
+{"action":"elements"}
+#   ... note the observation_id it prints. Now QUIT AND RELAUNCH the fixture app,
+#   ... within thirty seconds (past that it is expired_observation, not stale), then:
+{"action":"press","observation_id":"<the id it printed>","element_ref":"e1"}
+```
+
+  It must answer `stale_element` with `dispatch: not_sent`. This is the case a pid
+  alone would get wrong — the relaunched fixture may well take the same pid — so
+  it is worth doing twice. If it answers `unknown_observation` you are in a second
+  sidecar; if `expired_observation`, the relaunch took longer than the thirty
+  seconds and the step needs redoing, not reporting.
+* **Both addressing forms at once**: a click carrying `x`, `y` AND an
+  `element_ref` answers `addressing_conflict`, and nothing is clicked.
+
+## 5. A click by reference lands where the control IS
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX" \
+  '{"action":"left_click","element_ref":"e1"}'
+```
+
+* It clicks the control, and the state file records the press.
+* `receipt.input_method` is `"foreground_hid"`, not `"ax"`: a click by reference is
+  still a click, and the receipt says so.
+* Then MOVE the fixture window between the listing and the click — one sidecar
+  again, because both halves must be in the same observation table:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX"
+{"action":"elements"}
+#   ... now DRAG the fixture window a few hundred points across the screen, then:
+{"action":"left_click","observation_id":"<the id it printed>","element_ref":"e1"}
+```
+
+  The click must land on the control in its NEW place, because the bounds are read
+  again at that moment. A click that lands where the control used to be is the
+  defect this addressing exists to remove.
+
+## 6. Through Fermix, once
+
+Ask the assistant to do something in the fixture app that is best served by
+pressing a named control ("tick the AppKit checkbox in the fixture window"). It
+should take an element list and press by reference rather than aiming at pixels.
+Then ask it to do the same while you type into TextEdit; the answer must be
+correct and your typing must be untouched.
+
+## 7. A control in a browser or an Electron app
+
+The hardest family, and the one the matrix is really for. With Chrome in front,
+take `elements`, then press a link or a button by reference.
+
+* Chrome builds its accessibility tree lazily. A first `elements` that comes back
+  empty with an `ax_activation` note and a second that does not is the settle poll
+  working; a `truncated: "time"` there is worth recording.
+* A `press` that answers `ax_action_unsupported` on something that plainly looks
+  like a button is a TRUE answer about that control: Chromium publishes many
+  elements with no `AXPress`. Record the family as `failed` and click it instead —
+  the point of the matrix is to know which families can be named and which cannot.
+
+## 8. The support matrix
+
+Fill one row per combination you actually ran. **A cell nobody ran stays
+`unqualified`** — that is the honest value and the reason the column exists.
+`qualified` means it did the thing, changed the state the application owns, and
+reported `foreground_changed: false`. `failed` means any of those three did not
+hold; say which in the note.
+
+| OS version | App / toolkit | Control family | Action | Result | Note |
+|---|---|---|---|---|---|
+| | FixtureApp / AppKit | button | `press` | unqualified | |
+| | FixtureApp / AppKit | checkbox | `press` | unqualified | |
+| | FixtureApp / AppKit | text field | `set_value` | unqualified | |
+| | FixtureApp / AppKit | secure field | `set_value` | unqualified | |
+| | FixtureApp / AppKit | disabled button | `press` (refused) | unqualified | |
+| | FixtureApp / AppKit | pop-up button | `press` | unqualified | |
+| | FixtureApp / SwiftUI | button | `press` | unqualified | |
+| | FixtureApp / SwiftUI | checkbox | `press` | unqualified | |
+| | FixtureApp / SwiftUI | text field | `set_value` | unqualified | |
+| | FixtureApp / SwiftUI | secure field | `set_value` | unqualified | |
+| | FixtureApp / SwiftUI | disabled button | `press` (refused) | unqualified | |
+| | FixtureApp / SwiftUI | pop-up button | `press` | unqualified | |
+| | FixtureApp / AppKit | two "Save" buttons | `path` tells them apart | unqualified | |
+| | FixtureApp / SwiftUI | two "Save" buttons | `path` tells them apart | unqualified | |
+| | TextEdit / AppKit | text area | `set_value` | unqualified | |
+| | Finder / AppKit | toolbar button | `press` | unqualified | |
+| | Safari / WebKit | link | `press` | unqualified | |
+| | Chrome / Chromium | link | `press` | unqualified | |
+| | Chrome / Chromium | form field | `set_value` | unqualified | |
+| | an Electron app | button | `press` | unqualified | |
+
+## 9. What this check still cannot prove
+
+* **That a press is invisible to the application.** An application can tell an
+  `AXPress` from a click if it looks, and some will behave differently. The state
+  file proves the handler ran; it cannot prove the application could not tell.
+* **That the foreground never moves.** `foreground_changed` is read from the
+  accessibility API before and after, and a platform that will not answer reports
+  `false` rather than inventing a change. So a `false` on an application whose
+  accessibility is half-implemented is weaker evidence than a `false` on the
+  fixture. Your eyes on TextEdit are the stronger test.
+* **A control that moves DURING the action.** The bounds are read at the moment of
+  the action, which closes the window between the listing and the click, not the
+  one inside the click itself.
+* **Anything about a background window.** Every action here still runs under the
+  same courtesy wait and the same input seat as a click. Window-scoped traversal
+  and acting on a window that is not in front need a bound target, which is the
+  next slice.

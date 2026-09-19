@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use enigo::{Axis, Button, Direction, Key};
 
 use crate::held::Platform;
-use crate::wire::{ControlAction, Envelope, Request, Timings};
+use crate::wire::{ControlAction, Effect, Envelope, InputMethod, Request, Timings};
 
 /// The coarsest a cancellation may be noticed inside a loop or a sleep of ours.
 pub const CHECKPOINT_MS: u64 = 25;
@@ -140,6 +140,9 @@ pub struct Acknowledged {
 }
 
 /// What the action did, for the receipt that reports it.
+///
+/// Everything a receipt says comes from here, because the gate is the only path
+/// from an action to the screen: nothing is inferred from the action's name.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Dispatched {
     pub posted: bool,
@@ -148,6 +151,15 @@ pub struct Dispatched {
     pub input_complete: bool,
     pub cancelled: bool,
     pub timings: Timings,
+    /// How the action reached the machine. The pointer and keyboard path unless
+    /// an action says otherwise, because that is the only one it has.
+    pub input_method: InputMethod,
+    /// The effect the action could PROVE, when it could prove one. `None` leaves
+    /// the derivation (an after-image, or nothing) to speak.
+    pub effect: Option<Effect>,
+    /// Whether the foreground moved while the action ran, for the actions that
+    /// promise not to move it. `None` where the question was never asked.
+    pub foreground_changed: Option<bool>,
 }
 
 struct InFlight {
@@ -155,6 +167,9 @@ struct InFlight {
     posted: bool,
     input_complete: bool,
     timings: Timings,
+    input_method: InputMethod,
+    effect: Option<Effect>,
+    foreground_changed: Option<bool>,
 }
 
 struct State {
@@ -173,6 +188,14 @@ pub struct Gate {
     /// Read by every checkpoint WITHOUT the mutex, so a 25 ms cadence inside a
     /// drag never contends with the control that is trying to stop it.
     cancelled: Arc<AtomicBool>,
+    /// Set by a `release`, read and cleared by the action worker.
+    ///
+    /// Letting go of the seat lets go of what the caller could still address with
+    /// it — the images it was handed, and the native element references those
+    /// hold. That table belongs to the worker thread alone and takes no lock, so
+    /// the control cannot clear it: it raises this, and the worker acts on it
+    /// before it serves anything else.
+    released: Arc<AtomicBool>,
     clock: Arc<dyn Clock>,
 }
 
@@ -197,6 +220,7 @@ impl Gate {
                 in_flight: None,
             })),
             cancelled: Arc::new(AtomicBool::new(false)),
+            released: Arc::new(AtomicBool::new(false)),
             clock,
         }
     }
@@ -257,6 +281,9 @@ impl Gate {
             posted: false,
             input_complete: false,
             timings: Timings::default(),
+            input_method: InputMethod::default(),
+            effect: None,
+            foreground_changed: None,
         });
         self.cancelled.store(false, Ordering::SeqCst);
 
@@ -334,6 +361,44 @@ impl Gate {
         Ok(outcome)
     }
 
+    /// One accessibility message: checked here, run OUTSIDE the mutex, and marked
+    /// as dispatched only if it really went out.
+    ///
+    /// Two differences from [`Gate::dispatch`], and both are about what the
+    /// platform can tell us. An EVENT post cannot: a `CGEventPost` that returned
+    /// an error may still have reached the window server, so the only safe reading
+    /// is that it went out, and `dispatch` marks unconditionally. An accessibility
+    /// message CAN: "the accessibility API is disabled", "that element is gone"
+    /// and "I gave up waiting after I had sent it" are different answers, and a
+    /// receipt that called the first of those `sent` would tell a caller its press
+    /// may have landed when nothing ever left this process. So `sent` decides.
+    ///
+    /// And the call runs outside the mutex, like [`Gate::dispatch_long`]: one
+    /// message can take the whole messaging timeout, and a pause landing inside it
+    /// must still be acknowledged. The acknowledgement still names this request,
+    /// because `in_flight_request_id` comes from admission and not from this mark.
+    pub fn dispatch_message<T>(
+        &self,
+        call: impl FnOnce() -> T,
+        sent: impl FnOnce(&T) -> bool,
+    ) -> Result<T, Refusal> {
+        Self::check(&self.lock(), &self.cancelled)?;
+
+        let started = self.clock.now_ms();
+        let outcome = call();
+        let elapsed = self.clock.now_ms().saturating_sub(started);
+
+        if sent(&outcome) {
+            mark(&mut self.lock(), Phase::Input, elapsed);
+        } else {
+            // It cost time and dispatched nothing. Both facts are true and the
+            // receipt reports them separately.
+            self.record(Phase::Input, elapsed);
+        }
+
+        Ok(outcome)
+    }
+
     fn check(state: &State, cancelled: &AtomicBool) -> Result<(), Refusal> {
         if cancelled.load(Ordering::SeqCst) {
             return Err(Refusal::Cancelled);
@@ -364,11 +429,47 @@ impl Gate {
         }
     }
 
+    /// How this action reached the machine. Said, never inferred: `press` and
+    /// `set_value` go through the accessibility API, everything else through the
+    /// pointer and keyboard, and the receipt reports which.
+    pub fn used_input_method(&self, method: InputMethod) {
+        let mut state = self.lock();
+        if let Some(in_flight) = state.in_flight.as_mut() {
+            in_flight.input_method = method;
+        }
+    }
+
+    /// The effect this action PROVED — a value read back and found equal, or a
+    /// read-back that could not prove anything. Unsaid, the receipt derives what
+    /// it can from whether an after-image exists.
+    pub fn observed_effect(&self, effect: Effect) {
+        let mut state = self.lock();
+        if let Some(in_flight) = state.in_flight.as_mut() {
+            in_flight.effect = Some(effect);
+        }
+    }
+
+    /// Whether the foreground moved while this action ran. Only the actions that
+    /// promise not to move it ask, and one that could not read the answer reports
+    /// `false` rather than inventing a change.
+    pub fn note_foreground(&self, changed: bool) {
+        let mut state = self.lock();
+        if let Some(in_flight) = state.in_flight.as_mut() {
+            in_flight.foreground_changed = Some(changed);
+        }
+    }
+
     /// Is a request in flight? The reader asks before it hands over another, so a
     /// second action is refused now rather than queued behind work whose screen has
     /// moved on.
     pub fn is_busy(&self) -> bool {
         self.lock().in_flight.is_some()
+    }
+
+    /// Has a `release` been acknowledged since this was last asked? Answering it
+    /// clears it, so the worker acts on one release exactly once.
+    pub fn take_release(&self) -> bool {
+        self.released.swap(false, Ordering::SeqCst)
     }
 
     /// One cancellation check. Atomics only: no mutex, so a 25 ms cadence costs
@@ -405,12 +506,13 @@ impl Gate {
                 input_complete: in_flight.input_complete,
                 cancelled,
                 timings: in_flight.timings,
+                input_method: in_flight.input_method,
+                effect: in_flight.effect,
+                foreground_changed: in_flight.foreground_changed,
             },
             None => Dispatched {
-                posted: false,
-                input_complete: false,
                 cancelled,
-                timings: Timings::default(),
+                ..Dispatched::default()
             },
         }
     }
@@ -447,10 +549,13 @@ impl Gate {
             }
 
             // Let go of the seat: stop what is running and revoke, without
-            // installing a barrier against what comes next.
+            // installing a barrier against what comes next. What the caller could
+            // still address under the old authority goes with it; the worker does
+            // that part, because the table is its alone to touch.
             ControlAction::Release => {
                 state.authorization_generation += 1;
                 self.cancelled.store(true, Ordering::SeqCst);
+                self.released.store(true, Ordering::SeqCst);
                 self.acknowledge(&state, true)
             }
         }
@@ -646,6 +751,7 @@ mod tests {
                 None
             },
             observation_id: None,
+            element_ref: None,
         }
     }
 

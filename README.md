@@ -8,7 +8,11 @@ by a crash-isolated Rust sidecar spawned over a Port — **not** a NIF.
 {:ok, shot} = Compux.screenshot(cu, region: {0, 0, 800, 600})
 image       = shot["observation_id"]
 :ok         = Compux.click(cu, {120, 80}, observation_id: image, modifiers: [:cmd])
-{:ok, el}   = Compux.inspect(cu, {120, 80}, observation_id: image)
+
+{:ok, list} = Compux.elements(cu)
+save        = Enum.find(list["elements"], &("press" in &1["actions"]))
+:ok         = Compux.press(cu, save["element_ref"], observation_id: list["observation_id"])
+
 :ok         = Compux.stop(cu)
 ```
 
@@ -36,9 +40,10 @@ The split:
 `left_click_drag`, `scroll`, `type`, `paste` (clipboard-based — fast and
 unicode-safe for long text), `key` (chords like `"cmd+shift+4"`, incl. `f1`–`f12`),
 `wait`, `wait_for_change` (block until the screen changes, then return the new
-frame), `inspect` (the accessibility element under a point), and `elements` (the
-interactive accessibility elements with a click point each — target by element, not
-raw pixels).
+frame), `inspect` (the accessibility element under a point), `elements` (the
+interactive accessibility controls, each with a reference, a click point and what
+it can do), and `press` / `set_value` (act on a control by name, through the
+accessibility API).
 
 ## Coordinates name their image
 
@@ -61,6 +66,54 @@ or after the display has moved or changed mode, the action is refused with
 dispatched — take a fresh screenshot and read the coordinates again. A point
 outside the image it names is `point_outside_observation`, never clamped onto an
 edge.
+
+## Controls have names, not only places
+
+`elements` answers the controls an application publishes, and gives each one an
+`element_ref` — `e1`, `e2`, … scoped to that reply's `observation_id`. A reference
+is always sent with its observation; alone it means nothing.
+
+```json
+{
+  "element_ref": "e3", "role": "AXButton", "label": "Save",
+  "enabled": true, "actions": ["press"], "settable": false,
+  "bounds": {"x": 480, "y": 312, "w": 84, "h": 24},
+  "path": ["Document", "Toolbar"], "x": 186, "y": 121
+}
+```
+
+`path` is up to three ancestor labels, nearest last, which is what tells two
+buttons both labelled "Save" apart. `value` carries what a field holds, bounded and
+absent for a secure field. `actions` lists only what this build can really perform
+— `press`, and only where the control's own action list says so — and `settable`
+only where the accessibility API says the value may be written. Nothing is
+inferred from a role name.
+
+Two actions address a control rather than a point:
+
+* **`press/3`** performs the control's own press. The pointer does not move and it
+  cannot miss.
+* **`set_value/4`** writes the value and reads it back: the receipt says
+  `effect: "verified"` when the read-back matches, `"not_observed"` when it does
+  not (a secure field always reads back masked, so it never verifies).
+
+Both are offered only where the control advertises support and are refused
+`ax_action_unsupported` everywhere else — never silently replaced by a click,
+because which of the two to send is the caller's decision. A pointer action may
+also take `{:element, ref}` instead of a point, and the helper re-reads the
+control's bounds at the moment it acts, so a control that moved is hit where it is
+now. Both forms on one request is `addressing_conflict`.
+
+References die with the observation that listed them: the same three replies for
+thirty seconds. They also die with the process they came from — a pid is not an
+identity, so the process's start time is checked too — and with the helper. A
+reference that no longer names what it named is `stale_element`, a control that
+will not act is `element_disabled`, and both are refused with nothing dispatched.
+
+Every receipt says which method carried the action: `input_method` is `"ax"` for
+`press` and `set_value`, `"foreground_hid"` for everything else. An accessibility
+action also reports `foreground_changed`, read before and after, because an action
+that promises not to take the focus should have to say when it did.
 
 ## The version handshake
 
@@ -91,7 +144,9 @@ probe, idle detection). **Linux/X11** supports capture + input + `wait_for_chang
 + `paste` (the accessibility actions — `inspect` and `elements` — are macOS-only and
 return a typed error on Linux; the paste chord is Ctrl+V). The permission
 `probe` works on both (on Linux it reports X11-vs-Wayland capability).
-**Wayland**, **Linux accessibility**, and **Windows** are not supported yet.
+**Wayland**, **Linux accessibility**, and **Windows** are not supported yet. The
+accessibility actions `press` and `set_value` are macOS-only for the same reason
+`elements` is, and answer a typed error elsewhere rather than an empty success.
 
 `idle_ms` / `wait_for_idle` (operational, not model actions) report how long the
 human has been idle — a coexistence signal so a policy layer can yield the seat to
@@ -130,10 +185,14 @@ never read.
 
 Alpha (`0.x`). The coordinate math is unit-tested (including the Retina
 physical-vs-logical regression, at both the backing scale and 1x); the wire
-protocol, handshake, and capture paths are verified on-device. Input-injection
-landing and `inspect` roles need per-machine verification with the grants in place,
-and the Retina and second-display geometry needs a machine that has one —
-`LIVE_CHECK.md` says what such a run must show.
+protocol, handshake, and capture paths are verified on-device. The accessibility
+seam is a trait with a recording implementation, so the tree walk, the checks
+before an action and the retain/release balance of every element reference are
+tested with no OS call — but whether a `press` really presses, and whether it
+leaves the person's keyboard alone while it does, needs a real machine with the
+grants. `fixtures/macos/FixtureApp.swift` (built by `scripts/build_fixture_app.sh`,
+never shipped) is the application those runs are made against, and `LIVE_CHECK.md`
+ends with the support matrix they fill in.
 
 ## License
 

@@ -77,9 +77,23 @@ defmodule Compux.Protocol do
   # read in THAT image's pixels. Refusing `region` on a click is the wire change
   # that cannot be additive, so the version bumps and the handshake refuses the
   # pairing.
-  @protocol_version 8
+  #
+  # v9 (M42 slice 4, semantic references): `elements` answers controls the caller
+  # can NAME. Each element (and each mark) carries an `element_ref` — `e1`, `e2`,
+  # … scoped to the observation it was listed in — beside its role, label, value,
+  # whether it is enabled, what it can do, whether its value can be set, its
+  # bounds and a short path of ancestor labels. Two actions address a control
+  # rather than a point: `press` and `set_value`, offered only where the control
+  # itself advertises support and refused with a typed error everywhere else,
+  # never quietly replaced by a click. A pointer action may also carry an
+  # `element_ref` INSTEAD of `x`/`y`, and the sidecar re-reads the control's
+  # bounds and clicks its centre. Both addressing forms on one request is
+  # `addressing_conflict`. `element_ref` was a reserved field the sidecar refused
+  # outright until now, so the version bumps and the handshake refuses the
+  # pairing.
+  @protocol_version 9
 
-  @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows)
+  @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows press set_value)
 
   # Read-only in both senses the wire needs: a consumer may auto-run one without a
   # confirmation step, and it dispatches no input, so it carries no `mutation_seq`
@@ -89,11 +103,21 @@ defmodule Compux.Protocol do
   # mutations would put a sequence number and a receipt on a permission probe.
   @read_only ~w(screenshot mouse_move wait inspect wait_for_change elements windows
                 probe idle_ms wait_for_idle hello)
-  # v8: the actions whose coordinates are pixels in an image the caller was handed.
-  # Each one names that image with `observation_id` and takes no `region` — the
-  # rectangle is the sidecar's to remember, and a caller that echoes one back is
-  # the defect this replaces.
-  @addressed ~w(left_click right_click double_click mouse_move left_click_drag scroll inspect)
+  # v8: the actions addressed INTO an observation — their target is read out of a
+  # reply the caller was handed. Each one names that observation with
+  # `observation_id` and takes no `region`: the rectangle is the sidecar's to
+  # remember, and a caller that echoes one back is the defect this replaces.
+  @addressed ~w(left_click right_click double_click mouse_move left_click_drag scroll inspect
+                press set_value)
+
+  # v9: addressed by a CONTROL, never by a point. Their whole promise is that they
+  # cannot miss, so a coordinate on one of them is a contradiction, not a hint.
+  @element ~w(press set_value)
+
+  # v9: addressed by a point OR by a control, and the sidecar re-reads the
+  # control's bounds at the moment it acts. Both on one request is a conflict:
+  # nothing may guess which one the caller meant.
+  @pointer_or_element ~w(left_click right_click double_click mouse_move scroll)
 
   # The actions that PRODUCE coordinates. `region` stays theirs; an `observation_id`
   # beside it says which image the rectangle is read in.
@@ -148,14 +172,15 @@ defmodule Compux.Protocol do
 
   def validate(_other), do: {:error, "action params must be a map"}
 
-  # v8: which image a coordinate was read from, checked before the action's own
-  # arguments, because an action that names the wrong image cannot be fixed by
+  # v8/v9: which observation this action is addressed into, and — since v9 —
+  # whether it names a point or a control. Checked before the action's own
+  # arguments, because an action aimed at the wrong thing cannot be fixed by
   # having valid ones.
   defp check_addressing(action, params) when action in @addressed do
     cond do
       not observation?(params) ->
         {:error,
-         "#{action} requires observation_id: the id of the image its coordinates were read from"}
+         "#{action} requires observation_id: the id of the reply its target was read from"}
 
       Map.has_key?(params, "region") ->
         {:error,
@@ -163,28 +188,76 @@ defmodule Compux.Protocol do
            "by observation_id, which carries its own rectangle"}
 
       true ->
-        :ok
+        check_target(action, params)
     end
   end
 
   defp check_addressing(action, params) when action in @viewing do
-    if Map.has_key?(params, "observation_id") and not observation?(params),
-      do: {:error, "observation_id must be a non-empty string"},
-      else: :ok
+    cond do
+      Map.has_key?(params, "observation_id") and not observation?(params) ->
+        {:error, "observation_id must be a non-empty string"}
+
+      Map.has_key?(params, "element_ref") ->
+        {:error, "#{action} takes no element_ref — it produces references, it does not use one"}
+
+      true ->
+        :ok
+    end
   end
 
   defp check_addressing(action, params) do
-    if Map.has_key?(params, "observation_id"),
-      do: {:error, "#{action} takes no observation_id — it reads no coordinates"},
+    cond do
+      Map.has_key?(params, "observation_id") ->
+        {:error, "#{action} takes no observation_id — it reads no coordinates"}
+
+      Map.has_key?(params, "element_ref") ->
+        {:error, "#{action} takes no element_ref — it addresses no control"}
+
+      true ->
+        :ok
+    end
+  end
+
+  # `press` and `set_value` name a control and nothing else: a point beside the
+  # reference means the caller addressed the action two ways at once.
+  defp check_target(action, params) when action in @element do
+    cond do
+      not element?(params) ->
+        {:error,
+         "#{action} requires element_ref: the reference of the control, from the elements " <>
+           "reply named by observation_id"}
+
+      point?(params) ->
+        {:error, conflict(action)}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp check_target(action, params) when action in @pointer_or_element do
+    if element?(params) and point?(params), do: {:error, conflict(action)}, else: :ok
+  end
+
+  # `left_click_drag` names two points and `inspect` reports what is under one, so
+  # neither has a meaning for a control reference.
+  defp check_target(action, params) do
+    if Map.has_key?(params, "element_ref"),
+      do: {:error, "#{action} takes no element_ref — it addresses a point"},
       else: :ok
   end
 
-  defp observation?(params) do
-    case Map.get(params, "observation_id") do
-      id when is_binary(id) and id != "" -> true
-      _other -> false
-    end
+  defp conflict(action) do
+    "#{action} is addressed either by a point or by element_ref, never by both: " <>
+      "send the coordinates, or the reference, not the two together"
   end
+
+  defp observation?(params), do: nonempty_string?(Map.get(params, "observation_id"))
+  defp element?(params), do: nonempty_string?(Map.get(params, "element_ref"))
+
+  defp nonempty_string?(value), do: is_binary(value) and value != ""
+
+  defp point?(params), do: Enum.any?(~w(x y from to), &Map.has_key?(params, &1))
 
   defp put_observation(request, nil), do: request
   defp put_observation(request, id), do: Map.put(request, "observation_id", id)
@@ -215,12 +288,32 @@ defmodule Compux.Protocol do
 
   defp validate_action(action, params)
        when action in ~w(left_click right_click double_click mouse_move) do
-    with {:ok, x} <- coord(params, "x"),
-         {:ok, y} <- coord(params, "y"),
+    with {:ok, target} <- pointer_target(params),
          {:ok, modifiers} <- opt_modifiers(params),
          {:ok, display} <- opt_display(params) do
-      request = %{"action" => action, "x" => x, "y" => y}
+      request = Map.merge(%{"action" => action}, target)
       request = if modifiers == [], do: request, else: Map.put(request, "modifiers", modifiers)
+      {:ok, put_display(request, display)}
+    end
+  end
+
+  # v9: press the control the caller named. Offered only where the control's own
+  # action list says it can be pressed — the sidecar refuses it everywhere else
+  # and never falls back to clicking, which is the caller's decision to make.
+  defp validate_action("press", params) do
+    with {:ok, element} <- element_ref(params),
+         {:ok, display} <- opt_display(params) do
+      {:ok, put_display(%{"action" => "press", "element_ref" => element}, display)}
+    end
+  end
+
+  # v9: set the control's value directly, then read it back. Offered only where
+  # the control reports its value as settable.
+  defp validate_action("set_value", params) do
+    with {:ok, element} <- element_ref(params),
+         {:ok, value} <- value_text(params),
+         {:ok, display} <- opt_display(params) do
+      request = %{"action" => "set_value", "element_ref" => element, "value" => value}
       {:ok, put_display(request, display)}
     end
   end
@@ -294,18 +387,12 @@ defmodule Compux.Protocol do
   end
 
   defp validate_action("scroll", params) do
-    with {:ok, x} <- coord(params, "x"),
-         {:ok, y} <- coord(params, "y"),
+    with {:ok, target} <- pointer_target(params),
          {:ok, direction} <- scroll_direction(params),
          {:ok, amount} <- positive(params, "amount"),
          {:ok, display} <- opt_display(params) do
-      request = %{
-        "action" => "scroll",
-        "x" => x,
-        "y" => y,
-        "direction" => direction,
-        "amount" => amount
-      }
+      request =
+        Map.merge(%{"action" => "scroll", "direction" => direction, "amount" => amount}, target)
 
       {:ok, put_display(request, display)}
     end
@@ -338,6 +425,45 @@ defmodule Compux.Protocol do
 
       _other ->
         {:error, "wait.ms must be a positive integer ≤ #{@max_wait_ms}"}
+    end
+  end
+
+  # v9: a pointer action names its target one way or the other. `check_addressing`
+  # has already refused both at once, so a reference here means the caller sent no
+  # coordinates and a control is what it aimed at.
+  defp pointer_target(params) do
+    if element?(params) do
+      with {:ok, element} <- element_ref(params), do: {:ok, %{"element_ref" => element}}
+    else
+      with {:ok, x} <- coord(params, "x"),
+           {:ok, y} <- coord(params, "y"),
+           do: {:ok, %{"x" => x, "y" => y}}
+    end
+  end
+
+  defp element_ref(params) do
+    case Map.get(params, "element_ref") do
+      ref when is_binary(ref) and ref != "" ->
+        {:ok, ref}
+
+      _other ->
+        {:error,
+         "element_ref must be a non-empty string, as an elements reply spells it (e.g. \"e3\")"}
+    end
+  end
+
+  # The same bound `type` and `paste` carry: a value the sidecar sets in one AX
+  # call, not a stream.
+  defp value_text(params) do
+    case Map.get(params, "value") do
+      value when is_binary(value) and byte_size(value) <= @max_type_bytes ->
+        {:ok, value}
+
+      value when is_binary(value) ->
+        {:error, "set_value.value must be at most #{@max_type_bytes} bytes"}
+
+      _other ->
+        {:error, "set_value requires a string value"}
     end
   end
 

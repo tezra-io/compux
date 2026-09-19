@@ -258,6 +258,7 @@ mod tests {
             authorization_generation: Some(1),
             mutation_seq: Some(1),
             observation_id: Some("7c1e-1".to_string()),
+            element_ref: None,
         };
         gate.admit(&running).unwrap();
 
@@ -407,6 +408,7 @@ mod tests {
             authorization_generation: Some(1),
             mutation_seq: None,
             observation_id: None,
+            element_ref: None,
         };
         gate.admit(&request).unwrap();
 

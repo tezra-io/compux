@@ -20,6 +20,12 @@ defmodule Compux.ProtocolTest do
     end
   end
 
+  # A valid request addressed at a CONTROL rather than a point, so a test can
+  # remove or contradict exactly the field it is about.
+  defp element_params(action, extra \\ %{}) do
+    Map.merge(%{"action" => action, "observation_id" => "7c1e-12", "element_ref" => "e3"}, extra)
+  end
+
   describe "protocol_version/0" do
     test "is a positive integer" do
       assert is_integer(Protocol.protocol_version())
@@ -247,6 +253,112 @@ defmodule Compux.ProtocolTest do
     test "windows names no observation — it is what produces them" do
       assert {:error, _} =
                Protocol.validate(%{"action" => "windows", "observation_id" => "7c1e-12"})
+    end
+  end
+
+  # v9: a control has a name, not only a place. `press` and `set_value` address
+  # one and never a point; a pointer action may address either, and both at once
+  # is a contradiction nothing may resolve by guessing.
+  describe "validate/1 — element references (v9)" do
+    test "press and set_value are model actions that are not read-only" do
+      for action <- ~w(press set_value) do
+        assert action in Protocol.actions()
+        refute Protocol.read_only?(action), "#{action} acts on the machine"
+      end
+    end
+
+    test "press carries the observation and the reference" do
+      assert {:ok, req} = Protocol.validate(element_params("press"))
+      assert req == %{"action" => "press", "element_ref" => "e3", "observation_id" => "7c1e-12"}
+    end
+
+    test "set_value carries its value, empty string included" do
+      for value <- ["hello", ""] do
+        assert {:ok, req} = Protocol.validate(element_params("set_value", %{"value" => value}))
+        assert req["value"] == value
+        assert req["element_ref"] == "e3"
+      end
+    end
+
+    test "set_value without a string value is refused" do
+      for bad <- [nil, 7, %{}] do
+        params = element_params("set_value", %{"value" => bad})
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "value"
+      end
+    end
+
+    test "set_value refuses a value past the type bound" do
+      params = element_params("set_value", %{"value" => String.duplicate("x", 10_001)})
+      assert {:error, reason} = Protocol.validate(params)
+      assert reason =~ "bytes"
+    end
+
+    for action <- ~w(press set_value) do
+      test "#{action} without an element_ref is refused by name" do
+        params = Map.delete(element_params(unquote(action), %{"value" => "v"}), "element_ref")
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "element_ref"
+      end
+
+      test "#{action} without an observation_id is refused" do
+        params = Map.delete(element_params(unquote(action), %{"value" => "v"}), "observation_id")
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "observation_id"
+      end
+
+      test "#{action} refuses a point beside its reference" do
+        params = element_params(unquote(action), %{"value" => "v", "x" => 1, "y" => 2})
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "never by both"
+      end
+
+      test "#{action} refuses an element_ref that is not a non-empty string" do
+        for bad <- ["", 7, nil] do
+          params = element_params(unquote(action), %{"value" => "v", "element_ref" => bad})
+          assert {:error, _} = Protocol.validate(params)
+        end
+      end
+    end
+
+    for action <- ~w(left_click right_click double_click mouse_move scroll) do
+      test "#{action} may be addressed by a control instead of a point" do
+        extra =
+          if unquote(action) == "scroll", do: %{"direction" => "down", "amount" => 2}, else: %{}
+
+        assert {:ok, req} = Protocol.validate(element_params(unquote(action), extra))
+        assert req["element_ref"] == "e3"
+        refute Map.has_key?(req, "x")
+        refute Map.has_key?(req, "y")
+      end
+
+      test "#{action} refuses a point and a control on one request" do
+        extra =
+          if unquote(action) == "scroll", do: %{"direction" => "down", "amount" => 2}, else: %{}
+
+        params = element_params(unquote(action), Map.merge(extra, %{"x" => 1, "y" => 2}))
+
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "never by both"
+      end
+    end
+
+    # A drag names two points and `inspect` reports what is under one, so neither
+    # has a meaning for a reference — refused rather than quietly ignored.
+    for action <- ~w(left_click_drag inspect) do
+      test "#{action} takes no element_ref" do
+        params = Map.put(addressed_params(unquote(action)), "element_ref", "e3")
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "element_ref"
+      end
+    end
+
+    for action <- ~w(screenshot elements wait_for_change windows type paste key wait) do
+      test "#{action} takes no element_ref either" do
+        params = %{"action" => unquote(action), "element_ref" => "e3"}
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "element_ref"
+      end
     end
   end
 

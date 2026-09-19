@@ -31,14 +31,17 @@ use serde_json::{json, Map, Value};
 
 /// The fields reserved for a later slice. A request carrying one is refused, never
 /// silently run without the targeting it asked for. `observation_id` left this list
-/// at protocol 8, where it became the way every coordinate names its image.
-const RESERVED_FIELDS: [&str; 2] = ["target_id", "element_ref"];
+/// at protocol 8, where it became the way every coordinate names its image;
+/// `element_ref` left it at protocol 9, where it became the way an action names a
+/// control. `target_id` — a bound window — is slice 5's.
+const RESERVED_FIELDS: [&str; 1] = ["target_id"];
 
-/// The actions whose coordinates are pixels in an image the caller was handed.
-/// Each names that image with `observation_id`; none takes a `region`, because the
-/// rectangle belongs to the image, not to the action. Drag names one image for
-/// both of its points.
-const ADDRESSED_ACTIONS: [&str; 7] = [
+/// The actions addressed INTO an observation: their target is read out of a reply
+/// the caller was handed, as a pixel of that image or as one of the controls it
+/// listed. Each names that observation with `observation_id`; none takes a
+/// `region`, because the rectangle belongs to the image, not to the action. Drag
+/// names one image for both of its points.
+const ADDRESSED_ACTIONS: [&str; 9] = [
     "left_click",
     "right_click",
     "double_click",
@@ -46,6 +49,25 @@ const ADDRESSED_ACTIONS: [&str; 7] = [
     "left_click_drag",
     "scroll",
     "inspect",
+    "press",
+    "set_value",
+];
+
+/// Addressed by a CONTROL and never by a point. Their whole promise is that they
+/// cannot miss, so a coordinate on one of them is a contradiction rather than a
+/// hint at what was meant.
+const ELEMENT_ACTIONS: [&str; 2] = ["press", "set_value"];
+
+/// Addressed by a point OR by a control. With a reference the helper re-reads the
+/// control's bounds at the moment it acts and clicks its centre, so a control that
+/// moved since the listing is hit where it is now — and one that is gone is
+/// refused rather than clicked at the place it used to be.
+const POINT_OR_ELEMENT_ACTIONS: [&str; 5] = [
+    "left_click",
+    "right_click",
+    "double_click",
+    "mouse_move",
+    "scroll",
 ];
 
 /// The actions that PRODUCE coordinates. `region` stays theirs, and an
@@ -54,9 +76,14 @@ const ADDRESSED_ACTIONS: [&str; 7] = [
 /// in. Two spaces, both exact — not a recovery path.
 const VIEWING_ACTIONS: [&str; 3] = ["screenshot", "elements", "wait_for_change"];
 
-/// Does this action address a point in an image it must name?
+/// Does this action address a target inside an observation it must name?
 pub fn addresses_an_image(action: &str) -> bool {
     ADDRESSED_ACTIONS.contains(&action)
+}
+
+/// Does this action address a control, and only a control?
+pub fn addresses_an_element(action: &str) -> bool {
+    ELEMENT_ACTIONS.contains(&action)
 }
 
 /// Does this action take an `observation_id` at all?
@@ -71,13 +98,18 @@ pub const MAX_REQUEST_BYTES: usize = 65_536;
 
 const MAX_REQUEST_ID_BYTES: usize = 64;
 
-/// Actions that dispatch synthetic input. **Not** the same list as
+/// Actions that dispatch input. **Not** the same list as
 /// [`carries_mutation_seq`], and the difference is deliberate: `mouse_move` is
 /// read-only to the wire (it changes nothing a caller can read back, so it earns
 /// no sequence number and no receipt) yet it moves the human's pointer, so a
 /// pause must stop it. `request_permissions` is the mirror image — it is a
 /// mutation on the wire but it dispatches no input.
-const INPUT_ACTIONS: [&str; 9] = [
+///
+/// `press` and `set_value` are here too. They post no synthetic event and move no
+/// pointer, but they act on the machine in front of the person, and a pause that
+/// stopped the clicks and let the accessibility actions through would be a pause
+/// in name only.
+const INPUT_ACTIONS: [&str; 11] = [
     "mouse_move",
     "left_click",
     "right_click",
@@ -87,6 +119,8 @@ const INPUT_ACTIONS: [&str; 9] = [
     "type",
     "key",
     "paste",
+    "press",
+    "set_value",
 ];
 
 /// Read-only actions, mirroring `Compux.Protocol`'s `@read_only` exactly. The
@@ -175,6 +209,10 @@ pub struct Request {
     /// that address a point, optional on the ones that produce coordinates, refused
     /// on the rest — all decided in `parse`, so no action function can forget it.
     pub observation_id: Option<String>,
+    /// The control this request names, inside that observation. Required of
+    /// `press` and `set_value`, an alternative to `x`/`y` on a pointer action, and
+    /// refused everywhere else — also decided in `parse`.
+    pub element_ref: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -311,8 +349,8 @@ fn parse_request(value: &Value) -> Result<Inbound, ParseFailure> {
         });
     }
 
-    let observation_id = match addressing(value, &action) {
-        Ok(id) => id,
+    let (observation_id, element_ref) = match addressing(value, &action) {
+        Ok(addressed) => addressed,
         Err((error, detail)) => {
             return Err(ParseFailure {
                 error,
@@ -327,6 +365,7 @@ fn parse_request(value: &Value) -> Result<Inbound, ParseFailure> {
         request_id,
         action,
         observation_id,
+        element_ref,
         sidecar_generation: value
             .get("sidecar_generation")
             .and_then(Value::as_str)
@@ -340,42 +379,66 @@ fn parse_request(value: &Value) -> Result<Inbound, ParseFailure> {
     }))
 }
 
-/// Which image this request's coordinates belong to, decided before the action
-/// runs. The three answers are the whole addressing rule:
+/// What this request is addressed at, decided before the action runs: the
+/// observation its target was read from, and the control it names inside it.
 ///
-///   * an action that ADDRESSES a point must name its image and may not describe
-///     one — a `region` there is the defect this protocol replaces, a rectangle
-///     copied from a previous reply and applied to a transform that has moved on;
-///   * an action that PRODUCES coordinates may name one, and its `region` is then
-///     read in that image;
-///   * anything else reads no coordinates, so naming an image is a request this
-///     build cannot honour and is refused rather than ignored.
-fn addressing(value: &Value, action: &str) -> Result<Option<String>, (&'static str, String)> {
-    let named = match value.get("observation_id") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
-        Some(_other) => {
-            return Err((
-                "observation_required",
-                "observation_id must be a non-empty string naming the image these \
-                 coordinates were read in"
-                    .to_string(),
-            ))
-        }
-    };
+/// The whole addressing rule, in order:
+///
+///   * an action that is ADDRESSED into an observation must name one and may not
+///     describe one — a `region` there is the defect protocol 8 replaced, a
+///     rectangle copied from a previous reply and applied to a transform that has
+///     moved on;
+///   * inside that observation it names a point or a control. `press` and
+///     `set_value` name a control and nothing else; a pointer action names either
+///     but never both, because there is no safe way to choose between them;
+///   * an action that PRODUCES coordinates may name an observation, and its
+///     `region` is then read in that image;
+///   * anything else reads no coordinates and addresses no control, so naming
+///     either is a request this build cannot honour and is refused, not ignored.
+type Addressed = (Option<String>, Option<String>);
+
+fn addressing(value: &Value, action: &str) -> Result<Addressed, (&'static str, String)> {
+    let named = non_empty(value, "observation_id").map_err(|field| {
+        (
+            "observation_required",
+            format!(
+                "{field} must be a non-empty string naming the reply this request's target was \
+                 read from"
+            ),
+        )
+    })?;
+    let reference = non_empty(value, "element_ref").map_err(|field| {
+        (
+            "element_required",
+            format!(
+                "{field} must be a non-empty string naming a control, as an elements reply \
+                     spelled it"
+            ),
+        )
+    })?;
 
     if !takes_an_observation(action) {
-        return match named {
-            None => Ok(None),
-            Some(_) => Err((
+        return match (named, reference) {
+            (None, None) => Ok((None, None)),
+            (Some(_), _) => Err((
                 "unknown_field",
                 format!("{action} reads no coordinates, so it takes no observation_id"),
+            )),
+            (None, Some(_)) => Err((
+                "unknown_field",
+                format!("{action} addresses no control, so it takes no element_ref"),
             )),
         };
     }
 
     if !addresses_an_image(action) {
-        return Ok(named);
+        return match reference {
+            None => Ok((named, None)),
+            Some(_) => Err((
+                "unknown_field",
+                format!("{action} produces references, it does not take an element_ref"),
+            )),
+        };
     }
 
     if value.get("region").is_some() {
@@ -388,15 +451,69 @@ fn addressing(value: &Value, action: &str) -> Result<Option<String>, (&'static s
         ));
     }
 
-    match named {
-        Some(id) => Ok(Some(id)),
-        None => Err((
+    let Some(id) = named else {
+        return Err((
             "observation_required",
+            format!("{action} needs observation_id: the id of the reply its target was read from"),
+        ));
+    };
+
+    target(value, action, reference).map(|reference| (Some(id), reference))
+}
+
+/// A point, a control, or the refusal that says the request named both or neither.
+fn target(
+    value: &Value,
+    action: &str,
+    reference: Option<String>,
+) -> Result<Option<String>, (&'static str, String)> {
+    let point = ["x", "y", "from", "to"]
+        .iter()
+        .any(|field| value.get(*field).is_some());
+
+    if reference.is_some() && point {
+        return Err((
+            "addressing_conflict",
             format!(
-                "{action} needs observation_id: the id of the image its coordinates were \
-                 read in"
+                "{action} is addressed either by a point or by element_ref, never by both: send \
+                 the coordinates, or the reference, not the two together"
             ),
+        ));
+    }
+
+    if addresses_an_element(action) {
+        return match reference {
+            Some(reference) => Ok(Some(reference)),
+            None => Err((
+                "element_required",
+                format!(
+                    "{action} needs element_ref: the reference of the control, from the elements \
+                     reply that observation_id names"
+                ),
+            )),
+        };
+    }
+
+    // A drag names two points and `inspect` reports what is under one, so neither
+    // has a meaning for a reference; a pointer action takes either.
+    match reference {
+        None => Ok(None),
+        Some(_) if POINT_OR_ELEMENT_ACTIONS.contains(&action) => Ok(reference),
+        Some(_) => Err((
+            "unknown_field",
+            format!("{action} addresses a point, so it takes no element_ref"),
         )),
+    }
+}
+
+/// A string field that means nothing when empty: absent is `None`, a non-empty
+/// string is itself, and anything else names the field so the caller is told which
+/// one it got wrong.
+fn non_empty(value: &Value, field: &'static str) -> Result<Option<String>, &'static str> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if !text.is_empty() => Ok(Some(text.clone())),
+        Some(_other) => Err(field),
     }
 }
 
@@ -512,12 +629,17 @@ impl Dispatch {
     }
 }
 
-/// What is known about the effect. `verified` is deliberately absent: it is
-/// reserved for a code-derived predicate that arrives with semantic readback, and
-/// a changed-pixel signal is not one. An after-image is evidence for the model to
-/// assess, which is `not_observed`; no after-image at all is `unknown`.
+/// What is known about the effect.
+///
+/// `Verified` arrived at protocol 9 and is deliberately narrow: it means the
+/// action READ BACK what it had just written and got the same thing. A
+/// changed-pixel signal is not that, and an after-image is evidence for the model
+/// to assess rather than a verdict, which is `not_observed`; no after-image at
+/// all is `unknown`. A successful accessibility return is a dispatch result, not
+/// an effect, so `press` is `not_observed` however cleanly it returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effect {
+    Verified,
     NotObserved,
     Unknown,
 }
@@ -525,8 +647,33 @@ pub enum Effect {
 impl Effect {
     fn as_str(self) -> &'static str {
         match self {
+            Effect::Verified => "verified",
             Effect::NotObserved => "not_observed",
             Effect::Unknown => "unknown",
+        }
+    }
+}
+
+/// How the action reached the machine.
+///
+/// `foreground_hid` is a synthetic event posted at the input tap: it needs the
+/// pointer or the focus, and whatever is in front receives it. `ax` is a message
+/// to one control through the accessibility API: no pointer moves and nothing can
+/// miss. A caller reads this to know which of the two it got — and a `press` that
+/// reports `foreground_hid` would be exactly the silent fallback this build
+/// refuses to have.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InputMethod {
+    #[default]
+    ForegroundHid,
+    Ax,
+}
+
+impl InputMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            InputMethod::ForegroundHid => "foreground_hid",
+            InputMethod::Ax => "ax",
         }
     }
 }
@@ -543,12 +690,17 @@ pub struct Timings {
 pub struct Receipt {
     pub dispatch: Dispatch,
     pub effect: Effect,
+    pub input_method: InputMethod,
     pub timings: Timings,
     /// The image the action's coordinates were read in, and the one it handed back
     /// afterwards. Together they are the audit trail of a click: what it aimed at,
     /// and what the caller may aim at next.
     pub observation_id_before: Option<String>,
     pub observation_id_after: Option<String>,
+    /// Whether the action took the foreground, when it is the kind of action that
+    /// can be asked. `None` is "not applicable" — a click takes the foreground by
+    /// definition — and is left off the wire rather than published as `false`.
+    pub foreground_changed: Option<bool>,
 }
 
 impl Receipt {
@@ -568,9 +720,11 @@ impl Receipt {
             } else {
                 Effect::Unknown
             },
+            input_method: InputMethod::ForegroundHid,
             timings,
             observation_id_before: None,
             observation_id_after: None,
+            foreground_changed: None,
         }
     }
 
@@ -583,11 +737,28 @@ impl Receipt {
         self
     }
 
+    /// What only the action itself could know, as the gate recorded it: which
+    /// method carried it, the effect it could prove (`None` leaves the derived
+    /// one), and whether the foreground moved while it ran.
+    pub fn noted(
+        mut self,
+        method: InputMethod,
+        effect: Option<Effect>,
+        foreground_changed: Option<bool>,
+    ) -> Receipt {
+        self.input_method = method;
+        if let Some(effect) = effect {
+            self.effect = effect;
+        }
+        self.foreground_changed = foreground_changed;
+        self
+    }
+
     fn into_value(self) -> Value {
         let mut receipt = json!({
             "dispatch": self.dispatch.as_str(),
             "effect": self.effect.as_str(),
-            "input_method": "foreground_hid",
+            "input_method": self.input_method.as_str(),
             "timings_ms": {
                 "input": self.timings.input_ms,
                 "settle": self.timings.settle_ms,
@@ -603,6 +774,9 @@ impl Receipt {
                 if let Some(id) = id {
                     object.insert(key.to_string(), json!(id));
                 }
+            }
+            if let Some(changed) = self.foreground_changed {
+                object.insert("foreground_changed".to_string(), json!(changed));
             }
         }
 
@@ -848,10 +1022,139 @@ mod tests {
             assert!(failure.detail.contains(field), "{}", failure.detail);
         }
 
-        assert!(
-            !RESERVED_FIELDS.contains(&"observation_id"),
-            "observation_id is the addressing field now, not a reservation"
+        for field in ["observation_id", "element_ref"] {
+            assert!(
+                !RESERVED_FIELDS.contains(&field),
+                "{field} is an addressing field now, not a reservation"
+            );
+        }
+    }
+
+    // --- protocol 9: a control has a name ------------------------------------
+
+    /// A request line with the fields a test cares about, so each case below is
+    /// the one thing it is about.
+    fn line(action: &str, fields: &str) -> String {
+        format!(r#"{{"type":"request","request_id":"r1","action":"{action}"{fields}}}"#)
+    }
+
+    // `press` and `set_value` name a control, in an observation, and nothing else.
+    #[test]
+    fn an_element_action_names_its_observation_and_its_control() {
+        for action in ELEMENT_ACTIONS {
+            let Ok(Inbound::Request(request)) = parse(&line(
+                action,
+                r#","observation_id":"7c1e-1","element_ref":"e3""#,
+            )) else {
+                panic!("{action} must take both");
+            };
+            assert_eq!(request.observation_id.as_deref(), Some("7c1e-1"));
+            assert_eq!(request.element_ref.as_deref(), Some("e3"));
+
+            let no_image = parse(&line(action, r#","element_ref":"e3""#))
+                .expect_err("a reference alone means nothing");
+            assert_eq!(no_image.error, "observation_required");
+
+            let no_control = parse(&line(action, r#","observation_id":"7c1e-1""#))
+                .expect_err("it must say WHICH control");
+            assert_eq!(no_control.error, "element_required");
+            assert!(no_control.detail.contains("element_ref"));
+            assert_eq!(no_control.reply, Reply::Response("r1".to_string()));
+            assert_eq!(no_control.action.as_deref(), Some(action));
+        }
+    }
+
+    // A point beside a reference is two answers to one question, and nothing may
+    // choose between them: the control might have moved since the point was read,
+    // and clicking the point would then be the wrong thing done confidently.
+    #[test]
+    fn a_point_and_a_control_on_one_request_is_a_conflict() {
+        let conflicting = [
+            ("left_click", r#","x":4,"y":9"#),
+            ("right_click", r#","x":4,"y":9"#),
+            ("double_click", r#","x":4,"y":9"#),
+            ("mouse_move", r#","x":4,"y":9"#),
+            ("scroll", r#","x":4,"y":9,"direction":"down""#),
+            ("press", r#","x":4,"y":9"#),
+            ("set_value", r#","x":4,"y":9,"value":"hi""#),
+        ];
+
+        for (action, point) in conflicting {
+            let fields = format!(r#","observation_id":"7c1e-1","element_ref":"e3"{point}"#);
+            let failure = parse(&line(action, &fields)).expect_err("two ways at once");
+            assert_eq!(failure.error, "addressing_conflict", "{action}");
+            assert!(
+                failure.detail.contains("never by both"),
+                "{}",
+                failure.detail
+            );
+        }
+    }
+
+    // A pointer action takes either form, and the parse layer keeps them apart so
+    // no action function has to.
+    #[test]
+    fn a_pointer_action_takes_a_point_or_a_control() {
+        for action in POINT_OR_ELEMENT_ACTIONS {
+            let by_point = line(action, r#","observation_id":"7c1e-1","x":4,"y":9"#);
+            let Ok(Inbound::Request(request)) = parse(&by_point) else {
+                panic!("{action} by point");
+            };
+            assert_eq!(request.element_ref, None);
+
+            let by_control = line(action, r#","observation_id":"7c1e-1","element_ref":"e3""#);
+            let Ok(Inbound::Request(request)) = parse(&by_control) else {
+                panic!("{action} by control");
+            };
+            assert_eq!(request.element_ref.as_deref(), Some("e3"));
+        }
+    }
+
+    // A drag names two points and `inspect` reports what is under one, so a
+    // reference on either is refused rather than quietly ignored — and so is one
+    // on an action that produces references or reads nothing at all.
+    #[test]
+    fn an_action_with_no_meaning_for_a_control_refuses_a_reference() {
+        let cases = [
+            ("left_click_drag", r#","observation_id":"7c1e-1""#),
+            ("inspect", r#","observation_id":"7c1e-1""#),
+            ("elements", ""),
+            ("screenshot", ""),
+            ("windows", ""),
+            ("type", ""),
+            ("key", ""),
+        ];
+
+        for (action, extra) in cases {
+            let fields = format!(r#"{extra},"element_ref":"e3""#);
+            let failure =
+                parse(&line(action, &fields)).expect_err("a reference means nothing here");
+            assert_eq!(failure.error, "unknown_field", "{action}");
+            assert!(failure.detail.contains("element_ref"), "{}", failure.detail);
+        }
+
+        let empty = line("press", r#","observation_id":"7c1e-1","element_ref":"""#);
+        assert_eq!(
+            parse(&empty)
+                .expect_err("an empty reference names nothing")
+                .error,
+            "element_required"
         );
+    }
+
+    // A pause has to stop an accessibility action too. It posts no synthetic
+    // event, but it acts on the machine in front of the person, and a pause that
+    // stopped the clicks and let these through would be a pause in name only.
+    #[test]
+    fn an_accessibility_action_is_input_and_earns_a_receipt() {
+        for action in ELEMENT_ACTIONS {
+            assert!(touches_input(action), "{action} acts on the machine");
+            assert!(carries_mutation_seq(action), "{action} is not read-only");
+            assert!(addresses_an_element(action));
+            assert!(addresses_an_image(action), "{action} names its observation");
+        }
+
+        assert!(!addresses_an_element("left_click"));
     }
 
     #[test]
@@ -1072,6 +1375,46 @@ mod tests {
         let plain = Receipt::derive(true, true, false, Timings::default());
         let frame = response(&envelope(), "r1", json!({"ok": true}), Some(plain));
         assert!(frame["receipt"].get("observation_id_before").is_none());
+    }
+
+    // What only the action knows. Said, never inferred: an accessibility action
+    // reports its own method, the effect its read-back proved, and whether the
+    // foreground moved — and a pointer action reports none of the last.
+    #[test]
+    fn a_receipt_reports_the_method_the_effect_and_the_foreground() {
+        let ax = Receipt::derive(true, true, false, Timings::default()).noted(
+            InputMethod::Ax,
+            Some(Effect::Verified),
+            Some(false),
+        );
+        let frame = response(&envelope(), "r1", json!({"ok": true}), Some(ax));
+
+        assert_eq!(frame["receipt"]["input_method"], json!("ax"));
+        assert_eq!(frame["receipt"]["effect"], json!("verified"));
+        assert_eq!(frame["receipt"]["foreground_changed"], json!(false));
+
+        // An after-image would have derived `not_observed`; a proven effect wins,
+        // because it is the stronger claim and the only one that was measured.
+        let verified = Receipt::derive(true, true, true, Timings::default()).noted(
+            InputMethod::Ax,
+            Some(Effect::Verified),
+            Some(true),
+        );
+        let frame = response(&envelope(), "r1", json!({"ok": true}), Some(verified));
+        assert_eq!(frame["receipt"]["effect"], json!("verified"));
+        assert_eq!(frame["receipt"]["foreground_changed"], json!(true));
+
+        // A click says nothing about the foreground: it takes it by definition, so
+        // the field is absent rather than published as a meaningless false.
+        let click = Receipt::derive(true, true, true, Timings::default()).noted(
+            InputMethod::default(),
+            None,
+            None,
+        );
+        let frame = response(&envelope(), "r1", json!({"ok": true}), Some(click));
+        assert_eq!(frame["receipt"]["input_method"], json!("foreground_hid"));
+        assert_eq!(frame["receipt"]["effect"], json!("not_observed"));
+        assert!(frame["receipt"].get("foreground_changed").is_none());
     }
 
     #[test]

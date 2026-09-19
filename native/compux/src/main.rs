@@ -23,6 +23,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -47,11 +48,16 @@ use wire::Failure;
 /// the serialized `Emitter`. Isolated from the request/response core here.
 mod capture;
 
+/// Accessibility: the AX FFI and the tree walk, behind a trait narrow enough that
+/// everything above it — the element list, the references it hands out, the
+/// revalidation before an action — is tested with no OS call.
+mod ax;
+
 /// Held synthetic input: the press registry and the `Platform` seam every input
 /// sequence posts through, so nothing this process presses can outlive the action.
 mod held;
 
-/// The protocol-8 frames as types: line parsing, the outbound builders, receipts.
+/// The protocol-9 frames as types: line parsing, the outbound builders, receipts.
 mod wire;
 
 /// Display geometry and the one coordinate transform, pure and platform-injected.
@@ -111,7 +117,20 @@ mod control;
 /// from a rectangle a caller repeated — and it is built from a ratio MEASURED on
 /// the frame that was really captured rather than assumed from the display mode.
 /// See `mod observation` and `mod geometry`.
-const PROTOCOL_VERSION: u32 = 8;
+///
+/// v9 (M42 slice 4): controls the caller can NAME. Every element an `elements`
+/// reply lists, and every mark a `marks: true` screenshot badges, carries an
+/// `element_ref` scoped to its observation, and the observation RETAINS the native
+/// reference behind it (with the owning pid and that process's start time, so pid
+/// reuse cannot be mistaken for the same application). Two actions address a
+/// control rather than a point — `press` and `set_value`, offered only where the
+/// control itself advertises support — and a pointer action may carry an
+/// `element_ref` instead of `x`/`y`, in which case the bounds are read again at
+/// the moment it acts. Both addressing forms on one request is
+/// `addressing_conflict`. Receipts gained `input_method: "ax"`, the `verified`
+/// effect a read-back earns, and `foreground_changed`. `element_ref` was a
+/// reserved field this sidecar refused outright until now. See `mod ax`.
+const PROTOCOL_VERSION: u32 = 9;
 
 /// The capture-stall self-reap (EX_TEMPFAIL), and NOTHING else.
 ///
@@ -327,13 +346,15 @@ fn boot_generation() -> String {
 }
 
 /// Everything the action worker owns that is neither on the wire nor in the gate:
-/// the images handed out and the transform each was made with, and the pixels per
-/// point measured on each display. One thread reads and writes both, one request
-/// at a time, so neither is locked — and nothing else may take a reference to
-/// them, which is the invariant that keeps it that way.
+/// the images handed out and the transform each was made with, the pixels per
+/// point measured on each display, and the accessibility platform every element
+/// reference is retained and released through. One thread reads and writes them,
+/// one request at a time, so none is locked — and nothing else may take a
+/// reference to them, which is the invariant that keeps it that way.
 struct Worker {
     observations: Observations,
     measured: Measured,
+    ax: Rc<dyn ax::Ax>,
 }
 
 /// The serial action worker. One request at a time, to completion, on this thread.
@@ -341,10 +362,20 @@ fn run_worker(jobs: mpsc::Receiver<control::Job>, gate: &Gate, emitter: &capture
     let mut worker = Worker {
         observations: Observations::new(&gate.envelope().sidecar_generation, gate.clock()),
         measured: Measured::new(),
+        ax: Rc::new(ax::Real::new()),
     };
 
     for job in jobs {
         let control::Job::Action(request) = job;
+
+        // Letting go of the seat lets go of what the caller could still address
+        // with it. The table — and the native element references it retains — is
+        // this thread's alone to touch, so the control flips a flag and the answer
+        // is read here, which is the first moment anything may act on it.
+        if gate.take_release() {
+            worker.observations.clear();
+        }
+
         let frame = serve(&request, gate, emitter, &mut worker);
 
         // One JSON line per reply. A write failure means the parent is gone.
@@ -378,7 +409,7 @@ fn serve(
             &request.request_id,
             refusal.code(),
             Some(refusal.detail().to_string()),
-            receipt(request, false, false, false, wire::Timings::default(), None),
+            receipt(request, &gate::Dispatched::default(), false, None),
         );
     }
 
@@ -415,14 +446,7 @@ fn reply(
                 .get("observation_id")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let receipt = receipt(
-                request,
-                done.posted,
-                done.input_complete,
-                after_image,
-                done.timings,
-                after,
-            );
+            let receipt = receipt(request, &done, after_image, after);
             wire::response(gate.envelope(), &request.request_id, payload, receipt)
         }
 
@@ -431,14 +455,7 @@ fn reply(
             // INSIDE the action, so a click whose every event landed and whose own
             // screenshot then failed dispatched `sent`. Calling that `partial` would
             // have Fermix report `unknown` where the truth is performed-unverified.
-            let receipt = receipt(
-                request,
-                done.posted,
-                done.input_complete,
-                false,
-                done.timings,
-                None,
-            );
+            let receipt = receipt(request, &done, false, None);
             // Every refusal that reaches here was cancelled (a pause sets both
             // flags), so a refusal code only ever lands in `detail` and never
             // stands in for the action's own error. A detail that merely repeats
@@ -458,18 +475,22 @@ fn reply(
 
 /// A receipt rides every action that is not read-only, refusals included: "no
 /// input was sent" is exactly the fact a caller needs before it retries.
+///
+/// Everything it reports comes from the gate, which is the only path from an
+/// action to the screen: whether input was posted, how long each phase took,
+/// which method carried it, whether the action could verify its own effect, and
+/// whether the foreground moved. None of it is inferred from the action's name.
 fn receipt(
     request: &wire::Request,
-    posted: bool,
-    input_complete: bool,
+    done: &gate::Dispatched,
     after_image: bool,
-    timings: wire::Timings,
     after: Option<String>,
 ) -> Option<wire::Receipt> {
     if wire::carries_mutation_seq(&request.action) {
         Some(
-            wire::Receipt::derive(posted, input_complete, after_image, timings)
-                .addressing(request.observation_id.clone(), after),
+            wire::Receipt::derive(done.posted, done.input_complete, after_image, done.timings)
+                .addressing(request.observation_id.clone(), after)
+                .noted(done.input_method, done.effect, done.foreground_changed),
         )
     } else {
         None
@@ -512,6 +533,8 @@ fn handle(
         "paste" => paste(req, gate, worker),
         "elements" => elements(request, gate, worker),
         "windows" => windows(req, gate, worker),
+        "press" => press(request, gate, worker),
+        "set_value" => set_value(request, gate, worker),
         other => Err(format!("unknown action: {other}").into()),
     }
 }
@@ -567,6 +590,188 @@ fn refused(refusal: observation::Refusal) -> Failure {
     Failure::new(refusal.code(), refusal.detail())
 }
 
+// --- addressing: which CONTROL a request names (protocol 9) ------------------
+
+/// What an action is allowed to do to a control, and therefore what has to still
+/// be true of it. Named rather than a boolean because the two refusals a caller
+/// acts on differ: one says press it another way, the other says it is not a
+/// field you can set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Capability {
+    Press,
+    SetValue,
+}
+
+impl Capability {
+    fn detail(self) -> &'static str {
+        match self {
+            Capability::Press => {
+                "this control does not list press among its own actions, so it \
+                                  cannot be pressed by name; click it by element_ref or by point \
+                                  instead"
+            }
+            Capability::SetValue => {
+                "this control does not report its value as settable, so it \
+                                     cannot be set by name; type or paste into it instead"
+            }
+        }
+    }
+}
+
+/// The control a request named, out of the observation that listed it — the
+/// native reference included, which is why this is the one path to an
+/// accessibility action.
+///
+/// Copied rather than borrowed for the same reason `observed` copies: the action
+/// that follows goes on to mint its own check image into the same table. The
+/// references ride an `Arc`, so a copy shares them and releases nothing.
+fn element_in<'a>(
+    observation: &'a Observation,
+    request: &wire::Request,
+) -> Result<&'a ax::Entry, Failure> {
+    let reference = request
+        .element_ref
+        .as_deref()
+        .ok_or_else(|| Failure::from("element_required"))?;
+
+    let Some(elements) = observation.elements.as_deref() else {
+        return Err(Failure::new(
+            "stale_element",
+            "that reply listed no controls, so it holds no references; take `elements` (or a \
+             screenshot with marks) and use a reference from it"
+                .to_string(),
+        ));
+    };
+
+    elements.get(reference).ok_or_else(|| {
+        Failure::new(
+            "stale_element",
+            format!(
+                "{reference} is not one of the {} controls that reply listed; take `elements` \
+                 again and use a reference from the new list",
+                elements.len()
+            ),
+        )
+    })
+}
+
+/// Is this still the control the caller was shown, and will it act at all?
+///
+/// In this order on purpose, because each answer sends the caller somewhere
+/// different: the application first (a reference into a process that has quit —
+/// or whose pid another process now has — names nothing), then what the control
+/// says it is, then whether it will take input. Every refusal here is
+/// `dispatch: not_sent`, checked before anything is dispatched.
+fn present(
+    ax: &Rc<dyn ax::Ax>,
+    observation: &Observation,
+    entry: &ax::Entry,
+) -> Result<(), Failure> {
+    let elements = observation
+        .elements
+        .as_deref()
+        .ok_or_else(|| Failure::from("stale_element"))?;
+
+    if ax.process_started_at(elements.pid) != Some(elements.started_at) {
+        return Err(Failure::new(
+            "stale_element",
+            "the application that listed this control is not the one running now; take \
+             `elements` again and use a reference from the new list"
+                .to_string(),
+        ));
+    }
+
+    let handle = entry.element.handle();
+    match ax.role(handle) {
+        None => Err(Failure::new(
+            "stale_element",
+            "that control is no longer there; take `elements` again and use a reference from \
+             the new list"
+                .to_string(),
+        )),
+        Some(role) if role != entry.role => Err(Failure::new(
+            "stale_element",
+            format!(
+                "that reference now answers a {role} where it listed a {}, so it is not the \
+                 control you were shown; take `elements` again",
+                entry.role
+            ),
+        )),
+        Some(_same) if !ax.enabled(handle) => Err(Failure::new(
+            "element_disabled",
+            "that control is disabled, so it will not act; do not retry it — find what enables \
+             it first"
+                .to_string(),
+        )),
+        Some(_same) => Ok(()),
+    }
+}
+
+/// Everything [`present`] checks, plus the one capability this action needs — read
+/// from the control ITSELF, never inferred from what its role suggests it ought to
+/// support. A control that cannot do it is refused and never quietly clicked
+/// instead: which of the two to send is the caller's decision.
+fn revalidate(
+    ax: &Rc<dyn ax::Ax>,
+    observation: &Observation,
+    entry: &ax::Entry,
+    want: Capability,
+) -> Result<(), Failure> {
+    present(ax, observation, entry)?;
+
+    let handle = entry.element.handle();
+    let capable = match want {
+        Capability::Press => ax.action_names(handle).iter().any(|name| name == ax::PRESS),
+        Capability::SetValue => ax.settable(handle),
+    };
+
+    if capable {
+        Ok(())
+    } else {
+        Err(Failure::new(
+            "ax_action_unsupported",
+            want.detail().to_string(),
+        ))
+    }
+}
+
+/// Did this accessibility message leave the process?
+///
+/// A success did. A refusal did only when the platform says so — a timeout is the
+/// one refusal that arrives AFTER the message went out, and every other one (the
+/// accessibility API disabled, the element gone, a platform with no such API at
+/// all) means nothing was sent. A receipt that read `sent` for those would tell a
+/// caller its press may have landed when it provably did not.
+fn went_out(outcome: &Result<(), ax::Refusal>) -> bool {
+    match outcome {
+        Ok(()) => true,
+        Err(refusal) => refusal.sent(),
+    }
+}
+
+/// A gate refusal as the action's own failure: nothing was dispatched and the
+/// code says which barrier stopped it.
+fn barred(refusal: gate::Refusal) -> Failure {
+    Failure::new(refusal.code(), refusal.detail().to_string())
+}
+
+/// An accessibility call that failed after it went out.
+///
+/// Two codes, and the split is the whole point. A timeout means the message
+/// landed somewhere and the answer never came, so nothing may repeat it — its
+/// receipt says `dispatch: sent, effect: unknown`. Anything else is the
+/// application refusing a message it did receive. Neither is `stale_element`,
+/// which promises nothing was sent and is only ever minted by the revalidation
+/// before the call.
+fn ax_failure(refusal: ax::Refusal) -> Failure {
+    let code = if refusal.sent() {
+        "ax_timed_out"
+    } else {
+        "ax_action_failed"
+    };
+    Failure::new(code, refusal.detail())
+}
+
 // --- capture control (MILESTONE_32 §8.4a, NOT model actions) -----------------
 
 /// Start the capture observer and reply with the `observe_start` ack. On a refusal
@@ -613,14 +818,14 @@ fn hello() -> Result<Value, Failure> {
         "actions": [
             "screenshot", "left_click", "right_click", "double_click", "mouse_move",
             "left_click_drag", "scroll", "type", "key", "wait", "inspect",
-            "wait_for_change", "paste", "elements", "windows"
+            "wait_for_change", "paste", "elements", "windows", "press", "set_value"
         ],
-        // Listed only because this build really has them: one foreground HID input
-        // method, the three controls the gate implements, and the bounds of the
-        // observation table — a caller mirrors those numbers to know which ids it
-        // may still address before it asks.
+        // Listed only because this build really has them: the two input methods
+        // an action can carry, the three controls the gate implements, and the
+        // bounds of the observation table — a caller mirrors those numbers to know
+        // which ids it may still address before it asks.
         "capabilities": {
-            "input_methods": ["foreground_hid"],
+            "input_methods": ["foreground_hid", "ax"],
             "controls": ["pause", "resume", "release"],
             "observations": {
                 "max": observation::MAX_OBSERVATIONS,
@@ -1241,9 +1446,7 @@ mod overlay {
 
     /// B3: a numbered set-of-marks badge at an element's click point. The model
     /// answers with the NUMBER; the caller resolves it to the exact point — no
-    /// pixel estimation at all. Badges are only ever drawn from the macOS AX
-    /// mark collection, so the fn is scoped with it.
-    #[cfg(target_os = "macos")]
+    /// pixel estimation at all.
     pub fn badge(img: &mut RgbaImage, x: i32, y: i32, n: usize) {
         let text = n.to_string();
         let half_w = (text_width(&text) / 2 + 4).max(8);
@@ -1530,7 +1733,13 @@ fn capture_payload_encoded(
         overlay::rulers(&mut resized);
     }
     let marks = if overlays.marks {
-        Some(collect_marks(&geom, &region, &mut resized, gate))
+        Some(collect_marks(
+            &geom,
+            &region,
+            &mut resized,
+            gate,
+            &worker.ax,
+        ))
     } else {
         None
     };
@@ -1580,6 +1789,7 @@ fn capture_payload_encoded(
 
     // B3: the mark table, present (possibly empty) whenever marks were requested,
     // so the caller can tell "zero accessibility marks" from "none asked for".
+    let mut listed = None;
     if let (Some(info), Some(object)) = (marks, payload.as_object_mut()) {
         object.insert("marks".to_string(), Value::Array(info.entries));
         if let Some(note) = info.ax_activation {
@@ -1588,18 +1798,27 @@ fn capture_payload_encoded(
         if info.truncated > 0 {
             object.insert("marks_truncated".to_string(), json!(info.truncated));
         }
+        // The walk's own bound, distinct from the badge cap above it: one says a
+        // marked image shows fewer controls than exist, the other that the tree
+        // was not read to its end.
+        if let Some(truncation) = info.truncated_walk {
+            object.insert("truncated".to_string(), json!(truncation));
+        }
+        listed = info.elements;
     }
 
     // This image is now the space the caller's next coordinates are in, marks
-    // included, so it is minted and named before it leaves.
-    let observation = worker.observations.mint(
-        Kind::Image,
-        display.id,
-        display.facts,
-        geom,
+    // included, so it is minted and named before it leaves — with the references
+    // behind those marks, which live and die with it.
+    let observation = worker.observations.mint(observation::Minting {
+        kind: Kind::Image,
+        display_id: display.id,
+        facts: display.facts,
+        geometry: geom,
         region,
-        (sent_w, sent_h),
-    );
+        sent: (sent_w, sent_h),
+        elements: listed,
+    });
     name_observation(&mut payload, &observation);
 
     Ok(payload)
@@ -1631,50 +1850,99 @@ fn name_observation(payload: &mut Value, observation: &Observation) {
 /// The badge cap keeps a marked image readable — a dense tree can expose
 /// hundreds of interactive nodes, and a badge soup grounds worse than pixels.
 /// Tree-walk order is roughly top-down, so the cap drops the least prominent.
-#[cfg(target_os = "macos")]
 const MAX_MARKS: usize = 60;
 
 struct MarksInfo {
     entries: Vec<Value>,
     ax_activation: Option<String>,
+    /// How many interactive nodes were found beyond the badge cap.
     truncated: usize,
+    /// Why the WALK stopped early, when it did — a different fact from the cap
+    /// above, and one a caller needs before concluding a control is not there.
+    truncated_walk: Option<&'static str>,
+    /// The references behind these badges, to live with the image they are drawn
+    /// on: a mark can be pressed by name, like any other listed control.
+    elements: Option<Rc<ax::Elements>>,
 }
 
-#[cfg(target_os = "macos")]
+/// Badge the interactive elements in view and answer their table.
+///
+/// The read itself is the macOS half (`interactive_in_view`); everything from the
+/// nodes onwards is the same code on every platform, which is what keeps a
+/// reference, a badge and an element-list entry spelling the same fact one way.
 fn collect_marks(
     geom: &Geometry,
     region: &Region,
     img: &mut image::RgbaImage,
     gate: &Gate,
+    ax: &Rc<dyn ax::Ax>,
 ) -> MarksInfo {
-    let (nodes, ax_activation) = interactive_in_view(geom, region, gate);
-    let truncated = nodes.len().saturating_sub(MAX_MARKS);
+    let viewed = match interactive_in_view(ax, geom, region, gate) {
+        Ok(viewed) => viewed,
+        Err(unsupported) => {
+            return MarksInfo {
+                entries: Vec::new(),
+                ax_activation: Some(unsupported.code),
+                truncated: 0,
+                truncated_walk: None,
+                elements: None,
+            }
+        }
+    };
 
+    let truncated = viewed.nodes.len().saturating_sub(MAX_MARKS);
+    let names = viewed.owner.is_some();
     let mut entries = Vec::new();
-    for (index, (node, (sx, sy))) in nodes.into_iter().take(MAX_MARKS).enumerate() {
+    let mut listed = Vec::new();
+
+    for (index, (node, (sx, sy))) in viewed.nodes.into_iter().take(MAX_MARKS).enumerate() {
         let id = index + 1;
+        let reference = ax::reference_for(index);
         overlay::badge(img, sx as i32, sy as i32, id);
-        entries.push(json!({ "id": id, "role": node.role, "title": node.title, "x": sx, "y": sy }));
+
+        // `label`, spelled exactly as an `elements` entry spells it: it is the same
+        // fact read from the same attributes, and two names for one fact is how a
+        // consumer ends up with two ways to read a control's name. (`inspect` keeps
+        // its own `title` and `description`, which are genuinely different AX
+        // attributes rather than this one under another name.)
+        let mut entry = json!({ "id": id, "role": node.role, "x": sx, "y": sy });
+        if let Some(object) = entry.as_object_mut() {
+            if names {
+                object.insert("element_ref".to_string(), json!(reference));
+            }
+            if let Some(label) = &node.label {
+                object.insert("label".to_string(), json!(label));
+            }
+        }
+        entries.push(entry);
+
+        listed.push(ax::Entry {
+            reference,
+            role: node.role,
+            secure: node.secure,
+            element: node.element,
+        });
     }
 
     MarksInfo {
         entries,
-        ax_activation,
+        ax_activation: viewed.note,
         truncated,
+        truncated_walk: viewed.truncated,
+        elements: retained(viewed.owner, listed),
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn collect_marks(
-    _geom: &Geometry,
-    _region: &Region,
-    _img: &mut image::RgbaImage,
-    _gate: &Gate,
-) -> MarksInfo {
-    MarksInfo {
-        entries: Vec::new(),
-        ax_activation: Some("marks are only supported on macOS".to_string()),
-        truncated: 0,
+/// The references one reply hands out, or `None` when it listed none — an empty
+/// table would be a promise of controls that are not there.
+fn retained(owner: Option<(i32, u64)>, entries: Vec<ax::Entry>) -> Option<Rc<ax::Elements>> {
+    let (pid, started_at) = owner?;
+    let elements = ax::Elements::new(pid, started_at, entries);
+
+    if elements.is_empty() {
+        None
+    } else {
+        Some(Rc::new(elements))
     }
 }
 
@@ -1724,12 +1992,68 @@ fn modifiers(req: &Value) -> Vec<Key> {
         .unwrap_or_default()
 }
 
+/// Where a pointer action is aiming, in the global logical points the input path
+/// takes.
+///
+/// Two ways in, and neither is a recovery path for the other. A POINT is read in
+/// the image that named it, through the transform that image was made with. A
+/// CONTROL is re-read where it is NOW — its bounds at this moment, not where it
+/// was listed — so one that moved is hit where it moved to, and one that is gone
+/// is refused rather than clicked at the place it used to be.
+fn aim(
+    request: &wire::Request,
+    observation: &Observation,
+    worker: &Worker,
+) -> Result<(i32, i32), Failure> {
+    let Some(entry) = addressed_element(request, observation)? else {
+        let (x, y) = coords(&request.body)?;
+        return point_in(observation, x, y);
+    };
+
+    present(&worker.ax, observation, entry)?;
+    let bounds = worker.ax.bounds(entry.element.handle()).ok_or_else(|| {
+        Failure::new(
+            "stale_element",
+            "that control no longer reports where it is, so there is nowhere to click; take \
+             `elements` again"
+                .to_string(),
+        )
+    })?;
+
+    let (x, y) = bounds.centre();
+    Ok((x.round() as i32, y.round() as i32))
+}
+
+/// The control this request names, when it names one. `None` is "it named a
+/// point", which the parse layer has already proved is the only other answer.
+fn addressed_element<'a>(
+    request: &wire::Request,
+    observation: &'a Observation,
+) -> Result<Option<&'a ax::Entry>, Failure> {
+    match request.element_ref {
+        None => Ok(None),
+        Some(_) => element_in(observation, request).map(Some),
+    }
+}
+
+/// The display this action's check image is taken on and, for a POINT, proof that
+/// it is still the display that image was made on.
+///
+/// A control needs no such proof: its bounds are global logical points read at
+/// the moment of the action, so a display that has moved since the listing does
+/// not move the control. Not needing it is the point of addressing one.
+fn display_for(request: &wire::Request, observation: &Observation) -> Result<Display, Failure> {
+    if request.element_ref.is_some() {
+        Ok(target_display(&request.body)?)
+    } else {
+        same_display(observation, &request.body)
+    }
+}
+
 fn mouse_move(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
-    let req = &request.body;
-    let (x, y) = coords(req)?;
     let observation = observed(request, worker)?;
-    let (lx, ly) = point_in(&observation, x, y)?;
-    same_display(&observation, req)?;
+    let (lx, ly) = aim(request, &observation, worker)?;
+    display_for(request, &observation)?;
     // Read-only on the wire and still the human's pointer, so it goes through the
     // gate like every other input and a pause stops it.
     let mut platform = Gated::new(gate, held::Real::default());
@@ -1751,10 +2075,9 @@ fn click(
     count: u32,
 ) -> Result<Value, Failure> {
     let req = &request.body;
-    let (x, y) = coords(req)?;
     let observation = observed(request, worker)?;
-    let (lx, ly) = point_in(&observation, x, y)?;
-    let display = same_display(&observation, req)?;
+    let (lx, ly) = aim(request, &observation, worker)?;
+    let display = display_for(request, &observation)?;
     let mods = modifiers(req);
 
     // A local, not a temporary: enigo's own `Drop` paces the events it posted, and
@@ -1876,10 +2199,9 @@ fn drag_through<P: held::Platform>(
 
 fn scroll(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let req = &request.body;
-    let (x, y) = coords(req)?;
     let observation = observed(request, worker)?;
-    let (lx, ly) = point_in(&observation, x, y)?;
-    let display = same_display(&observation, req)?;
+    let (lx, ly) = aim(request, &observation, worker)?;
+    let display = display_for(request, &observation)?;
     let amount = req.get("amount").and_then(Value::as_i64).unwrap_or(3) as i32;
     let (axis, length) = match req.get("direction").and_then(Value::as_str) {
         Some("up") => (Axis::Vertical, -amount),
@@ -2177,6 +2499,159 @@ fn paste_modifier() -> Key {
     Key::Control
 }
 
+// --- accessibility actions (protocol 9) --------------------------------------
+
+/// Press the control the caller named, through the accessibility API: no pointer
+/// moves, nothing can miss, and whatever is in front stays in front.
+///
+/// Through the gate like every other action, so pause, generations and
+/// `mutation_seq` hold with no second path to the machine — but through
+/// `dispatch_message`, not `dispatch`: one accessibility message can take the
+/// whole one-second messaging timeout, and holding the gate's mutex across it
+/// would leave a pause landing there unacknowledged until the wedged application
+/// answered. That is slice 2's lesson, and it applies to a press exactly as it
+/// applied to a long `type`.
+fn press(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
+    let observation = observed(request, worker)?;
+    let entry = element_in(&observation, request)?;
+    revalidate(&worker.ax, &observation, entry, Capability::Press)?;
+
+    let handle = entry.element.handle();
+    let aimed = aimed_point(&request.body, &worker.ax, handle);
+    let before = worker.ax.frontmost_pid();
+
+    let outcome = gate
+        .dispatch_message(|| worker.ax.perform(handle, ax::PRESS), went_out)
+        .map_err(barred)?;
+    gate.input_complete();
+    note_ax(gate, worker, before);
+    outcome.map_err(ax_failure)?;
+
+    // A successful accessibility return is a DISPATCH result, not an effect: the
+    // control took the message, and what it did with it is for the caller to look
+    // at. Saying `verified` here would be the one lie this receipt exists to
+    // prevent.
+    gate.observed_effect(wire::Effect::NotObserved);
+    post_ax(&request.body, gate, worker, aimed)
+}
+
+/// Set the control's value, then read it back — which is the only thing in this
+/// build that earns `effect: verified`.
+///
+/// Through `dispatch_message` for the same reason `press` is: one message, outside
+/// the gate's mutex, so a pause landing while a slow application is thinking is
+/// still answered — and marked as dispatched only if it really went out.
+fn set_value(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
+    let value = request
+        .body
+        .get("value")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            Failure::new(
+                "invalid_argument",
+                "set_value needs a string value: the text to put in the control".to_string(),
+            )
+        })?
+        .to_string();
+
+    let observation = observed(request, worker)?;
+    let entry = element_in(&observation, request)?;
+    revalidate(&worker.ax, &observation, entry, Capability::SetValue)?;
+
+    let (handle, secure) = (entry.element.handle(), entry.secure);
+    let aimed = aimed_point(&request.body, &worker.ax, handle);
+    let before = worker.ax.frontmost_pid();
+
+    let outcome = gate
+        .dispatch_message(|| worker.ax.set_value(handle, &value), went_out)
+        .map_err(barred)?;
+    gate.input_complete();
+    note_ax(gate, worker, before);
+    outcome.map_err(ax_failure)?;
+
+    // Read it back. Equal is the one thing that earns `verified`; a secure field
+    // is not read at all — it reads back masked, so it could never verify, and
+    // not asking is a stronger guarantee than asking and discarding.
+    let read_back = if secure {
+        None
+    } else {
+        worker.ax.value(handle)
+    };
+    let verified = !secure && read_back.as_deref() == Some(value.as_str());
+    gate.observed_effect(if verified {
+        wire::Effect::Verified
+    } else {
+        wire::Effect::NotObserved
+    });
+
+    let mut payload = post_ax(&request.body, gate, worker, aimed)?;
+
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("verified".to_string(), json!(verified));
+        // What the field holds NOW, so a caller that did not verify can see what
+        // it got instead. Withheld for a secure field, whose value is never read.
+        if let (false, Some(read_back)) = (secure, read_back) {
+            object.insert("value".to_string(), json!(ax::bounded_value(read_back)));
+        }
+    }
+
+    Ok(payload)
+}
+
+/// The check image after an accessibility action, when one was asked for.
+///
+/// The display is resolved only then, deliberately: an accessibility action needs
+/// no display, so refusing one because the screen is asleep would fail an action
+/// that would have worked — and a press through the AX API is exactly the action
+/// that still works when a capture does not.
+fn post_ax(
+    req: &Value,
+    gate: &Gate,
+    worker: &mut Worker,
+    aimed: Option<(i32, i32)>,
+) -> Result<Value, Failure> {
+    if !wants_check_image(req) {
+        return Ok(json!({ "ok": true }));
+    }
+
+    post(req, &target_display(req)?, gate, worker, aimed)
+}
+
+/// Where the control is, for the check image's executed-point marker.
+///
+/// Read only when there is going to be an image to draw it on: an accessibility
+/// action aims at a name, not a place, so a bounds read it will not use is one
+/// more message to an application that may be slow to answer. Best effort even
+/// then — a control that will not say where it is still gets its action.
+fn aimed_point(req: &Value, ax: &Rc<dyn ax::Ax>, handle: ax::Handle) -> Option<(i32, i32)> {
+    if !wants_check_image(req) {
+        return None;
+    }
+
+    ax.bounds(handle).map(|bounds| {
+        let (x, y) = bounds.centre();
+        (x.round() as i32, y.round() as i32)
+    })
+}
+
+/// What only an accessibility action knows about its own receipt: the method that
+/// carried it, and whether the application took the foreground while it ran.
+///
+/// The foreground is read before and after. A change is reported only when BOTH
+/// readings answered — a platform that will not say must never be made to look
+/// like a change, and a `false` here is a claim the live check is meant to test.
+fn note_ax(gate: &Gate, worker: &Worker, before: Option<i32>) {
+    gate.used_input_method(wire::InputMethod::Ax);
+
+    // Only when BOTH readings answered. A platform that would not say leaves the
+    // field off the wire entirely: publishing `false` there would be this build
+    // asserting the background contract held, on evidence it does not have — and
+    // the support matrix is filled in from exactly that field.
+    if let (Some(before), Some(after)) = (before, worker.ax.frontmost_pid()) {
+        gate.note_foreground(before != after);
+    }
+}
+
 // --- windows ----------------------------------------------------------------
 
 /// Hard cap on the reported window list. A desktop can carry a hundred windows
@@ -2211,14 +2686,17 @@ fn windows(req: &Value, gate: &Gate, worker: &mut Worker) -> Result<Value, Failu
     listed.truncate(MAX_WINDOWS);
 
     let mut payload = json!({ "ok": true, "windows": listed });
-    let observation = worker.observations.mint(
-        Kind::Semantic,
-        display.id,
-        display.facts,
-        geom,
-        full,
-        crop_rect(&geom, &full).sent_dims(),
-    );
+    let observation = worker.observations.mint(observation::Minting {
+        kind: Kind::Semantic,
+        display_id: display.id,
+        facts: display.facts,
+        geometry: geom,
+        region: full,
+        sent: crop_rect(&geom, &full).sent_dims(),
+        // A window is not a control: it has no accessibility reference to hand
+        // out, and `elements` is what answers with those.
+        elements: None,
+    });
     name_observation(&mut payload, &observation);
 
     Ok(payload)
@@ -2309,73 +2787,216 @@ fn logical_bounds_to_region(
     })
 }
 
-/// Enumerate interactive accessibility elements (role + label + a click point in
-/// screenshot coordinates) so the model can target by element, not raw pixels.
+/// Enumerate the interactive accessibility elements so the caller can target by
+/// CONTROL rather than by raw pixels: what each one is, what it holds, what it can
+/// do, where it is, and a reference that outlives the reply.
 ///
 /// The click points are pixels in an image that is never sent, so this mints a
 /// `semantic` observation and names it: the coordinates are in the same space a
-/// `screenshot` of that region would be, and the model addresses them the same way.
+/// `screenshot` of that region would be, and the model addresses them the same way
+/// — and the references ride in the same observation, so they die with it.
 fn elements(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let display = target_display(&request.body)?;
     let geom = measured_geometry(&display, gate, worker)?;
     let region = viewing_region(request, &geom, worker)?;
-    let mut payload = elements_for(&geom, &region, gate)?;
+    let (mut payload, listed) = elements_for(&worker.ax, &geom, &region, gate)?;
 
     let (sent_w, sent_h) = crop_rect(&geom, &region).sent_dims();
-    let observation = worker.observations.mint(
-        Kind::Semantic,
-        display.id,
-        display.facts,
-        geom,
+    let observation = worker.observations.mint(observation::Minting {
+        kind: Kind::Semantic,
+        display_id: display.id,
+        facts: display.facts,
+        geometry: geom,
         region,
-        (sent_w, sent_h),
-    );
+        sent: (sent_w, sent_h),
+        elements: listed,
+    });
     name_observation(&mut payload, &observation);
 
     Ok(payload)
 }
 
-#[cfg(target_os = "macos")]
-fn elements_for(geom: &Geometry, region: &Region, gate: &Gate) -> Result<Value, Failure> {
-    let (nodes, ax_activation) = interactive_in_view(geom, region, gate);
+/// One element, as the wire publishes it.
+///
+/// Everything here was read in the ONE traversal that found it: a second round of
+/// queries per element would double the cost of a list and could disagree with
+/// itself half way through. Nothing is inferred from the role — `actions` lists
+/// `press` only where the control's own action list does, and `settable` only
+/// where the accessibility API says the value may be written.
+///
+/// `bounds` is in the SAME pixels as the click point beside it, which is the
+/// pixels of the image this reply names. The frame the walk read is in global
+/// logical points and stays inside this process: one reply, one coordinate space.
+fn element_value(
+    node: &ax::Node,
+    reference: Option<&str>,
+    point: (i64, i64),
+    geom: &Geometry,
+    region: &Region,
+) -> Value {
+    let frame = node.frame;
+    let bounds = geometry::sent_rect(geom, region, frame.x, frame.y, frame.w, frame.h);
 
-    let items: Vec<Value> = nodes
-        .iter()
-        .map(|(node, (x, y))| json!({ "role": node.role, "title": node.title, "x": x, "y": y }))
-        .collect();
+    let mut item = json!({
+        "role": node.role,
+        "enabled": node.enabled,
+        "settable": node.settable,
+        "bounds": {
+            "x": bounds.x.round() as i64,
+            "y": bounds.y.round() as i64,
+            "w": bounds.w.round().max(1.0) as i64,
+            "h": bounds.h.round().max(1.0) as i64
+        },
+        // The click point in this reply's own pixels, unchanged since protocol 4:
+        // a caller that aims by coordinate keeps working exactly as it did.
+        "x": point.0,
+        "y": point.1
+    });
+
+    if let Some(object) = item.as_object_mut() {
+        // A reference this reply cannot resolve is worse than none: the control is
+        // still listed with its click point, but nothing offers a name that would
+        // come back `stale_element` the moment it was used. The one place that can
+        // happen is an application whose start time would not read, which is what
+        // `retained` refuses to build a table from.
+        if let Some(reference) = reference {
+            object.insert("element_ref".to_string(), json!(reference));
+            object.insert(
+                "actions".to_string(),
+                json!(if node.press {
+                    vec!["press"]
+                } else {
+                    Vec::new()
+                }),
+            );
+        }
+        if let Some(label) = &node.label {
+            object.insert("label".to_string(), json!(label));
+        }
+        // Absent for a secure field, which is the only way to tell "no value" from
+        // "a value nobody may read".
+        if let Some(value) = &node.value {
+            object.insert("value".to_string(), json!(value));
+        }
+        if !node.path.is_empty() {
+            object.insert("path".to_string(), json!(node.path));
+        }
+    }
+
+    item
+}
+
+/// The element list and the references behind it. Portable on purpose: only the
+/// READ is per platform, so the shape a caller sees is written once.
+fn elements_for(
+    ax: &Rc<dyn ax::Ax>,
+    geom: &Geometry,
+    region: &Region,
+    gate: &Gate,
+) -> Result<(Value, Option<Rc<ax::Elements>>), Failure> {
+    let viewed = interactive_in_view(ax, geom, region, gate)?;
+
+    // Whether this reply can hand out references at all is decided BEFORE any is
+    // published: `retained` needs the owning process's start time, and without it
+    // there is no table to resolve them against.
+    let names = viewed.owner.is_some();
+
+    let mut items = Vec::new();
+    let mut listed = Vec::new();
+    for (index, (node, point)) in viewed.nodes.into_iter().enumerate() {
+        let reference = ax::reference_for(index);
+        items.push(element_value(
+            &node,
+            names.then_some(reference.as_str()),
+            point,
+            geom,
+            region,
+        ));
+        listed.push(ax::Entry {
+            reference,
+            role: node.role,
+            secure: node.secure,
+            element: node.element,
+        });
+    }
 
     let mut payload = json!({ "ok": true, "elements": items });
-    if let (Some(note), Some(object)) = (ax_activation, payload.as_object_mut()) {
-        object.insert("ax_activation".to_string(), json!(note));
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(note) = viewed.note {
+            object.insert("ax_activation".to_string(), json!(note));
+        }
+        // A walk that stopped at one of its bounds says which. Without it a caller
+        // reads a partial tree as the whole one and concludes a control is not
+        // there, which is the one wrong answer this list can give.
+        if let Some(truncation) = viewed.truncated {
+            object.insert("truncated".to_string(), json!(truncation));
+        }
     }
-    Ok(payload)
+
+    Ok((payload, retained(viewed.owner, listed)))
 }
 
 /// An interactive AX node paired with its click point in sent-image space.
-#[cfg(target_os = "macos")]
 type ViewNode = (ax::Node, (i64, i64));
 
-/// Interactive AX elements of ONE application: the ones whose centers fall
-/// inside this view (as sent-space points) plus the TOTAL interactive count the
-/// walk saw before the view filter. The total is what distinguishes "the app's
-/// tree is gated/empty" (activation territory) from "the app has elements, just
-/// none inside this region" (nothing to activate). Shared by `elements` and the
-/// `marks` overlay so the two can never disagree about what is clickable.
-#[cfg(target_os = "macos")]
-fn in_view_nodes(pid: i32, geom: &Geometry, region: &Region) -> (Vec<ViewNode>, usize) {
-    let nodes = ax::interactive_elements_of(pid);
-    let total = nodes.len();
+/// What one accessibility read found: the controls inside the view with their
+/// click points, the application they came from (and when that process started,
+/// which is what a reference is checked against), why the walk stopped early if it
+/// did, and the note that explains any of it.
+struct Viewed {
+    nodes: Vec<ViewNode>,
+    owner: Option<(i32, u64)>,
+    truncated: Option<&'static str>,
+    note: Option<String>,
+}
 
-    let in_view = nodes
+impl Viewed {
+    /// A read that found no tree to walk. It still says which application it
+    /// looked at where it knows, because "nothing here" and "I could not tell you
+    /// where I looked" are different facts.
+    fn nothing(note: String) -> Viewed {
+        Viewed {
+            nodes: Vec::new(),
+            owner: None,
+            truncated: None,
+            note: Some(note),
+        }
+    }
+}
+
+/// One walk of ONE application: the controls whose centres fall inside this view
+/// (as sent-space points), the TOTAL interactive count the walk saw before the
+/// view filter, and why it stopped early if it did.
+///
+/// The total is what distinguishes "the app's tree is gated or empty" (activation
+/// territory) from "the app has controls, just none inside this region" (nothing
+/// to activate). Shared by `elements` and the `marks` overlay so the two can never
+/// disagree about what is there.
+///
+/// Every node the view filter drops releases the reference the walk retained for
+/// it, because dropping a node IS releasing it.
+fn in_view_nodes(
+    ax: &Rc<dyn ax::Ax>,
+    pid: i32,
+    geom: &Geometry,
+    region: &Region,
+    gate: &Gate,
+) -> (Vec<ViewNode>, usize, Option<&'static str>) {
+    let clock = gate.clock();
+    let deadline = gate.now_ms().saturating_add(ax::WALK_BUDGET_MS);
+    let found = ax::walk(ax, pid, clock.as_ref(), deadline);
+    let total = found.nodes.len();
+
+    let in_view = found
+        .nodes
         .into_iter()
         .filter_map(|node| {
-            let center_x = node.x + node.w / 2.0;
-            let center_y = node.y + node.h / 2.0;
-            to_sent(geom, region, center_x, center_y).map(|point| (node, point))
+            let (centre_x, centre_y) = node.frame.centre();
+            to_sent(geom, region, centre_x, centre_y).map(|point| (node, point))
         })
         .collect();
 
-    (in_view, total)
+    (in_view, total, found.truncated)
 }
 
 /// The application to read accessibility from: the one OWNING the window the
@@ -2389,7 +3010,6 @@ fn in_view_nodes(pid: i32, geom: &Geometry, region: &Region) -> (Vec<ViewNode>, 
 /// named on-screen window (a menu-bar app with an open popover) cannot be
 /// resolved this way — the old query never reached those reliably either, and
 /// the typed no-window note says what happened.
-#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, PartialEq)]
 struct TargetApp {
     pid: i32,
@@ -2579,9 +3199,7 @@ fn overlap_area(a: &Region, b: &Region) -> f64 {
 /// accessibility on when an AX client starts querying it, then needs a moment
 /// to build the tree — so an empty first walk re-queries on a short cadence
 /// instead of concluding emptiness from one look.
-#[cfg(target_os = "macos")]
 const AX_SETTLE_POLL_MS: u64 = 300;
-#[cfg(target_os = "macos")]
 const AX_SETTLE_POLLS: u32 = 5;
 
 /// B4, revised on live evidence: enumerate the TARGET app's tree rooted at its
@@ -2594,36 +3212,41 @@ const AX_SETTLE_POLLS: u32 = 5;
 /// gated, and flipping enhanced-UI mode on it would be a pure side effect.
 /// Every outcome lands in the note — which app was read, what activation did,
 /// how long the tree took — so no result is silent about its cause.
-#[cfg(target_os = "macos")]
 fn interactive_in_view(
+    ax_platform: &Rc<dyn ax::Ax>,
     geom: &Geometry,
     region: &Region,
     gate: &Gate,
-) -> (Vec<ViewNode>, Option<String>) {
-    let candidates = match window_candidates(geom) {
-        Ok(candidates) => candidates,
-        Err(reason) => return (Vec::new(), Some(reason)),
-    };
-    let Some(target) = select_target(candidates, region) else {
-        return (
-            Vec::new(),
-            Some("no application window to target for accessibility".to_string()),
-        );
+) -> Result<Viewed, Failure> {
+    let target = match view_target(geom, region)? {
+        Ok(target) => target,
+        Err(note) => return Ok(Viewed::nothing(note)),
     };
 
-    let (found, total) = in_view_nodes(target.pid, geom, region);
+    // The reference that outlives this reply is only usable while the process it
+    // came from is still THAT process, so the start time is read once, here,
+    // against the same pid the walk is about to use.
+    let started_at = ax_platform.process_started_at(target.pid);
+    let owner = started_at.map(|started_at| (target.pid, started_at));
+
+    let (found, total, truncated) = in_view_nodes(ax_platform, target.pid, geom, region, gate);
     if !found.is_empty() {
-        return (found, Some(format!("read {}", target.app)));
+        return Ok(Viewed {
+            nodes: found,
+            owner,
+            truncated,
+            note: Some(format!("read {}", target.app)),
+        });
     }
     if total > 0 {
         let note = format!(
             "{}: {total} interactive element(s) in the app, none inside this view",
             target.app
         );
-        return (Vec::new(), Some(note));
+        return Ok(Viewed::nothing(note));
     }
 
-    let attempt = ax::activate_accessibility(target.pid);
+    let attempt = activate_accessibility(target.pid);
     for poll in 1..=AX_SETTLE_POLLS {
         // Up to 1.5 seconds, reached from `elements` AND from any `marks: true`
         // screenshot, so it is a checkpoint site: a pause during a check image
@@ -2631,9 +3254,10 @@ fn interactive_in_view(
         // answers with an empty set and a note rather than a cancelled action.
         if gate.sleep(AX_SETTLE_POLL_MS).is_err() {
             let note = format!("{}: cancelled while the tree settled", target.app);
-            return (Vec::new(), Some(note));
+            return Ok(Viewed::nothing(note));
         }
-        let (again, again_total) = in_view_nodes(target.pid, geom, region);
+        let (again, again_total, truncated) =
+            in_view_nodes(ax_platform, target.pid, geom, region, gate);
         let waited = u64::from(poll) * AX_SETTLE_POLL_MS;
         if !again.is_empty() {
             let note = format!(
@@ -2641,7 +3265,12 @@ fn interactive_in_view(
                 target.app,
                 attempt_note(&attempt)
             );
-            return (again, Some(note));
+            return Ok(Viewed {
+                nodes: again,
+                owner,
+                truncated,
+                note: Some(note),
+            });
         }
         if again_total > 0 {
             // The tree came alive; this view just contains none of it — more
@@ -2652,7 +3281,7 @@ fn interactive_in_view(
                 target.app,
                 attempt_note(&attempt)
             );
-            return (Vec::new(), Some(note));
+            return Ok(Viewed::nothing(note));
         }
     }
 
@@ -2662,20 +3291,50 @@ fn interactive_in_view(
         target.app,
         attempt_note(&attempt)
     );
-    (Vec::new(), Some(note))
+    Ok(Viewed::nothing(note))
 }
 
+/// Which application this view is about, when there is one.
+///
+/// Three answers, and they are different facts: a target, a note saying why there
+/// is none (a desktop with nothing in front, a window listing the OS refused), or
+/// a typed failure because this platform has no accessibility API at all.
 #[cfg(target_os = "macos")]
+fn view_target(geom: &Geometry, region: &Region) -> Result<Result<TargetApp, String>, Failure> {
+    let candidates = match window_candidates(geom) {
+        Ok(candidates) => candidates,
+        Err(reason) => return Ok(Err(reason)),
+    };
+
+    Ok(select_target(candidates, region)
+        .ok_or_else(|| "no application window to target for accessibility".to_string()))
+}
+
+/// Linux has no accessibility API this build speaks. A typed failure, not an
+/// empty list: a caller that cannot tell "nothing there" from "not supported
+/// here" writes the wrong sentence about both.
+#[cfg(not(target_os = "macos"))]
+fn view_target(_geom: &Geometry, _region: &Region) -> Result<Result<TargetApp, String>, Failure> {
+    Err("element enumeration is only supported on macOS".into())
+}
+
+/// Ask one application to expose its accessibility tree, where that is a thing
+/// that can be asked.
+#[cfg(target_os = "macos")]
+fn activate_accessibility(pid: i32) -> Result<&'static str, String> {
+    ax::activate_accessibility(pid)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn activate_accessibility(_pid: i32) -> Result<&'static str, String> {
+    Err("no accessibility API on this platform".to_string())
+}
+
 fn attempt_note(attempt: &Result<&'static str, String>) -> String {
     match attempt {
         Ok(attribute) => format!("{attribute} activated"),
         Err(reason) => format!("activation refused: {reason}"),
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn elements_for(_geom: &Geometry, _region: &Region, _gate: &Gate) -> Result<Value, Failure> {
-    Err("element enumeration is only supported on macOS".into())
 }
 
 // --- accessibility (inspect) ------------------------------------------------
@@ -2713,460 +3372,6 @@ fn inspect_at(_x: f32, _y: f32) -> Result<Value, String> {
     Err("element inspection is only supported on macOS".to_string())
 }
 
-/// macOS Accessibility FFI for `inspect`. Reads the element under a global LOGICAL
-/// point via the system-wide AX element; core-foundation owns CFType memory (drop =
-/// release), and every AX call's error code is checked before the out-param is read.
-/// NON-PROMPTING and read-only. Like the rest of the native driver, the runtime
-/// behavior needs a real Mac with the Accessibility grant to verify.
-#[cfg(target_os = "macos")]
-mod ax {
-    use core_foundation::base::{CFType, CFTypeRef, TCFType};
-    use core_foundation::boolean::CFBoolean;
-    use core_foundation::string::{CFString, CFStringRef};
-    use std::ffi::c_void;
-    use std::sync::Mutex;
-
-    type AXUIElementRef = CFTypeRef;
-
-    #[link(name = "ApplicationServices", kind = "framework")]
-    extern "C" {
-        fn AXUIElementCreateSystemWide() -> AXUIElementRef;
-        // AXError; 0 == success. On success `element` is set to a +1 (Copy-rule) ref.
-        fn AXUIElementCopyElementAtPosition(
-            application: AXUIElementRef,
-            x: f32,
-            y: f32,
-            element: *mut AXUIElementRef,
-        ) -> i32;
-        fn AXUIElementCopyAttributeValue(
-            element: AXUIElementRef,
-            attribute: CFStringRef,
-            value: *mut CFTypeRef,
-        ) -> i32;
-        // Extract the concrete value (CGPoint/CGSize) an AXValue wraps; false if the
-        // requested type doesn't match.
-        fn AXValueGetValue(value: CFTypeRef, the_type: u32, out: *mut c_void) -> bool;
-        // B4 activation: set an attribute on an application element, created
-        // from the pid the caller resolved off the window list.
-        fn AXUIElementSetAttributeValue(
-            element: AXUIElementRef,
-            attribute: CFStringRef,
-            value: CFTypeRef,
-        ) -> i32;
-        fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
-    }
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    extern "C" {
-        fn CFArrayGetCount(array: CFTypeRef) -> isize;
-        fn CFArrayGetValueAtIndex(array: CFTypeRef, index: isize) -> CFTypeRef;
-        fn CFGetTypeID(cf: CFTypeRef) -> usize;
-        fn CFArrayGetTypeID() -> usize;
-    }
-
-    // The AX attribute-name constants (`kAXRoleAttribute`, …) are header `extern
-    // const`s that don't link as symbols; their string VALUES are stable + documented,
-    // so we build the CFStrings from those instead.
-    const ROLE: &str = "AXRole";
-    const TITLE: &str = "AXTitle";
-    const DESCRIPTION: &str = "AXDescription";
-    const VALUE: &str = "AXValue";
-    const CHILDREN: &str = "AXChildren";
-    const POSITION: &str = "AXPosition";
-    const SIZE: &str = "AXSize";
-
-    // AXValueType tags for AXValueGetValue.
-    const AXVALUE_CGPOINT: u32 = 1;
-    const AXVALUE_CGSIZE: u32 = 2;
-
-    // Bound the tree walk so a deep/huge hierarchy can't stall the request:
-    // MAX_NODES caps elements COLLECTED, MAX_VISITED caps nodes TRAVERSED (a large
-    // sparse subtree has few interactive nodes but many to walk), MAX_DEPTH the depth.
-    const MAX_DEPTH: usize = 14;
-    const MAX_NODES: usize = 250;
-    const MAX_VISITED: usize = 3000;
-
-    // Roles worth surfacing as clickable targets (set-of-marks).
-    const INTERACTIVE: &[&str] = &[
-        "AXButton",
-        "AXMenuItem",
-        "AXMenuButton",
-        "AXPopUpButton",
-        "AXCheckBox",
-        "AXRadioButton",
-        "AXTextField",
-        "AXTextArea",
-        "AXComboBox",
-        "AXLink",
-        "AXTabButton",
-        "AXSlider",
-        "AXDisclosureTriangle",
-        "AXCell",
-    ];
-
-    #[repr(C)]
-    struct CGPoint {
-        x: f64,
-        y: f64,
-    }
-
-    #[repr(C)]
-    struct CGSize {
-        width: f64,
-        height: f64,
-    }
-
-    pub struct Element {
-        pub role: Option<String>,
-        pub title: Option<String>,
-        pub description: Option<String>,
-        pub value: Option<String>,
-    }
-
-    pub fn element_at(x: f32, y: f32) -> Option<Element> {
-        unsafe {
-            let system_ref = AXUIElementCreateSystemWide();
-            if system_ref.is_null() {
-                return None;
-            }
-            let system = CFType::wrap_under_create_rule(system_ref);
-
-            let mut element_ref: AXUIElementRef = std::ptr::null();
-            let err =
-                AXUIElementCopyElementAtPosition(system.as_CFTypeRef(), x, y, &mut element_ref);
-            if err != 0 || element_ref.is_null() {
-                return None;
-            }
-            let element = CFType::wrap_under_create_rule(element_ref);
-
-            Some(Element {
-                role: copy_string_attr(&element, ROLE),
-                title: copy_string_attr(&element, TITLE),
-                description: copy_string_attr(&element, DESCRIPTION),
-                value: copy_string_attr(&element, VALUE),
-            })
-        }
-    }
-
-    // Read any CFType-valued AX attribute (a +1 Copy-rule ref, released on drop).
-    unsafe fn copy_element_attr(element: &CFType, attribute: &str) -> Option<CFType> {
-        let attr = CFString::new(attribute);
-        let mut value_ref: CFTypeRef = std::ptr::null();
-        let err = AXUIElementCopyAttributeValue(
-            element.as_CFTypeRef(),
-            attr.as_concrete_TypeRef(),
-            &mut value_ref,
-        );
-        if err != 0 || value_ref.is_null() {
-            return None;
-        }
-        Some(CFType::wrap_under_create_rule(value_ref))
-    }
-
-    // Read a string-valued AX attribute. Non-string values (e.g. a slider's number)
-    // downcast to None — we only surface text labels.
-    unsafe fn copy_string_attr(element: &CFType, attribute: &str) -> Option<String> {
-        copy_element_attr(element, attribute)?
-            .downcast::<CFString>()
-            .map(|s| s.to_string())
-    }
-
-    /// An interactive element with its global-logical frame.
-    pub struct Node {
-        pub role: Option<String>,
-        pub title: Option<String>,
-        pub x: f64,
-        pub y: f64,
-        pub w: f64,
-        pub h: f64,
-    }
-
-    // --- accessibility activation (M28 B4) -----------------------------------
-
-    /// Chromium/Electron's opt-in switch: the family builds its AX tree only for
-    /// detected assistive clients, and this per-app attribute is the documented
-    /// way to request it manually. Current Chrome refuses it (and serves its
-    /// tree to a querying client regardless); Electron-family builds honor it.
-    pub const MANUAL_ACCESSIBILITY: &str = "AXManualAccessibility";
-    /// Second choice ONLY on a typed rejection: it also flips apps into an
-    /// enhanced-UI mode window managers react to (layout side effects), which
-    /// is why it is never tried first.
-    pub const ENHANCED_UI: &str = "AXEnhancedUserInterface";
-    /// AXError `kAXErrorAttributeUnsupported`.
-    const ATTRIBUTE_UNSUPPORTED: i32 = -25205;
-    /// AXError `kAXErrorNotImplemented` — what a process that does not
-    /// implement the attribute's setter answers (observed live from Chrome and
-    /// from non-Chromium apps).
-    const NOT_IMPLEMENTED: i32 = -25208;
-
-    /// The typed rejections that mean "this attribute is not a thing here" —
-    /// the deterministic criterion for trying the second attribute.
-    pub fn attribute_rejected(code: i32) -> bool {
-        code == ATTRIBUTE_UNSUPPORTED || code == NOT_IMPLEMENTED
-    }
-
-    /// `(pid, attribute)` pairs this process switched ON — cleared on the exit
-    /// paths so one enumeration never leaves an app in an altered AX mode.
-    static ACTIVATED: Mutex<Vec<(i32, &'static str)>> = Mutex::new(Vec::new());
-
-    /// Ask ONE application — the pid the caller resolved off the window list —
-    /// to expose its accessibility tree. Returns the attribute that activated,
-    /// or a typed reason. Setting the attribute on an app that does not gate
-    /// its tree is a harmless typed error — callers attempt unconditionally on
-    /// an empty enumeration, no app-family sniffing.
-    pub fn activate_accessibility(pid: i32) -> Result<&'static str, String> {
-        unsafe {
-            let app_ref = AXUIElementCreateApplication(pid);
-            if app_ref.is_null() {
-                return Err(format!("no accessibility connection to pid {pid}"));
-            }
-            let app = CFType::wrap_under_create_rule(app_ref);
-
-            match set_bool_attr(&app, MANUAL_ACCESSIBILITY, true) {
-                0 => {
-                    record(pid, MANUAL_ACCESSIBILITY);
-                    Ok(MANUAL_ACCESSIBILITY)
-                }
-                code if attribute_rejected(code) => match set_bool_attr(&app, ENHANCED_UI, true) {
-                    0 => {
-                        record(pid, ENHANCED_UI);
-                        Ok(ENHANCED_UI)
-                    }
-                    code => Err(format!("AXError {code}")),
-                },
-                code => Err(format!("AXError {code}")),
-            }
-        }
-    }
-
-    /// Best-effort teardown: switch OFF every attribute this process switched on.
-    pub fn clear_activations() {
-        let entries: Vec<(i32, &'static str)> = match ACTIVATED.lock() {
-            Ok(mut list) => list.drain(..).collect(),
-            Err(_poisoned) => return,
-        };
-
-        for (pid, attribute) in entries {
-            unsafe {
-                let app_ref = AXUIElementCreateApplication(pid);
-                if app_ref.is_null() {
-                    continue;
-                }
-                let app = CFType::wrap_under_create_rule(app_ref);
-                let _ = set_bool_attr(&app, attribute, false);
-            }
-        }
-    }
-
-    /// Record an activation the CAPTURE engine performed. Capture drives its own
-    /// set (it reads the prior value first and sequences two attributes), but the
-    /// teardown ledger is shared: one list, so the process-exit `clear_activations`
-    /// also undoes capture's switches on a path that never reaches its detach (a
-    /// panicked observer thread, a failed join).
-    pub fn record_activation(pid: i32, attribute: &'static str) {
-        record(pid, attribute);
-    }
-
-    /// Switch OFF every attribute this process turned on for ONE app (capture's
-    /// detach). Returns one message per attribute that could NOT be cleared, so the
-    /// caller logs the failure rather than hiding it; an app with nothing recorded
-    /// makes no AX call at all.
-    pub fn clear_activation(pid: i32) -> Vec<String> {
-        let mut failures = Vec::new();
-        for attribute in take_recorded(pid) {
-            unsafe {
-                let app_ref = AXUIElementCreateApplication(pid);
-                if app_ref.is_null() {
-                    failures.push(format!(
-                        "no accessibility connection to pid {pid} to clear {attribute}"
-                    ));
-                    continue;
-                }
-                let app = CFType::wrap_under_create_rule(app_ref);
-                let code = set_bool_attr(&app, attribute, false);
-                if code != 0 {
-                    failures.push(format!("could not clear {attribute} (AXError {code})"));
-                }
-            }
-        }
-        failures
-    }
-
-    /// Remove and return the attributes recorded for one pid, leaving every other
-    /// app's records in place.
-    fn take_recorded(pid: i32) -> Vec<&'static str> {
-        let mut mine = Vec::new();
-        if let Ok(mut list) = ACTIVATED.lock() {
-            list.retain(|(recorded_pid, attribute)| {
-                if *recorded_pid == pid {
-                    mine.push(*attribute);
-                    return false;
-                }
-                true
-            });
-        }
-        mine
-    }
-
-    fn record(pid: i32, attribute: &'static str) {
-        if let Ok(mut list) = ACTIVATED.lock() {
-            if !list.contains(&(pid, attribute)) {
-                list.push((pid, attribute));
-            }
-        }
-    }
-
-    unsafe fn set_bool_attr(element: &CFType, attribute: &str, value: bool) -> i32 {
-        let attr = CFString::new(attribute);
-        let flag = if value {
-            CFBoolean::true_value()
-        } else {
-            CFBoolean::false_value()
-        };
-        AXUIElementSetAttributeValue(
-            element.as_CFTypeRef(),
-            attr.as_concrete_TypeRef(),
-            flag.as_CFTypeRef(),
-        )
-    }
-
-    /// Walk ONE application's accessibility tree — rooted at its own
-    /// application element, never at `AXFocusedApplication` (a query that
-    /// proved flaky from this spawned process and, during a voice call, can
-    /// name the floating companion instead of the app on screen) — and collect
-    /// interactive elements (bounded depth + count) with global-logical frames.
-    /// NON-PROMPTING, read-only; runtime behavior needs a real Mac with the
-    /// Accessibility grant.
-    pub fn interactive_elements_of(pid: i32) -> Vec<Node> {
-        unsafe {
-            let app_ref = AXUIElementCreateApplication(pid);
-            if app_ref.is_null() {
-                return Vec::new();
-            }
-            let root = CFType::wrap_under_create_rule(app_ref);
-            let mut out = Vec::new();
-            let mut visited = 0;
-            walk(&root, 0, &mut visited, &mut out);
-            out
-        }
-    }
-
-    unsafe fn walk(element: &CFType, depth: usize, visited: &mut usize, out: &mut Vec<Node>) {
-        if depth > MAX_DEPTH || out.len() >= MAX_NODES || *visited >= MAX_VISITED {
-            return;
-        }
-        *visited += 1;
-        if let Some(node) = interactive_node(element) {
-            out.push(node);
-        }
-        for child in copy_children(element) {
-            walk(&child, depth + 1, visited, out);
-        }
-    }
-
-    unsafe fn interactive_node(element: &CFType) -> Option<Node> {
-        let role = copy_string_attr(element, ROLE)?;
-        if !INTERACTIVE.contains(&role.as_str()) {
-            return None;
-        }
-        let (x, y, w, h) = element_frame(element)?;
-        Some(Node {
-            title: copy_string_attr(element, TITLE)
-                .or_else(|| copy_string_attr(element, DESCRIPTION))
-                .or_else(|| copy_string_attr(element, VALUE)),
-            role: Some(role),
-            x,
-            y,
-            w,
-            h,
-        })
-    }
-
-    unsafe fn copy_children(element: &CFType) -> Vec<CFType> {
-        let Some(children) = copy_element_attr(element, CHILDREN) else {
-            return Vec::new();
-        };
-        let array = children.as_CFTypeRef();
-        // AXChildren SHOULD be a CFArray, but an app with a custom/broken AX impl can
-        // return another CFType; the CFArray getters would then type-confuse and read
-        // garbage. Verify the concrete type before treating it as an array.
-        if CFGetTypeID(array) != CFArrayGetTypeID() {
-            return Vec::new();
-        }
-        let count = CFArrayGetCount(array);
-        let mut out = Vec::new();
-        let mut index = 0;
-        while index < count && out.len() < MAX_NODES {
-            let child_ref = CFArrayGetValueAtIndex(array, index);
-            if !child_ref.is_null() {
-                out.push(CFType::wrap_under_get_rule(child_ref));
-            }
-            index += 1;
-        }
-        out
-    }
-
-    unsafe fn element_frame(element: &CFType) -> Option<(f64, f64, f64, f64)> {
-        let position = copy_element_attr(element, POSITION)?;
-        let size = copy_element_attr(element, SIZE)?;
-        let mut point = CGPoint { x: 0.0, y: 0.0 };
-        let mut dims = CGSize {
-            width: 0.0,
-            height: 0.0,
-        };
-        let got_point = AXValueGetValue(
-            position.as_CFTypeRef(),
-            AXVALUE_CGPOINT,
-            &mut point as *mut _ as *mut c_void,
-        );
-        let got_size = AXValueGetValue(
-            size.as_CFTypeRef(),
-            AXVALUE_CGSIZE,
-            &mut dims as *mut _ as *mut c_void,
-        );
-        if got_point && got_size && dims.width > 0.0 && dims.height > 0.0 {
-            Some((point.x, point.y, dims.width, dims.height))
-        } else {
-            None
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        // The teardown ledger is shared with the capture engine (one list, so a
-        // panicked observer thread still has its switches undone at process exit).
-        // Clearing ONE app must therefore drain that app's records and nobody else's.
-        // Pure bookkeeping only — no AX call is made for an app with no records.
-        #[test]
-        fn take_recorded_drains_only_the_requested_app() {
-            let (app_a, app_b) = (0x7f00_0001, 0x7f00_0002);
-            record(app_a, MANUAL_ACCESSIBILITY);
-            record(app_a, ENHANCED_UI);
-            record(app_b, MANUAL_ACCESSIBILITY);
-
-            assert!(
-                take_recorded(0x7f00_0003).is_empty(),
-                "an app with nothing recorded yields nothing to clear"
-            );
-
-            let mut drained = take_recorded(app_a);
-            drained.sort_unstable();
-            assert_eq!(drained, vec![ENHANCED_UI, MANUAL_ACCESSIBILITY]);
-            assert!(
-                take_recorded(app_a).is_empty(),
-                "a drained app is not cleared twice"
-            );
-            assert_eq!(
-                take_recorded(app_b),
-                vec![MANUAL_ACCESSIBILITY],
-                "another app's record survived"
-            );
-        }
-    }
-}
-
 // --- helpers ----------------------------------------------------------------
 
 /// After a mutating action, include the post-action screen state when the request
@@ -3186,11 +3391,7 @@ fn post(
     worker: &mut Worker,
     executed: Option<(i32, i32)>,
 ) -> Result<Value, Failure> {
-    if req
-        .get("screenshot_after")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+    if wants_check_image(req) {
         let overlays = Overlays {
             rulers: req.get("rulers").and_then(Value::as_bool).unwrap_or(false),
             marks: false,
@@ -3200,6 +3401,14 @@ fn post(
     } else {
         Ok(json!({ "ok": true }))
     }
+}
+
+/// Did this request ask for the screen back afterwards? One reader, so the two
+/// call sites cannot disagree about whether a display is needed.
+fn wants_check_image(req: &Value) -> bool {
+    req.get("screenshot_after")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn parse_point(req: &Value, field: &str) -> Result<Point, String> {
@@ -3278,9 +3487,16 @@ mod tests {
 
     /// A worker with an empty table, for a test that drives one action directly.
     fn idle_worker(gate: &Gate) -> Worker {
+        worker_with(gate, Rc::new(ax::Real::new()))
+    }
+
+    /// A worker over a given accessibility platform, so an action that acts on a
+    /// control is driven against the recording one.
+    fn worker_with(gate: &Gate, ax: Rc<dyn ax::Ax>) -> Worker {
         Worker {
             observations: Observations::new(&gate.envelope().sidecar_generation, gate.clock()),
             measured: Measured::new(),
+            ax,
         }
     }
 
@@ -3305,6 +3521,7 @@ mod tests {
             authorization_generation: None,
             mutation_seq: None,
             observation_id: body["observation_id"].as_str().map(str::to_string),
+            element_ref: body["element_ref"].as_str().map(str::to_string),
         }
     }
 
@@ -3662,7 +3879,6 @@ mod tests {
     }
 
     /// A badge paints its red disc/pill centered on the mark point.
-    #[cfg(target_os = "macos")]
     #[test]
     fn badge_is_centered_on_the_mark_point() {
         let mut img = blank(120, 80);
@@ -3719,9 +3935,15 @@ mod tests {
         let geom = Geometry::from_facts(&facts, measured, Host::MacOs);
         let region = Region::full(&geom);
         let sent = crop_rect(&geom, &region).sent_dims();
-        let observation = worker
-            .observations
-            .mint(Kind::Image, 424_242, facts, geom, region, sent);
+        let observation = worker.observations.mint(observation::Minting {
+            kind: Kind::Image,
+            display_id: 424_242,
+            facts,
+            geometry: geom,
+            region,
+            sent,
+            elements: None,
+        });
 
         (worker, observation)
     }
@@ -4090,6 +4312,7 @@ mod tests {
             authorization_generation: Some(1),
             mutation_seq,
             observation_id: wire::addresses_an_image(action).then(|| "7c1e-1".to_string()),
+            element_ref: wire::addresses_an_element(action).then(|| "e1".to_string()),
         }
     }
 
@@ -4233,7 +4456,8 @@ mod tests {
         assert!(frame["actions"].is_array());
         assert_eq!(
             frame["capabilities"]["input_methods"],
-            json!(["foreground_hid"])
+            json!(["foreground_hid", "ax"]),
+            "a caller reads which methods this build really has"
         );
         assert_eq!(
             frame["capabilities"]["controls"],
@@ -4368,4 +4592,630 @@ mod tests {
         assert!(frame.get("sidecar_generation").is_none());
         assert!(frame.get("receipt").is_none());
     }
+
+    // --- M42 slice 4: a control has a name -----------------------------------
+    //
+    // Every one of these runs through `serve`, so it exercises the same path a
+    // real request takes — admit, act, reply — against a scripted application.
+    // Nothing here makes an accessibility call, so they hold on a host with no
+    // grant, which is every host these were written on.
+
+    /// The scripted application every test below reads.
+    const FIXTURE_PID: i32 = 4711;
+
+    fn frame_at(x: f64, y: f64) -> ax::Frame {
+        ax::Frame {
+            x,
+            y,
+            w: 80.0,
+            h: 24.0,
+        }
+    }
+
+    /// Two controls: a pressable button and a settable field, the two capabilities
+    /// the slice adds.
+    fn fixture_app() -> Rc<ax::Recorder> {
+        ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                ax::Scripted::button("Save", frame_at(100.0, 200.0)),
+                ax::Scripted::field("Name", "ada", frame_at(100.0, 260.0)),
+            ],
+        )
+    }
+
+    /// A worker holding one `elements` reply over a scripted application, and the
+    /// observation that names it.
+    fn worker_listing(gate: &Gate, recorder: &Rc<ax::Recorder>) -> (Worker, Observation) {
+        let platform: Rc<dyn ax::Ax> = recorder.clone();
+        let mut worker = worker_with(gate, platform.clone());
+
+        let found = ax::walk(&platform, FIXTURE_PID, gate.clock().as_ref(), u64::MAX);
+        let entries: Vec<ax::Entry> = found
+            .nodes
+            .into_iter()
+            .enumerate()
+            .map(|(index, node)| ax::Entry {
+                reference: ax::reference_for(index),
+                role: node.role,
+                secure: node.secure,
+                element: node.element,
+            })
+            .collect();
+
+        let facts = MonitorFacts {
+            x: 0,
+            y: 0,
+            width: 1512,
+            height: 982,
+            scale_factor: 2.0,
+        };
+        let measured = geometry::Measurement {
+            frame_w: 3024,
+            frame_h: 1964,
+            pixels_per_point: 2.0,
+        };
+        let geom = Geometry::from_facts(&facts, measured, Host::MacOs);
+        let region = Region::full(&geom);
+        let sent = crop_rect(&geom, &region).sent_dims();
+
+        let observation = worker.observations.mint(observation::Minting {
+            kind: Kind::Semantic,
+            display_id: 424_242,
+            facts,
+            geometry: geom,
+            region,
+            sent,
+            elements: Some(Rc::new(ax::Elements::new(
+                FIXTURE_PID,
+                recorder.started_at(),
+                entries,
+            ))),
+        });
+
+        (worker, observation)
+    }
+
+    /// One request addressed at a control of that observation.
+    ///
+    /// Each gets its own sequence number, increasing across the whole test module:
+    /// the gate refuses a repeat as `stale_mutation`, so a test that served twice
+    /// would otherwise be reading that instead of what it is about.
+    fn at_element(action: &str, observation: &Observation, reference: &str) -> wire::Request {
+        static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = NEXT_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let mut request = running(action, Some(seq));
+        request.observation_id = Some(observation.id.clone());
+        request.element_ref = Some(reference.to_string());
+        request.body = json!({
+            "action": action,
+            "observation_id": observation.id,
+            "element_ref": reference,
+        });
+        request
+    }
+
+    /// A `set_value` of that text at a control of that observation.
+    fn set_to(observation: &Observation, reference: &str, value: &str) -> wire::Request {
+        let mut request = at_element("set_value", observation, reference);
+        request.body["value"] = json!(value);
+        request
+    }
+
+    fn served(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Value {
+        serve(request, gate, &capture::Emitter::new(), worker)
+    }
+
+    // The happy path, and every fact the receipt is for: it went through the
+    // accessibility API, one press reached the control the caller named, and the
+    // foreground did not move — which is the promise the whole action exists for.
+    #[test]
+    fn a_press_reaches_the_named_control_without_taking_the_foreground() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let frame = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+
+        assert_eq!(frame["ok"], json!(true));
+        assert_eq!(frame["receipt"]["dispatch"], json!("sent"));
+        assert_eq!(frame["receipt"]["input_method"], json!("ax"));
+        assert_eq!(
+            frame["receipt"]["effect"],
+            json!("not_observed"),
+            "a clean accessibility return is a dispatch result, not an effect"
+        );
+        assert_eq!(frame["receipt"]["foreground_changed"], json!(false));
+        assert_eq!(
+            frame["receipt"]["observation_id_before"],
+            json!(observation.id)
+        );
+
+        let performed = app.performed();
+        assert_eq!(performed.len(), 1, "exactly one press: {performed:?}");
+        assert_eq!(performed[0].1, ax::PRESS);
+    }
+
+    // The foreground moving is a background-contract violation, and this slice
+    // reports it truthfully rather than hiding it or failing the action.
+    #[test]
+    fn a_press_that_moved_the_foreground_says_so() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        // Another application takes the front WHILE the press runs.
+        app.takes_foreground(Some(FIXTURE_PID + 1));
+        let frame = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+
+        assert_eq!(frame["ok"], json!(true));
+        assert_eq!(frame["receipt"]["foreground_changed"], json!(true));
+
+        // A platform that will not say leaves the field OFF THE WIRE. Publishing
+        // `false` there would assert the background contract held on evidence this
+        // build does not have — and the support matrix is filled in from this
+        // field, so a guess in it is a qualification nobody earned.
+        app.set_frontmost(None);
+        let frame = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+        assert!(
+            frame["receipt"].get("foreground_changed").is_none(),
+            "an unanswered question is not a false: {}",
+            frame["receipt"]
+        );
+    }
+
+    // The receipt must not say a message went out when the platform says it never
+    // left. Every host without the Accessibility grant answers exactly this, and
+    // the Linux stub answers it for every call, so `dispatch: sent` there would be
+    // the ordinary case rather than the rare one.
+    #[test]
+    fn a_message_the_platform_never_sent_reports_nothing_sent() {
+        for (label, refusal) in [
+            ("the accessibility API is disabled", "AXError -25211"),
+            ("the element is gone", "AXError -25202"),
+            (
+                "no accessibility API at all",
+                "not supported on this platform",
+            ),
+        ] {
+            let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+            let app = fixture_app();
+            let (mut worker, observation) = worker_listing(&gate, &app);
+            app.fail_next(ax::Refusal::new(false, refusal));
+
+            let frame = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+
+            assert_eq!(frame["error"], json!("ax_action_failed"), "{label}");
+            assert_eq!(
+                frame["receipt"]["dispatch"],
+                json!("not_sent"),
+                "{label}: the platform says nothing left this process"
+            );
+            assert_eq!(frame["receipt"]["effect"], json!("unknown"), "{label}");
+        }
+    }
+
+    // The complement, so the rule cannot simply be "never sent": the one refusal
+    // that arrives AFTER the message went out still reports `sent`, and a clean
+    // return does too.
+    #[test]
+    fn a_message_that_did_go_out_reports_sent_however_it_ended() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        app.fail_next(ax::Refusal::new(true, "AXError -25204"));
+        let timed_out = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+        assert_eq!(timed_out["receipt"]["dispatch"], json!("sent"));
+
+        let landed = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+        assert_eq!(landed["receipt"]["dispatch"], json!("sent"));
+        assert_eq!(landed["ok"], json!(true));
+    }
+
+    // A control that does not list `AXPress` is REFUSED, and the helper never
+    // clicks it instead. Which of the two to send is the caller's decision; a
+    // silent substitution is the fallback this build refuses to have.
+    #[test]
+    fn a_control_that_cannot_be_pressed_is_refused_and_never_clicked_instead() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        // e2 is the text field: settable, and it lists no press action.
+        let frame = served(&at_element("press", &observation, "e2"), &gate, &mut worker);
+
+        assert_eq!(frame["error"], json!("ax_action_unsupported"));
+        assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"));
+        assert!(
+            frame["detail"].as_str().unwrap().contains("click it"),
+            "the sentence must name the next move: {}",
+            frame["detail"]
+        );
+        assert!(app.performed().is_empty(), "nothing may have been sent");
+    }
+
+    // A disabled control says so, and says not to retry: the model that cannot
+    // see the greyed-out button invents a reason it is missing.
+    #[test]
+    fn a_disabled_control_is_refused_by_name() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.change(0, |element| element.enabled = false);
+
+        let frame = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+
+        assert_eq!(frame["error"], json!("element_disabled"));
+        assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"));
+        assert!(app.performed().is_empty());
+    }
+
+    // Three ways a reference stops naming what it named, and one answer, because
+    // the next move is the same for all three: take the list again.
+    #[test]
+    fn a_reference_that_no_longer_names_what_it_named_is_stale() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+
+        // The application quit. A pid alone would not catch this: the next process
+        // to get 4711 would answer for it.
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.set_started_at(None);
+        let frame = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+        assert_eq!(frame["error"], json!("stale_element"));
+        assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"));
+
+        // The pid was REUSED by another process: alive, and a different start time.
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.set_started_at(Some(9_999_000_000));
+        let frame = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+        assert_eq!(frame["error"], json!("stale_element"));
+
+        // The reference now answers a different role, so it is not the control the
+        // caller was shown.
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.change(0, |element| element.role = "AXTextField".to_string());
+        let frame = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+        assert_eq!(frame["error"], json!("stale_element"));
+        assert!(frame["detail"].as_str().unwrap().contains("AXTextField"));
+
+        assert!(app.performed().is_empty(), "none of these sent anything");
+    }
+
+    // A reference nobody minted, and one against an image that listed no controls
+    // at all. Both are `stale_element`: the next move is to take a list.
+    #[test]
+    fn a_reference_this_observation_never_listed_is_refused() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let frame = served(&at_element("press", &observation, "e9"), &gate, &mut worker);
+        assert_eq!(frame["error"], json!("stale_element"));
+        assert!(frame["detail"].as_str().unwrap().contains("2 controls"));
+
+        // A plain screenshot lists no controls, so it holds no references — minted
+        // into the SAME table, so it is a second observation and not the first one
+        // under another name.
+        let image = worker.observations.mint(observation::Minting {
+            kind: Kind::Image,
+            display_id: observation.display_id,
+            facts: observation.facts,
+            geometry: observation.geometry,
+            region: observation.region,
+            sent: (observation.sent_w, observation.sent_h),
+            elements: None,
+        });
+        assert_ne!(image.id, observation.id);
+
+        let frame = served(&at_element("press", &image, "e1"), &gate, &mut worker);
+        assert_eq!(frame["error"], json!("stale_element"));
+        assert!(frame["detail"]
+            .as_str()
+            .unwrap()
+            .contains("listed no controls"));
+    }
+
+    // The read-back is the whole of `verified`, and it is the only thing in this
+    // build that earns it.
+    #[test]
+    fn a_set_value_verifies_only_when_the_read_back_matches() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let frame = served(&set_to(&observation, "e2", "grace"), &gate, &mut worker);
+
+        assert_eq!(frame["ok"], json!(true));
+        assert_eq!(frame["receipt"]["effect"], json!("verified"));
+        assert_eq!(frame["receipt"]["input_method"], json!("ax"));
+        assert_eq!(frame["verified"], json!(true));
+        assert_eq!(frame["value"], json!("grace"), "what the field holds now");
+    }
+
+    // A field that stores something else — a formatter, a mask, a control that
+    // rejected part of it — is `not_observed`, never `verified`.
+    #[test]
+    fn a_set_value_the_field_changed_is_not_verified() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.writes_instead("GRACE");
+
+        let frame = served(&set_to(&observation, "e2", "grace"), &gate, &mut worker);
+
+        assert_eq!(frame["ok"], json!(true));
+        assert_eq!(frame["receipt"]["effect"], json!("not_observed"));
+        assert_eq!(frame["verified"], json!(false));
+        assert_eq!(frame["value"], json!("GRACE"));
+    }
+
+    // A secure field reads back masked, so it can never verify — and its value is
+    // withheld rather than published as a row of bullets.
+    #[test]
+    fn a_secure_field_never_verifies_and_never_reports_its_value() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        // A password field keeps the ORDINARY text-field role and is told apart by
+        // its SUBROLE. Setting the role here instead is the mistake that published
+        // every password field's value, so the fixture models the real shape.
+        app.change(1, |element| {
+            element.subrole = Some(ax::SECURE_SUBROLE.to_string());
+        });
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let frame = served(&set_to(&observation, "e2", "hunter2"), &gate, &mut worker);
+
+        assert_eq!(frame["ok"], json!(true));
+        assert_eq!(frame["receipt"]["effect"], json!("not_observed"));
+        assert_eq!(frame["verified"], json!(false));
+        assert!(
+            frame.get("value").is_none(),
+            "a secure field's value never reaches the wire"
+        );
+    }
+
+    #[test]
+    fn a_control_whose_value_is_not_settable_is_refused() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        // e1 is the button: pressable, and its value is not settable.
+        let frame = served(&set_to(&observation, "e1", "nope"), &gate, &mut worker);
+
+        assert_eq!(frame["error"], json!("ax_action_unsupported"));
+        assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"));
+        assert!(frame["detail"].as_str().unwrap().contains("type or paste"));
+    }
+
+    // The case the receipt exists for: the message went out and the answer never
+    // came. Nothing may repeat it, and the receipt says so in the only two words
+    // that mean it — sent, and unknown.
+    #[test]
+    fn an_accessibility_call_that_timed_out_reports_sent_and_unknown() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.fail_next(ax::Refusal::new(true, "AXError -25204"));
+
+        let frame = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+
+        assert_eq!(frame["error"], json!("ax_timed_out"));
+        assert_eq!(frame["receipt"]["dispatch"], json!("sent"));
+        assert_eq!(frame["receipt"]["effect"], json!("unknown"));
+        assert_eq!(frame["receipt"]["input_method"], json!("ax"));
+    }
+
+    // A refusal the application made after receiving the message is NOT
+    // `stale_element`, which promises nothing was sent.
+    #[test]
+    fn an_application_that_refused_the_message_is_not_reported_as_stale() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.fail_next(ax::Refusal::new(false, "AXError -25200"));
+
+        let frame = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+
+        assert_eq!(frame["error"], json!("ax_action_failed"));
+        assert!(frame["detail"].as_str().unwrap().contains("-25200"));
+    }
+
+    // Through the gate exactly like a click: a pause stops it, and the receipt
+    // says nothing was sent.
+    #[test]
+    fn a_paused_press_is_refused_with_nothing_sent() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let paused = gate.control(wire::ControlAction::Pause, None);
+        let mut request = at_element("press", &observation, "e1");
+        request.authorization_generation = Some(paused.authorization_generation);
+
+        let frame = served(&request, &gate, &mut worker);
+
+        assert_eq!(frame["error"], json!("paused"));
+        assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"));
+        assert!(app.performed().is_empty());
+    }
+
+    // The point of addressing a pointer action by control: the bounds are read
+    // AGAIN at the moment it acts, so a control that moved is clicked where it is
+    // now rather than where it was listed.
+    #[test]
+    fn a_click_by_reference_reads_the_bounds_again_at_the_moment_it_acts() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (worker, observation) = worker_listing(&gate, &app);
+
+        let request = at_element("left_click", &observation, "e1");
+        let listed = aim(&request, &observation, &worker).expect("a control to aim at");
+        assert_eq!(listed, (140, 212), "the centre of the listed frame");
+
+        app.change(0, |element| element.frame = frame_at(500.0, 600.0));
+        let moved = aim(&request, &observation, &worker).expect("still a control to aim at");
+        assert_eq!(moved, (540, 612), "the centre of where it is NOW");
+    }
+
+    // A control that is gone is refused rather than clicked at the place it used
+    // to be, which is the one thing a stale coordinate would do.
+    #[test]
+    fn a_click_by_reference_on_a_gone_control_is_refused_rather_than_aimed() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.set_started_at(None);
+
+        let frame = served(
+            &at_element("left_click", &observation, "e1"),
+            &gate,
+            &mut worker,
+        );
+
+        assert_eq!(frame["error"], json!("stale_element"));
+        assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"));
+        assert_eq!(
+            frame["receipt"]["input_method"],
+            json!("foreground_hid"),
+            "a click by reference is still the pointer"
+        );
+    }
+
+    // Every refusal above leaves the references exactly as it found them: a
+    // refused action must not leak a retain, and must not release one the
+    // observation still holds.
+    #[test]
+    fn a_refused_action_changes_nothing_about_what_is_retained() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        assert_eq!(app.counts(), (2, 0, 2));
+
+        app.change(0, |element| element.enabled = false);
+        served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+        served(&at_element("press", &observation, "e9"), &gate, &mut worker);
+        served(&set_to(&observation, "e1", "nope"), &gate, &mut worker);
+
+        assert_eq!(app.counts(), (2, 0, 2), "a refusal is not a release");
+
+        drop(observation);
+        drop(worker);
+        assert_eq!(app.counts(), (2, 2, 0), "and everything goes in the end");
+    }
+
+    // The shape of one element on the wire. Written out in full because it is the
+    // contract the caller's summary is built from, and because every field here
+    // was read from the control itself rather than guessed from its role.
+    #[test]
+    fn an_element_is_published_with_everything_needed_to_name_and_judge_it() {
+        let app = fixture_app();
+        let platform: Rc<dyn ax::Ax> = app.clone();
+        let clock = SystemClock::new();
+        app.change(0, |element| {
+            element.path = vec!["Document".to_string(), "Toolbar".to_string()]
+        });
+
+        // A 1x display, so the bounds in this reply's pixels are the same numbers
+        // as the frame the walk read; the mapping itself is `geometry`'s to prove.
+        let facts = MonitorFacts {
+            x: 0,
+            y: 0,
+            width: 1366,
+            height: 768,
+            scale_factor: 1.0,
+        };
+        let geom = Geometry::from_facts(
+            &facts,
+            geometry::Measurement {
+                frame_w: 1366,
+                frame_h: 768,
+                pixels_per_point: 1.0,
+            },
+            Host::MacOs,
+        );
+        let region = Region::full(&geom);
+
+        let found = ax::walk(&platform, FIXTURE_PID, &clock, u64::MAX);
+        let button = element_value(&found.nodes[0], Some("e1"), (140, 212), &geom, &region);
+        let field = element_value(&found.nodes[1], Some("e2"), (140, 272), &geom, &region);
+
+        assert_eq!(
+            button,
+            json!({
+                "element_ref": "e1",
+                "role": "AXButton",
+                "label": "Save",
+                "enabled": true,
+                "actions": ["press"],
+                "settable": false,
+                "bounds": { "x": 100, "y": 200, "w": 80, "h": 24 },
+                "path": ["Document", "Toolbar"],
+                "x": 140,
+                "y": 212
+            })
+        );
+
+        assert_eq!(field["actions"], json!([]), "it lists no press of its own");
+        assert_eq!(field["settable"], json!(true));
+        assert_eq!(field["value"], json!("ada"));
+        assert!(
+            field.get("path").is_none(),
+            "an element with no ancestry carries no path"
+        );
+
+        // A reply that cannot resolve references offers none. Listing `e1` beside
+        // a table that would answer `stale_element` the moment it was used is a
+        // promise this build cannot keep.
+        let unnamed = element_value(&found.nodes[0], None, (140, 212), &geom, &region);
+        assert!(unnamed.get("element_ref").is_none());
+        assert!(
+            unnamed.get("actions").is_none(),
+            "nothing may be offered on a control that cannot be named"
+        );
+        assert_eq!(unnamed["role"], json!("AXButton"), "it is still listed");
+        assert_eq!(
+            unnamed["x"],
+            json!(140),
+            "with the point it can be clicked at"
+        );
+    }
+
+    // A walk that stopped early SAYS it stopped early. Without that a caller reads
+    // a partial tree as the whole one and concludes a control is not there, which
+    // is the one wrong answer an element list can give.
+    #[test]
+    fn a_truncated_walk_is_named_on_the_reply() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let platform: Rc<dyn ax::Ax> = app.clone();
+
+        let viewed = Viewed {
+            nodes: Vec::new(),
+            owner: None,
+            truncated: Some("time"),
+            note: Some("read Fixture".to_string()),
+        };
+        let mut payload = json!({ "ok": true, "elements": [] });
+        if let (Some(object), Some(truncation)) = (payload.as_object_mut(), viewed.truncated) {
+            object.insert("truncated".to_string(), json!(truncation));
+        }
+        assert_eq!(payload["truncated"], json!("time"));
+
+        // And the budget that produces it is the walk's own, not the caller's.
+        app.costs_per_node(WALK_COST_MS);
+        let deadline = gate.now_ms().saturating_add(ax::WALK_BUDGET_MS);
+        let found = ax::walk(&platform, FIXTURE_PID, gate.clock().as_ref(), deadline);
+        assert_eq!(found.truncated, Some("time"));
+        assert_eq!(app.walks(), 1);
+    }
+
+    /// More than the whole walk budget for one node, so the second one cannot be
+    /// reached.
+    const WALK_COST_MS: u64 = ax::WALK_BUDGET_MS - 1;
 }

@@ -21,8 +21,10 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::ax::Elements;
 use crate::gate::Clock;
 use crate::geometry::{Geometry, MonitorFacts, Region};
 
@@ -79,6 +81,15 @@ pub struct Observation {
     /// One counter per process, images only, so a reader can order the pictures a
     /// session produced.
     pub frame_seq: Option<u64>,
+    /// The controls this reply listed, and the native references behind them.
+    ///
+    /// Shared rather than owned, because an action COPIES the observation it named
+    /// and then goes on to mint its own check image into the same table; a copy
+    /// must not retain a second time, and must not release while the action is
+    /// still using it. The last copy to go releases them all, so a reference dies
+    /// with its observation — evicted, expired, cleared by a `release` control, or
+    /// gone with the helper.
+    pub elements: Option<Rc<Elements>>,
 }
 
 /// Why an observation cannot be used. Each is its own sentence to the model and
@@ -146,6 +157,23 @@ pub struct Observations {
     clock: Arc<dyn Clock>,
 }
 
+/// Everything about one reply that is not its pixels: which display it was made
+/// on, the transform it was made with, the rectangle it covers, its size, and the
+/// controls it listed.
+///
+/// A struct rather than seven arguments, because six were already more than a
+/// call site could be read at a glance and the seventh is the one that owns
+/// native memory.
+pub struct Minting {
+    pub kind: Kind,
+    pub display_id: u32,
+    pub facts: MonitorFacts,
+    pub geometry: Geometry,
+    pub region: Region,
+    pub sent: (u32, u32),
+    pub elements: Option<Rc<Elements>>,
+}
+
 impl Observations {
     pub fn new(sidecar_generation: &str, clock: Arc<dyn Clock>) -> Observations {
         Observations {
@@ -159,22 +187,15 @@ impl Observations {
 
     /// Record what a reply is about to hand out, and answer the id that names it.
     /// The oldest goes out when the table is full, and anything already expired
-    /// goes with it — a stale entry that nobody asked for still costs a slot.
-    pub fn mint(
-        &mut self,
-        kind: Kind,
-        display_id: u32,
-        facts: MonitorFacts,
-        geometry: Geometry,
-        region: Region,
-        sent: (u32, u32),
-    ) -> Observation {
+    /// goes with it — a stale entry that nobody asked for still costs a slot, and
+    /// the native references it holds are released as it goes.
+    pub fn mint(&mut self, minting: Minting) -> Observation {
         let now = self.clock.now_ms();
         self.entries
             .retain(|entry| now.saturating_sub(entry.captured_at_ms()) < TTL_MS);
 
         self.counter += 1;
-        let frame_seq = match kind {
+        let frame_seq = match minting.kind {
             Kind::Image => {
                 self.frame_seq += 1;
                 Some(self.frame_seq)
@@ -184,15 +205,16 @@ impl Observations {
 
         let observation = Observation {
             id: format!("{}-{}", self.prefix, self.counter),
-            kind,
-            display_id,
-            facts,
-            geometry,
-            region,
-            sent_w: sent.0,
-            sent_h: sent.1,
+            kind: minting.kind,
+            display_id: minting.display_id,
+            facts: minting.facts,
+            geometry: minting.geometry,
+            region: minting.region,
+            sent_w: minting.sent.0,
+            sent_h: minting.sent.1,
             captured_at_monotonic_ns: self.clock.now_ns(),
             frame_seq,
+            elements: minting.elements,
         };
 
         self.entries.push(observation.clone());
@@ -201,6 +223,13 @@ impl Observations {
         }
 
         observation
+    }
+
+    /// Forget everything this process has handed out, releasing every native
+    /// element reference with it. The `release` control's half: the authority those
+    /// replies were made under is gone, so what they let a caller address goes too.
+    pub fn clear(&mut self) {
+        self.entries.clear();
     }
 
     /// The observation an action named, or why it cannot be used. An id the table
@@ -328,9 +357,62 @@ mod tests {
     }
 
     fn mint(table: &mut Observations, kind: Kind) -> Observation {
+        mint_with(table, kind, None)
+    }
+
+    fn mint_with(
+        table: &mut Observations,
+        kind: Kind,
+        elements: Option<Rc<Elements>>,
+    ) -> Observation {
         let geometry = geometry();
         let region = Region::full(&geometry);
-        table.mint(kind, 7, facts(), geometry, region, (1366, 887))
+        table.mint(Minting {
+            kind,
+            display_id: 7,
+            facts: facts(),
+            geometry,
+            region,
+            sent: (1366, 887),
+            elements,
+        })
+    }
+
+    /// One observation's worth of controls, retained through a recording platform
+    /// that counts what it hands out and what comes back.
+    fn listed(recorder: &Rc<crate::ax::Recorder>) -> Rc<Elements> {
+        let ax: Rc<dyn crate::ax::Ax> = recorder.clone();
+        let found = crate::ax::walk(&ax, 4711, &crate::gate::SystemClock::new(), u64::MAX);
+
+        let entries = found
+            .nodes
+            .into_iter()
+            .enumerate()
+            .map(|(index, node)| crate::ax::Entry {
+                reference: crate::ax::reference_for(index),
+                role: node.role,
+                secure: node.secure,
+                element: node.element,
+            })
+            .collect();
+
+        Rc::new(Elements::new(4711, recorder.started_at(), entries))
+    }
+
+    fn recorder() -> Rc<crate::ax::Recorder> {
+        let frame = crate::ax::Frame {
+            x: 0.0,
+            y: 0.0,
+            w: 80.0,
+            h: 24.0,
+        };
+        crate::ax::Recorder::new(
+            4711,
+            vec![
+                crate::ax::Scripted::button("Save", frame),
+                crate::ax::Scripted::button("Cancel", frame),
+            ],
+        )
     }
 
     #[test]
@@ -462,5 +544,102 @@ mod tests {
 
         assert!(observation.contains(-1.0, 10.0).is_err());
         assert!(observation.contains(10.0, 887.0).is_err());
+    }
+
+    // --- protocol 9: a reference dies with the observation that listed it ------
+    //
+    // These are the whole retain/release proof above the FFI: every way an entry
+    // can leave this table must release what it was holding, and the recording
+    // platform counts to zero on each.
+
+    #[test]
+    fn eviction_releases_the_references_the_evicted_reply_held() {
+        let clock = TestClock::new();
+        let mut table = table(&clock);
+        let ax = recorder();
+
+        drop(mint_with(&mut table, Kind::Semantic, Some(listed(&ax))));
+        assert_eq!(ax.counts(), (2, 0, 2), "two controls retained");
+
+        // Three more replies push it out: the table holds three.
+        for _ in 0..3 {
+            mint(&mut table, Kind::Image);
+        }
+        assert_eq!(ax.counts(), (2, 2, 0), "the evicted reply let go of both");
+    }
+
+    #[test]
+    fn expiry_releases_them_too_and_needs_no_sleep() {
+        let clock = TestClock::new();
+        let mut table = table(&clock);
+        let ax = recorder();
+
+        drop(mint_with(&mut table, Kind::Semantic, Some(listed(&ax))));
+        clock.advance(TTL_MS);
+
+        // The next mint sweeps everything already expired, which is when the
+        // references it was holding go back.
+        mint(&mut table, Kind::Image);
+        assert_eq!(ax.counts(), (2, 2, 0));
+    }
+
+    #[test]
+    fn a_release_control_clears_the_table_and_everything_it_held() {
+        let clock = TestClock::new();
+        let mut table = table(&clock);
+        let ax = recorder();
+
+        // The id only, not the copy the mint answered with: an action still
+        // holding one keeps its references alive, which the test below is about.
+        let id = mint_with(&mut table, Kind::Semantic, Some(listed(&ax))).id;
+        assert!(table.resolve(&id).is_ok());
+
+        table.clear();
+
+        assert_eq!(table.resolve(&id), Err(Refusal::Unknown));
+        assert_eq!(ax.counts(), (2, 2, 0));
+    }
+
+    // The worker going away — the helper's own exit path — is the table being
+    // dropped, and it must let go of everything as it goes.
+    #[test]
+    fn dropping_the_table_releases_everything_it_held() {
+        let clock = TestClock::new();
+        let ax = recorder();
+
+        {
+            let mut table = table(&clock);
+            drop(mint_with(&mut table, Kind::Semantic, Some(listed(&ax))));
+            assert_eq!(ax.counts().2, 2);
+        }
+
+        assert_eq!(ax.counts(), (2, 2, 0));
+    }
+
+    // An action COPIES the observation it named and then mints its own check image
+    // into the same table, which can evict the original. The copy must keep the
+    // references alive while it is still using them, and release them when it is
+    // done — not twice, and not early.
+    #[test]
+    fn a_copy_in_flight_keeps_the_references_until_it_is_done() {
+        let clock = TestClock::new();
+        let mut table = table(&clock);
+        let ax = recorder();
+
+        let listed_in = mint_with(&mut table, Kind::Semantic, Some(listed(&ax)));
+        let in_flight = table.resolve(&listed_in.id).expect("just minted").clone();
+
+        for _ in 0..3 {
+            mint(&mut table, Kind::Image);
+        }
+        assert_eq!(
+            ax.counts(),
+            (2, 0, 2),
+            "the action is still holding what it is acting on"
+        );
+
+        drop(in_flight);
+        drop(listed_in);
+        assert_eq!(ax.counts(), (2, 2, 0));
     }
 }

@@ -250,5 +250,43 @@ defmodule CompuxTest do
       assert {:error, {:protocol_mismatch, %{sidecar: 1}}} =
                Compux.start(binary_path: @fake, env: [{~c"FAKE_PROTOCOL_VERSION", ~c"1"}])
     end
+
+    # v9: a control is addressed by name. The reference is only ever meaningful
+    # beside the observation that listed it, and an accessibility action reports
+    # its own input method and the effect its read-back earned.
+    test "presses and sets a control by reference, and refuses one nobody listed" do
+      assert {:ok, cu} = Compux.start(binary_path: @fake)
+
+      assert {:ok, list} = Compux.elements(cu)
+      image = list["observation_id"]
+      [element] = list["elements"]
+      assert element["element_ref"] == "e1"
+      assert element["actions"] == ["press"]
+
+      assert {:ok, pressed} = Compux.press(cu, element["element_ref"], observation_id: image)
+      assert pressed["receipt"]["input_method"] == "ax"
+      assert pressed["receipt"]["effect"] == "not_observed"
+      assert pressed["receipt"]["foreground_changed"] == false
+      refute Map.has_key?(pressed, "verified"), "a press verifies nothing"
+
+      assert {:ok, set} =
+               Compux.set_value(cu, element["element_ref"], "typed", observation_id: image)
+
+      assert set["receipt"]["effect"] == "verified"
+      assert set["verified"] == true
+      assert set["value"] == "typed", "the read-back, not the request echoed"
+
+      # The same control through the pointer: still the pointer's input method.
+      assert {:ok, clicked} = Compux.click(cu, {:element, "e1"}, observation_id: image)
+      assert clicked["receipt"]["input_method"] == "foreground_hid"
+
+      # A reference this observation never listed is refused, nothing dispatched.
+      assert {:error, {:action_failed, refusal}} = Compux.press(cu, "e9", observation_id: image)
+
+      assert refusal["error"] == "stale_element"
+      assert refusal["receipt"]["dispatch"] == "not_sent"
+
+      assert :ok = Compux.stop(cu)
+    end
   end
 end
