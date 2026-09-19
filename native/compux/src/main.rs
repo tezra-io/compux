@@ -28,7 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use enigo::{Axis, Button, Coordinate, Enigo, Key, Keyboard, Mouse, Settings};
 use image::ImageEncoder as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -37,6 +37,10 @@ use xcap::Monitor;
 /// Capture mode (MILESTONE_32 §8.4a): the AXObserver/CFRunLoop event-push engine +
 /// the serialized `Emitter`. Isolated from the request/response core here.
 mod capture;
+
+/// Held synthetic input: the press registry and the `Platform` seam every input
+/// sequence posts through, so nothing this process presses can outlive the action.
+mod held;
 
 /// Long-edge cap for a sent screenshot (design §5: oversized captures 400 on
 /// Anthropic and ground worse).
@@ -85,6 +89,15 @@ fn budget_scale(w: f32, h: f32) -> f32 {
 /// action changed, so neither side needs a new minimum.
 const PROTOCOL_VERSION: u32 = 6;
 
+/// The capture-stall self-reap (EX_TEMPFAIL), and NOTHING else.
+///
+/// Fermix reads this exact status as a clean, retryable capture wedge: it feeds
+/// `CaptureHealth`, `Session.note_capture_wedge/1` and the realtime feed's
+/// `wedge?/1`. Any other failure that exits 75 is therefore reported to the
+/// operator as a wedged capture backend, which is why `disclaim` owns its own
+/// codes and none of them is this one.
+const EXIT_CAPTURE_STALLED: i32 = 75;
+
 // --- macOS TCC responsibility disclaim ---------------------------------------
 
 /// Make this process its OWN TCC "responsible process".
@@ -104,6 +117,12 @@ const PROTOCOL_VERSION: u32 = 6;
 /// sentinel bounds it to a single re-exec. The API is private/header-less (resolved
 /// via `dlsym`), so we FAIL LOUD (non-zero exit) if it is absent or errors, rather
 /// than silently running un-disclaimed and resurrecting the mis-attribution bug.
+///
+/// EXIT CODES: this module owns 70-74, 76 and 77, one per distinguishable failure.
+/// It must never claim 75 — that is the capture-stall self-reap in `main`, which
+/// Fermix reads as a specific, clean, retryable condition (it feeds `CaptureHealth`
+/// and the realtime feed's wedge check). `posix_spawnattr_setflags` used to exit 75
+/// and was therefore reported to the operator as a wedged capture backend.
 #[cfg(target_os = "macos")]
 mod disclaim {
     use std::env;
@@ -114,13 +133,39 @@ mod disclaim {
     type SetDisclaimFn =
         unsafe extern "C" fn(*mut libc::posix_spawnattr_t, libc::c_int) -> libc::c_int;
 
+    /// One code per distinguishable failure, so an operator's exit status names
+    /// which step broke. Named rather than inline so the whole set can be gated:
+    /// see `no_disclaim_exit_code_collides_with_the_capture_stall`.
+    const NO_SETDISCLAIM_SYMBOL: i32 = 70;
+    const SETDISCLAIM_REFUSED: i32 = 71;
+    const REEXEC_FAILED: i32 = 72;
+    const NO_CURRENT_EXE: i32 = 73;
+    const ATTR_INIT_FAILED: i32 = 74;
+    const NUL_IN_ARGV: i32 = 76;
+    /// 77 because 70 to 76 were all taken and 75 belongs to the capture stall.
+    const SETFLAGS_FAILED: i32 = 77;
+
+    /// Every code this module can exit with. The gate loops over this, so a code
+    /// added later either joins it or fails the test.
+    #[cfg(test)]
+    pub const EXIT_CODES: [i32; 7] = [
+        NO_SETDISCLAIM_SYMBOL,
+        SETDISCLAIM_REFUSED,
+        REEXEC_FAILED,
+        NO_CURRENT_EXE,
+        ATTR_INIT_FAILED,
+        NUL_IN_ARGV,
+        SETFLAGS_FAILED,
+    ];
+
     pub fn become_responsible() {
         if env::var_os("COMPUX_DISCLAIMED").is_some() {
             return; // already the re-exec'd, disclaimed image
         }
 
         let set_disclaim = resolve_set_disclaim();
-        let exe = env::current_exe().unwrap_or_else(|e| fatal(73, &format!("current_exe: {e}")));
+        let exe = env::current_exe()
+            .unwrap_or_else(|e| fatal(NO_CURRENT_EXE, &format!("current_exe: {e}")));
         let exe_c = cstr(exe.as_os_str().as_bytes());
 
         let argv = CArray::new(env::args_os().map(|a| cstr(a.as_bytes())).collect());
@@ -138,15 +183,18 @@ mod disclaim {
         unsafe {
             let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
             if libc::posix_spawnattr_init(&mut attr) != 0 {
-                fatal(74, "posix_spawnattr_init failed");
+                fatal(ATTR_INIT_FAILED, "posix_spawnattr_init failed");
             }
             if set_disclaim(&mut attr, 1) != 0 {
-                fatal(71, "responsibility_spawnattrs_setdisclaim returned nonzero");
+                fatal(
+                    SETDISCLAIM_REFUSED,
+                    "responsibility_spawnattrs_setdisclaim returned nonzero",
+                );
             }
             if libc::posix_spawnattr_setflags(&mut attr, libc::POSIX_SPAWN_SETEXEC as libc::c_short)
                 != 0
             {
-                fatal(75, "posix_spawnattr_setflags failed");
+                fatal(SETFLAGS_FAILED, "posix_spawnattr_setflags failed");
             }
             // SETEXEC replaces this image; posix_spawn returns ONLY on failure.
             libc::posix_spawn(
@@ -157,7 +205,7 @@ mod disclaim {
                 argv.ptrs.as_ptr(),
                 envp.ptrs.as_ptr(),
             );
-            fatal(72, "POSIX_SPAWN_SETEXEC re-exec failed");
+            fatal(REEXEC_FAILED, "POSIX_SPAWN_SETEXEC re-exec failed");
         }
     }
 
@@ -167,13 +215,16 @@ mod disclaim {
         let name = cstr(b"responsibility_spawnattrs_setdisclaim");
         let sym = unsafe { libc::dlsym(rtld_default, name.as_ptr()) };
         if sym.is_null() {
-            fatal(70, "responsibility_spawnattrs_setdisclaim unavailable");
+            fatal(
+                NO_SETDISCLAIM_SYMBOL,
+                "responsibility_spawnattrs_setdisclaim unavailable",
+            );
         }
         unsafe { std::mem::transmute::<*mut libc::c_void, SetDisclaimFn>(sym) }
     }
 
     fn cstr(bytes: &[u8]) -> CString {
-        CString::new(bytes).unwrap_or_else(|_| fatal(76, "unexpected NUL in argv/env"))
+        CString::new(bytes).unwrap_or_else(|_| fatal(NUL_IN_ARGV, "unexpected NUL in argv/env"))
     }
 
     // Owns the CString backing store so the null-terminated pointer vector stays valid.
@@ -242,7 +293,7 @@ fn main() {
             capture::stop();
             #[cfg(target_os = "macos")]
             ax::clear_activations();
-            std::process::exit(75);
+            std::process::exit(EXIT_CAPTURE_STALLED);
         }
     }
 
@@ -1433,18 +1484,36 @@ fn click(req: &Value, button: Button, count: u32) -> Result<Value, String> {
     let (lx, ly) = to_logical(&display.geom, &region, x, y);
     let mods = modifiers(req);
 
-    let mut e = enigo()?;
-    e.move_mouse(lx, ly, Coordinate::Abs)
-        .map_err(|e| format!("move: {e}"))?;
-    pointer::settle(lx, ly)?;
-    hold(&mut e, &mods, Direction::Press)?;
-    for _ in 0..count {
-        e.button(button, Direction::Click)
-            .map_err(|e| format!("click: {e}"))?;
-    }
-    hold(&mut e, &mods, Direction::Release)?;
+    // A local, not a temporary: enigo's own `Drop` paces the events it posted, and
+    // it ran after the check image before. Inlining this into the call below would
+    // move that pacing sleep in front of the screenshot.
+    let mut platform = held::Real::default();
+    click_seq(&mut platform, lx, ly, button, count, &mods)?;
 
     post(req, &display)
+}
+
+/// The click itself, over the injected platform: warp, settle, hold the modifiers,
+/// post the button. The guard releases the modifiers after the last click AND on
+/// every failure in between — a `?` out of the repeat loop used to return with them
+/// still down.
+fn click_seq<P: held::Platform>(
+    platform: &mut P,
+    lx: i32,
+    ly: i32,
+    button: Button,
+    count: u32,
+    mods: &[Key],
+) -> Result<(), String> {
+    held::guarded(platform, |input| {
+        input.move_mouse(lx, ly)?;
+        input.settle(lx, ly)?;
+        input.press_keys(mods)?;
+        for _ in 0..count {
+            input.click_button(button)?;
+        }
+        Ok(())
+    })
 }
 
 /// Drag pacing. A zero-dwell teleport drag lands inside one render frame, which
@@ -1465,22 +1534,35 @@ fn drag(req: &Value) -> Result<Value, String> {
     let (fx, fy) = to_logical(&display.geom, &region, from.x, from.y);
     let (tx, ty) = to_logical(&display.geom, &region, to.x, to.y);
 
-    let mut e = enigo()?;
-    e.move_mouse(fx, fy, Coordinate::Abs)
-        .map_err(|e| format!("move: {e}"))?;
-    pointer::settle(fx, fy)?;
-    e.button(Button::Left, Direction::Press)
-        .map_err(|e| format!("press: {e}"))?;
-    // Let the press register (and the target arm its drag) before moving.
-    thread::sleep(Duration::from_millis(DRAG_GRAB_MS));
-    drag_through(&mut e, &drag_path(fx, fy, tx, ty, DRAG_STEPS))?;
-    pointer::settle(tx, ty)?;
-    // Dwell at the destination so the drop is observed where it happens.
-    thread::sleep(Duration::from_millis(DRAG_DROP_MS));
-    e.button(Button::Left, Direction::Release)
-        .map_err(|e| format!("release: {e}"))?;
+    // A local for the same reason as `click`: enigo's pacing runs on its drop.
+    let mut platform = held::Real::default();
+    drag_seq(&mut platform, fx, fy, tx, ty)?;
 
     post(req, &display)
+}
+
+/// The drag itself, over the injected platform. Everything from the press to the
+/// drop runs under the guard, so a failed step, a failed settle or a panic ends
+/// with the left button UP — it used to end with the desktop still dragging.
+fn drag_seq<P: held::Platform>(
+    platform: &mut P,
+    fx: i32,
+    fy: i32,
+    tx: i32,
+    ty: i32,
+) -> Result<(), String> {
+    held::guarded(platform, |input| {
+        input.move_mouse(fx, fy)?;
+        input.settle(fx, fy)?;
+        input.press_button(Button::Left)?;
+        // Let the press register (and the target arm its drag) before moving.
+        input.sleep(DRAG_GRAB_MS);
+        drag_through(input, &drag_path(fx, fy, tx, ty, DRAG_STEPS))?;
+        input.settle(tx, ty)?;
+        // Dwell at the destination so the drop is observed where it happens.
+        input.sleep(DRAG_DROP_MS);
+        Ok(())
+    })
 }
 
 /// The interpolated pointer path from start to end: `steps` evenly spaced
@@ -1498,27 +1580,15 @@ fn drag_path(fx: i32, fy: i32, tx: i32, ty: i32, steps: u32) -> Vec<(i32, i32)> 
         .collect()
 }
 
-/// macOS posts each step as an EXPLICIT `LeftMouseDragged` (enigo's `move_mouse`
-/// derives its event type from a live `pressedMouseButtons()` read that races
-/// the just-posted mouse-down and then emits `MouseMoved` — a hover mid-press).
-#[cfg(target_os = "macos")]
-fn drag_through(_e: &mut Enigo, path: &[(i32, i32)]) -> Result<(), String> {
+/// Walk the interpolated path with a dwell at each point. What ONE step is differs
+/// per platform (`held::Real::drag_step` holds that split); the pacing does not.
+fn drag_through<P: held::Platform>(
+    input: &mut held::Guard<'_, P>,
+    path: &[(i32, i32)],
+) -> Result<(), String> {
     for &(x, y) in path {
-        pointer::drag_step(x, y)?;
-        thread::sleep(Duration::from_millis(DRAG_STEP_MS));
-    }
-
-    Ok(())
-}
-
-/// X11 motion while the button is pressed IS the drag — no distinct event type —
-/// so enigo's own motion injection is correct here.
-#[cfg(not(target_os = "macos"))]
-fn drag_through(e: &mut Enigo, path: &[(i32, i32)]) -> Result<(), String> {
-    for &(x, y) in path {
-        e.move_mouse(x, y, Coordinate::Abs)
-            .map_err(|e| format!("drag: {e}"))?;
-        thread::sleep(Duration::from_millis(DRAG_STEP_MS));
+        input.drag_step(x, y)?;
+        input.sleep(DRAG_STEP_MS);
     }
 
     Ok(())
@@ -1569,15 +1639,26 @@ fn key_chord(req: &Value) -> Result<Value, String> {
     let mods: Vec<Key> = mod_parts.iter().filter_map(|m| modifier_key(m)).collect();
     let main = named_key(key_name).ok_or_else(|| format!("unknown key: {key_name}"))?;
 
-    let mut e = enigo()?;
-    hold(&mut e, &mods, Direction::Press)?;
-    let res = e
-        .key(main, Direction::Click)
-        .map_err(|e| format!("key: {e}"));
-    hold(&mut e, &mods, Direction::Release)?;
-    res?;
+    // A local for the same reason as `click`: enigo's pacing runs on its drop.
+    let mut platform = held::Real::default();
+    key_chord_seq(&mut platform, &mods, main)?;
 
     post(req, &target_display(req)?)
+}
+
+/// The chord itself, over the injected platform. This was the one sequence that
+/// already released its modifiers after a failed key — but `hold`'s own loop could
+/// still fail part way through PRESSING them and strand the earlier ones, which the
+/// guard's record-before-post closes.
+fn key_chord_seq<P: held::Platform>(
+    platform: &mut P,
+    mods: &[Key],
+    main: Key,
+) -> Result<(), String> {
+    held::guarded(platform, |input| {
+        input.press_keys(mods)?;
+        input.click_key(main)
+    })
 }
 
 fn wait(req: &Value) -> Result<Value, String> {
@@ -1751,33 +1832,29 @@ fn paste(req: &Value) -> Result<Value, String> {
         .get("text")
         .and_then(Value::as_str)
         .ok_or("missing text")?;
-    let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("clipboard: {e}"))?;
-    // Best-effort save of the user's clipboard TEXT so paste doesn't silently destroy
-    // it (a non-text clipboard — image/files — can't be preserved here).
-    let prior = clipboard.get_text().ok();
-    clipboard
-        .set_text(text)
-        .map_err(|e| format!("clipboard set: {e}"))?;
-    // Let the pasteboard write settle before the paste keystroke.
-    thread::sleep(Duration::from_millis(50));
 
-    let mut e = enigo()?;
-    let modifier = paste_modifier();
-    e.key(modifier, Direction::Press)
-        .map_err(|e| format!("paste modifier: {e}"))?;
-    e.key(Key::Unicode('v'), Direction::Click)
-        .map_err(|e| format!("paste key: {e}"))?;
-    e.key(modifier, Direction::Release)
-        .map_err(|e| format!("paste modifier: {e}"))?;
-
-    // Restore the prior clipboard once the target has consumed the paste (a small
-    // delay avoids racing the paste read).
-    if let Some(previous) = prior {
-        thread::sleep(Duration::from_millis(80));
-        let _ = clipboard.set_text(previous);
-    }
+    // A local for the same reason as `click`: enigo's pacing runs on its drop, and
+    // the clipboard handle lived this long too.
+    let mut platform = held::Real::default();
+    paste_seq(&mut platform, text)?;
 
     post(req, &target_display(req)?)
+}
+
+/// Let the pasteboard write settle before the paste keystroke.
+const PASTE_SETTLE_MS: u64 = 50;
+
+/// The paste itself, over the injected platform. `take_clipboard` saves the user's
+/// text and arms its restore in one call, and the guard runs that restore — and
+/// lifts the modifier — on every exit. A failure around the keystroke used to
+/// return with the modifier down and the user's clipboard still overwritten.
+fn paste_seq<P: held::Platform>(platform: &mut P, text: &str) -> Result<(), String> {
+    held::guarded(platform, |input| {
+        input.take_clipboard(text)?;
+        input.sleep(PASTE_SETTLE_MS);
+        input.press_keys(&[paste_modifier()])?;
+        input.click_key(Key::Unicode('v'))
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -2775,13 +2852,6 @@ fn executed_point_of(req: &Value) -> Option<(i32, i32)> {
     Some((x.round() as i32, y.round() as i32))
 }
 
-fn hold(e: &mut Enigo, mods: &[Key], dir: Direction) -> Result<(), String> {
-    for key in mods {
-        e.key(*key, dir).map_err(|e| format!("modifier: {e}"))?;
-    }
-    Ok(())
-}
-
 fn parse_point(req: &Value, field: &str) -> Result<Point, String> {
     serde_json::from_value(req.get(field).cloned().unwrap_or(Value::Null))
         .map_err(|_| format!("bad {field} point"))
@@ -2841,6 +2911,9 @@ fn named_key(name: &str) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::held::{sweep_injected_failures, Call, Recorder, CLIPBOARD_RESTORE_DWELL_MS};
+    use enigo::Direction;
 
     // The drag path's geometry is what makes an interpolated drag land exactly:
     // the LAST point must BE the destination (a rounded near-miss would drop the
@@ -3535,5 +3608,158 @@ mod tests {
     fn idle_detection_is_macos_only_off_macos() {
         assert!(idle_ms().is_err());
         assert!(wait_for_idle(&json!({})).is_err());
+    }
+
+    // 75 is a MEANING, not a number: Fermix reads it as a clean capture-stall
+    // self-reap. `posix_spawnattr_setflags` used to exit 75 too, so a disclaim
+    // failure reached the operator as a wedged capture backend. Stated as "NO
+    // disclaim code is 75" over the whole set, so a code added later either joins
+    // the list or fails here — asserting only the one code that moved would pass
+    // for the next collision as happily as this one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn no_disclaim_exit_code_collides_with_the_capture_stall() {
+        let codes = disclaim::EXIT_CODES;
+        assert!(
+            !codes.contains(&EXIT_CAPTURE_STALLED),
+            "a disclaim failure exits {EXIT_CAPTURE_STALLED}, which Fermix reads as a capture stall"
+        );
+
+        for (i, code) in codes.iter().enumerate() {
+            assert!(
+                !codes[i + 1..].contains(code),
+                "two disclaim failures share exit code {code}, so neither can be diagnosed"
+            );
+        }
+    }
+
+    // --- held input: the four sequences that can leave a press behind ---------
+    //
+    // Two assertions per sequence, and both matter. The CLEAN one pins the exact
+    // event list the desktop used to see, so the guard cannot have quietly changed
+    // what a click or a drag does. The SWEEP refuses every one of those calls in
+    // turn and demands that nothing is left held and the clipboard reads as the
+    // user left it — the defect class itself, asserted at every step rather than at
+    // the one step someone thought of.
+
+    #[test]
+    fn click_posts_the_event_sequence_it_always_has() {
+        let mut platform = Recorder::new(None);
+        click_seq(
+            &mut platform,
+            120,
+            240,
+            Button::Left,
+            2,
+            &[Key::Meta, Key::Shift],
+        )
+        .unwrap();
+
+        assert_eq!(
+            platform.calls,
+            vec![
+                Call::MoveMouse(120, 240),
+                Call::Settle(120, 240),
+                Call::Key(Key::Meta, Direction::Press),
+                Call::Key(Key::Shift, Direction::Press),
+                Call::Button(Button::Left, Direction::Click),
+                Call::Button(Button::Left, Direction::Click),
+                // Reverse of the press order (it used to release Meta first); the
+                // modifier flag state a target reads is identical either way.
+                Call::Key(Key::Shift, Direction::Release),
+                Call::Key(Key::Meta, Direction::Release),
+            ]
+        );
+    }
+
+    // The leak: a `?` out of the repeat loop returned with the modifiers down.
+    #[test]
+    fn click_releases_its_modifiers_however_it_fails() {
+        sweep_injected_failures(None, |platform| {
+            click_seq(platform, 12, 34, Button::Right, 2, &[Key::Meta, Key::Shift])
+        });
+    }
+
+    #[test]
+    fn drag_posts_the_event_sequence_it_always_has() {
+        let mut platform = Recorder::new(None);
+        drag_seq(&mut platform, 10, 20, 50, 60).unwrap();
+
+        let mut expected = vec![
+            Call::MoveMouse(10, 20),
+            Call::Settle(10, 20),
+            Call::Button(Button::Left, Direction::Press),
+            Call::Sleep(DRAG_GRAB_MS),
+        ];
+        for &(x, y) in &drag_path(10, 20, 50, 60, DRAG_STEPS) {
+            expected.push(Call::DragStep(x, y));
+            expected.push(Call::Sleep(DRAG_STEP_MS));
+        }
+        expected.push(Call::Settle(50, 60));
+        expected.push(Call::Sleep(DRAG_DROP_MS));
+        expected.push(Call::Button(Button::Left, Direction::Release));
+
+        assert_eq!(platform.calls, expected);
+    }
+
+    // The leak: anything between the press and the release left the desktop
+    // dragging — a held left button, which takes a physical click to clear.
+    #[test]
+    fn drag_releases_the_button_however_it_fails() {
+        sweep_injected_failures(None, |platform| drag_seq(platform, 10, 20, 50, 60));
+    }
+
+    #[test]
+    fn paste_posts_the_event_sequence_it_always_has() {
+        let mut platform = Recorder::new(Some("the user's own text"));
+        paste_seq(&mut platform, "pasted").unwrap();
+
+        assert_eq!(
+            platform.calls,
+            vec![
+                Call::ClipboardRead,
+                Call::ClipboardWrite("pasted".to_string()),
+                Call::Sleep(PASTE_SETTLE_MS),
+                Call::Key(paste_modifier(), Direction::Press),
+                Call::Key(Key::Unicode('v'), Direction::Click),
+                Call::Key(paste_modifier(), Direction::Release),
+                Call::Sleep(CLIPBOARD_RESTORE_DWELL_MS),
+                Call::ClipboardWrite("the user's own text".to_string()),
+            ]
+        );
+        assert_eq!(platform.clipboard.as_deref(), Some("the user's own text"));
+    }
+
+    // The leak: a failure around the keystroke returned with the modifier down AND
+    // the user's clipboard still holding our text.
+    #[test]
+    fn paste_releases_and_restores_the_clipboard_however_it_fails() {
+        sweep_injected_failures(Some("the user's own text"), |platform| {
+            paste_seq(platform, "pasted")
+        });
+    }
+
+    #[test]
+    fn key_chord_posts_the_event_sequence_it_always_has() {
+        let mut platform = Recorder::new(None);
+        key_chord_seq(&mut platform, &[Key::Meta], Key::Unicode('c')).unwrap();
+
+        assert_eq!(
+            platform.calls,
+            vec![
+                Call::Key(Key::Meta, Direction::Press),
+                Call::Key(Key::Unicode('c'), Direction::Click),
+                Call::Key(Key::Meta, Direction::Release),
+            ]
+        );
+    }
+
+    // This one already released after a failed key; what it could not survive was a
+    // failure part way through PRESSING several modifiers.
+    #[test]
+    fn key_chord_releases_its_modifiers_however_it_fails() {
+        sweep_injected_failures(None, |platform| {
+            key_chord_seq(platform, &[Key::Meta, Key::Shift, Key::Alt], Key::Tab)
+        });
     }
 }

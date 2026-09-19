@@ -298,3 +298,212 @@ turns an app's tree back off when it detaches and at process exit, but a **SIGKI
 sidecar runs neither path, so a Chromium app it activated keeps `AXManualAccessibility`
 set until that app quits. Nothing else needs undoing, and an app whose owner already had
 the switch on is never touched.
+
+---
+
+# Live check — held input is released on every path (M42 slice 2, R0)
+
+The unit tests prove the shape of this: for each of `left_click`, `left_click_drag`,
+`paste` and `key`, a refusal injected at **every** step of the sequence ends with
+nothing recorded as held and the clipboard as the user left it, the release order is
+the reverse of the press order, and a panic mid-sequence still releases. What they
+cannot prove is the only thing that matters to a person sitting at the machine: that
+the release actually reaches the window server, so a failed action does not leave the
+Command key down or the left button dragging. This session holds no Accessibility
+grant and can post no input at all, so the live half is below, in the order that
+fails fastest.
+
+Expected outcome in one line: every action still behaves exactly as it did, and when
+one of them fails part way through, the desktop is left the way it was found — no
+modifier down, no button held, and the clipboard still holding the owner's own text.
+
+## 0. Preconditions
+
+* **Build the sidecar from this branch**: `cd native/compux && cargo build --release`.
+  The binary is `native/compux/target/release/compux` — call it `$CX` below. No
+  daemon, no Fermix and no model is needed for any step here: the sidecar reads one
+  JSON line on stdin and answers one on stdout, which is the smallest instrument that
+  can show this behaviour.
+* `COMPUX_DISCLAIMED=1` makes the sidecar skip its TCC self-disclaim re-exec, so it
+  runs under the **launching terminal's** Accessibility grant. Without that variable
+  it re-execs into its own (unsigned, brand-new) identity, which has no grant — which
+  step 3 uses on purpose.
+* **Coordinates are sent-screenshot pixels**, not physical ones: the space of a
+  capture whose long edge is at most 1366. Pick a point over empty desktop; it does
+  not have to be precise for any step here.
+* Nothing below writes to `~/.fermix*` or to any database, and nothing needs the
+  `dev_local` sidecar to be replaced. Do that only if you also want to check the
+  actions through the assistant.
+
+```sh
+CX=/Users/sujshe/projects/compux/native/compux/target/release/compux
+```
+
+## 1. The success paths still land (30 seconds, fails fastest)
+
+This change rewrote the inside of four input verbs, so prove they still do what they
+did before worrying about how they fail. Open TextEdit with an empty document and
+bring it to the front.
+
+```sh
+# A modified click. The modifiers are now released in the REVERSE of the order they
+# were pressed, which is the one ordering difference in the whole change.
+printf '{"action":"left_click","x":400,"y":300,"modifiers":["cmd","shift"]}\n' \
+  | COMPUX_DISCLAIMED=1 "$CX"
+
+# A drag. Pick two points over a Finder window with an icon under `from`.
+printf '{"action":"left_click_drag","from":{"x":400,"y":300},"to":{"x":520,"y":380}}\n' \
+  | COMPUX_DISCLAIMED=1 "$CX"
+
+# A paste, with the owner's own clipboard put back afterwards.
+printf 'the owner clipboard' | pbcopy
+printf '{"action":"paste","text":"pasted by compux"}\n' | COMPUX_DISCLAIMED=1 "$CX"
+pbpaste; echo
+```
+
+Each must answer `{"ok":true}`. The click must click where a cmd-shift-click would;
+the drag must actually drag the icon (not demote to a click and leave it where it
+was — that is the interpolated path and its dwell, unchanged here); `pasted by
+compux` must appear in the document and `pbpaste` must print `the owner clipboard`.
+
+Then, with your hand off the keyboard, type a letter into the document. It must type
+the letter. A letter that fires a menu shortcut instead means a modifier is still
+down after a **successful** action, which would be a new defect in this change, not
+the one it fixes — stop and report it.
+
+## 2. The sidecar still starts, and 75 still means one thing
+
+The disclaim re-exec runs on every launch and now reports a failed spawn attribute as
+**77** instead of 75, so that a real capture stall is the only thing that ever exits
+75. A botched edit there breaks every launch, which step 1 already exercised — but
+check the disclaimed path too, since step 1 skipped it:
+
+```sh
+printf '{"action":"hello"}\n' | "$CX"; echo "exit=$?"
+```
+
+It must print the hello frame with `"protocol_version":6` and `exit=0` (R0 changes no
+wire field and no version). An exit in the 70s here is a disclaim failure and the
+stderr line above it names which step; report the number. There is no way to provoke
+`posix_spawnattr_setflags` failing on a healthy machine, so 77 itself is proved by
+the unit gate (`no_disclaim_exit_code_collides_with_the_capture_stall`) and not here.
+
+## 3. A failed paste leaves the clipboard as it was (no patched build)
+
+This is the one failure that can be provoked without touching a line of code, and it
+is the most damaging of the three: before this change a paste that could not reach
+the keyboard still overwrote the clipboard and never put it back, silently destroying
+whatever the owner had copied.
+
+Run the sidecar **without** `COMPUX_DISCLAIMED`, so it re-execs into its own unsigned
+identity, which holds no Accessibility grant:
+
+```sh
+printf 'the owner clipboard' | pbcopy
+printf '{"action":"paste","text":"pasted by compux"}\n' | "$CX"; echo "exit=$?"
+pbpaste; echo
+```
+
+* The reply must be `{"ok":false,"error":"init input: ..."}` — the keystroke never
+  reached the desktop. A stderr line above it reads `compux: Key(Meta) was NOT
+  released: init input: ...`: the guard recorded the modifier before posting it (it
+  has to — a call can fail after the event is already out) and could not lift it
+  through the same dead connection. It is reported there on purpose and kept OUT of
+  the reply, so the action's own error names the one thing that actually went wrong.
+* `pbpaste` must print **`the owner clipboard`**. This is the assertion. Before this
+  change it printed `pasted by compux` and the owner's text was gone for good.
+* If the reply is `{"ok":true}` instead, this identity happens to already hold an
+  Accessibility grant and the step proved nothing. Force the refusal another way:
+  System Settings → Privacy & Security → Accessibility, switch the entry for your
+  terminal OFF, quit and reopen it, and repeat the command **with**
+  `COMPUX_DISCLAIMED=1`. Switch it back on afterwards.
+
+## 4. A failed click leaves no modifier down (throwaway build)
+
+A click cannot be made to fail mid-sequence from the outside: everything that can
+refuse, refuses before the first modifier goes down. So this one needs a deliberately
+broken binary. **The patch below must never be committed** — it is a one-line
+throwaway, and step 6 rebuilds over it.
+
+In `native/compux/src/held.rs`, make the button event refuse. Insert the `if` below
+as the first statement of `impl Platform for Real`'s `button`, leaving the rest of
+the function as it is:
+
+```rust
+    fn button(&mut self, button: Button, direction: Direction) -> Result<(), String> {
+        if direction == Direction::Click {
+            return Err("provoked".to_string()); // TEMPORARY — never commit
+        }
+```
+
+Only the click verbs go through `Direction::Click`, so a drag is untouched by it.
+`cargo build --release`, then, with TextEdit in front and a document focused:
+
+```sh
+printf '{"action":"left_click","x":400,"y":300,"modifiers":["cmd","shift"]}\n' \
+  | COMPUX_DISCLAIMED=1 "$CX"
+```
+
+* The reply must be `{"ok":false,"error":"provoked"}`.
+* **Now type a letter into the document, with your hand off every modifier.** It must
+  type the letter. If it fires a shortcut (or selects to the end of the line), Command
+  or Shift is still down — that is the defect, and it is what the old code did on
+  every failed click. Recover by physically tapping each of Command and Shift once.
+* Run it again with `"modifiers":["cmd","shift","alt","ctrl"]` and type again. All
+  four must be up.
+
+## 5. A failed drag leaves no button held (same throwaway build)
+
+Undo the step-4 patch and instead make every drag step refuse — the failure lands
+between the press and the release, which is where the left button used to be
+stranded. In the same file, replace the BODY of the `#[cfg(target_os = "macos")]`
+`drag_step` (the one that calls `crate::pointer::drag_step`), renaming its two
+parameters so the build stays quiet:
+
+```rust
+    #[cfg(target_os = "macos")]
+    fn drag_step(&mut self, _x: i32, _y: i32) -> Result<(), String> {
+        Err("provoked".to_string()) // TEMPORARY — never commit
+    }
+```
+
+`cargo build --release` — it warns that `pointer::drag_step` and its CoreGraphics
+externs are now unused, which is the patch doing its job and not a problem. Then,
+over a Finder window with an icon under `from`:
+
+```sh
+printf '{"action":"left_click_drag","from":{"x":400,"y":300},"to":{"x":520,"y":380}}\n' \
+  | COMPUX_DISCLAIMED=1 "$CX"
+```
+
+* The reply must be `{"ok":false,"error":"provoked"}`.
+* **Then move the pointer around with your hand, touching nothing.** Nothing may be
+  dragged and no rubber-band selection may appear. If the desktop is dragging the
+  icon or drawing a selection rectangle with you, the left button is still down —
+  the old behaviour, and the single worst symptom in this change, because it takes a
+  physical click to clear and it drops whatever it is holding wherever you stop.
+* Recover, if it does stick, with one physical click.
+
+## 6. Restore and rebuild
+
+```sh
+cd /Users/sujshe/projects/compux && git diff --stat native/compux/src/held.rs
+```
+
+That must report **no** change once you have undone the step-4 and step-5 patches.
+Then `cargo build --release` once more, so no provoked binary is left on disk, and
+re-run step 1 to confirm the clean build still works.
+
+## 7. What this check still cannot prove
+
+* **A SIGKILLed sidecar releases nothing.** The guard covers a returned error and a
+  panic; it cannot run after `kill -9`, and the technical design says as much. If the
+  daemon force-kills a sidecar mid-drag, the button stays down. That is a known limit
+  of this slice, not a regression — cancellation as a control arrives with the
+  protocol work.
+* **A release the window server drops.** If a release event is posted and accepted
+  but the target application never processes it, compux believes the key is up. The
+  sidecar reports what it posted, and what it could not post it names on stderr and
+  in the action's own error.
+* **The three remaining sequences that hold nothing** (`mouse_move`, `scroll`,
+  `type`) were not changed and hold no key or button to leak.
