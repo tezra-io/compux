@@ -56,7 +56,7 @@ defmodule Compux.Transport do
 
       {:compux_sidecar_exit, transport_pid, non_neg_integer()}
       {:compux_sidecar_exit, transport_pid, {:poisoned, reason}}
-      {:compux_session_event, transport_pid, %Compux.Frame.SessionEvent{}}
+      {:compux_session_event, transport_pid, map()}
 
   The owner is the process that called `start_link/1` unless `:owner` says
   otherwise, and it is told **once** whenever the sidecar ends — including an
@@ -78,8 +78,18 @@ defmodule Compux.Transport do
   completes either: no owner is listening yet, and `start_link/1` returns the
   reason instead.
 
-  Nothing emits a session event in this protocol version; the family is decoded
-  and forwarded so a consumer can be written against it.
+  A session event is the sidecar speaking unasked: at protocol 11 it is the
+  ownership indicator's own buttons, which reach the sidecar's gate directly and
+  are reported here afterwards (`%{"kind" => "indicator", "event" =>
+  "operator_pause" | "operator_resume" | "operator_stop"}`). The owner gets the
+  frame's fields as a plain map — the envelope included, so nothing is hidden from
+  a consumer that wants it — rather than a struct of this library's.
+
+  **An event that carries an `authorization_generation` advances this transport's,
+  exactly as a `control_ack` does.** The indicator's Pause is applied to the gate
+  before it is reported, and the gate revokes the caller's authority when it
+  installs one; a transport that kept the old generation would have every later
+  request refused `stale_generation` and no way to learn why.
   """
 
   use GenServer
@@ -610,13 +620,45 @@ defmodule Compux.Transport do
     }
   end
 
+  # The sidecar speaking unasked. Two things happen, in this order: the owner is
+  # told, and the authority the event was minted under becomes ours. The second is
+  # not bookkeeping — the indicator's Pause installs a barrier in the gate, which
+  # revokes every request this transport has already minted, and a transport that
+  # ignored the new generation would spend the rest of the session being refused
+  # `stale_generation` for a pause it was never told about.
   defp forward_event(state, event) do
     if generations_match?(state, event) do
-      send(state.owner, {:compux_session_event, self(), event})
-      state
+      send(state.owner, {:compux_session_event, self(), event.payload})
+      adopt_generation(state, event.authorization_generation)
     else
       poison(state, {:stale_generation, event.kind})
     end
+  end
+
+  defp adopt_generation(state, nil), do: state
+
+  # Forward only. A generation is a barrier count that never goes down, but the
+  # REPORTS of two barriers installed a moment apart — the badge's Pause and a
+  # control's — reach this process from two writers with nothing ordering them.
+  # Taking whichever arrived last would leave the transport holding an authority
+  # the sidecar has already revoked, and every request after it refused
+  # `stale_generation` with no way to tell why.
+  defp adopt_generation(state, generation)
+       when is_integer(generation) and generation > state.authorization_generation,
+       do: %{state | authorization_generation: generation}
+
+  defp adopt_generation(state, generation) when is_integer(generation) and generation >= 0,
+    do: state
+
+  # A malformed generation is not a reason to poison a wire that is otherwise fine,
+  # and it is certainly not a reason to adopt it: the event is delivered, the
+  # authority stands, and the next request answers for itself.
+  defp adopt_generation(state, other) do
+    Logger.warning(
+      "compux: a session event carried an unusable authorization generation: #{inspect(other)}"
+    )
+
+    state
   end
 
   defp generations_match?(state, frame) do

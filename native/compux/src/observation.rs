@@ -367,6 +367,10 @@ mod tests {
             self.now_ms() as u128 * 1_000_000
         }
 
+        fn now_mach(&self) -> u64 {
+            self.now_ms() * 1_000_000
+        }
+
         fn sleep(&self, ms: u64) {
             self.advance(ms);
         }

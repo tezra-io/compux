@@ -34,7 +34,12 @@ use serde_json::{json, Map, Value};
 /// at protocol 8, where it became the way every coordinate names its image;
 /// `element_ref` left it at protocol 9, where it became the way an action names a
 /// control. `target_id` — a bound window — is slice 5's.
-const RESERVED_FIELDS: [&str; 1] = ["target_id"];
+/// Nothing is reserved any more: `observation_id` left this list at protocol 8,
+/// `element_ref` at protocol 9, and `target_id` — a bound window — at protocol 11.
+/// The array stays because the NEXT reservation belongs here, and a reserved field
+/// refused by name is how a build that asks for targeting this one cannot do learns
+/// so instead of having its request run without it.
+const RESERVED_FIELDS: [&str; 0] = [];
 
 /// A field this wire USED to have, and the sentence that says what replaced it. A
 /// request carrying one is refused rather than run without it: `screenshot_after`
@@ -101,6 +106,33 @@ pub fn takes_an_observation(action: &str) -> bool {
     addresses_an_image(action) || VIEWING_ACTIONS.contains(&action)
 }
 
+/// The actions that may name a bound window. Everything that looks at, or acts
+/// inside, ONE window — and nothing else. `windows` enumerates the desktop, which
+/// is how a target is found in the first place; `wait`, `wait_for_change` and the
+/// two target verbs have no window to name. Mirrors `Compux.Protocol`'s
+/// `@targetable` exactly; a test pins the two lists together.
+const TARGETABLE_ACTIONS: [&str; 14] = [
+    "screenshot",
+    "elements",
+    "inspect",
+    "left_click",
+    "right_click",
+    "double_click",
+    "mouse_move",
+    "left_click_drag",
+    "scroll",
+    "type",
+    "key",
+    "paste",
+    "press",
+    "set_value",
+];
+
+/// May this action act inside a bound window?
+pub fn takes_a_target(action: &str) -> bool {
+    TARGETABLE_ACTIONS.contains(&action)
+}
+
 /// One request line the sidecar will read. The Elixir transport refuses to write
 /// a larger one; this is the same bound on the reading side, so a line neither
 /// side would accept cannot half-arrive.
@@ -136,7 +168,7 @@ const INPUT_ACTIONS: [&str; 11] = [
 /// Read-only actions, mirroring `Compux.Protocol`'s `@read_only` exactly. The
 /// complement carries a `mutation_seq` and earns a receipt. A test pins the two
 /// lists together; they may not drift.
-const READ_ONLY_ACTIONS: [&str; 11] = [
+const READ_ONLY_ACTIONS: [&str; 13] = [
     "screenshot",
     "mouse_move",
     "wait",
@@ -144,6 +176,11 @@ const READ_ONLY_ACTIONS: [&str; 11] = [
     "wait_for_change",
     "elements",
     "windows",
+    // Binding and releasing a window dispatch nothing: no pointer moves, no key
+    // goes down, nothing on the screen is touched. A sequence number and a receipt
+    // on either would claim input where there was none.
+    "select_target",
+    "release_target",
     "probe",
     "idle_ms",
     "wait_for_idle",
@@ -153,6 +190,21 @@ const READ_ONLY_ACTIONS: [&str; 11] = [
 /// Does a pause have to stop this action?
 pub fn touches_input(action: &str) -> bool {
     INPUT_ACTIONS.contains(&action)
+}
+
+/// Does a paused gate refuse this action?
+///
+/// Not the same list as [`touches_input`], and the difference is one verb.
+/// `select_target` dispatches nothing — no pointer moves and no key goes down — but
+/// it opens a capture of somebody's window and puts a badge on their screen, and a
+/// pause is the person saying "not now" to exactly that. A paused session that
+/// could still bind a window would be a barrier with a door in it.
+///
+/// `release_target` is NOT here on purpose: giving a window back is always safe,
+/// and a pause that trapped a target until it was lifted would be a pause that
+/// leaves a badge on somebody's screen with no way to take it off.
+pub fn barred_by_a_pause(action: &str) -> bool {
+    touches_input(action) || action == "select_target"
 }
 
 /// Does this action carry a `mutation_seq` and earn a receipt?
@@ -239,6 +291,11 @@ pub struct Request {
     /// decided in `parse`, so no action function can be asked for a check it has
     /// no way to take.
     pub check: Check,
+    /// The bound window this request acts inside, when it names one. `None` is the
+    /// display-level path, byte for byte what it was at protocol 10. Refused in
+    /// `parse` on every action that has no window to name, so no action function
+    /// can run against the display while its caller believes it named a window.
+    pub target_id: Option<String>,
 }
 
 /// What an action is asked to show for itself afterwards.
@@ -483,6 +540,18 @@ fn parse_request(value: &Value) -> Result<Inbound, ParseFailure> {
         }
     };
 
+    let target_id = match binding(value, &action) {
+        Ok(target) => target,
+        Err(detail) => {
+            return Err(ParseFailure {
+                error: "unknown_field",
+                detail,
+                reply: Reply::Response(request_id),
+                action: Some(action),
+            })
+        }
+    };
+
     let check = match evidence(value, &action, element_ref.is_some()) {
         Ok(check) => check,
         Err(detail) => {
@@ -501,6 +570,7 @@ fn parse_request(value: &Value) -> Result<Inbound, ParseFailure> {
         observation_id,
         element_ref,
         check,
+        target_id,
         sidecar_generation: value
             .get("sidecar_generation")
             .and_then(Value::as_str)
@@ -512,6 +582,26 @@ fn parse_request(value: &Value) -> Result<Inbound, ParseFailure> {
         mutation_seq: value.get("mutation_seq").and_then(Value::as_u64),
         body: value.clone(),
     }))
+}
+
+/// The bound window this request acts inside, decided before the action runs.
+///
+/// A target changes where an action LOOKS and what its coordinates mean, so an
+/// action that has no such notion is refused rather than run against the display
+/// while its caller believes it named a window — the same rule, and the same
+/// reason, as a `region` on a click.
+fn binding(value: &Value, action: &str) -> Result<Option<String>, String> {
+    let named = non_empty(value, "target_id").map_err(|field| {
+        format!("{field} must be a non-empty string naming a window select_target bound")
+    })?;
+
+    match named {
+        None => Ok(None),
+        Some(_) if !takes_a_target(action) => Err(format!(
+            "{action} takes no target_id: it does not act inside one window"
+        )),
+        Some(id) => Ok(Some(id)),
+    }
 }
 
 /// The evidence this request asks for, decided before the action runs.
@@ -1078,6 +1168,33 @@ pub fn control_ack(
     Value::Object(frame)
 }
 
+/// The sidecar speaking unasked.
+///
+/// `kind` is the family — today only `indicator`, the ownership badge — and `event`
+/// is which one. The authority is on it because a session event can CHANGE it: the
+/// badge's Pause is applied to the gate before this is written, and the gate revokes
+/// the caller's authority when it installs a barrier. A consumer that did not learn
+/// the new generation here would have every later request refused `stale_generation`
+/// with no way to find out why.
+pub fn session_event(
+    envelope: &Envelope,
+    kind: &str,
+    event: &str,
+    authorization_generation: u64,
+) -> Value {
+    let mut frame = Map::new();
+    frame.insert("type".into(), json!("session_event"));
+    frame.insert("kind".into(), json!(kind));
+    frame.insert("event".into(), json!(event));
+    frame.insert(
+        "authorization_generation".into(),
+        json!(authorization_generation),
+    );
+    envelope.stamp(&mut frame);
+
+    Value::Object(frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1239,25 +1356,89 @@ mod tests {
     // A reserved field means the caller is asking for targeting this build cannot
     // do. Running the action anyway would act on the wrong thing while looking
     // like it obeyed.
+    // Nothing is reserved any more. The mechanism stays because the next
+    // reservation belongs in it, and a field that has GRADUATED must not still be
+    // in the list — a request that names its image, its control or its window would
+    // then be refused for asking for exactly what this build does.
     #[test]
-    fn a_reserved_later_slice_field_is_refused_by_name() {
-        for field in RESERVED_FIELDS {
-            let line = format!(
-                r#"{{"type":"request","request_id":"r1","action":"left_click","{field}":"x"}}"#
-            );
-            let failure = parse(&line).expect_err("a reserved field must be refused");
-            assert_eq!(failure.error, "unknown_field");
-            assert_eq!(failure.reply, Reply::Response("r1".to_string()));
-            assert_eq!(failure.action.as_deref(), Some("left_click"));
-            assert!(failure.detail.contains(field), "{}", failure.detail);
-        }
-
-        for field in ["observation_id", "element_ref"] {
+    fn no_field_this_build_implements_is_still_reserved() {
+        for field in ["observation_id", "element_ref", "target_id"] {
             assert!(
                 !RESERVED_FIELDS.contains(&field),
                 "{field} is an addressing field now, not a reservation"
             );
         }
+    }
+
+    // --- protocol 11: one window, bound --------------------------------------
+
+    // Everything that looks at, or acts inside, one window takes a target — written
+    // as the whole set, so an action added later joins this invariant or fails it.
+    #[test]
+    fn every_action_that_acts_inside_a_window_carries_its_target() {
+        for action in TARGETABLE_ACTIONS {
+            let fields = match action {
+                "press" | "set_value" => {
+                    r#","observation_id":"7c1e-1","element_ref":"e3","value":"v","target_id":"t1""#
+                }
+                "inspect" | "left_click_drag" => r#","observation_id":"7c1e-1","target_id":"t1""#,
+                "screenshot" | "elements" | "type" | "key" | "paste" => r#","target_id":"t1""#,
+                _pointer => r#","observation_id":"7c1e-1","x":4,"y":9,"target_id":"t1""#,
+            };
+
+            let Ok(Inbound::Request(request)) = parse(&line(action, fields)) else {
+                panic!("{action} must take a target");
+            };
+            assert_eq!(request.target_id.as_deref(), Some("t1"), "{action}");
+        }
+    }
+
+    // `windows` enumerates the DESKTOP, which is how a target is found in the first
+    // place; the rest have no window to name. Refused, not ignored: a caller that
+    // believes it named a window and got the display is the failure this prevents.
+    #[test]
+    fn an_action_with_no_window_to_name_refuses_a_target_by_name() {
+        for action in [
+            "windows",
+            "wait",
+            "wait_for_change",
+            "select_target",
+            "release_target",
+        ] {
+            let failure = parse(&line(action, r#","target_id":"t1""#))
+                .expect_err("that action has no window to name");
+            assert_eq!(failure.error, "unknown_field", "{action}");
+            assert!(failure.detail.contains("target_id"), "{}", failure.detail);
+            assert_eq!(failure.reply, Reply::Response("r1".to_string()));
+        }
+
+        let empty = parse(&line("screenshot", r#","target_id":"""#))
+            .expect_err("an empty id names nothing");
+        assert_eq!(empty.error, "unknown_field");
+    }
+
+    // Neither target verb touches the screen, so neither carries a sequence number
+    // or earns a receipt — and a pause does not refuse them.
+    #[test]
+    fn binding_a_window_dispatches_nothing() {
+        for action in ["select_target", "release_target"] {
+            assert!(!touches_input(action), "{action}");
+            assert!(!carries_mutation_seq(action), "{action}");
+            assert!(!takes_a_check(action), "{action}");
+            assert!(!takes_a_target(action), "{action}");
+        }
+    }
+
+    #[test]
+    fn a_session_event_carries_the_authority_it_was_minted_under() {
+        let frame = session_event(&envelope(), "indicator", "operator_pause", 4);
+
+        assert_eq!(frame["type"], json!("session_event"));
+        assert_eq!(frame["kind"], json!("indicator"));
+        assert_eq!(frame["event"], json!("operator_pause"));
+        assert_eq!(frame["authorization_generation"], json!(4));
+        assert_eq!(frame["sidecar_generation"], json!("boot-1"));
+        assert_eq!(frame["session_generation"], json!(1));
     }
 
     // --- protocol 9: a control has a name ------------------------------------
@@ -1474,6 +1655,26 @@ mod tests {
 
     // The two lists answer different questions and a reader will assume they are
     // the same one. `mouse_move` is the case that proves they are not.
+    #[test]
+    fn a_pause_bars_binding_a_window_and_never_bars_giving_one_back() {
+        // Binding dispatches nothing and is still barred: it opens a capture of
+        // somebody's window and puts a badge on their screen.
+        assert!(!touches_input("select_target"));
+        assert!(barred_by_a_pause("select_target"));
+
+        // Releasing is always allowed, or a pause would trap a target with a badge
+        // on screen and no way to take it off.
+        assert!(!barred_by_a_pause("release_target"));
+
+        // And everything else is exactly the input list.
+        for action in INPUT_ACTIONS {
+            assert!(barred_by_a_pause(action), "{action}");
+        }
+        for action in ["screenshot", "elements", "inspect", "windows", "hello"] {
+            assert!(!barred_by_a_pause(action), "{action}");
+        }
+    }
+
     #[test]
     fn mouse_move_is_read_only_on_the_wire_and_still_input() {
         assert!(carries_mutation_seq("left_click"));

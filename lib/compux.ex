@@ -46,6 +46,26 @@ defmodule Compux do
   `scroll/5` may take `{:element, ref}` instead of a point, and the sidecar
   re-reads that control's bounds before it clicks its centre.
 
+  ## One window, bound
+
+  `select_target/3` binds a window a `windows/2` listing named and answers a
+  `target_id`. Pass that id to a later call as `:target_id` and the helper answers
+  from that window's own frames, in that window's own coordinates — so a window
+  another one covers is still seen, and a click is refused rather than landing on
+  whatever is in front of it. While a target is held the helper shows an ownership
+  indicator on screen whose Pause and Stop reach it directly; those arrive as
+  session events (see `Compux.Transport`).
+
+      {:ok, list} = Compux.windows(cu)
+      [window | _] = list["windows"]
+      {:ok, bound} = Compux.select_target(cu, window["id"])
+
+      {:ok, shot} = Compux.screenshot(cu, target_id: bound["target_id"])
+      :ok = Compux.release_target(cu)
+
+  There is no "desktop" target: a call with no `:target_id` is the display-level
+  path this library has always had, unchanged.
+
   ## Every action says what evidence it wants back
 
   An action that dispatches input carries `:check`, and the reply's `receipt` says
@@ -320,6 +340,29 @@ defmodule Compux do
     run(cu, put_display(%{"action" => "windows"}, opts), opts)
   end
 
+  @doc """
+  Bind ONE window, by the `id` a `windows/2` listing gave it.
+
+  The reply carries the `target_id` to pass as `:target_id` from then on, the
+  window's `app` and `title`, the `methods` this binding really offers
+  (`foreground_hid`, plus `ax` where exactly one of the application's accessibility
+  windows matched this one), `ax_binding`, and a first observation of the window.
+
+  One target per helper: selecting again replaces it. A bound window is watched, so
+  an action that names one is refused rather than run when the window has gone,
+  been minimized, moved since the image was taken, or — for a click — been covered
+  by something else.
+  """
+  @spec select_target(t(), non_neg_integer(), keyword()) :: response()
+  def select_target(%__MODULE__{} = cu, window_id, opts \\ []) when is_integer(window_id) do
+    run(cu, %{"action" => "select_target", "window_id" => window_id}, opts)
+  end
+
+  @doc "Release the bound window, with its capture stream and its indicator. Idempotent."
+  @spec release_target(t(), keyword()) :: response()
+  def release_target(%__MODULE__{} = cu, opts \\ []),
+    do: run(cu, %{"action" => "release_target"}, opts)
+
   @doc "Paste `text` via the clipboard — fast and unicode-safe for long strings."
   @spec paste(t(), String.t(), keyword()) :: response()
   def paste(%__MODULE__{} = cu, text, opts \\ []) when is_binary(text),
@@ -376,7 +419,13 @@ defmodule Compux do
   # --- internals ------------------------------------------------------------
 
   defp run(%__MODULE__{driver: driver, state: state}, params, opts) do
-    params = maybe_put(params, "check", check_kind(Keyword.get(opts, :check)))
+    # The bound window is added here rather than at each verb, so every action that
+    # can name one takes `:target_id` the same way and the ones that cannot are
+    # refused by name in `Protocol.validate/1` instead of silently ignoring it.
+    params =
+      params
+      |> maybe_put("check", check_kind(Keyword.get(opts, :check)))
+      |> maybe_put("target_id", Keyword.get(opts, :target_id))
 
     with {:ok, request} <- Protocol.validate(params) do
       driver.execute(state, request)

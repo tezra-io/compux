@@ -94,9 +94,20 @@ impl Refusal {
 /// `now_ns` is the same clock at the resolution the wire reports an observation's
 /// age in; it is one reading, not two, so an expiry and a published timestamp can
 /// never disagree about when a frame was taken.
+///
+/// `now_mach` is a DIFFERENT clock and deliberately so: it is the mach absolute
+/// time base, which is the base ScreenCaptureKit stamps a frame's
+/// `SCStreamFrameInfoDisplayTime` on. The window fence compares the instant an
+/// input was dispatched with the instant a frame was DISPLAYED, and the only way to
+/// compare those without arithmetic nobody can verify blind is to read both in the
+/// same units. Nothing converts between the two bases; each is used where it
+/// belongs.
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
     fn now_ns(&self) -> u128;
+    /// The mach absolute time base, raw ticks — the units a frame's display time
+    /// arrives in. Never mixed with `now_ns`.
+    fn now_mach(&self) -> u64;
     fn sleep(&self, ms: u64);
 }
 
@@ -127,9 +138,40 @@ impl Clock for SystemClock {
         self.origin.elapsed().as_nanos()
     }
 
+    fn now_mach(&self) -> u64 {
+        mach_now()
+    }
+
     fn sleep(&self, ms: u64) {
         std::thread::sleep(std::time::Duration::from_millis(ms));
     }
+}
+
+/// The mach absolute time base, which is what a captured frame's display time is
+/// stamped on.
+#[cfg(target_os = "macos")]
+fn mach_now() -> u64 {
+    extern "C" {
+        fn mach_absolute_time() -> u64;
+    }
+
+    // SAFETY: no arguments, no allocation, and it is the documented reading of the
+    // one clock every frame attachment on this platform is stamped against.
+    unsafe { mach_absolute_time() }
+}
+
+/// Everywhere else there is no ScreenCaptureKit and therefore no display time to
+/// compare against; a monotonic reading keeps the seam honest without pretending
+/// this platform has the base.
+#[cfg(not(target_os = "macos"))]
+fn mach_now() -> u64 {
+    use std::sync::OnceLock;
+    static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+
+    ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64
 }
 
 /// What a control did, for the acknowledgement that reports it.
@@ -275,7 +317,7 @@ impl Gate {
             self.check_generations(&state, request)?;
             self.check_mutation_seq(&state, request)?;
 
-            if state.paused && crate::wire::touches_input(&request.action) {
+            if state.paused && crate::wire::barred_by_a_pause(&request.action) {
                 return Err(Refusal::Paused);
             }
 
@@ -614,8 +656,11 @@ impl Gate {
         }
     }
 
-    #[cfg(test)]
-    fn paused(&self) -> bool {
+    /// Is a pause installed? Read by the ownership indicator's watch, which shows
+    /// the person what the gate is doing — from the gate itself rather than from a
+    /// flag beside it, so a pause from a control frame, from the badge's own button
+    /// and from anywhere else all reach the badge by the same route.
+    pub fn paused(&self) -> bool {
         self.lock().paused
     }
 }
@@ -775,6 +820,10 @@ mod tests {
             self.now_ms() as u128 * 1_000_000
         }
 
+        fn now_mach(&self) -> u64 {
+            self.now_ms() * 1_000_000
+        }
+
         fn sleep(&self, ms: u64) {
             self.slept.lock().unwrap().push(ms);
             self.now.fetch_add(ms, Ordering::SeqCst);
@@ -802,6 +851,7 @@ mod tests {
             observation_id: None,
             element_ref: None,
             check: wire::Check::None,
+            target_id: None,
         }
     }
 
@@ -867,6 +917,32 @@ mod tests {
         let mut looked = request("screenshot");
         looked.authorization_generation = Some(ack.authorization_generation);
         assert_eq!(gate.admit(&looked), Ok(()), "a look is not input");
+    }
+
+    // Binding a window dispatches nothing, and a pause still refuses it: it opens a
+    // capture of somebody's window and puts a badge on their screen, which is
+    // exactly what a person pressing Pause is saying "not now" to.
+    //
+    // Releasing one is allowed while paused, and must be: a pause that trapped a
+    // target would leave a badge on the screen with no way to take it off.
+    #[test]
+    fn a_pause_refuses_binding_a_window_and_never_refuses_giving_one_back() {
+        let (gate, _) = gate();
+        let ack = gate.control(ControlAction::Pause, None);
+
+        let mut select = request("select_target");
+        select.authorization_generation = Some(ack.authorization_generation);
+        assert_eq!(gate.admit(&select), Err(Refusal::Paused));
+
+        let mut release = request("release_target");
+        release.authorization_generation = Some(ack.authorization_generation);
+        assert_eq!(gate.admit(&release), Ok(()));
+
+        // And once the person resumes, binding is admitted like anything else.
+        let resumed = gate.control(ControlAction::Resume, Some(ack.authorization_generation));
+        let mut again = request("select_target");
+        again.authorization_generation = Some(resumed.authorization_generation);
+        assert_eq!(gate.admit(&again), Ok(()));
     }
 
     #[test]

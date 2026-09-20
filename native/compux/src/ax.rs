@@ -261,12 +261,43 @@ pub trait Ax {
     /// The application in front. `None` when the platform will not say, in which
     /// case an action reports no foreground change rather than inventing one.
     fn frontmost_pid(&self) -> Option<i32>;
+
+    /// One application's own `AXWindow`s, retained.
+    ///
+    /// `owner` is this same platform, for the same reason [`Ax::walk`] takes it: a
+    /// trait object cannot recover its own `Rc`, and every reference handed back
+    /// here is released through the platform that made it. [`application_windows`]
+    /// is the one call site and hides it.
+    fn windows(&self, owner: &Rc<dyn Ax>, pid: i32) -> Vec<Retained>;
+
+    /// The same walk, from a root this process is already holding — the window a
+    /// target is bound to. Same collection, same bounds, same truncation reasons;
+    /// only where it starts differs, which is what keeps a bound window's controls
+    /// the window's rather than the whole application's.
+    fn walk_from(
+        &self,
+        owner: &Rc<dyn Ax>,
+        root: Handle,
+        clock: &dyn Clock,
+        deadline_ms: u64,
+    ) -> Walk;
 }
 
 /// Walk `pid`'s tree through `ax`, which is also what every reference the walk
 /// retains is released through.
 pub fn walk(ax: &Rc<dyn Ax>, pid: i32, clock: &dyn Clock, deadline_ms: u64) -> Walk {
     ax.walk(ax, pid, clock, deadline_ms)
+}
+
+/// One application's windows, retained through the platform that made them — which
+/// is how a bound target holds on to the one it matched.
+pub fn application_windows(ax: &Rc<dyn Ax>, pid: i32) -> Vec<Retained> {
+    ax.windows(ax, pid)
+}
+
+/// Walk from one window this process holds, rather than from an application.
+pub fn walk_from(ax: &Rc<dyn Ax>, root: Handle, clock: &dyn Clock, deadline_ms: u64) -> Walk {
+    ax.walk_from(ax, root, clock, deadline_ms)
 }
 
 // --- the references one reply handed out --------------------------------------
@@ -513,6 +544,13 @@ mod mac {
     const SIZE: &str = "AXSize";
     const ENABLED: &str = "AXEnabled";
     const FOCUSED_APPLICATION: &str = "AXFocusedApplication";
+    const WINDOWS: &str = "AXWindows";
+
+    /// How many of an application's windows are worth retaining to match one
+    /// against. A desktop application with more than this many open windows is not
+    /// a target-binding problem, and an unbounded retain here would hold every one
+    /// of them for the life of a target.
+    const MAX_APPLICATION_WINDOWS: usize = 64;
 
     // AXValueType tags for AXValueGetValue.
     const AXVALUE_CGPOINT: u32 = 1;
@@ -581,6 +619,33 @@ mod mac {
         fn element(&self, handle: Handle) -> Option<CFType> {
             self.registry().held.get(&handle.0).cloned()
         }
+
+        /// One traversal from one root. Both entry points come through here, so a
+        /// window's controls are collected by exactly the code an application's are.
+        unsafe fn walk_element(
+            &self,
+            owner: &Rc<dyn Ax>,
+            root: &CFType,
+            clock: &dyn Clock,
+            deadline_ms: u64,
+        ) -> Walk {
+            let mut walker = Walker {
+                platform: self,
+                owner,
+                clock,
+                deadline_ms,
+                visited: 0,
+                truncated: None,
+                nodes: Vec::new(),
+                ancestors: Vec::new(),
+            };
+            unsafe { walker.visit(root, 0) };
+
+            Walk {
+                nodes: walker.nodes,
+                truncated: walker.truncated,
+            }
+        }
     }
 
     impl Ax for Real {
@@ -596,22 +661,26 @@ mod mac {
                 // rather than the caller's whole deadline.
                 AXUIElementSetMessagingTimeout(root.as_CFTypeRef(), MESSAGING_TIMEOUT_S);
 
-                let mut walker = Walker {
-                    platform: self,
-                    owner,
-                    clock,
-                    deadline_ms,
-                    visited: 0,
-                    truncated: None,
-                    nodes: Vec::new(),
-                    ancestors: Vec::new(),
-                };
-                walker.visit(&root, 0);
+                self.walk_element(owner, &root, clock, deadline_ms)
+            }
+        }
 
-                Walk {
-                    nodes: walker.nodes,
-                    truncated: walker.truncated,
-                }
+        /// The same traversal from a window this process holds. The messaging
+        /// timeout is set on the element itself, exactly as `perform` does, because
+        /// there is no application element in the path to carry it.
+        fn walk_from(
+            &self,
+            owner: &Rc<dyn Ax>,
+            root: Handle,
+            clock: &dyn Clock,
+            deadline_ms: u64,
+        ) -> Walk {
+            let Some(element) = self.element(root) else {
+                return Walk::empty();
+            };
+            unsafe {
+                AXUIElementSetMessagingTimeout(element.as_CFTypeRef(), MESSAGING_TIMEOUT_S);
+                self.walk_element(owner, &element, clock, deadline_ms)
             }
         }
 
@@ -730,6 +799,41 @@ mod mac {
                 Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
             } else {
                 None
+            }
+        }
+
+        /// The application's own `AXWindows`, retained one by one. A window a
+        /// target is bound to has to outlive the reply that bound it, and a
+        /// borrowed child of a temporary application element would not.
+        fn windows(&self, owner: &Rc<dyn Ax>, pid: i32) -> Vec<Retained> {
+            unsafe {
+                let app_ref = AXUIElementCreateApplication(pid);
+                if app_ref.is_null() {
+                    return Vec::new();
+                }
+                let app = CFType::wrap_under_create_rule(app_ref);
+                AXUIElementSetMessagingTimeout(app.as_CFTypeRef(), MESSAGING_TIMEOUT_S);
+
+                let Some(windows) = copy_element_attr(&app, WINDOWS) else {
+                    return Vec::new();
+                };
+                let array = windows.as_CFTypeRef();
+                if CFGetTypeID(array) != CFArrayGetTypeID() {
+                    return Vec::new();
+                }
+
+                let count = CFArrayGetCount(array);
+                let mut out = Vec::new();
+                let mut index = 0;
+                while index < count && out.len() < MAX_APPLICATION_WINDOWS {
+                    let window_ref = CFArrayGetValueAtIndex(array, index);
+                    if !window_ref.is_null() {
+                        let window = CFType::wrap_under_get_rule(window_ref);
+                        out.push(Retained::new(self.hold(&window), owner.clone()));
+                    }
+                    index += 1;
+                }
+                out
             }
         }
 
@@ -1407,6 +1511,20 @@ mod stub {
         fn frontmost_pid(&self) -> Option<i32> {
             None
         }
+
+        fn windows(&self, _owner: &Rc<dyn Ax>, _pid: i32) -> Vec<Retained> {
+            Vec::new()
+        }
+
+        fn walk_from(
+            &self,
+            _owner: &Rc<dyn Ax>,
+            _root: Handle,
+            _clock: &dyn Clock,
+            _deadline_ms: u64,
+        ) -> Walk {
+            Walk::empty()
+        }
     }
 }
 
@@ -1517,6 +1635,9 @@ struct Recorded {
     /// driven into its wall-clock budget without sleeping.
     ms_per_node: u64,
     walks: usize,
+    /// Indices into `elements` that answer as the application's WINDOWS, for a test
+    /// that binds a target to one of them.
+    windows: Vec<usize>,
 }
 
 /// A [`Ax`] that answers from a script, records what was asked of it, and counts
@@ -1614,6 +1735,11 @@ impl Recorder {
 
     pub fn walks(&self) -> usize {
         self.state().walks
+    }
+
+    /// Which of the scripted elements answer as this application's windows.
+    pub fn windows_are(&self, indices: &[usize]) {
+        self.state().windows = indices.to_vec();
     }
 
     fn scripted(&self, handle: Handle) -> Option<Scripted> {
@@ -1778,6 +1904,43 @@ impl Ax for Recorder {
     fn frontmost_pid(&self) -> Option<i32> {
         self.state().frontmost
     }
+
+    /// A walk from a window this recorder holds answers the same scripted controls
+    /// an application walk does: a recording platform cannot model a real subtree,
+    /// and what the tests above it are about is WHERE the walk starts, which the
+    /// held-handle check proves.
+    fn walk_from(
+        &self,
+        owner: &Rc<dyn Ax>,
+        root: Handle,
+        clock: &dyn Clock,
+        deadline_ms: u64,
+    ) -> Walk {
+        if !self.state().held.contains_key(&root.0) {
+            return Walk::empty();
+        }
+        self.walk(owner, self.pid, clock, deadline_ms)
+    }
+
+    /// The scripted application's windows, retained like anything else — so a test
+    /// that binds a target proves the retain and the release too.
+    fn windows(&self, owner: &Rc<dyn Ax>, pid: i32) -> Vec<Retained> {
+        if pid != self.pid {
+            return Vec::new();
+        }
+
+        let mut state = self.state();
+        let windows = state.windows.clone();
+        let mut out = Vec::new();
+        for index in windows {
+            state.next += 1;
+            let handle = Handle(state.next);
+            state.held.insert(handle.0, index);
+            state.retains += 1;
+            out.push(Retained::new(handle, owner.clone()));
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -1805,6 +1968,10 @@ mod tests {
 
         fn now_ns(&self) -> u128 {
             self.now_ms() as u128 * 1_000_000
+        }
+
+        fn now_mach(&self) -> u64 {
+            self.now_ms() * 1_000_000
         }
 
         fn sleep(&self, ms: u64) {

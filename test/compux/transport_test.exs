@@ -4,7 +4,6 @@ defmodule Compux.TransportTest do
   # Several of these prove a refusal, and a refusal logs loudly by design.
   @moduletag :capture_log
 
-  alias Compux.Frame.SessionEvent
   alias Compux.Transport
 
   @fake Path.expand("../support/fake_sidecar.pl", __DIR__)
@@ -217,8 +216,7 @@ defmodule Compux.TransportTest do
       transport = start!()
       task = Task.async(fn -> Transport.request(transport, %{"action" => "defer"}, 5_000) end)
 
-      assert_receive {:compux_session_event, ^transport, %SessionEvent{kind: "request_deferred"}},
-                     2_000
+      assert_receive {:compux_session_event, ^transport, %{"kind" => "request_deferred"}}, 2_000
 
       assert {:error, :busy} = Transport.request(transport, %{"action" => "ping"}, 1_000)
 
@@ -235,8 +233,7 @@ defmodule Compux.TransportTest do
       transport = start!()
       task = Task.async(fn -> Transport.request(transport, %{"action" => "defer"}, 5_000) end)
 
-      assert_receive {:compux_session_event, ^transport, %SessionEvent{kind: "request_deferred"}},
-                     2_000
+      assert_receive {:compux_session_event, ^transport, %{"kind" => "request_deferred"}}, 2_000
 
       assert {:ok, ack} = Transport.control(transport, :pause, 2_000)
       assert ack.action == :pause
@@ -270,6 +267,50 @@ defmodule Compux.TransportTest do
       Transport.stop(transport)
     end
 
+    # The ownership indicator's Pause reaches the sidecar's gate directly, so by
+    # the time the owner hears about it the caller's authority has ALREADY been
+    # revoked. A transport that kept its old generation would spend the rest of the
+    # session being refused `stale_generation` for a pause nobody told it about.
+    test "a session event is delivered as a map and its new authority is adopted" do
+      transport = start!()
+
+      assert {:ok, _} = Transport.request(transport, %{"action" => "indicator"}, 2_000)
+
+      assert_receive {:compux_session_event, ^transport, event}, 2_000
+      assert event["kind"] == "indicator"
+      assert event["event"] == "operator_pause"
+      assert event["authorization_generation"] == 2
+
+      assert {:ok, echo} = Transport.request(transport, %{"action" => "echo"}, 2_000)
+      assert echo["seen_authorization_generation"] == 2
+
+      Transport.stop(transport)
+    end
+
+    # Two barriers can be installed within a moment of each other — the badge's
+    # Pause and a control's — and nothing orders the two reports. Adopting
+    # whichever arrived last would leave the transport on the LOWER authority, and
+    # every request after it refused `stale_generation` with nothing to act on.
+    test "an authority that arrives out of order never moves the transport backwards" do
+      transport = start!()
+
+      assert {:ok, _} =
+               Transport.request(transport, %{"action" => "indicator_out_of_order"}, 2_000)
+
+      assert_receive {:compux_session_event, ^transport, %{"authorization_generation" => 3}},
+                     2_000
+
+      assert_receive {:compux_session_event, ^transport, %{"authorization_generation" => 2}},
+                     2_000
+
+      assert {:ok, echo} = Transport.request(transport, %{"action" => "echo"}, 2_000)
+
+      assert echo["seen_authorization_generation"] == 3,
+             "the newer authority stands, whichever report arrived last"
+
+      Transport.stop(transport)
+    end
+
     test "a control that is never acknowledged is unconfirmed and poisons the transport" do
       transport = start!(control_mode("silent"))
 
@@ -287,8 +328,7 @@ defmodule Compux.TransportTest do
       transport = start!(control_mode("exit"))
       task = Task.async(fn -> Transport.request(transport, %{"action" => "defer"}, 30_000) end)
 
-      assert_receive {:compux_session_event, ^transport, %SessionEvent{kind: "request_deferred"}},
-                     2_000
+      assert_receive {:compux_session_event, ^transport, %{"kind" => "request_deferred"}}, 2_000
 
       assert {:error, {:sidecar_exited, 9}} = Transport.control(transport, :pause, 5_000)
       assert {:error, {:sidecar_exited, 9}} = Task.await(task, 5_000)

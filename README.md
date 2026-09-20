@@ -42,8 +42,62 @@ unicode-safe for long text), `key` (chords like `"cmd+shift+4"`, incl. `f1`–`f
 `wait`, `wait_for_change` (block until the screen changes, then return the new
 frame), `inspect` (the accessibility element under a point), `elements` (the
 interactive accessibility controls, each with a reference, a click point and what
-it can do), and `press` / `set_value` (act on a control by name, through the
-accessibility API).
+it can do), `press` / `set_value` (act on a control by name, through the
+accessibility API), and `select_target` / `release_target` (bind ONE window and
+work inside it).
+
+## One window, bound
+
+`select_target` takes the `id` a `windows` listing gave a window and binds it. Pass
+the `target_id` it answers as `:target_id` from then on, and the helper answers from
+that window's own stream of frames, in that window's own coordinates:
+
+```elixir
+{:ok, list}  = Compux.windows(cu)
+[window | _] = list["windows"]
+{:ok, bound} = Compux.select_target(cu, window["id"])
+
+{:ok, shot} = Compux.screenshot(cu, target_id: bound["target_id"])
+:ok = Compux.release_target(cu)
+```
+
+What binding one buys, and what it costs:
+
+- **A covered window is still seen.** The frames come from that window, so another
+  window in front of it changes nothing about what a `screenshot` or a `check`
+  shows.
+- **A pixel action on it is refused rather than misdirected.** A click needs the
+  window to be topmost at that exact point (`target_obstructed`, which names what is
+  in front). Nothing is raised and nothing is activated to make room: the person
+  keeps working where they were.
+- **A window that moved is never clicked where it was.** The window server's own
+  bounds, its display and its measured scale ride on every target observation, and
+  a difference at action time is `stale_observation`.
+- **An unchanged window is an answer, not a timeout.** A window nobody is touching
+  reports idle frames rather than pixels; a check over one comes back stable and
+  unchanged, with the picture it was unchanged from.
+- **Its controls are its own.** `elements` walks from the window's accessibility
+  element where exactly one of the application's matched it (`ax_binding: "bound"`),
+  and answers `ax_binding_unavailable` rather than listing the whole application's.
+- **The person can see it happening.** While a target is held the helper shows an
+  ownership badge, and its Pause and Stop reach the helper's own gate directly —
+  they arrive at the owner as `{:compux_session_event, transport, %{"event" =>
+  "operator_pause" | "operator_resume" | "operator_stop"}}`. Without that badge
+  running, a mutating request naming a window is refused
+  `control_surface_unavailable`.
+
+A paused session refuses `select_target` — binding a window opens a capture of it
+and puts a badge on somebody's screen, which is what a pause says "not now" to —
+and always allows `release_target`, because giving a window back is safe.
+
+Three refusals are worth knowing by name before the first run:
+`screen_recording_not_granted` is the grant and only the grant (System Settings,
+then restart the helper); `target_minimized` is a window to ask the person to bring
+back; `capture_geometry_mismatch` is a surface whose shape is not the window's, and
+it carries the numbers rather than mapping a coordinate through them.
+
+There is no "desktop" target: a call with no `:target_id` is the display-level path
+this library has always had, unchanged.
 
 ## Coordinates name their image
 

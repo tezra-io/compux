@@ -101,9 +101,21 @@ defmodule Compux.Protocol do
   # `semantic` re-reads the control an `element_ref` named and answers
   # `element_after`, with no capture; `none` is the receipt alone. The receipt says
   # which evidence it carries in `check` and what each phase cost in `timings_ms`.
-  @protocol_version 10
+  #
+  # v11 (M42 slice 5, bound targets): the caller may bind ONE window and work
+  # inside it. `select_target` takes a `window_id` from a `windows` listing and
+  # answers a `target_id` (`t1`, `t2`, …) with a first observation of that window
+  # alone; `release_target` ends it. An action that carries `target_id` is answered
+  # from the window's own frames and in the window's own coordinates, even when
+  # another window covers it, and the helper shows on screen that it is doing so.
+  # `target_id` was a reserved field the sidecar refused outright until now, so the
+  # version bumps and the handshake refuses the pairing. An action WITHOUT
+  # `target_id` behaves exactly as it did at protocol 10 — the display-level path is
+  # unchanged, and it is also how the full desktop stays reachable: there is no
+  # "desktop" target, there is the absence of one.
+  @protocol_version 11
 
-  @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows press set_value)
+  @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows press set_value select_target release_target)
 
   # Read-only in both senses the wire needs: a consumer may auto-run one without a
   # confirmation step, and it dispatches no input, so it carries no `mutation_seq`
@@ -111,8 +123,23 @@ defmodule Compux.Protocol do
   # `wait_for_idle` and `hello` are not model actions (they are absent from
   # `@actions`), but they change nothing on the screen and classifying them as
   # mutations would put a sequence number and a receipt on a permission probe.
+  #
+  # v11: `select_target` and `release_target` are here too. They change what the
+  # helper is bound to and they dispatch nothing — no pointer moves, no key goes
+  # down, nothing on the screen is touched — so putting a `mutation_seq` and a
+  # receipt on them would claim input where there was none. A pause therefore does
+  # not refuse them either, which is right: the person took the keyboard back, not
+  # the bookkeeping.
   @read_only ~w(screenshot mouse_move wait inspect wait_for_change elements windows
+                select_target release_target
                 probe idle_ms wait_for_idle hello)
+
+  # v11: the actions that may name a bound window. Everything that looks at, or
+  # acts inside, one window — and nothing else. `windows` enumerates the DESKTOP's
+  # windows, which is how a target is found in the first place; `wait`,
+  # `wait_for_change` and the two target verbs themselves have no target to name.
+  @targetable ~w(screenshot elements inspect left_click right_click double_click
+                 mouse_move left_click_drag scroll type key paste press set_value)
   # v8: the actions addressed INTO an observation — their target is read out of a
   # reply the caller was handed. Each one names that observation with
   # `observation_id` and takes no `region`: the rectangle is the sidecar's to
@@ -174,9 +201,14 @@ defmodule Compux.Protocol do
     case Map.get(params, "action") do
       action when action in @actions ->
         with :ok <- check_addressing(action, params),
+             :ok <- check_binding(action, params),
              :ok <- check_evidence(action, params),
              {:ok, request} <- validate_action(action, params) do
-          request = put_observation(request, Map.get(params, "observation_id"))
+          request =
+            request
+            |> put_observation(Map.get(params, "observation_id"))
+            |> put_target_id(Map.get(params, "target_id"))
+
           {:ok, put_check(request, Map.get(params, "check"))}
         end
 
@@ -303,6 +335,26 @@ defmodule Compux.Protocol do
     end
   end
 
+  # v11: the window this action is bound to, when it names one. A target changes
+  # where an action LOOKS and where its coordinates mean something, so an action
+  # that has no such notion is refused rather than run against the display while
+  # its caller believes it named a window.
+  defp check_binding(action, params) do
+    cond do
+      not Map.has_key?(params, "target_id") ->
+        :ok
+
+      action not in @targetable ->
+        {:error, "#{action} takes no target_id — it does not act inside one window"}
+
+      not nonempty_string?(Map.get(params, "target_id")) ->
+        {:error, ~s|target_id must be a non-empty string, as select_target spells it (e.g. "t1")|}
+
+      true ->
+        :ok
+    end
+  end
+
   defp observation?(params), do: nonempty_string?(Map.get(params, "observation_id"))
   defp element?(params), do: nonempty_string?(Map.get(params, "element_ref"))
 
@@ -312,6 +364,9 @@ defmodule Compux.Protocol do
 
   defp put_observation(request, nil), do: request
   defp put_observation(request, id), do: Map.put(request, "observation_id", id)
+
+  defp put_target_id(request, nil), do: request
+  defp put_target_id(request, id), do: Map.put(request, "target_id", id)
 
   defp put_check(request, nil), do: request
   defp put_check(request, kind), do: Map.put(request, "check", kind)
@@ -370,6 +425,30 @@ defmodule Compux.Protocol do
       request = %{"action" => "set_value", "element_ref" => element, "value" => value}
       {:ok, put_display(request, display)}
     end
+  end
+
+  # v11: bind one window, by the `id` a `windows` listing gave it. The helper
+  # answers a `target_id` and a first observation OF THAT WINDOW, so the caller's
+  # next coordinates are pixels of the window rather than of the display behind it.
+  #
+  # There is no "desktop" window id: the desktop is the ABSENCE of a target, which
+  # is the display-level path this protocol has always had. A second spelling for
+  # it would be a second code path for one behaviour.
+  defp validate_action("select_target", params) do
+    case Map.get(params, "window_id") do
+      id when is_integer(id) and id >= 0 ->
+        {:ok, %{"action" => "select_target", "window_id" => id}}
+
+      _other ->
+        {:error,
+         "select_target requires window_id: the non-negative integer id a windows " <>
+           "listing gave the window"}
+    end
+  end
+
+  # One target per helper, so this needs no id: it releases whatever is bound.
+  defp validate_action("release_target", _params) do
+    {:ok, %{"action" => "release_target"}}
   end
 
   defp validate_action("inspect", params) do

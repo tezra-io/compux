@@ -74,6 +74,22 @@ mod gate;
 /// The control reader thread, which owns stdin so the sidecar listens while it acts.
 mod control;
 
+/// The window server: what windows exist, where they are, and what is in front of
+/// what — behind a trait, so every rule a bound target lives by is a pure function.
+mod window_server;
+
+/// One window's frames: the `WindowFrames` seam, the after-action fence, the memory
+/// budget, and the ScreenCaptureKit stream that really produces them.
+mod window_frames;
+
+/// The bound window: what it is, whether it is still there, and what may be done
+/// inside it.
+mod target;
+
+/// The ownership indicator — the badge that shows the person their window is being
+/// worked in, and the Pause and Stop on it that reach the gate directly.
+mod indicator;
+
 /// Wire-compatibility version. MUST match `Compux.Protocol.protocol_version/0`.
 /// Bumped ONLY on a wire-incompatible change; reported in the `hello` handshake so
 /// a consumer can refuse a mismatched sidecar (the two-pin drift guard).
@@ -142,7 +158,21 @@ mod control;
 /// which evidence it carries (`check: {kind, settle, changed}`) and what each
 /// phase cost (`timings_ms` gained `encode`). `wait_for_change` returns the frame
 /// whose hash differed rather than a third one taken after the fact.
-const PROTOCOL_VERSION: u32 = 10;
+/// v11 (M42 slice 5): ONE WINDOW, bound. `select_target` takes a `window_id` from a
+/// `windows` listing and binds that window — its pid, that process's start time, its
+/// `CGWindowID`, and, where exactly one of the application's `AXWindow`s matches it,
+/// that window too — answering a `target_id` and a first observation of the window
+/// alone. An action carrying `target_id` is answered from that window's own stream
+/// of frames and in that window's own coordinates, so a window another one covers is
+/// still seen; a pixel action on it is refused `target_obstructed` rather than
+/// landing on whatever is in front, and nothing is ever raised or activated to make
+/// room. While a target is held the helper shows an ownership badge, and its Pause
+/// and Stop reach the gate directly and are reported as `session_event`s.
+/// `target_id` was a reserved field this sidecar refused outright until now. An
+/// action WITHOUT one behaves byte for byte as it did at protocol 10: the
+/// display-level path is untouched, and it is also how the whole desktop stays
+/// reachable — there is no "desktop" target, there is the absence of one.
+const PROTOCOL_VERSION: u32 = 11;
 
 /// The capture-stall self-reap (EX_TEMPFAIL), and NOTHING else.
 ///
@@ -368,6 +398,23 @@ struct Worker {
     measured: Measured,
     ax: Rc<dyn ax::Ax>,
     frames: Rc<dyn Frames>,
+    /// The window server, shared with the indicator's watch thread — which is why
+    /// this one is an `Arc` where the others are `Rc`.
+    windows: Arc<dyn window_server::Windows>,
+    /// What starts the ownership badge. Read for `hello` (is it in the bundle at
+    /// all) and used at every selection.
+    launcher: Arc<dyn indicator::Launcher>,
+    /// The ONE bound window, when there is one. Owned here, like the observation
+    /// table, so its stream and its badge are stopped by dropping it — a release, a
+    /// reselect and the worker ending all go through the same `Drop`.
+    target: Option<target::Target>,
+    /// How many targets this boot has bound, which is what `target_generation`
+    /// counts.
+    target_generation: u64,
+    /// The one serialized writer, for the `session_event`s the ownership badge
+    /// produces. Held here because a badge is restarted from inside an action, and
+    /// a restart needs everything the first start needed.
+    emitter: capture::Emitter,
 }
 
 /// The serial action worker. One request at a time, to completion, on this thread.
@@ -377,6 +424,11 @@ fn run_worker(jobs: mpsc::Receiver<control::Job>, gate: &Gate, emitter: &capture
         measured: Measured::new(),
         ax: Rc::new(ax::Real::new()),
         frames: Rc::new(Screen),
+        windows: Arc::new(window_server::Real::new()),
+        launcher: Arc::new(indicator::Bundled::new()),
+        target: None,
+        target_generation: 0,
+        emitter: emitter.clone(),
     };
 
     for job in jobs {
@@ -388,6 +440,10 @@ fn run_worker(jobs: mpsc::Receiver<control::Job>, gate: &Gate, emitter: &capture
         // is read here, which is the first moment anything may act on it.
         if gate.take_release() {
             worker.observations.clear();
+            // And of the window it was working in. Dropping the target is what
+            // stops its stream and its badge, so letting go of the seat lets go of
+            // the screen the person can see it on.
+            worker.target = None;
         }
 
         let frame = serve(&request, gate, emitter, &mut worker);
@@ -519,9 +575,9 @@ fn handle(
     let req = &request.body;
 
     match request.action.as_str() {
-        "hello" => hello(),
+        "hello" => hello(&worker.launcher),
         "probe" => probe(),
-        "idle_ms" => idle_ms(),
+        "idle_ms" => idle_ms(worker),
         "wait_for_idle" => wait_for_idle(req, gate),
         "request_permissions" => request_permissions(req),
         // Capture control verbs (MILESTONE_32 §8.4a) — NOT model actions, excluded
@@ -541,13 +597,15 @@ fn handle(
         "type" => type_text(request, gate, worker),
         "key" => key_chord(request, gate, worker),
         "wait" => wait(req, gate),
-        "inspect" => inspect(request, worker),
+        "inspect" => inspect(request, gate, worker),
         "wait_for_change" => wait_for_change(request, gate, worker),
         "paste" => paste(request, gate, worker),
         "elements" => elements(request, gate, worker),
         "windows" => windows(req, gate, worker),
         "press" => press(request, gate, worker),
         "set_value" => set_value(request, gate, worker),
+        "select_target" => select_target(request, gate, emitter, worker),
+        "release_target" => release_target(worker),
         other => Err(format!("unknown action: {other}").into()),
     }
 }
@@ -823,7 +881,7 @@ fn observe_ack(action: &str, ok: bool, error: Option<String>) -> Value {
 /// consumer refuse a sidecar whose `protocol_version` its compiled-in encoder does
 /// not speak (the two-pin drift guard). `compux_version` is diagnostic; `actions`
 /// is the model-facing verb set (probe/hello are operational, excluded).
-fn hello() -> Result<Value, Failure> {
+fn hello(launcher: &Arc<dyn indicator::Launcher>) -> Result<Value, Failure> {
     Ok(json!({
         "ok": true,
         "protocol_version": PROTOCOL_VERSION,
@@ -831,7 +889,8 @@ fn hello() -> Result<Value, Failure> {
         "actions": [
             "screenshot", "left_click", "right_click", "double_click", "mouse_move",
             "left_click_drag", "scroll", "type", "key", "wait", "inspect",
-            "wait_for_change", "paste", "elements", "windows", "press", "set_value"
+            "wait_for_change", "paste", "elements", "windows", "press", "set_value",
+            "select_target", "release_target"
         ],
         // Listed only because this build really has them: the two input methods
         // an action can carry, the three controls the gate implements, and the
@@ -844,8 +903,47 @@ fn hello() -> Result<Value, Failure> {
                 "max": observation::MAX_OBSERVATIONS,
                 "ttl_ms": observation::TTL_MS,
             },
+            // What a caller needs to decide whether to offer bound windows at all,
+            // BEFORE it selects anything. `indicator` is whether the badge's
+            // executable is beside this one: a target cannot be worked in without
+            // it, and finding that out by selecting a window and being refused
+            // would be finding it out too late.
+            "targets": targets_supported(),
+            "capture_methods": capture_methods(),
+            "indicator": indicator_presence(launcher),
         },
     }))
+}
+
+/// Can this build bind a window at all?
+///
+/// False where every selection would fail: there is no window server this build
+/// reads off macOS and no stream behind it, so `targets: true` there would be the
+/// handshake advertising a feature whose first use is a refusal. [M42.1] owns the
+/// Linux half and flips this with it.
+fn targets_supported() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// Which capture this build really has. `window` is a bound target's stream, and it
+/// is listed only where it exists: a caller that reads it and gets
+/// `capture_unavailable` on every selection has been lied to.
+fn capture_methods() -> Vec<&'static str> {
+    if targets_supported() {
+        vec!["display", "window"]
+    } else {
+        vec!["display"]
+    }
+}
+
+/// Read-only, and deliberately so: it looks for the file and never spawns it, so a
+/// handshake cannot put a panel on somebody's screen.
+fn indicator_presence(launcher: &Arc<dyn indicator::Launcher>) -> &'static str {
+    if launcher.present() {
+        "present"
+    } else {
+        "missing"
+    }
 }
 
 // --- probe (operational permission check, NOT a model action) ---------------
@@ -1469,22 +1567,266 @@ mod overlay {
     }
 }
 
+// --- binding one window ------------------------------------------------------
+
+/// Bind one window and answer what was bound, with a first observation OF IT.
+///
+/// One target per helper. Selecting again REPLACES the old one, and dropping it is
+/// what stops its stream and its badge — so there is never a moment with two
+/// streams, two badges, or a badge over a window nobody is working in.
+fn select_target(
+    request: &wire::Request,
+    gate: &Gate,
+    emitter: &capture::Emitter,
+    worker: &mut Worker,
+) -> Result<Value, Failure> {
+    let window_id = request
+        .body
+        .get("window_id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            Failure::new(
+                "invalid_argument",
+                "select_target needs window_id: the id a `windows` listing gave the window"
+                    .to_string(),
+            )
+        })? as u32;
+
+    // The display the window is on, so a target observation records the same facts
+    // every other observation does and a display that changes mode is still caught.
+    let display = target_display(&request.body)?;
+
+    // The old binding goes FIRST and completely: its stream, its badge and its
+    // watch stop with it, and only then is anything new started.
+    worker.target = None;
+    worker.target_generation += 1;
+    let generation = worker.target_generation;
+
+    let selected = target::select(
+        window_id,
+        generation,
+        format!("t{generation}"),
+        gate,
+        target::Selecting {
+            windows: &worker.windows,
+            ax: &worker.ax,
+            launcher: &worker.launcher,
+            emitter,
+            stream: new_window_stream(gate),
+            display_id: display.id,
+            facts: display.facts,
+        },
+    )?;
+
+    let mut payload = target::selected_payload(&selected.target);
+    let geometry = selected.geometry;
+    let image = selected.first.to_rgba().map_err(target::as_failure)?;
+    worker.target = Some(selected.target);
+
+    // The first observation is a picture of the WINDOW, so the caller's next
+    // coordinates are pixels of it rather than of the display behind it.
+    let captured = capture_payload_encoded(
+        &display,
+        geometry,
+        &image,
+        Rendering {
+            requested: Requested::Exactly(Region::full(&geometry)),
+            jpeg_quality: None,
+            overlays: Overlays::default(),
+        },
+        gate,
+        worker,
+    )?;
+    merge_into(&mut payload, captured);
+    note_target(&mut payload, worker, true)?;
+
+    Ok(payload)
+}
+
+/// Let the bound window go. Idempotent, and a no-op when there was none: releasing
+/// nothing is what the caller asked for either way, and refusing it would make a
+/// tidy-up path fail for doing its job.
+fn release_target(worker: &mut Worker) -> Result<Value, Failure> {
+    let released = worker.target.take().is_some();
+
+    Ok(json!({ "ok": true, "released": released }))
+}
+
+/// A fresh stream for one binding.
+#[cfg(target_os = "macos")]
+fn new_window_stream(gate: &Gate) -> Rc<dyn window_frames::WindowFrames> {
+    Rc::new(window_frames::sck::Stream::new(gate.clock()))
+}
+
+/// Linux has no window capture this build speaks, so a selection fails typed rather
+/// than binding a window nothing can look at. [M42.1] owns the Linux half.
+#[cfg(not(target_os = "macos"))]
+fn new_window_stream(_gate: &Gate) -> Rc<dyn window_frames::WindowFrames> {
+    Rc::new(window_frames::Unsupported)
+}
+
+/// Fold one payload into another, which is how `select_target` answers both what it
+/// bound and the first picture of it in one reply.
+fn merge_into(payload: &mut Value, extra: Value) {
+    let (Some(object), Value::Object(extra)) = (payload.as_object_mut(), extra) else {
+        return;
+    };
+
+    for (key, value) in extra {
+        // `ok` is already there and the two agree; anything else the capture named
+        // is the caller's to read.
+        object.entry(key).or_insert(value);
+    }
+}
+
+// --- what a request is answered from ----------------------------------------
+
+/// Where an action's pixels come from and what they mean.
+///
+/// Two ways to fill it and ONE shape after that: the display, or the one bound
+/// window. Everything downstream — the transform, the frames a settle samples
+/// through, the rectangle a check covers, the observation that is minted — is the
+/// same code either way, which is the whole reason a window's frames are just
+/// another [`Frames`].
+struct View {
+    display: Display,
+    /// The transform, when it is already known. A bound window's is built from the
+    /// frame it was read from, so it is known before anything is captured; the
+    /// display's is measured from a real capture, and measuring it eagerly would
+    /// cost an action that never looks a capture it does not need.
+    geometry: Option<Geometry>,
+    frames: Rc<dyn Frames>,
+    /// The window this view is OF, when it is one.
+    bound: Option<target::Live>,
+}
+
+impl View {
+    /// The transform in force, measuring the display's if nothing has yet.
+    fn geometry(&self, gate: &Gate, worker: &mut Worker) -> Result<Geometry, Failure> {
+        match self.geometry {
+            Some(geometry) => Ok(geometry),
+            None => measured_geometry(&self.display, gate, worker),
+        }
+    }
+}
+
+/// The bound window this request names, checked and ready — or `None`, which is the
+/// display-level path exactly as it was.
+///
+/// The badge check is here rather than in each action, because "no ready indicator,
+/// no target mutation" is a property of the REQUEST (does it name a window, does it
+/// dispatch input) and not of what any one verb does.
+fn bound(
+    request: &wire::Request,
+    gate: &Gate,
+    worker: &mut Worker,
+) -> Result<Option<target::Live>, Failure> {
+    let Some(named) = request.target_id.as_deref() else {
+        return Ok(None);
+    };
+
+    let live = target::live(worker.target.as_ref(), named, &worker.windows, &worker.ax)?;
+
+    if target::needs_control_surface(&request.action) {
+        let (launcher, windows, emitter) = (
+            worker.launcher.clone(),
+            worker.windows.clone(),
+            worker.emitter.clone(),
+        );
+        if let Some(target) = worker.target.as_mut() {
+            target::control_surface(
+                target,
+                target::Restarting {
+                    launcher: &launcher,
+                    windows: &windows,
+                    gate,
+                    emitter: &emitter,
+                },
+            )?;
+        }
+    }
+
+    Ok(Some(live))
+}
+
+/// What this request looks at: the bound window it names, or the display.
+fn view(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<View, Failure> {
+    let bound = bound(request, gate, worker)?;
+
+    match bound {
+        Some(live) => Ok(View {
+            display: Display {
+                facts: live.facts,
+                id: live.display_id,
+            },
+            geometry: Some(live.geometry),
+            frames: live.frames.clone(),
+            bound: Some(live),
+        }),
+
+        None => Ok(View {
+            display: target_display(&request.body)?,
+            geometry: None,
+            frames: worker.frames.clone(),
+            bound: None,
+        }),
+    }
+}
+
 // --- screenshot -------------------------------------------------------------
 
 fn screenshot(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let req = &request.body;
-    let display = target_display(req)?;
-    let frame = take_frame(&display, gate, &worker.frames)?;
+    let view = view(request, gate, worker)?;
+    let frame = take_frame(&view.display, gate, &view.frames)?;
+    // A display's transform is measured from the frame that was really captured; a
+    // bound window's came with the frame. Both are the picture speaking for itself.
+    let geom = match view.geometry {
+        Some(geometry) => geometry,
+        None => measure_geometry(&view.display, &frame, worker)?,
+    };
 
-    capture_payload_encoded(
-        &display,
+    let mut payload = capture_payload_encoded(
+        &view.display,
+        geom,
         &frame,
-        Requested::Region(request),
-        parse_jpeg_quality(req)?,
-        parse_overlays(req)?,
+        Rendering {
+            requested: Requested::Region(request),
+            jpeg_quality: parse_jpeg_quality(req)?,
+            overlays: parse_overlays(req)?,
+        },
         gate,
         worker,
-    )
+    )?;
+    note_target(&mut payload, worker, view.bound.is_some())?;
+
+    Ok(payload)
+}
+
+/// Say which window a reply is about, and which of that application's other windows
+/// have appeared since it was bound.
+///
+/// On every reply that looks at THAT target, because a sheet that opened is the one
+/// thing a caller cannot see in a picture of the window it was covering — and on no
+/// other reply, however much a target happens to be bound. A display-level
+/// screenshot is a picture of the whole screen, and stamping a `target_id` on it
+/// would tell the caller its coordinates are in a window's space when they are not.
+fn note_target(payload: &mut Value, worker: &Worker, about_target: bool) -> Result<(), Failure> {
+    if !about_target {
+        return Ok(());
+    }
+
+    let (Some(target), Some(object)) = (worker.target.as_ref(), payload.as_object_mut()) else {
+        return Ok(());
+    };
+
+    // A listing that could not be taken is NOT an empty one: the caller would read
+    // "no new windows" for "nobody knows", which is the sheet it cannot see.
+    let children = target::children(target, &worker.windows)?;
+
+    object.insert("target_id".to_string(), json!(target.id));
+    object.insert("children".to_string(), Value::Array(children));
+    Ok(())
 }
 
 /// What a capture is being asked to cover. A `screenshot` carries the request whose
@@ -1698,56 +2040,59 @@ fn encode_image(
 /// thread, a stall budget, a re-resolve by display id) is not this trait's
 /// business and stays exactly where it was.
 trait Frames {
-    fn capture(&self, display_id: u32) -> Result<image::RgbaImage, String>;
+    fn capture(&self, display_id: u32) -> Result<image::RgbaImage, Failure>;
 }
 
 /// The real screen.
 struct Screen;
 
 impl Frames for Screen {
-    fn capture(&self, display_id: u32) -> Result<image::RgbaImage, String> {
+    fn capture(&self, display_id: u32) -> Result<image::RgbaImage, Failure> {
         ensure_display_awake(display_id)?;
-        capture_display_image(display_id)
+        Ok(capture_display_image(display_id)?)
     }
 }
 
-/// One capture, timed the way the receipt reports it: measured, never estimated.
-fn timed_capture(
-    display: &Display,
-    gate: &Gate,
-    frames: &Rc<dyn Frames>,
-) -> Result<image::RgbaImage, String> {
-    let started = gate.now_ms();
-    let image = frames.capture(display.id)?;
-    gate.record(Phase::Capture, gate.now_ms().saturating_sub(started));
-    Ok(image)
-}
-
-/// One frame, as an action reads it. Every capture in this process goes through
-/// here, so what a frame costs is counted once and in one place.
+/// One frame, as an action reads it, timed the way the receipt reports it. Every
+/// capture in this process goes through here, so what a frame costs is counted once
+/// and in one place — a display's, and a bound window's alike.
 fn take_frame(
     display: &Display,
     gate: &Gate,
     frames: &Rc<dyn Frames>,
 ) -> Result<image::RgbaImage, Failure> {
-    Ok(timed_capture(display, gate, frames)?)
+    let started = gate.now_ms();
+    let image = frames.capture(display.id);
+    gate.record(Phase::Capture, gate.now_ms().saturating_sub(started));
+    image
+}
+
+/// What one captured frame is turned into: which rectangle of it, how it is
+/// encoded, and what is drawn on it. A struct rather than three arguments, because
+/// the three always travel together and a call site reads better naming them.
+struct Rendering<'a> {
+    requested: Requested<'a>,
+    jpeg_quality: Option<u8>,
+    overlays: Overlays,
 }
 
 fn capture_payload_encoded(
     display: &Display,
+    geom: Geometry,
     image: &image::RgbaImage,
-    requested: Requested<'_>,
-    jpeg_quality: Option<u8>,
-    overlays: Overlays,
+    rendering: Rendering<'_>,
     gate: &Gate,
     worker: &mut Worker,
 ) -> Result<Value, Failure> {
-    // The transform is built from the FRAME, because how many pixels the OS answers
-    // per point is a fact about the image and not about the display mode. A frame
-    // that cannot be explained that way fails the action here, before any of it is
-    // handed out as coordinates.
-    let geom = measure_geometry(display, image, worker)?;
-
+    let Rendering {
+        requested,
+        jpeg_quality,
+        overlays,
+    } = rendering;
+    // The transform is the caller's, because it is built from the FRAME this image
+    // came out of — a display's measured from the capture, a bound window's from the
+    // window's own content rectangle — and how many pixels there are per point is a
+    // fact about the picture rather than about the display mode.
     let region = match requested {
         Requested::Exactly(region) => region,
         Requested::Region(request) => viewing_region(request, &geom, worker)?,
@@ -2083,17 +2428,38 @@ fn addressed_element<'a>(
     }
 }
 
-/// The display this action's check image is taken on and, for a POINT, proof that
-/// it is still the display that image was made on.
+/// The view an ADDRESSED action acts in, with its staleness proved.
 ///
-/// A control needs no such proof: its bounds are global logical points read at
-/// the moment of the action, so a display that has moved since the listing does
-/// not move the control. Not needing it is the point of addressing one.
-fn display_for(request: &wire::Request, observation: &Observation) -> Result<Display, Failure> {
-    if request.element_ref.is_some() {
-        Ok(target_display(&request.body)?)
-    } else {
-        same_display(observation, &request.body)
+/// The two paths prove the same thing about two different things. On the display,
+/// the check is that the display has not moved or changed mode since the image was
+/// made. On a bound window it is that the WINDOW has not: its bounds, its display
+/// and its scale are part of every target observation, and a difference in any of
+/// them means a coordinate read in that image maps somewhere nobody chose.
+///
+/// A control needs neither: its bounds are read live in global points at the moment
+/// it acts, and not needing this is the point of addressing one.
+fn acting_view(
+    request: &wire::Request,
+    observation: &Observation,
+    gate: &Gate,
+    worker: &mut Worker,
+) -> Result<View, Failure> {
+    let view = view(request, gate, worker)?;
+
+    match (&view.bound, request.element_ref.is_some()) {
+        (_, true) => Ok(view),
+        (Some(live), false) => target::unmoved(observation, live).map(|()| view),
+        (None, false) => same_display(observation, &request.body).map(|_display| view),
+    }
+}
+
+/// A pixel action on a bound window needs that window to be topmost where it is
+/// aiming. Nothing else does: typing goes to the focus, and a control is reached by
+/// name rather than through whatever is drawn over it.
+fn reachable(view: &View, worker: &Worker, lx: i32, ly: i32) -> Result<(), Failure> {
+    match view.bound.as_ref() {
+        None => Ok(()),
+        Some(live) => target::unobstructed(live, &worker.windows, lx, ly),
     }
 }
 
@@ -2101,7 +2467,8 @@ fn mouse_move(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resu
     let observation = observed(request, worker)?;
     let element = addressed_element(request, &observation)?;
     let (lx, ly) = aim(request, &observation, element, worker)?;
-    display_for(request, &observation)?;
+    let view = acting_view(request, &observation, gate, worker)?;
+    reachable(&view, worker, lx, ly)?;
     // Read-only on the wire and still the human's pointer, so it goes through the
     // gate like every other input and a pause stops it.
     let mut platform = Gated::new(gate, held::Real::default());
@@ -2126,7 +2493,8 @@ fn click(
     let observation = observed(request, worker)?;
     let element = addressed_element(request, &observation)?;
     let (lx, ly) = aim(request, &observation, element, worker)?;
-    let display = display_for(request, &observation)?;
+    let view = acting_view(request, &observation, gate, worker)?;
+    reachable(&view, worker, lx, ly)?;
     let mods = modifiers(req);
 
     // A local, not a temporary: enigo's own `Drop` paces the events it posted, and
@@ -2141,7 +2509,7 @@ fn click(
         executed: Some((lx, ly)),
         element,
     };
-    post(request, Some(display), gate, worker, acted)
+    post(request, Some(view), gate, worker, acted)
 }
 
 /// The click itself, over the injected platform: warp, settle, hold the modifiers,
@@ -2186,7 +2554,11 @@ fn drag(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Val
     let observation = observed(request, worker)?;
     let (fx, fy) = point_in(&observation, from.x, from.y)?;
     let (tx, ty) = point_in(&observation, to.x, to.y)?;
-    let display = same_display(&observation, req)?;
+    let view = acting_view(request, &observation, gate, worker)?;
+    // BOTH ends: a drag that starts on the target and finishes under something else
+    // would drop where nobody chose.
+    reachable(&view, worker, fx, fy)?;
+    reachable(&view, worker, tx, ty)?;
 
     // A local for the same reason as `click`: enigo's pacing runs on its drop.
     let mut platform = Gated::new(gate, held::Real::default());
@@ -2200,7 +2572,7 @@ fn drag(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Val
         executed: Some((tx, ty)),
         element: None,
     };
-    post(request, Some(display), gate, worker, acted)
+    post(request, Some(view), gate, worker, acted)
 }
 
 /// The drag itself, over the injected platform. Everything from the press to the
@@ -2261,7 +2633,8 @@ fn scroll(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<V
     let observation = observed(request, worker)?;
     let element = addressed_element(request, &observation)?;
     let (lx, ly) = aim(request, &observation, element, worker)?;
-    let display = display_for(request, &observation)?;
+    let view = acting_view(request, &observation, gate, worker)?;
+    reachable(&view, worker, lx, ly)?;
     let amount = req.get("amount").and_then(Value::as_i64).unwrap_or(3) as i32;
     let (axis, length) = match req.get("direction").and_then(Value::as_str) {
         Some("up") => (Axis::Vertical, -amount),
@@ -2284,7 +2657,7 @@ fn scroll(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<V
         executed: Some((lx, ly)),
         element,
     };
-    post(request, Some(display), gate, worker, acted)
+    post(request, Some(view), gate, worker, acted)
 }
 
 fn type_text(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
@@ -2297,12 +2670,15 @@ fn type_text(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resul
     // checkpoint and this slice does not pretend it can: it is checked at the gate
     // before dispatch and not inside. Chunking the string would change typing
     // timing in ways only a live check could qualify.
+    // A window may still be named: typing goes to the focus wherever it is, and the
+    // check then shows the window the caller is working in rather than the screen.
+    let view = view(request, gate, worker)?;
     let mut platform = Gated::new(gate, held::Real::default());
     platform.text(text)?;
     gate.input_complete();
     // Typing executes at the focus, not at a coordinate: it names no image and
-    // there is nothing to mark, so its check is the whole display.
-    post(request, None, gate, worker, nothing_named())
+    // there is nothing to mark, so its check is the whole of the view.
+    post(request, Some(view), gate, worker, nothing_named())
 }
 
 fn key_chord(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
@@ -2318,12 +2694,13 @@ fn key_chord(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resul
     let mods: Vec<Key> = mod_parts.iter().filter_map(|m| modifier_key(m)).collect();
     let main = named_key(key_name).ok_or_else(|| format!("unknown key: {key_name}"))?;
 
+    let view = view(request, gate, worker)?;
     // A local for the same reason as `click`: enigo's pacing runs on its drop.
     let mut platform = Gated::new(gate, held::Real::default());
     key_chord_seq(&mut platform, &mods, main)?;
     gate.input_complete();
 
-    post(request, None, gate, worker, nothing_named())
+    post(request, Some(view), gate, worker, nothing_named())
 }
 
 /// The chord itself, over the injected platform. This was the one sequence that
@@ -2436,10 +2813,13 @@ fn wait_for_change_on(
             };
             let mut payload = capture_payload_encoded(
                 display,
+                geom,
                 &frame,
-                Requested::Exactly(region),
-                None,
-                overlays,
+                Rendering {
+                    requested: Requested::Exactly(region),
+                    jpeg_quality: None,
+                    overlays,
+                },
                 gate,
                 worker,
             )?;
@@ -2588,13 +2968,31 @@ fn human_idle_ms() -> Result<u64, String> {
 /// Report ms since the last input event. Operational (a policy-support probe), NOT a
 /// model action — excluded from `hello`'s advertised verbs like `probe`.
 #[cfg(target_os = "macos")]
-fn idle_ms() -> Result<Value, Failure> {
-    Ok(json!({ "ok": true, "idle_ms": human_idle_ms()? }))
+fn idle_ms(worker: &Worker) -> Result<Value, Failure> {
+    let mut payload = json!({ "ok": true, "idle_ms": human_idle_ms()? });
+    note_front_is_target(&mut payload, worker);
+    Ok(payload)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn idle_ms() -> Result<Value, Failure> {
+fn idle_ms(_worker: &Worker) -> Result<Value, Failure> {
     Err("idle detection is only supported on macOS".into())
+}
+
+/// Whether the window the person is working in is the TARGET's.
+///
+/// The difference between a person busy in this application and a person busy
+/// somewhere else, which is what decides whether an action that takes no pointer has
+/// to wait for them at all. Absent when nothing is bound, and absent when the window
+/// server would not say — never invented as `false`, which is a claim.
+fn note_front_is_target(payload: &mut Value, worker: &Worker) {
+    let (Some(target), Some(object)) = (worker.target.as_ref(), payload.as_object_mut()) else {
+        return;
+    };
+
+    if let Some(front) = target::front_is_target(target, &worker.windows) {
+        object.insert("front_is_target".to_string(), json!(front));
+    }
 }
 
 /// Block until the human has been idle for `idle_ms` (default 1000), bounded by
@@ -2644,13 +3042,14 @@ fn paste(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Va
         .and_then(Value::as_str)
         .ok_or("missing text")?;
 
+    let view = view(request, gate, worker)?;
     // A local for the same reason as `click`: enigo's pacing runs on its drop, and
     // the clipboard handle lived this long too.
     let mut platform = Gated::new(gate, held::Real::default());
     paste_seq(&mut platform, text)?;
     gate.input_complete();
 
-    post(request, None, gate, worker, nothing_named())
+    post(request, Some(view), gate, worker, nothing_named())
 }
 
 /// Let the pasteboard write settle before the paste keystroke.
@@ -2693,6 +3092,10 @@ fn paste_modifier() -> Key {
 /// applied to a long `type`.
 fn press(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let observation = observed(request, worker)?;
+    // Resolved BEFORE the control, so a request naming a window that is gone is
+    // refused for that rather than for a reference that went with it — and so the
+    // badge check runs before anything is dispatched.
+    let view = view(request, gate, worker)?;
     let entry = element_in(&observation, request)?;
     revalidate(&worker.ax, &observation, entry, Capability::Press)?;
 
@@ -2718,7 +3121,7 @@ fn press(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Va
         executed: aimed,
         element: Some(entry),
     };
-    post(request, None, gate, worker, acted)
+    post(request, Some(view), gate, worker, acted)
 }
 
 /// Set the control's value, then read it back — which is the only thing in this
@@ -2741,6 +3144,7 @@ fn set_value(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resul
         .to_string();
 
     let observation = observed(request, worker)?;
+    let view = view(request, gate, worker)?;
     let entry = element_in(&observation, request)?;
     revalidate(&worker.ax, &observation, entry, Capability::SetValue)?;
 
@@ -2775,7 +3179,7 @@ fn set_value(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resul
         executed: aimed,
         element: Some(entry),
     };
-    let mut payload = post(request, None, gate, worker, acted)?;
+    let mut payload = post(request, Some(view), gate, worker, acted)?;
 
     if let Some(object) = payload.as_object_mut() {
         object.insert("verified".to_string(), json!(verified));
@@ -2896,11 +3300,25 @@ struct Settled {
 /// could not be obtained never turns `sent` into anything else.
 fn post(
     request: &wire::Request,
-    display: Option<Display>,
+    view: Option<View>,
     gate: &Gate,
     worker: &mut Worker,
     acted: Acted<'_>,
 ) -> Result<Value, Failure> {
+    // The fence is armed the instant the input is complete and disarmed when the
+    // action ends, so every sample a check takes is held to it and nothing later is.
+    // A view with no window has no fence: a display capture is taken now, by
+    // definition after the input, and has no sequence to be beyond.
+    let _fenced = view
+        .as_ref()
+        .and_then(|view| view.bound.as_ref())
+        .map(|live| {
+            // On the MACH base, because that is the base the frame's display
+            // time arrives on and nothing converts between the two.
+            live.frames.arm(gate.clock().now_mach(), live.seq);
+            Fenced(live.frames.clone())
+        });
+
     match request.check {
         wire::Check::None => {
             gate.observed_check(wire::Checked {
@@ -2913,7 +3331,18 @@ fn post(
 
         wire::Check::Semantic => element_after(gate, worker, acted.element),
 
-        wire::Check::Image => check_image(request, display, gate, worker, acted),
+        wire::Check::Image => check_image(request, view, gate, worker, acted),
+    }
+}
+
+/// The armed fence, disarmed on EVERY path out of the check — the settle finishing,
+/// a capture failing, a pause cancelling it, an early `?`. A fence left armed would
+/// hold the next action to the last one's dispatch.
+struct Fenced(Rc<target::TargetFrames>);
+
+impl Drop for Fenced {
+    fn drop(&mut self) {
+        self.0.disarm();
     }
 }
 
@@ -2926,24 +3355,31 @@ fn post(
 /// named nothing gets the display.
 fn check_image(
     request: &wire::Request,
-    display: Option<Display>,
+    view: Option<View>,
     gate: &Gate,
     worker: &mut Worker,
     acted: Acted<'_>,
 ) -> Result<Value, Failure> {
-    let display = match display {
-        Some(display) => display,
-        None => target_display(&request.body)?,
+    let view = match view {
+        Some(view) => view,
+        None => View {
+            display: target_display(&request.body)?,
+            geometry: None,
+            frames: worker.frames.clone(),
+            bound: None,
+        },
     };
 
     // The transform before the first sample, because the rectangle the settle
-    // watches has to be the rectangle that is then encoded — and a transform is
-    // measured from a frame, so this is the one place a check may take a capture
-    // it does not keep (only on a display this process has never measured).
-    let geom = measured_geometry(&display, gate, worker)?;
+    // watches has to be the rectangle that is then encoded — and a display's
+    // transform is measured from a frame, so this is the one place a check may take
+    // a capture it does not keep (only on a display this process has never
+    // measured). A bound window's came with the frame it was read from.
+    let geom = view.geometry(gate, worker)?;
+    let display = &view.display;
     let region = check_view(&geom, acted.named);
     let before = acted.named.and_then(|observation| observation.view_hash);
-    let settled = settle_view(&display, &geom, &region, before, gate, worker)?;
+    let settled = settle_view(display, &geom, &region, before, gate, &view.frames, worker)?;
 
     // Evidence about the VIEW, not about the action: did what the model looked at
     // change since the image it acted on. A listing carries no hash, and saying
@@ -2958,15 +3394,19 @@ fn check_image(
             .map(|(lx, ly)| Annotate::Logical(lx as f32, ly as f32)),
     };
 
-    let payload = capture_payload_encoded(
-        &display,
+    let mut payload = capture_payload_encoded(
+        display,
+        geom,
         &settled.frame,
-        Requested::Exactly(region),
-        check_quality(&region, &geom),
-        overlays,
+        Rendering {
+            requested: Requested::Exactly(region),
+            jpeg_quality: check_quality(&region, &geom),
+            overlays,
+        },
         gate,
         worker,
     )?;
+    note_target(&mut payload, worker, view.bound.is_some())?;
 
     gate.observed_check(wire::Checked {
         kind: wire::Check::Image,
@@ -3041,7 +3481,8 @@ fn settle_view(
     region: &Region,
     before: Option<ViewHash>,
     gate: &Gate,
-    worker: &Worker,
+    frames: &Rc<dyn Frames>,
+    _worker: &Worker,
 ) -> Result<Settled, Failure> {
     let crop = crop_rect(geom, region);
     let started = gate.now_ms();
@@ -3064,7 +3505,7 @@ fn settle_view(
         }
 
         looked_at = gate.now_ms();
-        let frame = take_frame(display, gate, &worker.frames)?;
+        let frame = take_frame(display, gate, frames)?;
         let hash = sample_hash(&frame, &crop, gate);
 
         // What a change is measured FROM: the image the caller acted on when this
@@ -3314,10 +3755,30 @@ fn logical_bounds_to_region(
 /// `screenshot` of that region would be, and the model addresses them the same way
 /// — and the references ride in the same observation, so they die with it.
 fn elements(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
-    let display = target_display(&request.body)?;
-    let geom = measured_geometry(&display, gate, worker)?;
+    let view = view(request, gate, worker)?;
+    let geom = view.geometry(gate, worker)?;
+    let display = &view.display;
     let region = viewing_region(request, &geom, worker)?;
-    let (mut payload, listed) = elements_for(&worker.ax, &geom, &region, gate)?;
+
+    // On a bound window the walk starts at THAT window's accessibility element, so
+    // a listing is the window's controls and not the application's. Without one
+    // there is nothing to walk from, and walking the application instead would name
+    // controls of windows the caller never bound.
+    let root = match view.bound.as_ref() {
+        None => None,
+        Some(_live) => Some(target::ax_root(
+            worker
+                .target
+                .as_ref()
+                .ok_or_else(|| Failure::from("target_unavailable"))?,
+        )?),
+    };
+
+    let (mut payload, listed) = match root {
+        None => elements_for(&worker.ax, &geom, &region, gate)?,
+        Some(root) => elements_rooted(&worker.ax, root, &geom, &region, gate, worker)?,
+    };
+    note_target(&mut payload, worker, view.bound.is_some())?;
 
     let (sent_w, sent_h) = crop_rect(&geom, &region).sent_dims();
     let observation = worker.observations.mint(observation::Minting {
@@ -3416,8 +3877,21 @@ fn elements_for(
     region: &Region,
     gate: &Gate,
 ) -> Result<(Value, Option<Rc<ax::Elements>>), Failure> {
-    let viewed = interactive_in_view(ax, geom, region, gate)?;
+    Ok(publish_elements(
+        interactive_in_view(ax, geom, region, gate)?,
+        geom,
+        region,
+    ))
+}
 
+/// One read, as the wire publishes it. Shared by the application listing and the
+/// bound window's, so a reference, a click point and a bounds rectangle mean the
+/// same thing however the walk was rooted.
+fn publish_elements(
+    viewed: Viewed,
+    geom: &Geometry,
+    region: &Region,
+) -> (Value, Option<Rc<ax::Elements>>) {
     // Whether this reply can hand out references at all is decided BEFORE any is
     // published: `retained` needs the owning process's start time, and without it
     // there is no table to resolve them against.
@@ -3455,7 +3929,49 @@ fn elements_for(
         }
     }
 
-    Ok((payload, retained(viewed.owner, listed)))
+    (payload, retained(viewed.owner, listed))
+}
+
+/// The controls of ONE window, from the accessibility element a target is bound to.
+///
+/// Everything below the read is the same code an application listing uses — the
+/// same click points, the same references, the same bounds — because a control is a
+/// control wherever the walk started. Only the root differs, and only the root has
+/// to.
+fn elements_rooted(
+    ax: &Rc<dyn ax::Ax>,
+    root: ax::Handle,
+    geom: &Geometry,
+    region: &Region,
+    gate: &Gate,
+    worker: &Worker,
+) -> Result<(Value, Option<Rc<ax::Elements>>), Failure> {
+    let target = worker
+        .target
+        .as_ref()
+        .ok_or_else(|| Failure::from("target_unavailable"))?;
+
+    let clock = gate.clock();
+    let deadline = gate.now_ms().saturating_add(ax::WALK_BUDGET_MS);
+    let found = ax::walk_from(ax, root, clock.as_ref(), deadline);
+
+    let in_view: Vec<ViewNode> = found
+        .nodes
+        .into_iter()
+        .filter_map(|node| {
+            let (centre_x, centre_y) = node.frame.centre();
+            to_sent(geom, region, centre_x, centre_y).map(|point| (node, point))
+        })
+        .collect();
+
+    let viewed = Viewed {
+        nodes: in_view,
+        owner: Some((target.pid, target.started_at)),
+        truncated: found.truncated,
+        note: Some(format!("read {} — {}", target.app, target.title)),
+    };
+
+    Ok(publish_elements(viewed, geom, region))
 }
 
 /// An interactive AX node paired with its click point in sent-image space.
@@ -3678,14 +4194,14 @@ fn window_candidates(geom: &Geometry) -> Result<Vec<(Region, TargetApp)>, String
 #[cfg(target_os = "macos")]
 const AX_TARGET_MIN_OVERLAP: f64 = 0.10;
 
-/// Pick the app the view is ABOUT from front-to-back candidates: the frontmost
+/// Pick the APPLICATION the view is about from front-to-back candidates: the frontmost
 /// window with SUBSTANTIAL overlap of the request region wins — stacking order
 /// is the tiebreak the screen actually shows, so a maximized background window
 /// can never beat the smaller window in front of it. Only when nothing is
 /// substantial (a sparse desktop of small windows) does raw maximum overlap
 /// decide. Pure, so the selection semantics are unit-tested.
 #[cfg(target_os = "macos")]
-fn select_target(candidates: Vec<(Region, TargetApp)>, region: &Region) -> Option<TargetApp> {
+fn choose_target_app(candidates: Vec<(Region, TargetApp)>, region: &Region) -> Option<TargetApp> {
     let region_area = (region.w * region.h).max(1.0);
 
     let mut best: Option<(f64, TargetApp)> = None;
@@ -3828,7 +4344,7 @@ fn view_target(geom: &Geometry, region: &Region) -> Result<Result<TargetApp, Str
         Err(reason) => return Ok(Err(reason)),
     };
 
-    Ok(select_target(candidates, region)
+    Ok(choose_target_app(candidates, region)
         .ok_or_else(|| "no application window to target for accessibility".to_string()))
 }
 
@@ -3866,11 +4382,11 @@ fn attempt_note(attempt: &Result<&'static str, String>) -> String {
 /// before a consequential click), not a gate. It addresses a point exactly as a
 /// click does, through the transform its image was made with, so what it reports
 /// is what a click at that coordinate would reach.
-fn inspect(request: &wire::Request, worker: &Worker) -> Result<Value, Failure> {
+fn inspect(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let (x, y) = coords(&request.body)?;
     let observation = observed(request, worker)?;
     let (lx, ly) = point_in(&observation, x, y)?;
-    same_display(&observation, &request.body)?;
+    acting_view(request, &observation, gate, worker)?;
     Ok(inspect_at(lx as f32, ly as f32)?)
 }
 
@@ -3959,6 +4475,12 @@ mod tests {
     use crate::held::{sweep_injected_failures, Call, Recorder, CLIPBOARD_RESTORE_DWELL_MS};
     use enigo::Direction;
 
+    /// A launcher a test can ask about without a bundle: the badge is "there", and
+    /// nothing is ever spawned unless a test spawns it.
+    fn test_launcher() -> Arc<dyn indicator::Launcher> {
+        indicator::Scripted::new()
+    }
+
     /// A gate with nothing in flight, for a test that drives one function directly.
     fn idle_gate() -> Gate {
         Gate::new("boot-test".to_string(), Arc::new(SystemClock::new()))
@@ -3989,6 +4511,11 @@ mod tests {
             measured: Measured::new(),
             ax,
             frames,
+            windows: window_server::Recorder::new(Vec::new()),
+            launcher: indicator::Scripted::new(),
+            target: None,
+            target_generation: 0,
+            emitter: capture::Emitter::capturing(),
         }
     }
 
@@ -4014,6 +4541,7 @@ mod tests {
             mutation_seq: None,
             observation_id: body["observation_id"].as_str().map(str::to_string),
             element_ref: body["element_ref"].as_str().map(str::to_string),
+            target_id: body["target_id"].as_str().map(str::to_string),
             check: match body["check"].as_str() {
                 Some("image") => wire::Check::Image,
                 Some("semantic") => wire::Check::Semantic,
@@ -4152,7 +4680,7 @@ mod tests {
             candidate(0.0, 0.0, 1931.0, 543.0, 30, "Slack"),
         ];
 
-        let chosen = select_target(candidates, &full).expect("a target");
+        let chosen = choose_target_app(candidates, &full).expect("a target");
         assert_eq!(chosen.app, "Google Chrome");
     }
 
@@ -4172,7 +4700,7 @@ mod tests {
             candidate(0.0, 16.0, 823.0, 481.0, 20, "Google Chrome"),
         ];
 
-        let chosen = select_target(candidates, &request).expect("a target");
+        let chosen = choose_target_app(candidates, &request).expect("a target");
         assert_eq!(chosen.app, "Google Chrome");
     }
 
@@ -4192,14 +4720,14 @@ mod tests {
             candidate(100.0, 100.0, 80.0, 60.0, 10, "Tiny"),
             candidate(400.0, 200.0, 300.0, 150.0, 20, "MiniPlayer"),
         ];
-        let chosen = select_target(candidates, &full).expect("a target");
+        let chosen = choose_target_app(candidates, &full).expect("a target");
         assert_eq!(chosen.app, "MiniPlayer");
 
         let tied = vec![
             candidate(0.0, 0.0, 100.0, 100.0, 1, "Front"),
             candidate(500.0, 0.0, 100.0, 100.0, 2, "Back"),
         ];
-        let chosen = select_target(tied, &full).expect("a target");
+        let chosen = choose_target_app(tied, &full).expect("a target");
         assert_eq!(chosen.app, "Front", "an exact tie keeps the frontmost");
     }
 
@@ -4213,8 +4741,8 @@ mod tests {
             h: 300.0,
         };
         let candidates = vec![candidate(1500.0, 400.0, 200.0, 100.0, 10, "Elsewhere")];
-        assert_eq!(select_target(candidates, &request), None);
-        assert_eq!(select_target(Vec::new(), &request), None);
+        assert_eq!(choose_target_app(candidates, &request), None);
+        assert_eq!(choose_target_app(Vec::new(), &request), None);
     }
 
     #[cfg(target_os = "macos")]
@@ -4289,6 +4817,103 @@ mod tests {
         assert!(
             logical_bounds_to_region(&g, &full, 9000.0, 0.0, 800.0, 600.0).is_none(),
             "entirely to the right of this display"
+        );
+    }
+
+    /// A target bound to window 20, with one frame in its stream — enough for the
+    /// replies that name it and the ones that do not.
+    fn bound_worker(gate: &Gate) -> Worker {
+        use window_frames::WindowFrames as _;
+
+        let stream = window_frames::Recorder::new();
+        stream
+            .start(window_frames::StreamWindow {
+                id: 20,
+                width: 1600,
+                height: 1200,
+            })
+            .unwrap();
+        stream.deliver_sized(1_000, window_frames::Health::Live, 1600, 1200, 1600 * 4);
+
+        let mut worker = idle_worker(gate);
+        worker.windows = window_server::Recorder::new(vec![window_server::window(
+            20,
+            200,
+            window_server::Bounds {
+                x: 0.0,
+                y: 0.0,
+                w: 800.0,
+                h: 600.0,
+            },
+        )]);
+        worker.target = Some(target::Target {
+            id: "t1".to_string(),
+            generation: 1,
+            window_id: 20,
+            pid: 200,
+            started_at: 1,
+            app: "App200".to_string(),
+            title: "Window 20".to_string(),
+            ax_binding: target::AxBinding::Unavailable,
+            ax_window: None,
+            siblings: vec![20],
+            display_id: 7,
+            facts: MonitorFacts {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                scale_factor: 2.0,
+            },
+            frames: Rc::new(target::TargetFrames::new(stream, gate.clock())),
+            indicator: None,
+            restarts: 0,
+        });
+        worker
+    }
+
+    // A picture of the whole screen is not a picture of the bound window, whatever
+    // is bound at the time. Stamping a `target_id` on it would tell the caller its
+    // coordinates are in a window's space when they are the display's.
+    #[test]
+    fn a_display_level_reply_is_never_stamped_with_the_bound_window() {
+        let gate = Gate::new("boot-test".to_string(), Arc::new(SystemClock::new()));
+        let worker = bound_worker(&gate);
+
+        let mut display_level = json!({ "ok": true });
+        note_target(&mut display_level, &worker, false).expect("nothing to do");
+        assert_eq!(display_level.get("target_id"), None);
+        assert_eq!(display_level.get("children"), None);
+
+        let mut about_the_window = json!({ "ok": true });
+        note_target(&mut about_the_window, &worker, true).expect("the window server answered");
+        assert_eq!(about_the_window["target_id"], json!("t1"));
+        assert_eq!(about_the_window["children"], json!([]));
+    }
+
+    // A window server that would not answer is not an empty list of children: the
+    // caller would read "no new windows" for "nobody knows".
+    #[test]
+    fn a_reply_about_a_window_fails_rather_than_claiming_no_children() {
+        let gate = Gate::new("boot-test".to_string(), Arc::new(SystemClock::new()));
+        let refused = window_server::Recorder::new(Vec::new());
+        refused.refuses("the window server refused");
+
+        let mut worker = bound_worker(&gate);
+        worker.windows = refused;
+
+        let mut payload = json!({ "ok": true });
+        let refusal = note_target(&mut payload, &worker, true).expect_err("nothing is known");
+        assert_eq!(refusal.code, "target_unavailable");
+    }
+
+    // The handshake may not offer a feature whose every use is a refusal.
+    #[test]
+    fn the_handshake_offers_targets_exactly_where_a_window_can_be_captured() {
+        assert_eq!(
+            targets_supported(),
+            capture_methods().contains(&"window"),
+            "`targets` and the window capture method are one fact"
         );
     }
 
@@ -4392,7 +5017,7 @@ mod tests {
 
     #[test]
     fn hello_reports_the_protocol_version_and_verbs() {
-        let v = hello().unwrap();
+        let v = hello(&test_launcher()).unwrap();
         assert_eq!(v["ok"], json!(true));
         assert_eq!(v["protocol_version"], json!(PROTOCOL_VERSION));
         assert!(v["compux_version"].is_string());
@@ -4516,7 +5141,10 @@ mod tests {
     // model verbs — same posture as `probe`. Lock that so they aren't offered to a model.
     #[test]
     fn idle_verbs_are_not_advertised_model_actions() {
-        let actions = hello().unwrap()["actions"].as_array().unwrap().clone();
+        let actions = hello(&test_launcher()).unwrap()["actions"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert!(!actions.iter().any(|a| a == "idle_ms"));
         assert!(!actions.iter().any(|a| a == "wait_for_idle"));
     }
@@ -4525,7 +5153,10 @@ mod tests {
     // no model tool call must reach observe_start/observe_stop (MILESTONE_32 §8.4a).
     #[test]
     fn observe_verbs_are_not_advertised_model_actions() {
-        let actions = hello().unwrap()["actions"].as_array().unwrap().clone();
+        let actions = hello(&test_launcher()).unwrap()["actions"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert!(!actions.iter().any(|a| a == "observe_start"));
         assert!(!actions.iter().any(|a| a == "observe_stop"));
     }
@@ -4544,7 +5175,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn idle_ms_reports_a_nonnegative_value() {
-        let v = idle_ms().unwrap();
+        let gate = idle_gate();
+        let v = idle_ms(&idle_worker(&gate)).unwrap();
         assert_eq!(v["ok"], json!(true));
         assert!(v["idle_ms"].as_u64().is_some());
     }
@@ -4787,6 +5419,10 @@ mod tests {
             0
         }
 
+        fn now_mach(&self) -> u64 {
+            0
+        }
+
         fn sleep(&self, _ms: u64) {
             let nth = self
                 .sleeps
@@ -4812,6 +5448,7 @@ mod tests {
             observation_id: wire::addresses_an_image(action).then(|| "7c1e-1".to_string()),
             element_ref: wire::addresses_an_element(action).then(|| "e1".to_string()),
             check: wire::Check::None,
+            target_id: None,
         }
     }
 
@@ -5757,6 +6394,10 @@ mod tests {
             self.now_ms() as u128 * 1_000_000
         }
 
+        fn now_mach(&self) -> u64 {
+            self.now_ms() * 1_000_000
+        }
+
         fn sleep(&self, ms: u64) {
             self.advance(ms);
         }
@@ -5787,7 +6428,7 @@ mod tests {
     }
 
     impl Frames for ScriptedScreen {
-        fn capture(&self, _display_id: u32) -> Result<image::RgbaImage, String> {
+        fn capture(&self, _display_id: u32) -> Result<image::RgbaImage, Failure> {
             let taken = self.taken.get();
             self.taken.set(taken + 1);
             self.clock.advance(self.cost_ms);
@@ -5867,12 +6508,16 @@ mod tests {
     ) -> Result<Observation, Failure> {
         let display = check_display();
         let frame = shaded(shade);
+        let geom = measure_geometry(&display, &frame, worker)?;
         let payload = capture_payload_encoded(
             &display,
+            geom,
             &frame,
-            Requested::Exactly(region),
-            None,
-            Overlays::default(),
+            Rendering {
+                requested: Requested::Exactly(region),
+                jpeg_quality: None,
+                overlays: Overlays::default(),
+            },
             gate,
             worker,
         )?;
@@ -5886,6 +6531,17 @@ mod tests {
             .resolve(&id)
             .expect("just minted")
             .clone())
+    }
+
+    /// The display-level view a check test drives `post` with, which is exactly what
+    /// `view` builds for a request that names no window.
+    fn display_view(worker: &Worker) -> View {
+        View {
+            display: check_display(),
+            geometry: None,
+            frames: worker.frames.clone(),
+            bound: None,
+        }
     }
 
     fn crop_region(x: f64, y: f64, w: f64, h: f64) -> Region {
@@ -5929,6 +6585,7 @@ mod tests {
             &Region::full(&geom),
             None,
             &gate,
+            &worker.frames.clone(),
             &worker,
         )
         .expect("a settle with nothing in its way");
@@ -5960,6 +6617,7 @@ mod tests {
             &Region::full(&geom),
             None,
             &gate,
+            &worker.frames.clone(),
             &worker,
         )
         .expect("a settle that runs out of looks");
@@ -5985,6 +6643,7 @@ mod tests {
             &Region::full(&geom),
             None,
             &gate,
+            &worker.frames.clone(),
             &worker,
         )
         .expect("a settle that runs out of time");
@@ -6018,7 +6677,7 @@ mod tests {
 
         let refused = post(
             &request,
-            Some(check_display()),
+            Some(display_view(&worker)),
             &gate,
             &mut { worker },
             nothing_named(),
@@ -6050,7 +6709,7 @@ mod tests {
 
         let payload = post(
             &request,
-            Some(check_display()),
+            Some(display_view(&worker)),
             &gate,
             &mut worker,
             nothing_named(),
@@ -6097,7 +6756,7 @@ mod tests {
 
         let payload = post(
             &request,
-            Some(check_display()),
+            Some(display_view(&worker)),
             &gate,
             &mut worker,
             Acted {
@@ -6134,7 +6793,7 @@ mod tests {
 
             let payload = post(
                 &request,
-                Some(check_display()),
+                Some(display_view(&worker)),
                 &gate,
                 &mut worker,
                 Acted {
@@ -6181,9 +6840,10 @@ mod tests {
         assert_eq!(listing.view_hash, None, "a listing keeps no hash");
 
         let request = checking("press", wire::Check::Image);
+        let view = display_view(&worker);
         post(
             &request,
-            Some(display),
+            Some(view),
             &gate,
             &mut worker,
             Acted {
@@ -6210,7 +6870,7 @@ mod tests {
 
         let payload = post(
             &request,
-            Some(check_display()),
+            Some(display_view(&worker)),
             &gate,
             &mut worker,
             nothing_named(),
@@ -6568,7 +7228,7 @@ mod tests {
 
         post(
             &request,
-            Some(check_display()),
+            Some(display_view(&worker)),
             &gate,
             &mut worker,
             nothing_named(),
@@ -6603,7 +7263,7 @@ mod tests {
 
             post(
                 &checking("type", wire::Check::Image),
-                Some(check_display()),
+                Some(display_view(&worker)),
                 &gate,
                 &mut worker,
                 nothing_named(),
@@ -6637,7 +7297,7 @@ mod tests {
 
         let payload = post(
             &checking("left_click", wire::Check::Image),
-            Some(check_display()),
+            Some(display_view(&worker)),
             &gate,
             &mut worker,
             Acted {
@@ -6675,7 +7335,7 @@ mod tests {
 
         post(
             &checking("left_click", wire::Check::Image),
-            Some(check_display()),
+            Some(display_view(&worker)),
             &gate,
             &mut worker,
             Acted {
@@ -6713,7 +7373,7 @@ mod tests {
 
         post(
             &checking("left_click", wire::Check::Image),
-            Some(check_display()),
+            Some(display_view(&worker)),
             &gate,
             &mut worker,
             Acted {

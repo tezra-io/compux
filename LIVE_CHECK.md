@@ -58,11 +58,11 @@ Sanity-check the wire without starting a session (the binary reads stdin, so it 
 given a line — never run it with no input, it will simply wait):
 
 ```sh
-printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":10,"deadline_ms":10000}\n' \
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":11,"deadline_ms":10000}\n' \
   | COMPUX_DISCLAIMED=1 "$SIDE/compux"
 ```
 
-It must report `"protocol_version":10`. **Every line into this sidecar is a tagged frame
+It must report `"protocol_version":11`. **Every line into this sidecar is a tagged frame
 now** — a request carries a `type` and a `request_id`, and an untagged protocol-6 line
 is refused rather than served. That is why the `printf` above looks nothing like the one
 this document carried when it was written against protocol 6.
@@ -376,7 +376,7 @@ def recv():
     return reply
 
 send({"type": "request", "request_id": "r1", "action": "hello",
-      "protocol_version": 10, "deadline_ms": 10000})
+      "protocol_version": 11, "deadline_ms": 10000})
 hello = recv()
 print("hello   ", json.dumps(hello))
 
@@ -402,13 +402,17 @@ ADDRESSED = {"left_click", "right_click", "double_click", "mouse_move",
 
 def run(body):
     if body.get("action") in ADDRESSED and "observation_id" not in body:
-        # A control is named in an `elements` reply; a point, in a screenshot.
+        # A control is named in an `elements` reply; a point, in a screenshot. Both
+        # are taken IN THE SAME WINDOW the action names, when it names one: an image
+        # of the display would put the action's coordinates in a space the bound
+        # window's transform knows nothing about.
+        into = {"target_id": body["target_id"]} if "target_id" in body else {}
         if "element_ref" in body:
-            listed = act({"action": "elements"})
+            listed = act({"action": "elements", **into})
             print("elements", json.dumps(listed))
             body["observation_id"] = listed.get("observation_id")
         else:
-            shot = act({"action": "screenshot"})
+            shot = act({"action": "screenshot", **into})
             print("image   ", json.dumps(shot))
             body["observation_id"] = shot.get("observation_id")
     print("action  ", json.dumps(act(body)))
@@ -430,8 +434,12 @@ side.stdin.close()
 PYEOF
 ```
 
+`select_target` and `release_target` are ordinary actions to this script: send one
+and every later line may carry `"target_id": "t1"`, and the script then takes its
+screenshots and listings in that window rather than on the display.
+
 The first line it prints is always the handshake, and it must say
-`"protocol_version": 10`, with a `capabilities.observations` of
+`"protocol_version": 11`, with a `capabilities.observations` of
 `{"max": 3, "ttl_ms": 30000}`. If it does not, the binary is not the one you just
 built. Every `image` or `elements` line names the reply the action after it is
 aimed at. If that line reads `"ok": false`, the sidecar could not capture — the
@@ -483,11 +491,11 @@ The disclaim re-exec runs on every launch and now reports a failed spawn attribu
 check the disclaimed path too, since step 1 skipped it:
 
 ```sh
-printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":10,"deadline_ms":10000}\n' \
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":11,"deadline_ms":10000}\n' \
   | "$CX"; echo "exit=$?"
 ```
 
-It must print the hello frame with `"protocol_version":10` and `exit=0`. An exit in
+It must print the hello frame with `"protocol_version":11` and `exit=0`. An exit in
 the 70s here is a disclaim failure and the
 stderr line above it names which step; report the number. There is no way to provoke
 `posix_spawnattr_setflags` failing on a healthy machine, so 77 itself is proved by
@@ -665,11 +673,11 @@ moved under it. In the order that fails fastest.
 ## 1. The handshake, before any daemon (10 seconds)
 
 ```sh
-printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":10,"deadline_ms":10000}\n' \
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":11,"deadline_ms":10000}\n' \
   | COMPUX_DISCLAIMED=1 "$CX"
 ```
 
-One line back, `"type":"response"`, `"request_id":"r1"`, `"protocol_version":10`, a
+One line back, `"type":"response"`, `"request_id":"r1"`, `"protocol_version":11`, a
 `"sidecar_generation"` that starts `boot-`, a `"capabilities"` object listing
 `["foreground_hid","ax"]`, the three controls and
 `"observations":{"max":3,"ttl_ms":30000}`. A different `protocol_version` means the
@@ -1416,7 +1424,7 @@ def recv():
     return reply
 
 send({"type": "request", "request_id": "r1", "action": "hello",
-      "protocol_version": 10, "deadline_ms": 10000})
+      "protocol_version": 11, "deadline_ms": 10000})
 hello = recv()
 envelope = {"sidecar_generation": hello["sidecar_generation"],
             "session_generation": 1, "authorization_generation": 1}
@@ -1486,7 +1494,7 @@ def recv():
     return json.loads(side.stdout.readline())
 
 send({"type": "request", "request_id": "r1", "action": "hello",
-      "protocol_version": 10, "deadline_ms": 10000})
+      "protocol_version": 11, "deadline_ms": 10000})
 hello = recv()
 envelope = {"sidecar_generation": hello["sidecar_generation"],
             "session_generation": 1, "authorization_generation": 1}
@@ -1594,3 +1602,303 @@ What to read out of them, and what each answer would mean:
 * **Anything about a display this machine does not have.** Every number above is
   this panel's; a Retina panel at a scaled mode, or two displays of different
   backing scales, are their own rows.
+
+---
+
+# Live check — one window, bound (M42 slice 5)
+
+Everything in this slice is a promise about somebody else's window, and no unit
+test can keep any of them: whether a covered window is really still captured,
+whether the badge really sits on the right window and really takes no focus,
+whether Stop on it really stops a drag when the daemon is suspended. The seams are
+proved without a screen (`window_server.rs`, `window_frames.rs`, `target.rs`,
+`indicator.rs` — 329 Rust tests); this is the half that needs a person.
+
+Expected outcome in one line: with one window bound, the helper sees it even when
+something covers it, refuses to click through whatever is in front, shows the
+person a badge that follows the window and never takes their focus, and stops on
+that badge's Stop even when the daemon cannot answer.
+
+> **Steps 3, 5, 6, 7 and 8 POST REAL INPUT and every step from 2 on STARTS A REAL
+> CAPTURE STREAM of one window.** Nothing here may be run by an agent. Run it
+> yourself, at the machine, with the fixture app and TextEdit open and nothing
+> confidential on screen.
+
+## 0. Preconditions
+
+* **Build both halves.** `cd native/compux && cargo build --release` for the
+  helper, and the indicator from its own repository half
+  (`scripts/build_app.sh`); the badge's own steps are in
+  [`native/indicator/LIVE_CHECK_INDICATOR.md`](native/indicator/LIVE_CHECK_INDICATOR.md),
+  which is where its panel, its status item and its `--self-test` are checked. Run
+  that file FIRST: if the badge does not come up on its own, nothing below can.
+* **`compux-indicator` must sit beside the helper.** It is resolved from the
+  running executable's own directory, so a `cargo build` tree needs it copied into
+  `native/compux/target/release/` and a bundle needs it in
+  `Fermix.app/Contents/MacOS/`. `hello` says which it found — see step 1.
+* **The fixture app** (`scripts/build_fixture_app.sh`, slice 4) is the target for
+  every step. **TextEdit** is the canary: it is what you type into to prove the
+  badge and a background action take nothing from you.
+* **Screen Recording and Accessibility** on the launching terminal, as every
+  earlier section needs. A bound window additionally needs Screen Recording for
+  the STREAM, which is a different prompt from the one a `screenshot` raises on
+  some versions. The helper now says this in its own code: a selection that
+  answers **`screen_recording_not_granted`** is the grant and nothing else, and
+  the remedy is System Settings, Privacy & Security, Screen Recording, then a
+  restart of the helper. `capture_unavailable` is a different fault and step 2
+  says what to do about it.
+* `cx.py` from the slice-2 section drives everything below; it speaks protocol 11
+  and takes `select_target` like any other action. Keep ONE sidecar for a whole
+  step: a target is per process, and a second run of the script binds nothing the
+  first one bound.
+
+## 1. The handshake says what this build can do (10 seconds, fails fastest)
+
+```sh
+CX=/Users/sujshe/projects/compux/native/compux/target/release/compux
+printf '{"type":"request","request_id":"r1","action":"hello","protocol_version":11,"deadline_ms":10000}\n' \
+  | COMPUX_DISCLAIMED=1 "$CX" | python3 -m json.tool
+```
+
+It must say `"protocol_version": 11`, and its `capabilities` must carry
+`"targets": true`, `"capture_methods": ["display", "window"]` and
+**`"indicator": "present"`**. `"missing"` means the badge is not beside the binary
+and every step below will refuse `control_surface_unavailable`; fix that before
+going on. `actions` must list `select_target` and `release_target`.
+
+## 2. A window binds, and its first frame arrives
+
+**This starts a capture stream of the fixture window.** Bring the fixture app to
+the front, then:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py "$CX"
+# at the prompt, one line at a time:
+{"action":"windows"}
+#   ... read the fixture app's `id` out of that list, then:
+{"action":"select_target","window_id":<id>}
+```
+
+What to look at, in order:
+
+* the reply carries `target_id: "t1"`, the app and title you expect, `methods`,
+  and an `ax_binding`. **`"bound"` is what you want**: `ambiguous` means the
+  fixture has two windows that look alike (close one), `unavailable` means its
+  accessibility window could not be matched (note it — step 5 depends on it);
+* it carries a picture — `width`, `height`, `observation_id` — and those
+  dimensions are the WINDOW's, not the display's. Decode the image and confirm it
+  is the fixture window and nothing around it;
+* **write down how long the reply took.** That is the stream's first frame, and it
+  is the number that decides whether binding a window is usable at all;
+* **the badge is now on screen**, at the window's upper left. Leave it.
+
+**If `select_target` hangs for about five seconds and then refuses**, the first
+suspect is not the grant. `shareable_content()` asks `SCShareableContent` what is
+capturable and blocks the calling thread on a completion handler, and **it is
+unverified which queue ScreenCaptureKit delivers that completion on**. If it is
+the main queue, and the request came in on the helper's main thread, the wait and
+the delivery are the same thread and the five seconds is a self-deadlock that ends
+at `HANDSHAKE_MS`, not a slow window server. What to try, in order: run the same
+selection with the helper started fresh and nothing else in flight (if it succeeds
+only sometimes, it is a race and not a deadlock); then check whether the refusal
+is exactly "the window server did not say what is capturable in time" every time,
+which is the deadlock's signature. If it is, the fix is to drive that call from a
+worker thread rather than to lengthen the wait — say so and stop rather than
+raising the constant.
+
+**A picture the wrong size, or a refusal naming two scales.** A reply of
+`capture_geometry_mismatch` means the surface that came back is not the shape this
+window is: the refusal carries the frame's pixels, the window's points and both
+measured ratios. Copy the numbers into the report — they are what says whether the
+surface request (window points x the display's backing scale) was honoured on this
+panel.
+
+## 3. The badge takes nothing from you
+
+**Real input, by you, not by the helper.** With the target still bound, click into
+TextEdit and type a sentence. Every character must land in TextEdit. The badge
+must not come to the front, must not steal the caret, and must not appear in the
+Cmd-Tab list.
+
+Then drag the fixture window a few hundred points across the screen. The badge
+must follow it within about a quarter of a second, and must not lag behind by more
+than that. Move another window over the fixture's upper-left corner: the badge
+must **hide**. Move it away: the badge must come back.
+
+## 4. A covered window is still seen, and a click on it is refused
+
+Put a large window (a browser, Finder) fully over the fixture window, so none of
+the fixture is visible. Then, in the same `cx.py` session:
+
+```
+{"action":"screenshot","target_id":"t1"}
+```
+
+The image must still be the fixture window, complete. That is the whole point of
+the slice; if it is the covering window, or blank, stop and report it.
+
+Now aim at a control in that image and click it:
+
+```
+{"action":"left_click","target_id":"t1","x":<x>,"y":<y>,"check":"image"}
+```
+
+It must be refused **`target_obstructed`**, and the detail must name the window
+that is in front. Nothing must move: the covering window must not have been
+raised, lowered or activated, and the pointer must not have moved.
+
+## 5. A covered window's controls are still pressed, by name
+
+**Real input.** Still fully covered:
+
+```
+{"action":"elements","target_id":"t1"}
+#   ... find a button of the fixture window, then:
+{"action":"press","target_id":"t1","element_ref":"<ref>","check":"semantic"}
+```
+
+* the listing must contain the fixture WINDOW's controls and nothing from the
+  application's other windows;
+* the press must land — the fixture records it — with `input_method: "ax"`, the
+  pointer must not move, and the covering window must stay in front;
+* if step 2 said `ax_binding: "unavailable"`, `elements` here answers
+  `ax_binding_unavailable` instead. That is correct behaviour and a finding: write
+  down which application it was.
+
+## 6. A window that moved is not clicked where it was
+
+**Real input.** Uncover the fixture window.
+
+```
+{"action":"screenshot","target_id":"t1"}
+```
+
+Now **drag the fixture window** a few hundred points, and then send a click at a
+coordinate you read in that image:
+
+```
+{"action":"left_click","target_id":"t1","x":<x>,"y":<y>,"check":"image"}
+```
+
+It must be refused **`stale_observation`** with the detail `geometry_changed`, and
+nothing may be clicked. Take a fresh screenshot and click again: it must land.
+
+This is the step that proves the mapping is built from the window server's bounds
+rather than from the frame's own content rectangle. That rectangle is
+surface-relative — it says the same thing wherever the window sits — so a build
+that read it as the window's position would pass every other step in this file and
+fail only here, by never refusing. **A click that lands after the drag, with no
+refusal, is that bug and not a pass.**
+
+Then the other half: **do nothing at all** to the fixture window and send an
+action with `check: "image"` that changes nothing (a click on empty space inside
+it). The check must come back `settle: stable` with `changed: false` — NOT
+`effect: unknown`. An unchanged window reports idle frames rather than pixels, and
+"the window server says nothing changed" is an answer; a timeout here means the
+idle path is not being credited.
+
+## 7. Stop on the badge halts a long drag with the daemon suspended
+
+**This is the step the whole slice exists for, and it posts real input.** Start a
+long drag inside the fixture window, then suspend the process driving it and press
+**Stop** on the badge.
+
+```sh
+# in one terminal, with the target bound, start a slow drag:
+{"action":"left_click_drag","target_id":"t1","from":{"x":<x1>,"y":<y1>},"to":{"x":<x2>,"y":<y2>}}
+
+# in another, the instant it starts:
+kill -STOP $(pgrep -f 'cx.py')
+```
+
+With the driver suspended, press **Stop** on the badge. The drag must stop within
+a moment, the left button must come back **up** (nothing on the desktop is still
+dragging), and `kill -CONT` on the driver must then show the action answered
+`cancelled` with a receipt that says what it had dispatched. This proves the
+badge's buttons reach the helper's gate with no daemon in the path.
+
+Repeat with **Pause** and then **Resume**: the badge must read `paused` while it
+is paused, and `working` again after.
+
+## 8. Minimize, close, relaunch
+
+Each of these, with the target still bound, and each must answer its own typed
+error and nothing else:
+
+* **minimize the fixture window** → `{"action":"screenshot","target_id":"t1"}` is
+  `target_minimized`, and the badge reads `unavailable` with no bounds;
+* **close the window** → `target_unavailable`;
+* **quit and relaunch the fixture app**, then act on `t1` → `target_unavailable`,
+  *even if the new process has the same pid*. That is the start-time half of the
+  binding, and it is the one nothing else can catch.
+
+## 9. Twenty cycles, and nothing left behind
+
+```sh
+# Before: note the numbers.
+pgrep -f compux-indicator | wc -l
+ps -o rss= -p $(pgrep -f 'release/compux' | head -1)
+```
+
+Then, in ONE `cx.py` session, twenty times:
+
+```
+{"action":"select_target","window_id":<id>}
+{"action":"release_target"}
+```
+
+Afterwards, with the sidecar still running:
+
+* `pgrep -f compux-indicator | wc -l` must be **0**. One left behind is a zombie
+  or an unreaped child and is a defect;
+* the sidecar's RSS must be within a few MB of what it was. A bound window holds
+  at most four frames' worth — the stream's `queueDepth` of three plus the one
+  copy the slot keeps — and twenty cycles must not accumulate;
+* `sudo lsof -p <sidecar pid> | grep -ci screencapture` (or Activity Monitor's
+  Open Files) must not have grown.
+
+Then quit the sidecar and confirm no `compux-indicator` survives it.
+
+## 10. Three numbers this check decides
+
+Each of these is a constant chosen against a documented behaviour with no promised
+cadence, and each has one live symptom. If you see the symptom, change the number
+here rather than working around it.
+
+* **`SILENCE_LIMIT_MS` (5 s, `window_frames.rs`).** A stream that says nothing at
+  all for this long stops being trusted, because otherwise a stream that quietly
+  died answers its last picture as the present forever. The header documents an
+  idle sample for an unchanged window but promises no interval, so the symptom of
+  a bound that is too tight is **`capture_unavailable` on a window nobody is
+  touching** — leave the fixture window alone for ten seconds, then take a
+  screenshot of it. It must still answer a picture.
+* **`FENCE_WAIT_MS` (400 ms, `target.rs`).** How long an after-action look waits
+  for a frame past the fence. Too short shows up as `effect: unknown` with the
+  dispatch preserved — a truthful answer, but a useless one if it is common.
+* **`LETTERBOX_TOLERANCE_PIXELS` (2 px, `target.rs`).** How far the content may
+  fall short of filling the surface before the mapping is refused
+  `capture_geometry_mismatch`. A materially inset surface must be refused; a
+  surface a pixel short of the window's rounded point size must not. The symptom
+  of too tight is a **selection that refuses a perfectly ordinary window** — the
+  refusal carries the numbers, so copy them into the report rather than raising
+  the constant blind.
+
+## 11. What this check still cannot prove
+
+* **That the fence never returns a frame from before the action.** It is proved at
+  the seam and the timing is the machine's; what a live run can show is the
+  opposite failure — a check that says `effect: unknown` because no frame arrived
+  in time. The fence now compares the frame's `SCStreamFrameInfoDisplayTime` with
+  a `mach_absolute_time()` read at the dispatch — the same base, no conversion —
+  so what remains unproven is only whether the window server's display times are
+  monotonic across a display change.
+* **That a frame the reader panicked on is recovered from.** The callback catches
+  its own unwind and records the fault, and the next look answers it; nothing here
+  can make a real frame panic.
+* **What a routed post would do instead.** `cargo run --example
+  routed_input_probe -- <pid> click <x> <y>` posts ONE event to one process
+  through `CGEventPostToPid`. It is the owner's study (M42 §7.3), not a step of
+  this check, and it posts real input.
+* **Anything about a window on another display, or a display this machine does
+  not have.** A window dragged between two panels of different backing scales is
+  its own row.

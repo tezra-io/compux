@@ -31,6 +31,14 @@
 #     outside the minted image is `point_outside_observation`. Each refusal carries
 #     the `not_sent` receipt the real helper sends, because a library regression
 #     that dropped a refusal's receipt would otherwise look like a success;
+#   * TARGETS (protocol 11): `select_target` answers a `target_id` with the shape
+#     the helper answers — methods, an `ax_binding`, and a first observation of the
+#     window — and an action naming a `target_id` nobody minted is refused
+#     `target_unavailable` with the `not_sent` receipt, so a consumer that stopped
+#     checking would be caught. The `indicator` action emits the `session_event`
+#     the ownership badge produces, carrying the authority the gate minted when it
+#     applied the pause: a transport that ignored it would be refused for the rest
+#     of the session;
 #   * REFERENCES (protocol 9): `elements` mints an observation and hands back one
 #     element carrying an `element_ref`, and `press` / `set_value` / a pointer
 #     action addressed by that reference resolve it the way the helper does —
@@ -45,12 +53,16 @@
 # write to a pipe would hang the reader).
 #
 # Request actions:
-#   hello         -> the identity handshake (protocol 10, a boot generation)
+#   hello         -> the identity handshake (protocol 11, a boot generation)
 #   screenshot    -> a 100x50 image that mints an observation and names it
 #   elements      -> one element (`e1`) in a fresh observation, as the helper lists it
 #   left_click, right_click, double_click, mouse_move, left_click_drag, scroll,
 #   inspect       -> addressed: they resolve their observation or refuse
 #   press, set_value -> addressed by element_ref inside an observation
+#   select_target -> bind a window: a target_id, its methods, a first observation
+#   release_target-> let the bound window go (ok whether or not one was bound)
+#   indicator     -> the ownership indicator's own Pause, as a session_event that
+#                    carries the NEW authority the gate minted when it installed it
 #   boom          -> exit 7                     (a sidecar death mid-request)
 #   hang          -> sleep, never reply         (the action deadline)
 #   defer         -> announce a session_event, then hold the response back
@@ -83,7 +95,7 @@ use strict;
 use warnings;
 $| = 1;
 
-my $PROTOCOL     = defined $ENV{FAKE_PROTOCOL_VERSION}   ? $ENV{FAKE_PROTOCOL_VERSION}   : 10;
+my $PROTOCOL     = defined $ENV{FAKE_PROTOCOL_VERSION}   ? $ENV{FAKE_PROTOCOL_VERSION}   : 11;
 my $BOOT         = defined $ENV{FAKE_SIDECAR_GENERATION} ? $ENV{FAKE_SIDECAR_GENERATION} : 'boot-test';
 my $CONTROL_MODE = defined $ENV{FAKE_CONTROL_MODE}       ? $ENV{FAKE_CONTROL_MODE}       : 'ack';
 
@@ -111,6 +123,10 @@ my %ADDRESSED = map { $_ => 1 } qw(
 
 # `wire::ELEMENT_ACTIONS`: addressed by a control and never by a point.
 my %ELEMENT_ONLY = map { $_ => 1 } qw(press set_value);
+
+# The one bound window, as the helper holds it: at most one, replaced on reselect.
+my $TARGET_COUNTER = 0;
+my $TARGET;
 
 while (my $line = <STDIN>) {
     my ($type)   = $line =~ /"type":"([^"]*)"/;
@@ -319,6 +335,67 @@ sub checked_response {
 sub request {
     my ($id, $action, $line) = @_;
 
+    # A named target must be the one this process holds. Checked before anything
+    # else an action does, exactly as the helper checks liveness before every use.
+    my ($named_target) = $line =~ /"target_id":"([^"]*)"/;
+    if (defined $named_target && (!defined $TARGET || $named_target ne $TARGET)) {
+        refuse($id, 'target_unavailable',
+            'that window is not the one this helper is bound to', $line);
+        return;
+    }
+
+    if ($action eq 'select_target') {
+        $TARGET_COUNTER++;
+        $TARGET = "t$TARGET_COUNTER";
+        $OBS_COUNTER++;
+        my $obs = "fake-$OBS_COUNTER";
+        $OBSERVED{$obs} = 1;
+        ok_response($id,
+            qq("target_id":"$TARGET","app":"FixtureApp","title":"Untitled",)
+            . qq("methods":["foreground_hid","ax"],"ax_binding":"bound",)
+            . qq("target_generation":$TARGET_COUNTER,)
+            . qq("mime":"image/png","width":$SENT_W,"height":$SENT_H,"data":"AAA",)
+            . qq("observation_id":"$obs","observation_kind":"image",)
+            . qq("captured_at_monotonic_ns":1,"frame_seq":$OBS_COUNTER),
+            $line);
+        return;
+    }
+
+    if ($action eq 'release_target') {
+        undef $TARGET;
+        ok_response($id, '"released":true', $line);
+        return;
+    }
+
+    if ($action eq 'indicator') {
+        # The badge's Pause: applied to the gate FIRST (which mints a new
+        # authority), then reported. The event carries that authority, which is
+        # the only way the caller can learn its own was revoked.
+        $AUTH++;
+        print qq({"type":"session_event","sidecar_generation":"$BOOT","session_generation":1,)
+            . qq("authorization_generation":$AUTH,"event_seq":1,"kind":"indicator",)
+            . qq("event":"operator_pause"}\n);
+        ok_response($id, '"pong":true', $line);
+        return;
+    }
+
+    if ($action eq 'indicator_out_of_order') {
+        # Two barriers in quick succession — the badge's Pause and a control's —
+        # reported in the wrong order, which is what two writers into one pipe can
+        # produce. The HIGHER authority is the one that stands.
+        $AUTH += 2;
+        my $newer = $AUTH;
+        my $older = $AUTH - 1;
+        for my $pair ([$newer, 1], [$older, 2]) {
+            my ($auth, $seq) = @$pair;
+            print qq({"type":"session_event","sidecar_generation":"$BOOT","session_generation":1,)
+                . qq("authorization_generation":$auth,"event_seq":$seq,"kind":"indicator",)
+                . qq("event":"operator_pause"}\n);
+        }
+        ok_response($id, '"pong":true', $line);
+        return;
+    }
+
     if ($ADDRESSED{$action}) {
         return unless defined addressed($id, $action, $line);
 
@@ -411,9 +488,12 @@ sub request {
         # session generation too.
         my $head = envelope($id, $BOOT, 1);
         print qq({"type":"response",$head,"ok":true,"protocol_version":$PROTOCOL,)
-            . qq("compux_version":"0.0.0-test","actions":["screenshot"],)
+            . qq("compux_version":"0.0.0-test",)
+            . qq("actions":["screenshot","select_target","release_target"],)
             . qq("capabilities":{"input_methods":["foreground_hid"],)
             . qq("controls":["pause","resume","release"],)
+            . qq("targets":true,"capture_methods":["display","window"],)
+            . qq("indicator":"present",)
             . qq("observations":{"max":3,"ttl_ms":30000}}}\n);
     }
     elsif ($action eq 'dribble') {

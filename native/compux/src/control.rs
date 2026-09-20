@@ -260,6 +260,7 @@ mod tests {
             observation_id: Some("7c1e-1".to_string()),
             element_ref: None,
             check: wire::Check::None,
+            target_id: None,
         };
         gate.admit(&running).unwrap();
 
@@ -284,18 +285,30 @@ mod tests {
         assert_eq!(frames[0]["receipt"]["dispatch"], json!("not_sent"));
     }
 
+    // A window a click names reaches the worker; a window an action with no notion
+    // of one names is refused HERE, against its own request id, so no action
+    // downstream has to remember to check and the caller is told nothing was sent.
     #[test]
-    fn a_reserved_slice_three_field_is_refused_against_its_own_request_id() {
-        let (emitter, jobs, _) = drive(
+    fn a_target_is_carried_where_it_means_something_and_refused_where_it_does_not() {
+        let (_, jobs, _) = drive(
             "{\"type\":\"request\",\"request_id\":\"r1\",\"action\":\"left_click\",\
-             \"observation_id\":\"7c1e-1\",\"target_id\":\"t1\"}\n",
+             \"x\":4,\"y\":9,\"observation_id\":\"7c1e-1\",\"target_id\":\"t1\",\
+             \"mutation_seq\":1}\n",
+        );
+        assert_eq!(jobs.len(), 1);
+        let Job::Action(request) = &jobs[0];
+        assert_eq!(request.target_id.as_deref(), Some("t1"));
+
+        let (emitter, jobs, _) = drive(
+            "{\"type\":\"request\",\"request_id\":\"r2\",\"action\":\"windows\",\
+             \"target_id\":\"t1\"}\n",
         );
 
         assert!(jobs.is_empty(), "it must never reach the worker");
         let frames = emitter.captured();
-        assert_eq!(frames[0]["request_id"], json!("r1"));
+        assert_eq!(frames[0]["request_id"], json!("r2"));
         assert_eq!(frames[0]["error"], json!("unknown_field"));
-        assert_eq!(frames[0]["receipt"]["dispatch"], json!("not_sent"));
+        assert!(frames[0]["detail"].as_str().unwrap().contains("target_id"));
     }
 
     // A coordinate whose image is not named cannot be acted on safely, so it is
@@ -388,6 +401,10 @@ mod tests {
             0
         }
 
+        fn now_mach(&self) -> u64 {
+            0
+        }
+
         fn sleep(&self, ms: u64) {
             std::thread::sleep(std::time::Duration::from_millis(ms));
         }
@@ -411,6 +428,7 @@ mod tests {
             observation_id: None,
             element_ref: None,
             check: wire::Check::None,
+            target_id: None,
         };
         gate.admit(&request).unwrap();
 

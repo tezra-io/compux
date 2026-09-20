@@ -447,6 +447,81 @@ defmodule Compux.ProtocolTest do
     end
   end
 
+  describe "validate/1 — bound targets (v11)" do
+    test "select_target takes a window id and nothing else" do
+      assert {:ok, request} =
+               Protocol.validate(%{"action" => "select_target", "window_id" => 4711})
+
+      assert request == %{"action" => "select_target", "window_id" => 4711}
+
+      for bad <- [-1, "4711", 1.5, true] do
+        params = %{"action" => "select_target", "window_id" => bad}
+        assert {:error, reason} = Protocol.validate(params), "window_id #{inspect(bad)}"
+        assert reason =~ "window_id"
+      end
+
+      assert {:error, reason} = Protocol.validate(%{"action" => "select_target"})
+      assert reason =~ "window_id"
+    end
+
+    # One target per helper, so there is nothing to name.
+    test "release_target takes no arguments" do
+      assert {:ok, %{"action" => "release_target"}} =
+               Protocol.validate(%{"action" => "release_target"})
+    end
+
+    # Neither of them touches the screen, so neither carries a sequence number or
+    # earns a receipt — and a pause does not refuse them.
+    test "both target verbs are read-only model actions" do
+      assert Protocol.read_only?("select_target")
+      assert Protocol.read_only?("release_target")
+      assert "select_target" in Protocol.actions()
+      assert "release_target" in Protocol.actions()
+    end
+
+    # Everything that looks at, or acts inside, one window — written as the whole
+    # set, so an action added later joins this invariant or fails it.
+    test "every action that acts inside a window carries target_id through" do
+      targetable =
+        ~w(screenshot elements inspect left_click right_click double_click mouse_move
+           left_click_drag scroll type key paste press set_value)
+
+      for action <- targetable do
+        params = Map.put(check_params(action), "target_id", "t1")
+        assert {:ok, request} = Protocol.validate(params), "#{action} must take a target"
+        assert request["target_id"] == "t1"
+      end
+    end
+
+    # `windows` enumerates the DESKTOP, which is how a target is found in the first
+    # place; the rest have no window to name. Refused rather than ignored: a caller
+    # that believes it named a window and got the display is the failure this wire
+    # exists to prevent.
+    test "an action with no notion of a window refuses target_id by name" do
+      for action <- ~w(windows wait wait_for_change select_target release_target) do
+        params =
+          case action do
+            "wait" -> %{"action" => "wait", "ms" => 10}
+            "select_target" -> %{"action" => "select_target", "window_id" => 1}
+            other -> %{"action" => other}
+          end
+
+        assert {:error, reason} = Protocol.validate(Map.put(params, "target_id", "t1")),
+               "#{action} must take no target_id"
+
+        assert reason =~ "target_id"
+      end
+    end
+
+    test "an empty or non-string target_id names nothing" do
+      for bad <- ["", 1, true, %{}] do
+        params = Map.put(addressed_params("left_click"), "target_id", bad)
+        assert {:error, reason} = Protocol.validate(params), "target_id #{inspect(bad)}"
+        assert reason =~ "target_id"
+      end
+    end
+  end
+
   describe "validate/1 — drag/scroll/type/key/wait" do
     test "left_click_drag needs from/to points" do
       assert {:error, _} =

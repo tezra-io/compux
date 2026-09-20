@@ -164,6 +164,38 @@ defmodule CompuxTest do
       assert {:error, _reason} = Compux.click(cu, {-1, 2}, observation_id: "7c1e-12")
       refute_received {:executed, %{"action" => "left_click"}}
     end
+
+    test "select_target names the window and release_target names nothing", %{cu: cu} do
+      Compux.select_target(cu, 4711)
+      assert_received {:executed, %{"action" => "select_target", "window_id" => 4711}}
+
+      Compux.release_target(cu)
+      assert_received {:executed, %{"action" => "release_target"}}
+    end
+
+    # The bound window rides on one option, added in one place, so every verb that
+    # can name one takes it the same way.
+    test "a bound target rides on every action that acts inside a window", %{cu: cu} do
+      Compux.screenshot(cu, target_id: "t1")
+      assert_received {:executed, %{"action" => "screenshot", "target_id" => "t1"}}
+
+      Compux.click(cu, {10, 20}, observation_id: "7c1e-12", target_id: "t1")
+      assert_received {:executed, %{"action" => "left_click", "target_id" => "t1"}}
+
+      Compux.type(cu, "hello", target_id: "t1")
+      assert_received {:executed, %{"action" => "type", "target_id" => "t1"}}
+
+      Compux.press(cu, "e3", observation_id: "7c1e-12", target_id: "t1")
+      assert_received {:executed, %{"action" => "press", "target_id" => "t1"}}
+    end
+
+    # `windows` is how a target is FOUND; naming one on it is a contradiction, and
+    # it is refused here rather than carried to the helper.
+    test "an action with no window to name refuses the option", %{cu: cu} do
+      assert {:error, reason} = Compux.windows(cu, target_id: "t1")
+      assert reason =~ "target_id"
+      refute_received {:executed, %{"action" => "windows"}}
+    end
   end
 
   describe "probe/1" do
