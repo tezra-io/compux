@@ -1437,7 +1437,7 @@ pub use mac::{
 /// tell "nothing there" from "not supported here" writes the wrong sentence.
 #[cfg(not(target_os = "macos"))]
 mod stub {
-    use super::{Ax, Frame, Handle, Refusal, Walk};
+    use super::{Ax, Frame, Handle, Refusal, Retained, Walk};
     use crate::gate::Clock;
     use std::rc::Rc;
 

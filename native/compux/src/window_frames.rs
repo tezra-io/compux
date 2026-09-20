@@ -238,7 +238,8 @@ impl WindowFrame {
         let mut out = Vec::with_capacity(needed * height);
         for row in 0..height {
             let start = row * self.stride;
-            for pixel in self.pixels[start..start + needed].chunks_exact(BYTES_PER_PIXEL) {
+            let (pixels, _rest) = self.pixels[start..start + needed].as_chunks::<BYTES_PER_PIXEL>();
+            for pixel in pixels {
                 out.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
             }
         }

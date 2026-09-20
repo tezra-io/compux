@@ -5219,8 +5219,9 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn idle_detection_is_macos_only_off_macos() {
-        assert!(idle_ms().is_err());
-        assert!(wait_for_idle(&json!({}), &idle_gate()).is_err());
+        let gate = idle_gate();
+        assert!(idle_ms(&idle_worker(&gate)).is_err());
+        assert!(wait_for_idle(&json!({}), &gate).is_err());
     }
 
     // 75 is a MEANING, not a number: Fermix reads it as a clean capture-stall
