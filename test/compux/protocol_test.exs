@@ -3,6 +3,41 @@ defmodule Compux.ProtocolTest do
 
   alias Compux.Protocol
 
+  # A valid request for one of the actions that address a point in a named image,
+  # so a test can remove exactly the field it is about.
+  defp addressed_params(action) do
+    base = %{"action" => action, "observation_id" => "7c1e-12"}
+
+    case action do
+      "left_click_drag" ->
+        Map.merge(base, %{"from" => %{"x" => 1, "y" => 2}, "to" => %{"x" => 3, "y" => 4}})
+
+      "scroll" ->
+        Map.merge(base, %{"x" => 1, "y" => 2, "direction" => "down", "amount" => 3})
+
+      _pointer ->
+        Map.merge(base, %{"x" => 1, "y" => 2})
+    end
+  end
+
+  # A valid request addressed at a CONTROL rather than a point, so a test can
+  # remove or contradict exactly the field it is about.
+  defp element_params(action, extra \\ %{}) do
+    Map.merge(%{"action" => action, "observation_id" => "7c1e-12", "element_ref" => "e3"}, extra)
+  end
+
+  # A valid request for one action that dispatches input, whichever way that action
+  # is addressed — so a test about the `check` field can be written over the whole
+  # set and an action added later joins it or fails it.
+  defp check_params(action) do
+    cond do
+      action in ~w(press set_value) -> element_params(action, %{"value" => "v"})
+      action in ~w(type paste) -> %{"action" => action, "text" => "hi"}
+      action == "key" -> %{"action" => "key", "chord" => "ctrl+s"}
+      true -> addressed_params(action)
+    end
+  end
+
   describe "protocol_version/0" do
     test "is a positive integer" do
       assert is_integer(Protocol.protocol_version())
@@ -29,6 +64,16 @@ defmodule Compux.ProtocolTest do
       refute Protocol.read_only?("left_click")
       refute Protocol.read_only?("type")
       refute Protocol.read_only?("paste")
+    end
+
+    # The same list decides whether a request carries a `mutation_seq` and earns a
+    # receipt, so the operational verbs have to be in it: a permission probe is
+    # not a mutation, and sequencing one would put a receipt on it.
+    test "the operational verbs are read-only too, though they are not model actions" do
+      for action <- ~w(probe idle_ms wait_for_idle hello) do
+        assert Protocol.read_only?(action), "#{action} dispatches no input"
+        refute action in Protocol.actions(), "#{action} is not a model verb"
+      end
     end
   end
 
@@ -110,39 +155,383 @@ defmodule Compux.ProtocolTest do
   describe "validate/1 — clicks and inspect" do
     for action <- ~w(left_click right_click double_click mouse_move inspect) do
       test "#{action} requires x and y" do
-        assert {:error, _} = Protocol.validate(%{"action" => unquote(action)})
+        assert {:error, _} =
+                 Protocol.validate(%{"action" => unquote(action), "observation_id" => "7c1e-1"})
 
         assert {:ok, req} =
-                 Protocol.validate(%{"action" => unquote(action), "x" => 10, "y" => 20})
+                 Protocol.validate(%{
+                   "action" => unquote(action),
+                   "x" => 10,
+                   "y" => 20,
+                   "observation_id" => "7c1e-1"
+                 })
 
         assert req["x"] == 10 and req["y"] == 20
       end
     end
 
     test "a click carries modifiers when present" do
-      params = %{"action" => "left_click", "x" => 1, "y" => 2, "modifiers" => ["cmd", "shift"]}
+      params = %{
+        "action" => "left_click",
+        "x" => 1,
+        "y" => 2,
+        "modifiers" => ["cmd", "shift"],
+        "observation_id" => "7c1e-1"
+      }
+
       assert {:ok, req} = Protocol.validate(params)
       assert req["modifiers"] == ["cmd", "shift"]
     end
 
     test "a click rejects an unknown modifier" do
-      params = %{"action" => "left_click", "x" => 1, "y" => 2, "modifiers" => ["hyper"]}
+      params = %{
+        "action" => "left_click",
+        "x" => 1,
+        "y" => 2,
+        "modifiers" => ["hyper"],
+        "observation_id" => "7c1e-1"
+      }
+
       assert {:error, _} = Protocol.validate(params)
     end
 
     test "negative coordinates are rejected" do
-      assert {:error, _} = Protocol.validate(%{"action" => "left_click", "x" => -1, "y" => 2})
+      assert {:error, _} =
+               Protocol.validate(%{
+                 "action" => "left_click",
+                 "x" => -1,
+                 "y" => 2,
+                 "observation_id" => "7c1e-1"
+               })
+    end
+  end
+
+  # v8: a coordinate names the image it was read from. An action that addresses a
+  # point carries `observation_id` and no `region`; an action that PRODUCES an
+  # image takes both, and `region` then means "in the image that id names".
+  describe "validate/1 — addressing (v8)" do
+    for action <-
+          ~w(left_click right_click double_click mouse_move inspect left_click_drag scroll) do
+      test "#{action} carries the observation it was read from" do
+        assert {:ok, req} = Protocol.validate(addressed_params(unquote(action)))
+        assert req["observation_id"] == "7c1e-12"
+      end
+
+      test "#{action} without an observation_id is refused" do
+        params = Map.delete(addressed_params(unquote(action)), "observation_id")
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "observation_id"
+      end
+
+      test "#{action} refuses a region — the image is named, not described" do
+        params =
+          Map.put(
+            addressed_params(unquote(action)),
+            "region",
+            %{"x" => 0, "y" => 0, "w" => 10, "h" => 10}
+          )
+
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "region"
+      end
+
+      test "#{action} refuses an observation_id that is not a non-empty string" do
+        for bad <- ["", 7, nil] do
+          params = Map.put(addressed_params(unquote(action)), "observation_id", bad)
+          assert {:error, _} = Protocol.validate(params)
+        end
+      end
+    end
+
+    for action <- ~w(screenshot elements wait_for_change) do
+      test "#{action} takes an observation_id beside its region" do
+        params = %{
+          "action" => unquote(action),
+          "observation_id" => "7c1e-12",
+          "region" => %{"x" => 0, "y" => 0, "w" => 10, "h" => 10}
+        }
+
+        assert {:ok, req} = Protocol.validate(params)
+        assert req["observation_id"] == "7c1e-12"
+        assert req["region"]["w"] == 10
+      end
+
+      test "#{action} still works with neither" do
+        assert {:ok, req} = Protocol.validate(%{"action" => unquote(action)})
+        refute Map.has_key?(req, "observation_id")
+      end
+    end
+
+    test "windows names no observation — it is what produces them" do
+      assert {:error, _} =
+               Protocol.validate(%{"action" => "windows", "observation_id" => "7c1e-12"})
+    end
+  end
+
+  # v9: a control has a name, not only a place. `press` and `set_value` address
+  # one and never a point; a pointer action may address either, and both at once
+  # is a contradiction nothing may resolve by guessing.
+  describe "validate/1 — element references (v9)" do
+    test "press and set_value are model actions that are not read-only" do
+      for action <- ~w(press set_value) do
+        assert action in Protocol.actions()
+        refute Protocol.read_only?(action), "#{action} acts on the machine"
+      end
+    end
+
+    test "press carries the observation and the reference" do
+      assert {:ok, req} = Protocol.validate(element_params("press"))
+      assert req == %{"action" => "press", "element_ref" => "e3", "observation_id" => "7c1e-12"}
+    end
+
+    test "set_value carries its value, empty string included" do
+      for value <- ["hello", ""] do
+        assert {:ok, req} = Protocol.validate(element_params("set_value", %{"value" => value}))
+        assert req["value"] == value
+        assert req["element_ref"] == "e3"
+      end
+    end
+
+    test "set_value without a string value is refused" do
+      for bad <- [nil, 7, %{}] do
+        params = element_params("set_value", %{"value" => bad})
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "value"
+      end
+    end
+
+    test "set_value refuses a value past the type bound" do
+      params = element_params("set_value", %{"value" => String.duplicate("x", 10_001)})
+      assert {:error, reason} = Protocol.validate(params)
+      assert reason =~ "bytes"
+    end
+
+    for action <- ~w(press set_value) do
+      test "#{action} without an element_ref is refused by name" do
+        params = Map.delete(element_params(unquote(action), %{"value" => "v"}), "element_ref")
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "element_ref"
+      end
+
+      test "#{action} without an observation_id is refused" do
+        params = Map.delete(element_params(unquote(action), %{"value" => "v"}), "observation_id")
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "observation_id"
+      end
+
+      test "#{action} refuses a point beside its reference" do
+        params = element_params(unquote(action), %{"value" => "v", "x" => 1, "y" => 2})
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "never by both"
+      end
+
+      test "#{action} refuses an element_ref that is not a non-empty string" do
+        for bad <- ["", 7, nil] do
+          params = element_params(unquote(action), %{"value" => "v", "element_ref" => bad})
+          assert {:error, _} = Protocol.validate(params)
+        end
+      end
+    end
+
+    for action <- ~w(left_click right_click double_click mouse_move scroll) do
+      test "#{action} may be addressed by a control instead of a point" do
+        extra =
+          if unquote(action) == "scroll", do: %{"direction" => "down", "amount" => 2}, else: %{}
+
+        assert {:ok, req} = Protocol.validate(element_params(unquote(action), extra))
+        assert req["element_ref"] == "e3"
+        refute Map.has_key?(req, "x")
+        refute Map.has_key?(req, "y")
+      end
+
+      test "#{action} refuses a point and a control on one request" do
+        extra =
+          if unquote(action) == "scroll", do: %{"direction" => "down", "amount" => 2}, else: %{}
+
+        params = element_params(unquote(action), Map.merge(extra, %{"x" => 1, "y" => 2}))
+
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "never by both"
+      end
+    end
+
+    # A drag names two points and `inspect` reports what is under one, so neither
+    # has a meaning for a reference — refused rather than quietly ignored.
+    for action <- ~w(left_click_drag inspect) do
+      test "#{action} takes no element_ref" do
+        params = Map.put(addressed_params(unquote(action)), "element_ref", "e3")
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "element_ref"
+      end
+    end
+
+    for action <- ~w(screenshot elements wait_for_change windows type paste key wait) do
+      test "#{action} takes no element_ref either" do
+        params = %{"action" => unquote(action), "element_ref" => "e3"}
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "element_ref"
+      end
+    end
+  end
+
+  # v10: the evidence an action brings back. One field, three kinds, and the rules
+  # that decide which of them a given action may ask for.
+  describe "validate/1 — check (v10)" do
+    test "every action that dispatches input takes an image check and a bare receipt" do
+      for action <- Enum.reject(Protocol.actions(), &Protocol.read_only?/1),
+          kind <- ~w(image none) do
+        params = Map.put(check_params(action), "check", kind)
+
+        assert {:ok, request} = Protocol.validate(params), "#{action} must accept check #{kind}"
+        assert request["check"] == kind
+      end
+    end
+
+    test "an absent check is absent on the wire" do
+      assert {:ok, request} = Protocol.validate(addressed_params("left_click"))
+      refute Map.has_key?(request, "check")
+    end
+
+    test "a kind this wire does not have is refused by name" do
+      for bad <- ["bogus", "IMAGE", true, 1] do
+        params = Map.put(addressed_params("left_click"), "check", bad)
+        assert {:error, reason} = Protocol.validate(params)
+        assert reason =~ "check"
+      end
+    end
+
+    # A semantic check re-reads the control the action named. An action that named
+    # a point has no control to re-read, so asking for one is a contradiction and
+    # not a request to photograph it instead.
+    test "a semantic check needs a control, not a point" do
+      params = Map.put(addressed_params("left_click"), "check", "semantic")
+      assert {:error, reason} = Protocol.validate(params)
+      assert reason =~ "element_ref"
+
+      for action <- ~w(left_click right_click double_click scroll press set_value) do
+        extra =
+          case action do
+            "scroll" -> %{"direction" => "down", "amount" => 2}
+            "set_value" -> %{"value" => "v"}
+            _other -> %{}
+          end
+
+        params = element_params(action, Map.put(extra, "check", "semantic"))
+        assert {:ok, request} = Protocol.validate(params), "#{action} names a control"
+        assert request["check"] == "semantic"
+      end
+    end
+
+    test "an action that dispatches no input takes no check" do
+      for action <- Enum.filter(Protocol.actions(), &Protocol.read_only?/1) do
+        params =
+          if action in ~w(mouse_move inspect),
+            do: addressed_params(action),
+            else: %{"action" => action}
+
+        assert {:error, reason} = Protocol.validate(Map.put(params, "check", "image")),
+               "#{action} must take no check"
+
+        assert reason =~ "check"
+      end
+    end
+
+    # `screenshot_after` was replaced, not kept beside `check`. Dropping it in
+    # silence would leave a caller that still sends it with no check at all, and
+    # nothing said about it.
+    test "screenshot_after is gone, and saying so is loud" do
+      params = Map.put(addressed_params("left_click"), "screenshot_after", true)
+      assert {:error, reason} = Protocol.validate(params)
+      assert reason =~ "screenshot_after"
+      assert reason =~ "check"
+    end
+  end
+
+  describe "validate/1 — bound targets (v11)" do
+    test "select_target takes a window id and nothing else" do
+      assert {:ok, request} =
+               Protocol.validate(%{"action" => "select_target", "window_id" => 4711})
+
+      assert request == %{"action" => "select_target", "window_id" => 4711}
+
+      for bad <- [-1, "4711", 1.5, true] do
+        params = %{"action" => "select_target", "window_id" => bad}
+        assert {:error, reason} = Protocol.validate(params), "window_id #{inspect(bad)}"
+        assert reason =~ "window_id"
+      end
+
+      assert {:error, reason} = Protocol.validate(%{"action" => "select_target"})
+      assert reason =~ "window_id"
+    end
+
+    # One target per helper, so there is nothing to name.
+    test "release_target takes no arguments" do
+      assert {:ok, %{"action" => "release_target"}} =
+               Protocol.validate(%{"action" => "release_target"})
+    end
+
+    # Neither of them touches the screen, so neither carries a sequence number or
+    # earns a receipt — and a pause does not refuse them.
+    test "both target verbs are read-only model actions" do
+      assert Protocol.read_only?("select_target")
+      assert Protocol.read_only?("release_target")
+      assert "select_target" in Protocol.actions()
+      assert "release_target" in Protocol.actions()
+    end
+
+    # Everything that looks at, or acts inside, one window — written as the whole
+    # set, so an action added later joins this invariant or fails it.
+    test "every action that acts inside a window carries target_id through" do
+      targetable =
+        ~w(screenshot elements inspect left_click right_click double_click mouse_move
+           left_click_drag scroll type key paste press set_value)
+
+      for action <- targetable do
+        params = Map.put(check_params(action), "target_id", "t1")
+        assert {:ok, request} = Protocol.validate(params), "#{action} must take a target"
+        assert request["target_id"] == "t1"
+      end
+    end
+
+    # `windows` enumerates the DESKTOP, which is how a target is found in the first
+    # place; the rest have no window to name. Refused rather than ignored: a caller
+    # that believes it named a window and got the display is the failure this wire
+    # exists to prevent.
+    test "an action with no notion of a window refuses target_id by name" do
+      for action <- ~w(windows wait wait_for_change select_target release_target) do
+        params =
+          case action do
+            "wait" -> %{"action" => "wait", "ms" => 10}
+            "select_target" -> %{"action" => "select_target", "window_id" => 1}
+            other -> %{"action" => other}
+          end
+
+        assert {:error, reason} = Protocol.validate(Map.put(params, "target_id", "t1")),
+               "#{action} must take no target_id"
+
+        assert reason =~ "target_id"
+      end
+    end
+
+    test "an empty or non-string target_id names nothing" do
+      for bad <- ["", 1, true, %{}] do
+        params = Map.put(addressed_params("left_click"), "target_id", bad)
+        assert {:error, reason} = Protocol.validate(params), "target_id #{inspect(bad)}"
+        assert reason =~ "target_id"
+      end
     end
   end
 
   describe "validate/1 — drag/scroll/type/key/wait" do
     test "left_click_drag needs from/to points" do
-      assert {:error, _} = Protocol.validate(%{"action" => "left_click_drag"})
+      assert {:error, _} =
+               Protocol.validate(%{"action" => "left_click_drag", "observation_id" => "7c1e-1"})
 
       params = %{
         "action" => "left_click_drag",
         "from" => %{"x" => 0, "y" => 0},
-        "to" => %{"x" => 5, "y" => 5}
+        "to" => %{"x" => 5, "y" => 5},
+        "observation_id" => "7c1e-1"
       }
 
       assert {:ok, req} = Protocol.validate(params)
@@ -150,10 +539,26 @@ defmodule Compux.ProtocolTest do
     end
 
     test "scroll needs a valid direction and a positive amount" do
-      bad = %{"action" => "scroll", "x" => 0, "y" => 0, "direction" => "sideways", "amount" => 3}
+      bad = %{
+        "action" => "scroll",
+        "x" => 0,
+        "y" => 0,
+        "direction" => "sideways",
+        "amount" => 3,
+        "observation_id" => "7c1e-1"
+      }
+
       assert {:error, _} = Protocol.validate(bad)
 
-      ok = %{"action" => "scroll", "x" => 0, "y" => 0, "direction" => "down", "amount" => 3}
+      ok = %{
+        "action" => "scroll",
+        "x" => 0,
+        "y" => 0,
+        "direction" => "down",
+        "amount" => 3,
+        "observation_id" => "7c1e-1"
+      }
+
       assert {:ok, req} = Protocol.validate(ok)
       assert req["direction"] == "down" and req["amount"] == 3
     end
@@ -176,31 +581,18 @@ defmodule Compux.ProtocolTest do
     end
   end
 
-  describe "encode_request/1 and decode_response/1" do
-    test "encode appends a newline and stays valid JSON" do
-      line = Protocol.encode_request(%{"action" => "screenshot"})
-      assert String.ends_with?(line, "\n")
-      assert {:ok, %{"action" => "screenshot"}} = Jason.decode(String.trim(line))
+  # One wire format means one encoder and one decoder, and neither is here any
+  # more. `encode_request/1` wrote the UNTAGGED protocol-6 line a protocol-7
+  # sidecar refuses; `decode_response/1` called any `ok: true` map a response, so
+  # an `ack` or an `event` could stand in for an action's reply. Both live in
+  # `Compux.Frame` now, which is what every caller uses.
+  describe "the protocol neither encodes nor decodes a frame" do
+    test "encode_request/1 is gone" do
+      refute function_exported?(Protocol, :encode_request, 1)
     end
 
-    test "decodes an ok response" do
-      assert {:ok, %{"ok" => true, "data" => "x"}} =
-               Protocol.decode_response(~s({"ok":true,"data":"x"}))
-    end
-
-    test "decodes a failure response to its error reason" do
-      assert {:error, "no_active_display"} =
-               Protocol.decode_response(~s({"ok":false,"error":"no_active_display"}))
-    end
-
-    test "a malformed shape fails loud" do
-      assert {:error, "malformed sidecar response: " <> _} =
-               Protocol.decode_response(~s({"weird":1}))
-    end
-
-    test "invalid JSON fails loud" do
-      assert {:error, "invalid JSON from sidecar: " <> _} =
-               Protocol.decode_response("{not json")
+    test "decode_response/1 is gone" do
+      refute function_exported?(Protocol, :decode_response, 1)
     end
   end
 

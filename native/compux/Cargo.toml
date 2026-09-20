@@ -11,7 +11,7 @@
 
 [package]
 name = "compux"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 description = "Native screen-capture + input-injection helper for the compux Elixir library"
 license = "MIT"
@@ -40,9 +40,24 @@ arboard = "3"
 # transitively via xcap, so this adds no new compilation.
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
+dispatch2 = "0.3"
 # posix_spawn + dlsym for the TCC responsibility self-disclaim re-exec (see
 # `disclaim` in src/main.rs) — makes compux its own TCC responsible process.
 libc = "0.2"
+# ScreenCaptureKit, for a stream of ONE window's frames (`window_frames.rs`). The
+# objc2 family, not a third-party wrapper: every crate it pulls in except
+# `objc2-uniform-type-identifiers` is already in this tree at the same version via
+# xcap's objc2 stack, the bindings are generated from Apple's own headers (so a
+# name here is the name in the SDK), the whole family is MIT, and it needs no
+# toolchain step beyond the stock macOS runner's SDK.
+objc2 = "0.6"
+block2 = "0.6"
+objc2-core-graphics = "0.3"
+objc2-foundation = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = ["std", "SCStream", "SCShareableContent", "SCError", "block2", "dispatch2", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-media"] }
 
 [profile.release]
 strip = true

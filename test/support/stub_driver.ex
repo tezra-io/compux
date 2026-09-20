@@ -4,7 +4,8 @@ defmodule Compux.StubDriver do
   # (handshake, request building, version gate) is fully unit-testable.
   #
   # `start/1` opts: `:protocol_version` (default 1), `:compux_version`, `:log` (a pid
-  # sent `{:executed, request}` / `:stopped`), `:responses` (action => reply),
+  # sent `{:executed, request}` / `{:controlled, action}` / `:stopped`),
+  # `:responses` (action => reply), `:acks` (control action => reply),
   # `:fail_hello` (make the handshake error).
   @behaviour Compux.Driver
 
@@ -16,6 +17,7 @@ defmodule Compux.StubDriver do
        compux_version: Keyword.get(opts, :compux_version, "0.0.0-stub"),
        log: Keyword.get(opts, :log),
        responses: Keyword.get(opts, :responses, %{}),
+       acks: Keyword.get(opts, :acks, %{}),
        fail_hello: Keyword.get(opts, :fail_hello, false)
      }}
   end
@@ -24,6 +26,16 @@ defmodule Compux.StubDriver do
   def execute(state, %{"action" => action} = request) do
     if state.log, do: send(state.log, {:executed, request})
     reply(state, action, request)
+  end
+
+  @impl true
+  def control(state, action) when action in [:pause, :resume, :release] do
+    if state.log, do: send(state.log, {:controlled, action})
+
+    Map.get(state.acks, action, {
+      :ok,
+      %{action: action, ok: true, authorization_generation: 2, in_flight_request_id: nil}
+    })
   end
 
   @impl true

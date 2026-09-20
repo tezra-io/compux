@@ -50,10 +50,122 @@ defmodule Compux.Protocol do
   # browser context (`browser_id`/`window_ref`/`tab_ref`/`host`/`private_state`) on
   # `field.value`, both ADDITIVE fields on that same push wire, and accepts-and-ignores
   # the retired `sites` key of `observe_start` — no control action changed.
-  @protocol_version 6
+  #
+  # v7 (M42 slice 2, transport and control): the action wire becomes TAGGED and
+  # CORRELATED. Every line now carries a `type` (`request`, `response`, `control`,
+  # `control_ack`, `session_event`, beside computer-history's unchanged `ack` and
+  # `event`), every request a `request_id` the response echoes, and — after the
+  # handshake — the `sidecar_generation`, `session_generation` and
+  # `authorization_generation` a frame belongs to. A mutating request also carries
+  # an increasing `mutation_seq`, and its response carries a `receipt` saying
+  # whether input was dispatched. The caller's remaining budget rides as
+  # `deadline_ms`, deliberately NOT `timeout_ms`, which two actions have used as
+  # an argument of their own since v2. Requests and responses no longer pair by
+  # ORDER, so the desync class — a late frame answering the next action — is gone;
+  # `hello` is itself a request now, and its response returns the sidecar's boot
+  # generation and a `capabilities` map. `Compux.Frame` owns the shapes.
+  #
+  # v8 (M42 slice 3, observation identity): every reply that hands the caller
+  # coordinates names the image they were read from (`observation_id`), and every
+  # coordinate sent back names that image. An action that ADDRESSES a point
+  # (`left_click`, `right_click`, `double_click`, `mouse_move`, `left_click_drag`,
+  # `scroll`, `inspect`) carries `observation_id` and no `region`: the sidecar
+  # stores the transform with the image and uses it as stored, so nothing
+  # re-derives it from a rectangle the caller echoed back. An action that PRODUCES
+  # an image or a list of coordinates (`screenshot`, `elements`, `wait_for_change`)
+  # keeps `region` and may name an observation beside it, and the rectangle is then
+  # read in THAT image's pixels. Refusing `region` on a click is the wire change
+  # that cannot be additive, so the version bumps and the handshake refuses the
+  # pairing.
+  #
+  # v9 (M42 slice 4, semantic references): `elements` answers controls the caller
+  # can NAME. Each element (and each mark) carries an `element_ref` — `e1`, `e2`,
+  # … scoped to the observation it was listed in — beside its role, label, value,
+  # whether it is enabled, what it can do, whether its value can be set, its
+  # bounds and a short path of ancestor labels. Two actions address a control
+  # rather than a point: `press` and `set_value`, offered only where the control
+  # itself advertises support and refused with a typed error everywhere else,
+  # never quietly replaced by a click. A pointer action may also carry an
+  # `element_ref` INSTEAD of `x`/`y`, and the sidecar re-reads the control's
+  # bounds and clicks its centre. Both addressing forms on one request is
+  # `addressing_conflict`. `element_ref` was a reserved field the sidecar refused
+  # outright until now, so the version bumps and the handshake refuses the
+  # pairing.
+  #
+  # v10 (M42 slice 6, the check): an action that dispatches input says what
+  # evidence it wants back, and `check` REPLACES `screenshot_after` — deleted, not
+  # kept beside it, so a request carrying the old field is refused rather than run
+  # with no check at all. `image` returns the view the caller acted in (the crop of
+  # the observation the action named, or the full display when that observation was
+  # the full display or the action names none), settled before it is taken;
+  # `semantic` re-reads the control an `element_ref` named and answers
+  # `element_after`, with no capture; `none` is the receipt alone. The receipt says
+  # which evidence it carries in `check` and what each phase cost in `timings_ms`.
+  #
+  # v11 (M42 slice 5, bound targets): the caller may bind ONE window and work
+  # inside it. `select_target` takes a `window_id` from a `windows` listing and
+  # answers a `target_id` (`t1`, `t2`, …) with a first observation of that window
+  # alone; `release_target` ends it. An action that carries `target_id` is answered
+  # from the window's own frames and in the window's own coordinates, even when
+  # another window covers it, and the helper shows on screen that it is doing so.
+  # `target_id` was a reserved field the sidecar refused outright until now, so the
+  # version bumps and the handshake refuses the pairing. An action WITHOUT
+  # `target_id` behaves exactly as it did at protocol 10 — the display-level path is
+  # unchanged, and it is also how the full desktop stays reachable: there is no
+  # "desktop" target, there is the absence of one.
+  @protocol_version 11
 
-  @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows)
-  @read_only ~w(screenshot mouse_move wait inspect wait_for_change elements windows)
+  @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows press set_value select_target release_target)
+
+  # Read-only in both senses the wire needs: a consumer may auto-run one without a
+  # confirmation step, and it dispatches no input, so it carries no `mutation_seq`
+  # and earns no receipt. The operational verbs sit here too — `probe`, `idle_ms`,
+  # `wait_for_idle` and `hello` are not model actions (they are absent from
+  # `@actions`), but they change nothing on the screen and classifying them as
+  # mutations would put a sequence number and a receipt on a permission probe.
+  #
+  # v11: `select_target` and `release_target` are here too. They change what the
+  # helper is bound to and they dispatch nothing — no pointer moves, no key goes
+  # down, nothing on the screen is touched — so putting a `mutation_seq` and a
+  # receipt on them would claim input where there was none. A pause therefore does
+  # not refuse them either, which is right: the person took the keyboard back, not
+  # the bookkeeping.
+  @read_only ~w(screenshot mouse_move wait inspect wait_for_change elements windows
+                select_target release_target
+                probe idle_ms wait_for_idle hello)
+
+  # v11: the actions that may name a bound window. Everything that looks at, or
+  # acts inside, one window — and nothing else. `windows` enumerates the DESKTOP's
+  # windows, which is how a target is found in the first place; `wait`,
+  # `wait_for_change` and the two target verbs themselves have no target to name.
+  @targetable ~w(screenshot elements inspect left_click right_click double_click
+                 mouse_move left_click_drag scroll type key paste press set_value)
+  # v8: the actions addressed INTO an observation — their target is read out of a
+  # reply the caller was handed. Each one names that observation with
+  # `observation_id` and takes no `region`: the rectangle is the sidecar's to
+  # remember, and a caller that echoes one back is the defect this replaces.
+  @addressed ~w(left_click right_click double_click mouse_move left_click_drag scroll inspect
+                press set_value)
+
+  # v9: addressed by a CONTROL, never by a point. Their whole promise is that they
+  # cannot miss, so a coordinate on one of them is a contradiction, not a hint.
+  @element ~w(press set_value)
+
+  # v9: addressed by a point OR by a control, and the sidecar re-reads the
+  # control's bounds at the moment it acts. Both on one request is a conflict:
+  # nothing may guess which one the caller meant.
+  @pointer_or_element ~w(left_click right_click double_click mouse_move scroll)
+
+  # The actions that PRODUCE coordinates. `region` stays theirs; an `observation_id`
+  # beside it says which image the rectangle is read in.
+  @viewing ~w(screenshot elements wait_for_change)
+
+  # v10: the evidence an action brings back. Only an action that DISPATCHES INPUT
+  # has anything to bring back, so the field is offered exactly there — `mouse_move`
+  # is read-only on the wire and returns no check, and a read-only verb asking for
+  # one has misunderstood what it is.
+  @check_kinds ~w(image semantic none)
+
   @modifiers ~w(cmd ctrl alt shift)
   @scroll_directions ~w(up down left right)
   @max_type_bytes 10_000
@@ -81,48 +193,188 @@ defmodule Compux.Protocol do
   @doc """
   Validate + canonicalize an action params map (string keys) into a sidecar
   request. Returns `{:ok, request}` or `{:error, reason}`. The caller fills the
-  default `display` and the transport `screenshot_after` flag before encoding;
-  this function validates only the action's own arguments.
+  default `display`; this function validates the action's own arguments, the
+  observation and control it is addressed at, and the `check` it asks for.
   """
   @spec validate(map()) :: {:ok, map()} | {:error, String.t()}
   def validate(params) when is_map(params) do
     case Map.get(params, "action") do
-      action when action in @actions -> validate_action(action, params)
-      nil -> {:error, "missing required field: action"}
-      other -> {:error, "unknown action: #{inspect(other)}"}
+      action when action in @actions ->
+        with :ok <- check_addressing(action, params),
+             :ok <- check_binding(action, params),
+             :ok <- check_evidence(action, params),
+             {:ok, request} <- validate_action(action, params) do
+          request =
+            request
+            |> put_observation(Map.get(params, "observation_id"))
+            |> put_target_id(Map.get(params, "target_id"))
+
+          {:ok, put_check(request, Map.get(params, "check"))}
+        end
+
+      nil ->
+        {:error, "missing required field: action"}
+
+      other ->
+        {:error, "unknown action: #{inspect(other)}"}
     end
   end
 
   def validate(_other), do: {:error, "action params must be a map"}
 
-  @doc "Encode a validated request to a single JSON line for the sidecar's stdin."
-  @spec encode_request(map()) :: binary()
-  def encode_request(request) when is_map(request), do: Jason.encode!(request) <> "\n"
+  # v8/v9: which observation this action is addressed into, and — since v9 —
+  # whether it names a point or a control. Checked before the action's own
+  # arguments, because an action aimed at the wrong thing cannot be fixed by
+  # having valid ones.
+  defp check_addressing(action, params) when action in @addressed do
+    cond do
+      not observation?(params) ->
+        {:error,
+         "#{action} requires observation_id: the id of the reply its target was read from"}
 
-  @doc """
-  Decode one sidecar response line. A success carries `ok: true`; a failure
-  carries `ok: false` + `error`. Anything else (or invalid JSON) fails loud so a
-  malformed sidecar can never look like a successful action.
-  """
-  @spec decode_response(binary()) :: {:ok, map()} | {:error, String.t()}
-  def decode_response(line) when is_binary(line) do
-    case Jason.decode(String.trim(line)) do
-      {:ok, %{"ok" => true} = resp} ->
-        {:ok, resp}
+      Map.has_key?(params, "region") ->
+        {:error,
+         "region is not accepted on #{action}: its coordinates are pixels in the image named " <>
+           "by observation_id, which carries its own rectangle"}
 
-      {:ok, %{"ok" => false, "error" => error}} ->
-        {:error, to_string(error)}
-
-      {:ok, %{"error" => error}} ->
-        {:error, to_string(error)}
-
-      {:ok, other} ->
-        {:error, "malformed sidecar response: #{inspect(other)}"}
-
-      {:error, %Jason.DecodeError{} = error} ->
-        {:error, "invalid JSON from sidecar: #{Exception.message(error)}"}
+      true ->
+        check_target(action, params)
     end
   end
+
+  defp check_addressing(action, params) when action in @viewing do
+    cond do
+      Map.has_key?(params, "observation_id") and not observation?(params) ->
+        {:error, "observation_id must be a non-empty string"}
+
+      Map.has_key?(params, "element_ref") ->
+        {:error, "#{action} takes no element_ref — it produces references, it does not use one"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp check_addressing(action, params) do
+    cond do
+      Map.has_key?(params, "observation_id") ->
+        {:error, "#{action} takes no observation_id — it reads no coordinates"}
+
+      Map.has_key?(params, "element_ref") ->
+        {:error, "#{action} takes no element_ref — it addresses no control"}
+
+      true ->
+        :ok
+    end
+  end
+
+  # `press` and `set_value` name a control and nothing else: a point beside the
+  # reference means the caller addressed the action two ways at once.
+  defp check_target(action, params) when action in @element do
+    cond do
+      not element?(params) ->
+        {:error,
+         "#{action} requires element_ref: the reference of the control, from the elements " <>
+           "reply named by observation_id"}
+
+      point?(params) ->
+        {:error, conflict(action)}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp check_target(action, params) when action in @pointer_or_element do
+    if element?(params) and point?(params), do: {:error, conflict(action)}, else: :ok
+  end
+
+  # `left_click_drag` names two points and `inspect` reports what is under one, so
+  # neither has a meaning for a control reference.
+  defp check_target(action, params) do
+    if Map.has_key?(params, "element_ref"),
+      do: {:error, "#{action} takes no element_ref — it addresses a point"},
+      else: :ok
+  end
+
+  defp conflict(action) do
+    "#{action} is addressed either by a point or by element_ref, never by both: " <>
+      "send the coordinates, or the reference, not the two together"
+  end
+
+  # v10: the evidence this action asks for. Checked here rather than inside each
+  # action, because the rule is about what the action IS — whether it dispatches
+  # input, and whether it named a control — and not about its own arguments.
+  #
+  # `screenshot_after` is refused by name. It was replaced by `check`, and this
+  # function builds a canonical request from a whitelist, so dropping it in silence
+  # would leave a caller that still sends it with no check at all and nothing said.
+  defp check_evidence(action, params) do
+    cond do
+      Map.has_key?(params, "screenshot_after") ->
+        {:error,
+         ~s(screenshot_after was replaced by check: send check with "image", "semantic" ) <>
+           ~s(or "none")}
+
+      not Map.has_key?(params, "check") ->
+        :ok
+
+      read_only?(action) ->
+        {:error, "#{action} takes no check — it dispatches no input, so it reports no evidence"}
+
+      Map.get(params, "check") not in @check_kinds ->
+        {:error, "check must be one of #{Enum.join(@check_kinds, ", ")}"}
+
+      Map.get(params, "check") == "semantic" and not element?(params) ->
+        {:error,
+         "a semantic check re-reads the control the action named, so it needs an element_ref: " <>
+           "address this action by reference, or ask for an image check"}
+
+      true ->
+        :ok
+    end
+  end
+
+  # v11: the window this action is bound to, when it names one. A target changes
+  # where an action LOOKS and where its coordinates mean something, so an action
+  # that has no such notion is refused rather than run against the display while
+  # its caller believes it named a window.
+  defp check_binding(action, params) do
+    cond do
+      not Map.has_key?(params, "target_id") ->
+        :ok
+
+      action not in @targetable ->
+        {:error, "#{action} takes no target_id — it does not act inside one window"}
+
+      not nonempty_string?(Map.get(params, "target_id")) ->
+        {:error, ~s|target_id must be a non-empty string, as select_target spells it (e.g. "t1")|}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp observation?(params), do: nonempty_string?(Map.get(params, "observation_id"))
+  defp element?(params), do: nonempty_string?(Map.get(params, "element_ref"))
+
+  defp nonempty_string?(value), do: is_binary(value) and value != ""
+
+  defp point?(params), do: Enum.any?(~w(x y from to), &Map.has_key?(params, &1))
+
+  defp put_observation(request, nil), do: request
+  defp put_observation(request, id), do: Map.put(request, "observation_id", id)
+
+  defp put_target_id(request, nil), do: request
+  defp put_target_id(request, id), do: Map.put(request, "target_id", id)
+
+  defp put_check(request, nil), do: request
+  defp put_check(request, kind), do: Map.put(request, "check", kind)
+
+  # This module validates and classifies; it no longer writes a line. `encode_request/1`
+  # produced the UNTAGGED protocol-6 shape, which a protocol-7 sidecar refuses —
+  # one wire format means one encoder, and that is `Compux.Frame.encode/1`, for
+  # the action wire and the computer-history connection alike.
 
   defp validate_action("screenshot", params) do
     with {:ok, display} <- opt_display(params),
@@ -145,24 +397,65 @@ defmodule Compux.Protocol do
 
   defp validate_action(action, params)
        when action in ~w(left_click right_click double_click mouse_move) do
-    with {:ok, x} <- coord(params, "x"),
-         {:ok, y} <- coord(params, "y"),
+    with {:ok, target} <- pointer_target(params),
          {:ok, modifiers} <- opt_modifiers(params),
-         {:ok, display} <- opt_display(params),
-         {:ok, region} <- opt_region(params) do
-      request = %{"action" => action, "x" => x, "y" => y}
+         {:ok, display} <- opt_display(params) do
+      request = Map.merge(%{"action" => action}, target)
       request = if modifiers == [], do: request, else: Map.put(request, "modifiers", modifiers)
-      {:ok, put_region(put_display(request, display), region)}
+      {:ok, put_display(request, display)}
     end
+  end
+
+  # v9: press the control the caller named. Offered only where the control's own
+  # action list says it can be pressed — the sidecar refuses it everywhere else
+  # and never falls back to clicking, which is the caller's decision to make.
+  defp validate_action("press", params) do
+    with {:ok, element} <- element_ref(params),
+         {:ok, display} <- opt_display(params) do
+      {:ok, put_display(%{"action" => "press", "element_ref" => element}, display)}
+    end
+  end
+
+  # v9: set the control's value directly, then read it back. Offered only where
+  # the control reports its value as settable.
+  defp validate_action("set_value", params) do
+    with {:ok, element} <- element_ref(params),
+         {:ok, value} <- value_text(params),
+         {:ok, display} <- opt_display(params) do
+      request = %{"action" => "set_value", "element_ref" => element, "value" => value}
+      {:ok, put_display(request, display)}
+    end
+  end
+
+  # v11: bind one window, by the `id` a `windows` listing gave it. The helper
+  # answers a `target_id` and a first observation OF THAT WINDOW, so the caller's
+  # next coordinates are pixels of the window rather than of the display behind it.
+  #
+  # There is no "desktop" window id: the desktop is the ABSENCE of a target, which
+  # is the display-level path this protocol has always had. A second spelling for
+  # it would be a second code path for one behaviour.
+  defp validate_action("select_target", params) do
+    case Map.get(params, "window_id") do
+      id when is_integer(id) and id >= 0 ->
+        {:ok, %{"action" => "select_target", "window_id" => id}}
+
+      _other ->
+        {:error,
+         "select_target requires window_id: the non-negative integer id a windows " <>
+           "listing gave the window"}
+    end
+  end
+
+  # One target per helper, so this needs no id: it releases whatever is bound.
+  defp validate_action("release_target", _params) do
+    {:ok, %{"action" => "release_target"}}
   end
 
   defp validate_action("inspect", params) do
     with {:ok, x} <- coord(params, "x"),
          {:ok, y} <- coord(params, "y"),
-         {:ok, display} <- opt_display(params),
-         {:ok, region} <- opt_region(params) do
-      request = put_display(%{"action" => "inspect", "x" => x, "y" => y}, display)
-      {:ok, put_region(request, region)}
+         {:ok, display} <- opt_display(params) do
+      {:ok, put_display(%{"action" => "inspect", "x" => x, "y" => y}, display)}
     end
   end
 
@@ -221,29 +514,20 @@ defmodule Compux.Protocol do
   defp validate_action("left_click_drag", params) do
     with {:ok, from} <- point(params, "from"),
          {:ok, to} <- point(params, "to"),
-         {:ok, display} <- opt_display(params),
-         {:ok, region} <- opt_region(params) do
-      request = put_display(%{"action" => "left_click_drag", "from" => from, "to" => to}, display)
-      {:ok, put_region(request, region)}
+         {:ok, display} <- opt_display(params) do
+      {:ok, put_display(%{"action" => "left_click_drag", "from" => from, "to" => to}, display)}
     end
   end
 
   defp validate_action("scroll", params) do
-    with {:ok, x} <- coord(params, "x"),
-         {:ok, y} <- coord(params, "y"),
+    with {:ok, target} <- pointer_target(params),
          {:ok, direction} <- scroll_direction(params),
          {:ok, amount} <- positive(params, "amount"),
-         {:ok, display} <- opt_display(params),
-         {:ok, region} <- opt_region(params) do
-      request = %{
-        "action" => "scroll",
-        "x" => x,
-        "y" => y,
-        "direction" => direction,
-        "amount" => amount
-      }
+         {:ok, display} <- opt_display(params) do
+      request =
+        Map.merge(%{"action" => "scroll", "direction" => direction, "amount" => amount}, target)
 
-      {:ok, put_region(put_display(request, display), region)}
+      {:ok, put_display(request, display)}
     end
   end
 
@@ -277,10 +561,49 @@ defmodule Compux.Protocol do
     end
   end
 
+  # v9: a pointer action names its target one way or the other. `check_addressing`
+  # has already refused both at once, so a reference here means the caller sent no
+  # coordinates and a control is what it aimed at.
+  defp pointer_target(params) do
+    if element?(params) do
+      with {:ok, element} <- element_ref(params), do: {:ok, %{"element_ref" => element}}
+    else
+      with {:ok, x} <- coord(params, "x"),
+           {:ok, y} <- coord(params, "y"),
+           do: {:ok, %{"x" => x, "y" => y}}
+    end
+  end
+
+  defp element_ref(params) do
+    case Map.get(params, "element_ref") do
+      ref when is_binary(ref) and ref != "" ->
+        {:ok, ref}
+
+      _other ->
+        {:error,
+         "element_ref must be a non-empty string, as an elements reply spells it (e.g. \"e3\")"}
+    end
+  end
+
+  # The same bound `type` and `paste` carry: a value the sidecar sets in one AX
+  # call, not a stream.
+  defp value_text(params) do
+    case Map.get(params, "value") do
+      value when is_binary(value) and byte_size(value) <= @max_type_bytes ->
+        {:ok, value}
+
+      value when is_binary(value) ->
+        {:error, "set_value.value must be at most #{@max_type_bytes} bytes"}
+
+      _other ->
+        {:error, "set_value requires a string value"}
+    end
+  end
+
   defp coord(params, key) do
     case Map.get(params, key) do
       value when is_integer(value) and value >= 0 -> {:ok, value}
-      _other -> {:error, "#{key} must be a non-negative integer (screenshot pixel space)"}
+      _other -> {:error, "#{key} must be a non-negative integer (pixels in the named image)"}
     end
   end
 
@@ -373,9 +696,10 @@ defmodule Compux.Protocol do
   defp maybe_put(request, _key, nil), do: request
   defp maybe_put(request, key, value), do: Map.put(request, key, value)
 
-  # A zoom rectangle in the full-screenshot pixel space — the coordinates the model
-  # reads off a normal screenshot. Passing the same `region` on a `screenshot` and the
-  # follow-up click maps the click back through the crop.
+  # A zoom rectangle, read in the image named by `observation_id` or — with none —
+  # in the full-display image. It is accepted only by the actions that PRODUCE an
+  # image or a list of coordinates; an action that addresses a point names its image
+  # instead, so no rectangle is ever copied from one request into the next.
   # Opt into JPEG for this capture. Absent = PNG, the lossless default for reading
   # fine UI text; a BULK periodic caller (a continuous screen feed) sets it, because
   # a full-desktop PNG is an order of magnitude larger and saturates the uplink at
@@ -412,7 +736,7 @@ defmodule Compux.Protocol do
   defp region_error do
     {:error,
      "region must be an object with non-negative integer x,y and positive integer w,h " <>
-       "(in the full-screenshot pixel space)"}
+       "(pixels in the image named by observation_id, or the full-display image with none)"}
   end
 
   defp put_region(request, nil), do: request

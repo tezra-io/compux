@@ -14,9 +14,77 @@ defmodule Compux do
 
       {:ok, cu}   = Compux.start()
       {:ok, shot} = Compux.screenshot(cu, region: {0, 0, 400, 300})
-      :ok         = Compux.click(cu, {120, 80}, button: :left, modifiers: [:cmd])
-      {:ok, el}   = Compux.inspect(cu, {120, 80})
+      :ok         = Compux.click(cu, {120, 80}, observation_id: shot["observation_id"])
+      {:ok, el}   = Compux.inspect(cu, {120, 80}, observation_id: shot["observation_id"])
       :ok         = Compux.stop(cu)
+
+  ## Coordinates name their image
+
+  Every reply that hands you coordinates carries an `observation_id`, and every
+  call that sends coordinates back names the image they were read from. The
+  sidecar keeps the transform with the image, so a click is mapped by the geometry
+  the picture was taken with — never by a rectangle the caller repeated. The
+  actions that address a point therefore take `:observation_id` and no `:region`;
+  the actions that produce an image or a list of coordinates take both.
+
+  ## Controls have names, not only places
+
+  `elements/2` gives each control an `element_ref` (`e1`, `e2`, … scoped to that
+  reply's observation) beside its role, label, value, whether it is enabled, what
+  it can do and where it is. A reference is always sent with its
+  `observation_id`; on its own it means nothing.
+
+      {:ok, list} = Compux.elements(cu)
+      image       = list["observation_id"]
+      [save | _]  = Enum.filter(list["elements"], &("press" in &1["actions"]))
+
+      :ok = Compux.press(cu, save["element_ref"], observation_id: image)
+      :ok = Compux.click(cu, {:element, save["element_ref"]}, observation_id: image)
+
+  `press/3` and `set_value/4` do not touch the pointer at all, and are offered
+  only where the control itself advertises support. `click/3`, `move/3` and
+  `scroll/5` may take `{:element, ref}` instead of a point, and the sidecar
+  re-reads that control's bounds before it clicks its centre.
+
+  ## One window, bound
+
+  `select_target/3` binds a window a `windows/2` listing named and answers a
+  `target_id`. Pass that id to a later call as `:target_id` and the helper answers
+  from that window's own frames, in that window's own coordinates — so a window
+  another one covers is still seen, and a click is refused rather than landing on
+  whatever is in front of it. While a target is held the helper shows an ownership
+  indicator on screen whose Pause and Stop reach it directly; those arrive as
+  session events (see `Compux.Transport`).
+
+      {:ok, list} = Compux.windows(cu)
+      [window | _] = list["windows"]
+      {:ok, bound} = Compux.select_target(cu, window["id"])
+
+      {:ok, shot} = Compux.screenshot(cu, target_id: bound["target_id"])
+      :ok = Compux.release_target(cu)
+
+  There is no "desktop" target: a call with no `:target_id` is the display-level
+  path this library has always had, unchanged.
+
+  ## Every action says what evidence it wants back
+
+  An action that dispatches input carries `:check`, and the reply's `receipt` says
+  which evidence it really carries (`check: %{kind:, settle:, changed:}`).
+
+    * `:image` — the view you acted in: the crop of the image (or listing) the
+      action named, or the whole display when that is what it named and when the
+      action names none at all. The helper waits for the view to stop moving
+      first, and `settle` says whether it did (`"stable"`) or was still moving at
+      the cap (`"timeout"`). `changed` says whether that view differs from the one
+      you acted on — evidence about the view, never a verdict on the action.
+    * `:semantic` — for an action addressed by `element_ref`: the control is read
+      again and returned as `element_after` (role, whether it is enabled, and its
+      value unless it is a secure field). No capture, so it is not visual evidence.
+    * `:none` — the receipt alone.
+
+  Left out, the action brings nothing back. Whatever the check says, the receipt's
+  `dispatch` is about the INPUT and is decided before the check runs: evidence that
+  could not be obtained never changes what was sent.
 
   ## The version handshake
 
@@ -38,6 +106,12 @@ defmodule Compux do
 
   @type t :: %__MODULE__{driver: module(), state: term(), info: map()}
   @type coord :: {integer(), integer()}
+  @typedoc """
+  What a pointer action aims at: a pixel of the named image, or a control the
+  named `elements` reply listed. Never both — the sidecar refuses a request that
+  carries the two, because nothing may guess which one was meant.
+  """
+  @type target :: coord() | {:element, String.t()}
   @type response :: {:ok, map()} | {:error, term()}
 
   @doc "The wire-compatibility version this build speaks."
@@ -65,7 +139,12 @@ defmodule Compux do
     end
   end
 
-  @doc "The sidecar's reported identity (`:protocol_version`, `:compux_version`, `:actions`)."
+  @doc """
+  The sidecar's reported identity: `:protocol_version`, `:compux_version`,
+  `:actions`, the `:sidecar_generation` this boot minted, and the `:capabilities`
+  it advertises (`input_methods`, `controls`). A capability is listed only if the
+  build really has it, so this is what a caller reads before offering one.
+  """
   @spec info(t()) :: map()
   def info(%__MODULE__{info: info}), do: info
 
@@ -75,7 +154,8 @@ defmodule Compux do
 
   @doc """
   Run a raw action params map (string keys) through validation and the driver.
-  `opts` may carry `:screenshot_after` (a transport flag, not an action argument).
+  `opts` may carry `:check` (see the module doc), which is an action argument like
+  any other and is validated with them.
   """
   @spec execute(t(), map(), keyword()) :: response()
   def execute(%__MODULE__{} = cu, params, opts \\ []) when is_map(params),
@@ -95,42 +175,76 @@ defmodule Compux do
     do: run(cu, put_opts(%{"action" => "screenshot"}, opts), opts)
 
   @doc """
-  Click at a screenshot-space coordinate. `:button` is `:left` (default), `:right`,
-  or `:double`; other opts: `:modifiers`, `:display`, `:region`, `:screenshot_after`.
+  Click a pixel of the image named by `:observation_id`, or the control that
+  image's `elements` reply listed (`{:element, "e3"}`) — the sidecar re-reads that
+  control's bounds and clicks its centre, so a control that moved since the
+  listing is hit where it is now. `:button` is `:left` (default), `:right`, or
+  `:double`; other opts: `:modifiers`, `:display`, `:check`.
   """
-  @spec click(t(), coord(), keyword()) :: response()
-  def click(%__MODULE__{} = cu, {x, y}, opts \\ []) do
+  @spec click(t(), target(), keyword()) :: response()
+  def click(%__MODULE__{} = cu, target, opts \\ []) do
     params =
-      %{"action" => click_action(Keyword.get(opts, :button, :left)), "x" => x, "y" => y}
+      %{"action" => click_action(Keyword.get(opts, :button, :left))}
+      |> put_target(target)
       |> maybe_put("modifiers", modifiers(opts))
 
-    run(cu, put_opts(params, opts), opts)
+    run(cu, put_addressed(params, opts), opts)
   end
 
-  @doc "Move the pointer to a screenshot-space coordinate (read-only, no post-shot)."
-  @spec move(t(), coord(), keyword()) :: response()
-  def move(%__MODULE__{} = cu, {x, y}, opts \\ []) do
+  @doc "Move the pointer to a pixel, or to a control's centre (read-only, no post-shot)."
+  @spec move(t(), target(), keyword()) :: response()
+  def move(%__MODULE__{} = cu, target, opts \\ []) do
     params =
-      maybe_put(%{"action" => "mouse_move", "x" => x, "y" => y}, "modifiers", modifiers(opts))
+      %{"action" => "mouse_move"}
+      |> put_target(target)
+      |> maybe_put("modifiers", modifiers(opts))
 
-    run(cu, put_opts(params, opts), opts)
+    run(cu, put_addressed(params, opts), opts)
   end
 
-  @doc "Scroll `amount` steps in `:up`/`:down`/`:left`/`:right` at a coordinate."
-  @spec scroll(t(), coord(), atom() | String.t(), pos_integer(), keyword()) :: response()
-  def scroll(%__MODULE__{} = cu, {x, y}, direction, amount, opts \\ []) do
-    params = %{
-      "action" => "scroll",
-      "x" => x,
-      "y" => y,
-      "direction" => to_string(direction),
-      "amount" => amount
-    }
+  @doc "Scroll `amount` steps in `:up`/`:down`/`:left`/`:right` at a point or a control."
+  @spec scroll(t(), target(), atom() | String.t(), pos_integer(), keyword()) :: response()
+  def scroll(%__MODULE__{} = cu, target, direction, amount, opts \\ []) do
+    params =
+      %{"action" => "scroll", "direction" => to_string(direction), "amount" => amount}
+      |> put_target(target)
 
-    run(cu, put_opts(params, opts), opts)
+    run(cu, put_addressed(params, opts), opts)
   end
 
-  @doc "Press-drag from one screenshot-space coordinate to another."
+  @doc """
+  Press the control `element_ref` names in the `elements` reply named by
+  `:observation_id`, through the accessibility API: the pointer does not move and
+  the press cannot miss.
+
+  Offered only where the control's own action list advertises it — `elements`
+  says so per element in `actions`. Anywhere else this is refused
+  `ax_action_unsupported` and nothing is dispatched; the sidecar never falls back
+  to a click, because which one to send is the caller's decision.
+  """
+  @spec press(t(), String.t(), keyword()) :: response()
+  def press(%__MODULE__{} = cu, element_ref, opts \\ []) when is_binary(element_ref) do
+    params = %{"action" => "press", "element_ref" => element_ref}
+    run(cu, put_addressed(params, opts), opts)
+  end
+
+  @doc """
+  Set the value of the control `element_ref` names, then read it back: the receipt
+  says `effect: "verified"` when the read-back matches, and `not_observed` when it
+  does not (a secure field reads back masked, so it never verifies).
+
+  Offered only where the control reports its value as settable — `elements` says
+  so per element in `settable`. Anywhere else this is refused
+  `ax_action_unsupported`; `type` and `paste` remain for a field that is not.
+  """
+  @spec set_value(t(), String.t(), String.t(), keyword()) :: response()
+  def set_value(%__MODULE__{} = cu, element_ref, value, opts \\ [])
+      when is_binary(element_ref) and is_binary(value) do
+    params = %{"action" => "set_value", "element_ref" => element_ref, "value" => value}
+    run(cu, put_addressed(params, opts), opts)
+  end
+
+  @doc "Press-drag from one pixel of the named image to another."
   @spec drag(t(), coord(), coord(), keyword()) :: response()
   def drag(%__MODULE__{} = cu, {fx, fy}, {tx, ty}, opts \\ []) do
     params = %{
@@ -139,7 +253,7 @@ defmodule Compux do
       "to" => %{"x" => tx, "y" => ty}
     }
 
-    run(cu, put_opts(params, opts), opts)
+    run(cu, put_addressed(params, opts), opts)
   end
 
   @doc "Type a unicode string at the current focus."
@@ -158,13 +272,12 @@ defmodule Compux do
     do: run(cu, %{"action" => "wait", "ms" => ms}, [])
 
   @doc """
-  Report the accessibility element under a screenshot-space coordinate (role,
-  title, description, value). Read-only; macOS only. Shadows `Kernel.inspect/2`.
+  Report the accessibility element under a pixel of the named image (role, title,
+  description, value). Read-only; macOS only. Shadows `Kernel.inspect/2`.
   """
   @spec inspect(t(), coord(), keyword()) :: response()
   def inspect(%__MODULE__{} = cu, {x, y}, opts \\ []) do
-    params = put_display(%{"action" => "inspect", "x" => x, "y" => y}, opts)
-    run(cu, put_region(params, opts), opts)
+    run(cu, put_addressed(%{"action" => "inspect", "x" => x, "y" => y}, opts), opts)
   end
 
   @doc """
@@ -177,6 +290,7 @@ defmodule Compux do
       %{"action" => "wait_for_change"}
       |> put_display(opts)
       |> put_region(opts)
+      |> put_observation(opts)
       |> maybe_put("timeout_ms", Keyword.get(opts, :timeout_ms))
       |> maybe_put("poll_ms", Keyword.get(opts, :poll_ms))
 
@@ -184,13 +298,26 @@ defmodule Compux do
   end
 
   @doc """
-  Enumerate the accessibility elements (role, label, bounds) under the focused
-  window or a `:region`, so the caller can target by element rather than raw
-  pixels. Read-only; macOS only.
+  Enumerate the accessibility elements under the focused window or a `:region`, so
+  the caller can target by control rather than by raw pixels. Read-only; macOS
+  only.
+
+  Each element carries an `element_ref` scoped to this reply's `observation_id`,
+  its `role`, its `label` (the control's title, else its description), its `value`
+  (bounded, and absent for a secure field), whether it is `enabled`, the `actions`
+  this build can perform on it, whether its value is `settable`, its `bounds`, a
+  `path` of up to three ancestor labels (nearest last, so two "Save" buttons are
+  tellable apart) and the click point `x`, `y` in this reply's pixels.
+
+  A walk that stopped at one of its bounds says so in `truncated` (`"nodes"`,
+  `"depth"` or `"time"`); a reply without that key listed everything it found.
   """
   @spec elements(t(), keyword()) :: response()
   def elements(%__MODULE__{} = cu, opts \\ []) do
-    run(cu, put_region(put_display(%{"action" => "elements"}, opts), opts), opts)
+    params =
+      %{"action" => "elements"} |> put_display(opts) |> put_region(opts) |> put_observation(opts)
+
+    run(cu, params, opts)
   end
 
   @doc """
@@ -212,6 +339,29 @@ defmodule Compux do
   def windows(%__MODULE__{} = cu, opts \\ []) do
     run(cu, put_display(%{"action" => "windows"}, opts), opts)
   end
+
+  @doc """
+  Bind ONE window, by the `id` a `windows/2` listing gave it.
+
+  The reply carries the `target_id` to pass as `:target_id` from then on, the
+  window's `app` and `title`, the `methods` this binding really offers
+  (`foreground_hid`, plus `ax` where exactly one of the application's accessibility
+  windows matched this one), `ax_binding`, and a first observation of the window.
+
+  One target per helper: selecting again replaces it. A bound window is watched, so
+  an action that names one is refused rather than run when the window has gone,
+  been minimized, moved since the image was taken, or — for a click — been covered
+  by something else.
+  """
+  @spec select_target(t(), non_neg_integer(), keyword()) :: response()
+  def select_target(%__MODULE__{} = cu, window_id, opts \\ []) when is_integer(window_id) do
+    run(cu, %{"action" => "select_target", "window_id" => window_id}, opts)
+  end
+
+  @doc "Release the bound window, with its capture stream and its indicator. Idempotent."
+  @spec release_target(t(), keyword()) :: response()
+  def release_target(%__MODULE__{} = cu, opts \\ []),
+    do: run(cu, %{"action" => "release_target"}, opts)
 
   @doc "Paste `text` via the clipboard — fast and unicode-safe for long strings."
   @spec paste(t(), String.t(), keyword()) :: response()
@@ -269,15 +419,25 @@ defmodule Compux do
   # --- internals ------------------------------------------------------------
 
   defp run(%__MODULE__{driver: driver, state: state}, params, opts) do
-    with {:ok, request} <- Protocol.validate(params) do
-      request =
-        if Keyword.get(opts, :screenshot_after, false),
-          do: Map.put(request, "screenshot_after", true),
-          else: request
+    # The bound window is added here rather than at each verb, so every action that
+    # can name one takes `:target_id` the same way and the ones that cannot are
+    # refused by name in `Protocol.validate/1` instead of silently ignoring it.
+    params =
+      params
+      |> maybe_put("check", check_kind(Keyword.get(opts, :check)))
+      |> maybe_put("target_id", Keyword.get(opts, :target_id))
 
+    with {:ok, request} <- Protocol.validate(params) do
       driver.execute(state, request)
     end
   end
+
+  # The kind as the wire spells it. An atom is the ergonomic form and a string is
+  # what a caller reading it off a config already has; anything else goes through
+  # unchanged so `Protocol.validate/1` refuses it by name rather than here.
+  defp check_kind(nil), do: nil
+  defp check_kind(kind) when is_atom(kind), do: Atom.to_string(kind)
+  defp check_kind(kind), do: kind
 
   defp maybe_default_binary_path(Compux.PortDriver, opts) do
     if Keyword.has_key?(opts, :binary_path),
@@ -303,7 +463,9 @@ defmodule Compux do
     %{
       protocol_version: Map.get(identity, "protocol_version"),
       compux_version: Map.get(identity, "compux_version"),
-      actions: Map.get(identity, "actions", [])
+      actions: Map.get(identity, "actions", []),
+      sidecar_generation: Map.get(identity, "sidecar_generation"),
+      capabilities: Map.get(identity, "capabilities", %{})
     }
   end
 
@@ -319,7 +481,29 @@ defmodule Compux do
   end
 
   defp put_opts(params, opts),
-    do: params |> put_display(opts) |> put_region(opts) |> put_jpeg_quality(opts)
+    do:
+      params
+      |> put_display(opts)
+      |> put_region(opts)
+      |> put_observation(opts)
+      |> put_jpeg_quality(opts)
+
+  # An addressed action names the reply its target was read from and takes no
+  # rectangle: the sidecar holds the transform that image was made with, and the
+  # native reference behind each element.
+  defp put_addressed(params, opts),
+    do: params |> put_display(opts) |> put_observation(opts)
+
+  # A point or a control, never both — so the two forms cannot be sent together
+  # from here at all.
+  defp put_target(params, {x, y}) when is_integer(x) and is_integer(y),
+    do: params |> Map.put("x", x) |> Map.put("y", y)
+
+  defp put_target(params, {:element, reference}) when is_binary(reference),
+    do: Map.put(params, "element_ref", reference)
+
+  defp put_observation(params, opts),
+    do: maybe_put(params, "observation_id", Keyword.get(opts, :observation_id))
 
   defp put_jpeg_quality(params, opts),
     do: maybe_put(params, "jpeg_quality", Keyword.get(opts, :jpeg_quality))

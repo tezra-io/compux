@@ -54,11 +54,12 @@ defmodule CompuxTest do
                        }}
     end
 
-    test "click button variants + modifiers + screenshot_after", %{cu: cu} do
+    test "click button variants + modifiers + check", %{cu: cu} do
       Compux.click(cu, {10, 20},
         button: :right,
         modifiers: [:cmd, :shift],
-        screenshot_after: true
+        check: :image,
+        observation_id: "7c1e-12"
       )
 
       assert_received {:executed,
@@ -67,21 +68,56 @@ defmodule CompuxTest do
                          "x" => 10,
                          "y" => 20,
                          "modifiers" => ["cmd", "shift"],
-                         "screenshot_after" => true
+                         "check" => "image",
+                         "observation_id" => "7c1e-12"
                        }}
 
-      Compux.click(cu, {1, 2}, button: :double)
+      Compux.click(cu, {1, 2}, button: :double, observation_id: "7c1e-12")
       assert_received {:executed, %{"action" => "double_click"}}
 
-      Compux.click(cu, {1, 2})
+      Compux.click(cu, {1, 2}, observation_id: "7c1e-12")
       assert_received {:executed, %{"action" => "left_click"}}
     end
 
+    # The evidence an action brings back is asked for by name, on the same call.
+    # A kind this wire does not have never reaches the driver.
+    test "check rides every call that dispatches input", %{cu: cu} do
+      Compux.type(cu, "hi", check: :none)
+      assert_received {:executed, %{"action" => "type", "check" => "none"}}
+
+      Compux.press(cu, "e3", observation_id: "7c1e-12", check: :semantic)
+      assert_received {:executed, %{"action" => "press", "check" => "semantic"}}
+
+      Compux.set_value(cu, "e3", "42", observation_id: "7c1e-12", check: "image")
+      assert_received {:executed, %{"action" => "set_value", "check" => "image"}}
+
+      Compux.paste(cu, "text")
+      assert_received {:executed, executed}
+      refute Map.has_key?(executed, "check")
+
+      assert {:error, reason} = Compux.click(cu, {1, 2}, observation_id: "7c1e-12", check: :bogus)
+      assert reason =~ "check"
+      refute_received {:executed, %{"action" => "left_click"}}
+    end
+
+    # Every coordinate names the image it was read in. The facade will not build a
+    # request without one, so a caller cannot send a click whose space is unknown.
+    test "an action that addresses a point needs the image it was read in", %{cu: cu} do
+      assert {:error, reason} = Compux.click(cu, {10, 20})
+      assert reason =~ "observation_id"
+      refute_received {:executed, %{"action" => "left_click"}}
+
+      assert {:error, _} = Compux.drag(cu, {0, 0}, {9, 9})
+      assert {:error, _} = Compux.scroll(cu, {5, 5}, :down, 3)
+      assert {:error, _} = Compux.move(cu, {3, 4})
+      assert {:error, _} = Compux.inspect(cu, {7, 8})
+    end
+
     test "scroll / drag / type / key / wait / move / inspect", %{cu: cu} do
-      Compux.scroll(cu, {5, 5}, :down, 3)
+      Compux.scroll(cu, {5, 5}, :down, 3, observation_id: "7c1e-12")
       assert_received {:executed, %{"action" => "scroll", "direction" => "down", "amount" => 3}}
 
-      Compux.drag(cu, {0, 0}, {9, 9})
+      Compux.drag(cu, {0, 0}, {9, 9}, observation_id: "7c1e-12")
 
       assert_received {:executed,
                        %{
@@ -99,10 +135,10 @@ defmodule CompuxTest do
       Compux.wait(cu, 100)
       assert_received {:executed, %{"action" => "wait", "ms" => 100}}
 
-      Compux.move(cu, {3, 4})
+      Compux.move(cu, {3, 4}, observation_id: "7c1e-12")
       assert_received {:executed, %{"action" => "mouse_move", "x" => 3, "y" => 4}}
 
-      Compux.inspect(cu, {7, 8})
+      Compux.inspect(cu, {7, 8}, observation_id: "7c1e-12")
       assert_received {:executed, %{"action" => "inspect", "x" => 7, "y" => 8}}
     end
 
@@ -125,8 +161,40 @@ defmodule CompuxTest do
     end
 
     test "invalid params fail loud before hitting the driver", %{cu: cu} do
-      assert {:error, _reason} = Compux.click(cu, {-1, 2})
+      assert {:error, _reason} = Compux.click(cu, {-1, 2}, observation_id: "7c1e-12")
       refute_received {:executed, %{"action" => "left_click"}}
+    end
+
+    test "select_target names the window and release_target names nothing", %{cu: cu} do
+      Compux.select_target(cu, 4711)
+      assert_received {:executed, %{"action" => "select_target", "window_id" => 4711}}
+
+      Compux.release_target(cu)
+      assert_received {:executed, %{"action" => "release_target"}}
+    end
+
+    # The bound window rides on one option, added in one place, so every verb that
+    # can name one takes it the same way.
+    test "a bound target rides on every action that acts inside a window", %{cu: cu} do
+      Compux.screenshot(cu, target_id: "t1")
+      assert_received {:executed, %{"action" => "screenshot", "target_id" => "t1"}}
+
+      Compux.click(cu, {10, 20}, observation_id: "7c1e-12", target_id: "t1")
+      assert_received {:executed, %{"action" => "left_click", "target_id" => "t1"}}
+
+      Compux.type(cu, "hello", target_id: "t1")
+      assert_received {:executed, %{"action" => "type", "target_id" => "t1"}}
+
+      Compux.press(cu, "e3", observation_id: "7c1e-12", target_id: "t1")
+      assert_received {:executed, %{"action" => "press", "target_id" => "t1"}}
+    end
+
+    # `windows` is how a target is FOUND; naming one on it is a contradiction, and
+    # it is refused here rather than carried to the helper.
+    test "an action with no window to name refuses the option", %{cu: cu} do
+      assert {:error, reason} = Compux.windows(cu, target_id: "t1")
+      assert reason =~ "target_id"
+      refute_received {:executed, %{"action" => "windows"}}
     end
   end
 
@@ -191,6 +259,86 @@ defmodule CompuxTest do
   describe "stop/1" do
     test "delegates to the driver" do
       cu = start!()
+      assert :ok = Compux.stop(cu)
+    end
+  end
+
+  # The facade over the REAL driver, transport and a real Port. The stub above
+  # proves the request building; this proves the handshake, the correlated wire
+  # and the teardown actually fit together.
+  describe "over the production driver" do
+    @fake Path.expand("support/fake_sidecar.pl", __DIR__)
+
+    test "handshakes, acts and stops against a real Port" do
+      assert {:ok, cu} = Compux.start(binary_path: @fake)
+
+      info = Compux.info(cu)
+      assert info.protocol_version == Compux.protocol_version()
+      assert info.sidecar_generation == "boot-test"
+      assert info.capabilities["controls"] == ["pause", "resume", "release"]
+      # The bounds of the sidecar's observation table reach the caller as they are.
+      assert info.capabilities["observations"] == %{"max" => 3, "ttl_ms" => 30_000}
+
+      # The image names itself, and a click that names it is accepted.
+      assert {:ok, shot} = Compux.screenshot(cu)
+      assert shot["observation_kind"] == "image"
+      assert is_binary(shot["observation_id"])
+
+      assert {:ok, %{"ok" => true}} =
+               Compux.click(cu, {10, 20}, observation_id: shot["observation_id"])
+
+      # One that names an image this sidecar never minted is refused, with nothing
+      # dispatched — the refusal the library must carry through as a failure, not
+      # as a reply the caller could mistake for a click.
+      assert {:error, {:action_failed, refusal}} =
+               Compux.click(cu, {10, 20}, observation_id: "nobody-1")
+
+      assert refusal["error"] == "unknown_observation"
+      assert refusal["receipt"]["dispatch"] == "not_sent"
+
+      assert :ok = Compux.stop(cu)
+    end
+
+    test "refuses a sidecar on another protocol version" do
+      assert {:error, {:protocol_mismatch, %{sidecar: 1}}} =
+               Compux.start(binary_path: @fake, env: [{~c"FAKE_PROTOCOL_VERSION", ~c"1"}])
+    end
+
+    # v9: a control is addressed by name. The reference is only ever meaningful
+    # beside the observation that listed it, and an accessibility action reports
+    # its own input method and the effect its read-back earned.
+    test "presses and sets a control by reference, and refuses one nobody listed" do
+      assert {:ok, cu} = Compux.start(binary_path: @fake)
+
+      assert {:ok, list} = Compux.elements(cu)
+      image = list["observation_id"]
+      [element] = list["elements"]
+      assert element["element_ref"] == "e1"
+      assert element["actions"] == ["press"]
+
+      assert {:ok, pressed} = Compux.press(cu, element["element_ref"], observation_id: image)
+      assert pressed["receipt"]["input_method"] == "ax"
+      assert pressed["receipt"]["effect"] == "not_observed"
+      assert pressed["receipt"]["foreground_changed"] == false
+      refute Map.has_key?(pressed, "verified"), "a press verifies nothing"
+
+      assert {:ok, set} =
+               Compux.set_value(cu, element["element_ref"], "typed", observation_id: image)
+
+      assert set["receipt"]["effect"] == "verified"
+      assert set["verified"] == true
+      assert set["value"] == "typed", "the read-back, not the request echoed"
+
+      # The same control through the pointer: still the pointer's input method.
+      assert {:ok, clicked} = Compux.click(cu, {:element, "e1"}, observation_id: image)
+      assert clicked["receipt"]["input_method"] == "foreground_hid"
+
+      # A reference this observation never listed is refused, nothing dispatched.
+      assert {:error, {:action_failed, refusal}} = Compux.press(cu, "e9", observation_id: image)
+
+      assert refusal["error"] == "stale_element"
+      assert refusal["receipt"]["dispatch"] == "not_sent"
+
       assert :ok = Compux.stop(cu)
     end
   end
