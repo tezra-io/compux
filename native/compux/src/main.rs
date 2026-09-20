@@ -2985,6 +2985,10 @@ fn idle_ms(_worker: &Worker) -> Result<Value, Failure> {
 /// somewhere else, which is what decides whether an action that takes no pointer has
 /// to wait for them at all. Absent when nothing is bound, and absent when the window
 /// server would not say — never invented as `false`, which is a claim.
+///
+/// Gated with its one caller: `idle_ms` reads a macOS-only idle counter, so on a
+/// build without one there is no reply for this to ride on.
+#[cfg(target_os = "macos")]
 fn note_front_is_target(payload: &mut Value, worker: &Worker) {
     let (Some(target), Some(object)) = (worker.target.as_ref(), payload.as_object_mut()) else {
         return;

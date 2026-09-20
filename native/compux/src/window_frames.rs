@@ -59,6 +59,21 @@
 //! cannot pass on a story the real stream does not tell. The adapter itself is
 //! compiled on every macOS build and started only on a real machine.
 
+// The slot, the fence, the budget, the health codes and the frame type are the
+// portable half of this module: on macOS the ScreenCaptureKit adapter produces
+// every one of them and the unit tests exercise them on every target, but on a
+// build whose `WindowFrames` is the refusing stub nothing constructs a frame at
+// all, so the producer side is unreachable rather than unwanted. Scoped to
+// non-macOS so a genuinely unused helper still fails the macOS gate — the same
+// shape, and for the same reason, as `capture.rs`'s portable frame builders.
+//
+// It is one attribute rather than a gate per item because the unreachable set
+// includes struct FIELDS and enum VARIANTS (`WindowFrame`'s timing and status,
+// `Health`'s four, `FrameError`'s four), and a type whose shape changes with the
+// target is a worse thing to own than a scoped allow. M42.1's Linux capture makes
+// the whole of it reachable again and this line goes with it.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use std::sync::{Arc, Mutex};
 
 use crate::window_server::Bounds;

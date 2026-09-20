@@ -202,6 +202,11 @@ pub fn ids_of(listed: &[WindowFacts], pid: i32) -> Vec<u32> {
 /// Is this application's window the front one? The frontmost on-screen window at
 /// the ordinary window layer, because the Dock and the menu bar are always above
 /// everything and are nobody's idea of "what the person is working in".
+///
+/// Gated to the builds that can reach it: its one caller answers `idle_ms`, which
+/// needs a macOS idle counter. The rule itself is pure and the test below runs
+/// everywhere, which is what the `test` arm is for.
+#[cfg(any(target_os = "macos", test))]
 pub fn front_window(listed: &[WindowFacts]) -> Option<&WindowFacts> {
     listed
         .iter()

@@ -851,6 +851,10 @@ pub fn children(target: &Target, windows: &Arc<dyn Windows>) -> Result<Vec<Value
 /// The difference between a person busy in this application and a person busy
 /// somewhere else entirely, which is what decides whether an accessibility action
 /// has to wait for them.
+///
+/// Gated to the builds that can reach it: it is read by `idle_ms`, which needs a
+/// macOS idle counter. The rule is pure and its test runs on every target.
+#[cfg(any(target_os = "macos", test))]
 pub fn front_is_target(target: &Target, windows: &Arc<dyn Windows>) -> Option<bool> {
     let listed = windows.list().ok()?;
     let front = window_server::front_window(&listed)?;

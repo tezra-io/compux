@@ -175,7 +175,10 @@ pub struct Retained {
 
 impl Retained {
     /// Take ownership of a reference the platform has already retained. Private
-    /// on purpose: only the platform may say a reference exists.
+    /// on purpose: only the platform may say a reference exists — which is exactly
+    /// the two places this is gated to: the macOS walk, and the recording platform
+    /// the tests drive on every target.
+    #[cfg(any(target_os = "macos", test))]
     fn new(handle: Handle, ax: Rc<dyn Ax>) -> Retained {
         Retained { handle, ax }
     }
