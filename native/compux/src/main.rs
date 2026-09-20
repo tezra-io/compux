@@ -404,6 +404,9 @@ struct Worker {
     /// What starts the ownership badge. Read for `hello` (is it in the bundle at
     /// all) and used at every selection.
     launcher: Arc<dyn indicator::Launcher>,
+    /// What the OS says about the displays. A seam so no unit test ever reaches a
+    /// real screen; see [`Displays`].
+    displays: Rc<dyn Displays>,
     /// The ONE bound window, when there is one. Owned here, like the observation
     /// table, so its stream and its badge are stopped by dropping it — a release, a
     /// reselect and the worker ending all go through the same `Drop`.
@@ -426,6 +429,7 @@ fn run_worker(jobs: mpsc::Receiver<control::Job>, gate: &Gate, emitter: &capture
         frames: Rc::new(Screen),
         windows: Arc::new(window_server::Real::new()),
         launcher: Arc::new(indicator::Bundled::new()),
+        displays: Rc::new(RealDisplays),
         target: None,
         target_generation: 0,
         emitter: emitter.clone(),
@@ -645,8 +649,12 @@ fn point_in(observation: &Observation, x: f64, y: f64) -> Result<(i32, i32), Fai
 /// us. Reads what the OS says — bounds, origin, mode scale, id — which needs no
 /// capture, and refuses on any difference: a click computed from a geometry that
 /// has since moved lands somewhere nobody chose.
-fn same_display(observation: &Observation, req: &Value) -> Result<Display, Failure> {
-    let display = target_display(req)?;
+fn same_display(
+    observation: &Observation,
+    req: &Value,
+    worker: &Worker,
+) -> Result<Display, Failure> {
+    let display = target_display(req, worker)?;
 
     if observation.matches_display(display.id, &display.facts) {
         Ok(display)
@@ -1232,6 +1240,7 @@ fn input_control_ok() -> bool {
 /// A display, as the OS describes it. The geometry is NOT here: it depends on the
 /// pixels-per-point ratio, which is measured from a capture (see `mod geometry`),
 /// so it is built per action from these facts and a measurement.
+#[derive(Clone, Copy, Debug)]
 struct Display {
     facts: MonitorFacts,
     /// The monitor's stable id (CGDirectDisplayID on macOS). Capture and the
@@ -1240,6 +1249,40 @@ struct Display {
     /// different physical monitor. The xcap `Monitor` handle isn't `Send` and
     /// isn't held past geometry read — the id is all a later capture needs.
     id: u32,
+}
+
+/// What the OS says about the displays, behind a trait.
+///
+/// It exists for one reason: enumerating the screens is an OS call, and a unit
+/// test that makes it is a test that passes on a developer's Mac and fails on a
+/// headless runner. Every test worker is built with [`ScriptedDisplays`], and the
+/// real implementation REFUSES TO RUN under `cfg(test)` — so a path that reaches
+/// the screen fails here too, rather than only where there is no screen to reach.
+trait Displays {
+    /// The display at this index, as the OS describes it right now.
+    fn at(&self, index: usize) -> Result<Display, String>;
+}
+
+/// The real one: `xcap`'s monitor list.
+struct RealDisplays;
+
+impl Displays for RealDisplays {
+    #[cfg(not(test))]
+    fn at(&self, index: usize) -> Result<Display, String> {
+        enumerate_display(index)
+    }
+
+    /// Under test there is no screen this process may look at, whatever this
+    /// machine happens to have attached. A test that lands here has been given the
+    /// real displays by mistake; the panic names the fix, and it is the whole
+    /// proof that the suite is headless-safe.
+    #[cfg(test)]
+    fn at(&self, _index: usize) -> Result<Display, String> {
+        panic!(
+            "a unit test asked the OS to enumerate displays: build the worker with \
+             ScriptedDisplays, or make the path under test resolve its display lazily"
+        )
+    }
 }
 
 /// Pick the requested monitor, distinguishing "no display is capturable at all"
@@ -1261,11 +1304,26 @@ fn select_monitor(monitors: Vec<Monitor>, index: usize) -> Result<Monitor, Strin
         .ok_or_else(|| format!("display {index} not found"))
 }
 
+/// Which display the request named. Parsing only — it asks nobody anything, which
+/// is what lets a view carry it around unresolved.
+fn display_index(req: &Value) -> usize {
+    req.get("display").and_then(Value::as_u64).unwrap_or(0) as usize
+}
+
 /// What the OS says about the requested display, right now. Cheap — it enumerates
 /// monitors and reads their numbers, and takes no capture — which is what lets the
 /// staleness check run before every addressed action.
-fn target_display(req: &Value) -> Result<Display, String> {
-    let index = req.get("display").and_then(Value::as_u64).unwrap_or(0) as usize;
+///
+/// Through the worker's [`Displays`], never `Monitor::all` directly: that is the
+/// one seam that keeps a unit test off the real screen.
+fn target_display(req: &Value, worker: &Worker) -> Result<Display, String> {
+    worker.displays.at(display_index(req))
+}
+
+/// The enumeration itself. Only [`RealDisplays`] calls it, and only on a build
+/// that is not the test binary.
+#[cfg(not(test))]
+fn enumerate_display(index: usize) -> Result<Display, String> {
     let monitors = Monitor::all().map_err(|e| format!("enumerate displays: {e}"))?;
     let monitor = select_monitor(monitors, index)?;
 
@@ -1594,7 +1652,7 @@ fn select_target(
 
     // The display the window is on, so a target observation records the same facts
     // every other observation does and a display that changes mode is still caught.
-    let display = target_display(&request.body)?;
+    let display = target_display(&request.body, worker)?;
 
     // The old binding goes FIRST and completely: its stream, its badge and its
     // watch stop with it, and only then is anything new started.
@@ -1689,7 +1747,20 @@ fn merge_into(payload: &mut Value, extra: Value) {
 /// same code either way, which is the whole reason a window's frames are just
 /// another [`Frames`].
 struct View {
-    display: Display,
+    /// The display this view is on, WHEN IT IS ALREADY KNOWN. A bound window
+    /// brings its own with the binding; the display-level path leaves this `None`
+    /// and carries the index instead.
+    ///
+    /// Lazy on purpose, and the reason is a bug this shape had: asking the OS
+    /// which screens exist is an OS call, and an action that presses a control by
+    /// name has no business making it. Resolving it when the view was built meant
+    /// a machine with no display session refused `press` with a display error
+    /// before it ever revalidated the control — so `stale_element`,
+    /// `element_disabled` and `ax_action_unsupported`, every one of which sent
+    /// nothing, were masked by the state of a screen they do not touch.
+    on: Option<Display>,
+    /// Which display the request named, for the resolve that may never happen.
+    index: usize,
     /// The transform, when it is already known. A bound window's is built from the
     /// frame it was read from, so it is known before anything is captured; the
     /// display's is measured from a real capture, and measuring it eagerly would
@@ -1701,11 +1772,25 @@ struct View {
 }
 
 impl View {
+    /// The display this view is on, asking the OS only if nothing has yet.
+    ///
+    /// Every caller of this is about to want pixels. An action whose check is
+    /// `semantic` or `none` never reaches it, which is the point.
+    fn display(&self, worker: &Worker) -> Result<Display, Failure> {
+        match self.on {
+            Some(display) => Ok(display),
+            None => Ok(worker.displays.at(self.index)?),
+        }
+    }
+
     /// The transform in force, measuring the display's if nothing has yet.
     fn geometry(&self, gate: &Gate, worker: &mut Worker) -> Result<Geometry, Failure> {
         match self.geometry {
             Some(geometry) => Ok(geometry),
-            None => measured_geometry(&self.display, gate, worker),
+            None => {
+                let display = self.display(worker)?;
+                measured_geometry(&display, gate, worker)
+            }
         }
     }
 }
@@ -1755,17 +1840,21 @@ fn view(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Vie
 
     match bound {
         Some(live) => Ok(View {
-            display: Display {
+            on: Some(Display {
                 facts: live.facts,
                 id: live.display_id,
-            },
+            }),
+            index: display_index(&request.body),
             geometry: Some(live.geometry),
             frames: live.frames.clone(),
             bound: Some(live),
         }),
 
+        // Nothing is asked of the OS here. A `press` with no check builds this
+        // view, dispatches, and never resolves a display at all.
         None => Ok(View {
-            display: target_display(&request.body)?,
+            on: None,
+            index: display_index(&request.body),
             geometry: None,
             frames: worker.frames.clone(),
             bound: None,
@@ -1778,16 +1867,17 @@ fn view(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Vie
 fn screenshot(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let req = &request.body;
     let view = view(request, gate, worker)?;
-    let frame = take_frame(&view.display, gate, &view.frames)?;
+    let display = view.display(worker)?;
+    let frame = take_frame(&display, gate, &view.frames)?;
     // A display's transform is measured from the frame that was really captured; a
     // bound window's came with the frame. Both are the picture speaking for itself.
     let geom = match view.geometry {
         Some(geometry) => geometry,
-        None => measure_geometry(&view.display, &frame, worker)?,
+        None => measure_geometry(&display, &frame, worker)?,
     };
 
     let mut payload = capture_payload_encoded(
-        &view.display,
+        &display,
         geom,
         &frame,
         Rendering {
@@ -1906,7 +1996,10 @@ fn parse_jpeg_quality(req: &Value) -> Result<Option<u8>, String> {
 /// ~30s give-up — long enough to bust a caller's action deadline, and a client
 /// stuck in that wait wedges SCK for every later capture system-wide (observed
 /// live, 2026-07-01). The typed error lets the caller say what is actually wrong.
-#[cfg(target_os = "macos")]
+/// Compiled out of the test binary: its only caller is [`Screen::capture`]'s real
+/// body, and a unit test that reached the real screen would be a test that cannot
+/// run headless.
+#[cfg(all(target_os = "macos", not(test)))]
 fn ensure_display_awake(display_id: u32) -> Result<(), String> {
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
@@ -1920,7 +2013,7 @@ fn ensure_display_awake(display_id: u32) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(test)))]
 fn ensure_display_awake(_display_id: u32) -> Result<(), String> {
     Ok(())
 }
@@ -1932,6 +2025,7 @@ fn ensure_display_awake(_display_id: u32) -> Result<(), String> {
 /// wedge: CGWindowListCreateImage's ScreenCaptureKit proxy waited out a ~30s XPC
 /// semaphore PER CALL), and waiting would burn the caller's whole action
 /// deadline. Fail fast with the typed `capture_stalled` instead.
+#[cfg(not(test))]
 const CAPTURE_STALL_MS: u64 = 5_000;
 
 /// Set when a capture blew its budget: the OS capture backend is wedged and a
@@ -1953,6 +2047,10 @@ static CAPTURE_WEDGED: AtomicBool = AtomicBool::new(false);
 /// instead of silently rebinding to whatever now occupies that index. On a hard
 /// stall we set `CAPTURE_WEDGED` (→ process exit + respawn) so a leaked worker
 /// can never pile up or wedge the process forever.
+/// Compiled out of the test binary: its only caller is [`Screen::capture`]'s real
+/// body, and a unit test that reached the real screen would be a test that cannot
+/// run headless.
+#[cfg(not(test))]
 fn capture_display_image(monitor_id: u32) -> Result<image::RgbaImage, String> {
     let (tx, rx) = mpsc::channel();
 
@@ -1984,6 +2082,7 @@ fn capture_display_image(monitor_id: u32) -> Result<image::RgbaImage, String> {
     }
 }
 
+#[cfg(not(test))]
 fn capture_by_id(monitor_id: u32) -> Result<image::RgbaImage, String> {
     let monitors = Monitor::all().map_err(|e| format!("enumerate displays: {e}"))?;
 
@@ -2047,9 +2146,22 @@ trait Frames {
 struct Screen;
 
 impl Frames for Screen {
+    #[cfg(not(test))]
     fn capture(&self, display_id: u32) -> Result<image::RgbaImage, Failure> {
         ensure_display_awake(display_id)?;
         Ok(capture_display_image(display_id)?)
+    }
+
+    /// Under test there is no screen this process may capture, whatever this
+    /// machine has attached. Every test worker is given [`tests::BlankScreen`];
+    /// landing here means one was not, and a capture of the developer's desktop is
+    /// both a test that cannot run headless and a picture nobody asked for.
+    #[cfg(test)]
+    fn capture(&self, _display_id: u32) -> Result<image::RgbaImage, Failure> {
+        panic!(
+            "a unit test asked to capture the real screen: build the worker with a scripted \
+             `Frames`"
+        )
     }
 }
 
@@ -2449,7 +2561,7 @@ fn acting_view(
     match (&view.bound, request.element_ref.is_some()) {
         (_, true) => Ok(view),
         (Some(live), false) => target::unmoved(observation, live).map(|()| view),
-        (None, false) => same_display(observation, &request.body).map(|_display| view),
+        (None, false) => same_display(observation, &request.body, worker).map(|_display| view),
     }
 }
 
@@ -2744,7 +2856,7 @@ fn wait_for_change(
     gate: &Gate,
     worker: &mut Worker,
 ) -> Result<Value, Failure> {
-    let display = target_display(&request.body)?;
+    let display = target_display(&request.body, worker)?;
     wait_for_change_on(&display, request, gate, worker)
 }
 
@@ -3367,7 +3479,8 @@ fn check_image(
     let view = match view {
         Some(view) => view,
         None => View {
-            display: target_display(&request.body)?,
+            on: None,
+            index: display_index(&request.body),
             geometry: None,
             frames: worker.frames.clone(),
             bound: None,
@@ -3380,7 +3493,7 @@ fn check_image(
     // a capture it does not keep (only on a display this process has never
     // measured). A bound window's came with the frame it was read from.
     let geom = view.geometry(gate, worker)?;
-    let display = &view.display;
+    let display = &view.display(worker)?;
     let region = check_view(&geom, acted.named);
     let before = acted.named.and_then(|observation| observation.view_hash);
     let settled = settle_view(display, &geom, &region, before, gate, &view.frames, worker)?;
@@ -3639,7 +3752,7 @@ const MAX_WINDOWS: usize = 40;
 /// mints an observation, and on a display nothing has captured yet that costs one
 /// frame to measure the transform those coordinates are in.
 fn windows(req: &Value, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
-    let display = target_display(req)?;
+    let display = target_display(req, worker)?;
     let geom = measured_geometry(&display, gate, worker)?;
     let full = Region::full(&geom);
     let mut listed = window_entries(&geom, &full)?;
@@ -3761,7 +3874,7 @@ fn logical_bounds_to_region(
 fn elements(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let view = view(request, gate, worker)?;
     let geom = view.geometry(gate, worker)?;
-    let display = &view.display;
+    let display = &view.display(worker)?;
     let region = viewing_region(request, &geom, worker)?;
 
     // On a bound window the walk starts at THAT window's accessibility element, so
@@ -4497,6 +4610,49 @@ mod tests {
     }
 
     /// A worker with an empty table, for a test that drives one action directly.
+    /// The displays a test is given: fixed facts, no OS call, and the SAME shape
+    /// every other seam in this suite has.
+    ///
+    /// Every worker a test builds gets this. `RealDisplays` panics under
+    /// `cfg(test)`, so a path that resolves a display the eager way fails here on
+    /// a Mac with three screens attached exactly as it would on a headless runner
+    /// — which is the only way a suite can prove it is headless-safe from a
+    /// machine that has a display.
+    struct ScriptedDisplays {
+        display: Display,
+        /// Answers for an index nobody scripted. A test that asks for display 3 of
+        /// a one-display desktop gets the refusal a real host would give it.
+        listed: usize,
+    }
+
+    impl ScriptedDisplays {
+        fn one() -> Rc<ScriptedDisplays> {
+            Rc::new(ScriptedDisplays {
+                display: check_display(),
+                listed: 1,
+            })
+        }
+
+        /// A host with no display session at all — a locked Mac, a headless
+        /// runner, a CI container. Every resolve refuses.
+        fn none() -> Rc<ScriptedDisplays> {
+            Rc::new(ScriptedDisplays {
+                display: check_display(),
+                listed: 0,
+            })
+        }
+    }
+
+    impl Displays for ScriptedDisplays {
+        fn at(&self, index: usize) -> Result<Display, String> {
+            if index < self.listed {
+                Ok(self.display)
+            } else {
+                Err(format!("display {index} not found"))
+            }
+        }
+    }
+
     fn idle_worker(gate: &Gate) -> Worker {
         worker_with(gate, Rc::new(ax::Real::new()))
     }
@@ -4504,7 +4660,22 @@ mod tests {
     /// A worker over a given accessibility platform, so an action that acts on a
     /// control is driven against the recording one.
     fn worker_with(gate: &Gate, ax: Rc<dyn ax::Ax>) -> Worker {
-        frames_worker(gate, ax, Rc::new(Screen))
+        frames_worker(gate, ax, Rc::new(BlankScreen))
+    }
+
+    /// The frames a test worker is given when the test is not about pixels: one
+    /// flat image the size of [`check_display`], so a measured transform comes out
+    /// at one pixel a point and nothing asks the OS for anything.
+    struct BlankScreen;
+
+    impl Frames for BlankScreen {
+        fn capture(&self, _display_id: u32) -> Result<image::RgbaImage, Failure> {
+            Ok(image::RgbaImage::from_pixel(
+                CHECK_DISPLAY_W,
+                CHECK_DISPLAY_H,
+                image::Rgba([20, 20, 20, 255]),
+            ))
+        }
     }
 
     /// A worker over both injected platforms: the accessibility tree it reads, and
@@ -4517,6 +4688,7 @@ mod tests {
             frames,
             windows: window_server::Recorder::new(Vec::new()),
             launcher: indicator::Scripted::new(),
+            displays: ScriptedDisplays::one(),
             target: None,
             target_generation: 0,
             emitter: capture::Emitter::capturing(),
@@ -5994,6 +6166,59 @@ mod tests {
         assert!(app.performed().is_empty());
     }
 
+    // An accessibility action reaches a control BY NAME. It moves no pointer, it
+    // maps no coordinate, and it has no business asking the OS which screens
+    // exist — so on a host with no display session at all it must still work.
+    //
+    // This is the regression guard for a real defect: the view was resolved
+    // eagerly, so `press` asked for a display before it had even revalidated the
+    // control, and a headless host refused every accessibility action with a
+    // display error.
+    #[test]
+    fn an_accessibility_action_needs_no_display_at_all() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        worker.displays = ScriptedDisplays::none();
+
+        let frame = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+
+        assert_eq!(frame["ok"], json!(true), "{frame}");
+        assert_eq!(frame["receipt"]["dispatch"], json!("sent"));
+        assert_eq!(frame["receipt"]["input_method"], json!("ax"));
+    }
+
+    // And the refusals keep their own names. A control that is gone, disabled, or
+    // cannot take the message sent NOTHING — so what the caller is told must not
+    // depend on the state of a screen none of them touch.
+    #[test]
+    fn a_refusal_that_sent_nothing_is_never_masked_by_a_display_error() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        worker.displays = ScriptedDisplays::none();
+        app.set_started_at(None);
+
+        let frame = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+        assert_eq!(frame["error"], json!("stale_element"), "{frame}");
+        assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"));
+
+        // A semantic check re-reads the control and nothing else, so it needs no
+        // display either.
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        worker.displays = ScriptedDisplays::none();
+
+        let mut checked = at_element("press", &observation, "e1");
+        checked.check = wire::Check::Semantic;
+        checked.body["check"] = json!("semantic");
+
+        let frame = served(&checked, &gate, &mut worker);
+        assert_eq!(frame["ok"], json!(true), "{frame}");
+        assert_eq!(frame["element_after"]["present"], json!(true));
+    }
+
     // Three ways a reference stops naming what it named, and one answer, because
     // the next move is the same for all three: take the list again.
     #[test]
@@ -6542,7 +6767,8 @@ mod tests {
     /// `view` builds for a request that names no window.
     fn display_view(worker: &Worker) -> View {
         View {
-            display: check_display(),
+            on: Some(check_display()),
+            index: 0,
             geometry: None,
             frames: worker.frames.clone(),
             bound: None,
