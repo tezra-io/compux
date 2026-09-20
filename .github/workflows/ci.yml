@@ -36,6 +36,24 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  # The ownership indicator ships inside Fermix.app beside the helper, so a Swift file
+  # that does not compile is a release that does not build. Both architectures are built
+  # here for the same reason the Linux leg exists below: neither may be first compiled at
+  # tag time. The self-test that RUNS is the headless half — a hosted runner's GUI
+  # session is not a thing to gate a release on; the windowed `--self-test` belongs to
+  # the build machine and to native/indicator/LIVE_CHECK_INDICATOR.md.
+  indicator:
+    name: indicator (build + headless self-test)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build both architectures (warnings are errors)
+        run: |
+          scripts/build_indicator.sh arm64 "$RUNNER_TEMP/compux-indicator-arm64"
+          scripts/build_indicator.sh x86_64 "$RUNNER_TEMP/compux-indicator-x86_64"
+      - name: Self-test (no window)
+        run: "$RUNNER_TEMP/compux-indicator-arm64 --self-test-headless"
+
   # The linux-x86_64 release target must never be first compiled at tag time:
   # this leg proves the Linux build (incl. the system libs xcap/enigo/arboard
   # link via pkg-config) on every PR. Keep its apt list in sync with release.yml.
