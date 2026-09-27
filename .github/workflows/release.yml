@@ -1,9 +1,9 @@
 name: release
 
 # Tag `vX.Y.Z` (matching mix.exs + Cargo.toml) and push it. Per target this
-# cross-builds the crate, packs the release artifact, sha256s it, and cosign-signs
-# it (keyless/OIDC). The publish job attaches everything to a GitHub Release and
-# prints the checksum map to paste into `checksum-compux.exs`.
+# cross-builds the crate and packs the release artifact; the publish job sha256s
+# and cosign-signs (keyless/OIDC) every artifact, attaches everything to a GitHub
+# Release and prints the checksum map to paste into `checksum-compux.exs`.
 #
 # Per-target artifact shape (Compux.Binary.artifact_name/2):
 #   * macOS  — a Developer-ID-signed, notarized, STAPLED `Fermix.app` zipped with
@@ -19,7 +19,16 @@ name: release
 #   * Linux  — a bare `compux` binary tarball: `compux-<ver>-linux-x86_64.tar.gz`
 #     (no TCC on X11; nothing to sign).
 #
-# Required macOS repo secrets (a partial set fails the early validate guard, loud):
+# Who holds what. The build jobs run third-party crate build code, so they hold
+# no credential and may only read. The helper is signed in its own job,
+# sign-macos, which downloads the unsigned binary, runs in the `release-macos`
+# environment and is the only job that reads the Apple secrets, each in the one
+# step that needs it. Only publish can mint a Sigstore certificate or write the
+# release. A run on anything but a v*.*.* tag, a dispatch included, is refused
+# before anything is built.
+#
+# Apple secrets (a partial set fails the early validate guard, loud), kept as
+# secrets of the `release-macos` environment:
 #   MACOS_CERT_P12_BASE64   base64 of the "Developer ID Application" .p12
 #   MACOS_CERT_PASSWORD     its export password
 #   MACOS_KEYCHAIN_PASSWORD an ephemeral CI keychain password
@@ -35,12 +44,32 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
+  # A dispatch runs this workflow on whatever ref it is given, and only a
+  # release tag, the same v*.*.* the push trigger matches, may be built, signed
+  # and notarized.
+  preflight:
+    name: refuse a non-tag ref
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require a release tag
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          case "$REF" in
+            refs/tags/v*.*.*) echo "releasing $REF" ;;
+            *)
+              echo "::error title=Not a release tag::release.yml builds, signs and notarizes only a v*.*.* tag; dispatch it on the tag, not $REF"
+              exit 1
+              ;;
+          esac
+
   build:
     name: build ${{ matrix.target }}
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -54,9 +83,11 @@ jobs:
       TARGET: ${{ matrix.target }}
       REF_NAME: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
 
       - name: Linux — install system libs (xcap/enigo/arboard link deps)
         if: matrix.target == 'linux-x86_64'
@@ -70,10 +101,52 @@ jobs:
         working-directory: native/compux
         run: cargo build --release --locked
 
-      - name: macOS — validate signing secrets are complete
+      # Leaves unsigned: sign-macos signs it on a runner that never ran this
+      # build's dependency code.
+      - name: macOS — upload the unsigned helper
+        if: matrix.target == 'macos-aarch64'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-macos-aarch64
+          path: native/compux/target/release/compux
+          if-no-files-found: error
+
+      - name: Linux — package the binary
+        if: matrix.target == 'linux-x86_64'
+        env:
+          BIN_DIR: native/compux/target/release
+        run: |
+          set -euo pipefail
+          tar -czf "compux-${REF_NAME#v}-${TARGET}.tar.gz" -C "$BIN_DIR" compux
+
+      - name: Linux — upload the artifact
+        if: matrix.target == 'linux-x86_64'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-linux-x86_64
+          path: compux-*.tar.gz
+          if-no-files-found: error
+
+  sign-macos:
+    name: sign macos-aarch64
+    needs: build
+    runs-on: macos-14
+    environment: release-macos
+    env:
+      TARGET: macos-aarch64
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Download the unsigned helper
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unsigned-macos-aarch64
+          path: unsigned
+
+      - name: Validate signing secrets are complete
         # Signing is MANDATORY on macOS: fail loud + early if ANY of the seven is
         # missing, rather than shipping an ad-hoc bundle or dying mid-notarization.
-        if: matrix.target == 'macos-aarch64'
         env:
           MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -90,12 +163,11 @@ jobs:
             [ -n "${!v}" ] || missing="$missing $v"
           done
           if [ -n "$missing" ]; then
-            echo "::error title=Missing signing secrets::macOS signing is mandatory but these secrets are unset:$missing. Configure all seven on the compux repo and re-run."
+            echo "::error title=Missing signing secrets::macOS signing is mandatory but these secrets are unset:$missing. Configure all seven for the compux repo's release-macos environment and re-run."
             exit 1
           fi
 
-      - name: macOS — import Developer ID certificate
-        if: matrix.target == 'macos-aarch64'
+      - name: Import Developer ID certificate
         env:
           CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
           CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -110,27 +182,28 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
           rm -f cert.p12
 
-      - name: macOS — build, sign, notarize + staple Fermix.app
-        if: matrix.target == 'macos-aarch64'
+      - name: Build + sign Fermix.app
         env:
           DEVELOPER_ID: ${{ secrets.MACOS_DEVELOPER_ID }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           set -euo pipefail
-          VERSION="${REF_NAME#v}"
-
-          # Wrap the signed binary in the Fermix.app bundle (hardened runtime). This
-          # also compiles the ownership indicator from native/indicator and signs it
-          # inside the bundle, for the architectures the helper itself was built for.
-          scripts/build_app.sh native/compux/target/release/compux Fermix.app "$VERSION" "$DEVELOPER_ID"
+          # Wrap the helper in the Fermix.app bundle and sign it (hardened runtime).
+          # This also compiles the ownership indicator from native/indicator and signs
+          # it inside the bundle, for the architectures the helper itself was built for.
+          scripts/build_app.sh unsigned/compux Fermix.app "${REF_NAME#v}" "$DEVELOPER_ID"
 
           # Both executables, or the badge is missing from a release nobody notices
           # until the first target is selected. `lipo` exits non-zero on a missing file.
           lipo -archs Fermix.app/Contents/MacOS/compux
           lipo -archs Fermix.app/Contents/MacOS/compux-indicator
 
+      - name: Notarize + staple Fermix.app
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
           # Notarize the bundle (submit a zip; the ticket is stapled to the .app so
           # Gatekeeper works offline). Submit WITHOUT --wait, then poll: `--wait` holds
           # one HTTP loop open for the whole scan (an hour+ on a first submission) and
@@ -162,59 +235,52 @@ jobs:
           xcrun stapler staple Fermix.app
           codesign --verify --deep --strict --verbose=2 Fermix.app
 
-      - name: Package artifact + sha256
-        env:
-          BIN_DIR: native/compux/target/release
+      # Nothing after this signs, so the identity leaves the runner before the
+      # steps that follow run.
+      - name: Remove the signing keychain
+        run: security delete-keychain build.keychain
+
+      - name: Package Fermix.app
         run: |
           set -euo pipefail
-          VERSION="${REF_NAME#v}"
-          if [ "$TARGET" = "macos-aarch64" ]; then
-            # ditto-zip the stapled bundle (preserves _CodeSignature/xattrs).
-            OUT="compux-${VERSION}-${TARGET}.zip"
-            ditto -c -k --keepParent Fermix.app "$OUT"
-          else
-            OUT="compux-${VERSION}-${TARGET}.tar.gz"
-            tar -czf "$OUT" -C "$BIN_DIR" compux
-          fi
-          shasum -a 256 "$OUT" | awk '{print $1}' > "$OUT.sha256"
-          echo "artifact=$OUT" >> "$GITHUB_ENV"
+          # ditto-zip the stapled bundle (preserves _CodeSignature/xattrs).
+          ditto -c -k --keepParent Fermix.app "compux-${REF_NAME#v}-${TARGET}.zip"
 
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: cosign sign-blob (keyless)
-        run: |
-          set -euo pipefail
-          cosign sign-blob --yes \
-            --output-signature "${artifact}.sig" \
-            --output-certificate "${artifact}.pem" \
-            "${artifact}"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload the artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ${{ matrix.target }}
-          path: |
-            compux-*.tar.gz
-            compux-*.tar.gz.sha256
-            compux-*.tar.gz.sig
-            compux-*.tar.gz.pem
-            compux-*.zip
-            compux-*.zip.sha256
-            compux-*.zip.sig
-            compux-*.zip.pem
+          name: release-macos-aarch64
+          path: compux-*.zip
           if-no-files-found: error
 
   publish:
     name: publish release
-    needs: build
+    needs: [build, sign-macos]
     runs-on: ubuntu-24.04
-    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+      id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
+          pattern: release-*
           path: dist
           merge-multiple: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
+
+      - name: sha256 + cosign sign-blob (keyless)
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          for f in compux-*.tar.gz compux-*.zip; do
+            shasum -a 256 "$f" | awk '{print $1}' > "$f.sha256"
+            cosign sign-blob --yes \
+              --output-signature "$f.sig" \
+              --output-certificate "$f.pem" \
+              "$f"
+          done
 
       - name: Print checksum map (paste into checksum-compux.exs)
         working-directory: dist
