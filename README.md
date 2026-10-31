@@ -185,15 +185,16 @@ is turned off again when it exits. `ax_activation` says what happened, and
 `ax_messages` counts only the last of those walks: the one whose list is returned.
 
 On Linux, `elements` reads the same way through AT-SPI, the desktop's accessibility
-bus, and the same walk lists what it finds (M86 L1, the reading half):
+bus, and the same walk lists what it finds (M86 L1):
 
 * the application read is the one whose window reads ACTIVE on the accessibility
   bus, and the view decides which of its controls are listed;
 * `native_role` is AT-SPI's own role, as the name of its `AtspiRole` constant
-  (`push button`, `check box`, `password text`, …), and `role` reads `unknown` until
-  the role table has an AT-SPI column; a control is listed for its role or for one
-  of its own actions named `click`, `press`, `activate`, `jump`, `check`, `open`,
-  `clickAncestor`, `toggle`, `increase` or `decrease`, in any case;
+  (`push button`, `check box`, `password text`, …), and `role` is the normalised
+  role `PROTOCOL.md` maps it to; a control is listed for its role or for one of its
+  own actions named `click`, `press`, `activate`, `jump`, `check`, `open`,
+  `toggle`, `increase` or `decrease`, in any case (a node whose only such action is
+  Chromium's `clickAncestor` is its ancestor's text, not a control);
 * every property is read with its own `Get`, the optional interfaces only when the
   node lists them, and action names one index at a time (`NActions`, then
   `GetName(i)`). The helper never sends `Action.GetActions` — ATK bridge 2.38
@@ -201,17 +202,45 @@ bus, and the same walk lists what it finds (M86 L1, the reading half):
   `Properties.GetAll`, which kills a Qt 6.4 application. A control some of whose
   actions would not name says `"actions_partial": true`;
 * a node's reads go out together, and up to eight siblings are read at once;
-* bounds are the X11 screen extents of a node that says it is SHOWING; a password
-  field (`password text`) is listed and its text is never asked for;
+* bounds are the X11 screen extents of a node that says it is SHOWING, clipped to
+  the scroll pane it sits in; a password field (`password text`) is listed and its
+  text is never asked for;
 * GTK 4 has no screen positions, on X11 too (it answers every node's screen extents
-  at 0, 0), so a GTK 4 application's controls are not listed yet;
+  at 0, 0), and a Wayland session gives no client a position at all: those
+  controls are listed with no `bounds` and no click point, and act by reference
+  only. A session that places nothing lists without a display;
+* a row with no name of its own takes its label's, a combo box its `LABELLED_BY`
+  label, a combo box that is not open is not walked into, and the embedded-object
+  character (U+FFFC) is dropped from text values;
 * `ax_messages` counts the D-Bus calls of the walk.
 
-The Linux build reads controls and does not act on them yet: a control lists no
-verbs, `hello` offers none of them, nor `wait_for` or `inspect`, and an element
-reference is used only to read again. Nothing on Linux switches accessibility on for the person: an application
-that publishes no tree (a Qt one without `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`, a
-GTK4 one started before the accessibility bus) lists nothing.
+The verbs act through AT-SPI too, each only where the control's own read gives
+it a route: `press` is `DoAction` at the index its press name was read at (never
+`doDefault`), `set_value` is `EditableText.SetTextContents` or
+`Value.CurrentValue`, `type` by reference deletes the selection and inserts at
+the caret, `select` asks the container's `Selection`, `toggle`, `expand` and
+`collapse` act only when the state differs, `focus` is `Component.GrabFocus` and
+only inside the active window (never on GTK 4, which refuses it), and
+`scroll_to` is `Component.ScrollTo` on Chromium and the scroll bar's value on
+GTK. A reference is found again before every action, by its place in the tree and
+by the object itself: two candidates are `ambiguous_element`, one that stays
+unreadable after two more reads is `identity_unknown`. `inspect` is macOS-only.
+
+What the toolkits do not offer, measured on the fixture apps (`fixtures/linux`,
+`spike.sh` stage `verbs`), and so not listed there: a GTK 4 check box names no
+action (no `toggle`) and refuses `GrabFocus` (no `focus`); a GTK 4 menu-bar item
+names no action and a Qt one only `ShowMenu`, so neither menu opens by reference;
+Qt's item views and tab list list no `Selection` (no `select`; a Qt tab is
+pressed), its tree cells' one action toggles their selection (no `expand`), and Qt
+has no `scroll_to`.
+
+Nothing on Linux switches accessibility on for the person. An application in
+front whose toolkit publishes no tree until it is asked, and whose tree stays
+empty, is refused `toolkit_accessibility_off` with the switch that would make it
+publish one (Qt: `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`; Chromium:
+`--force-renderer-accessibility` and `ACCESSIBILITY_ENABLED=1`). One that is not
+on the accessibility bus at all (those, and a GTK 4 one started before the bus)
+leaves no window reading active there, and the note says so.
 
 Two actions address a control rather than a point:
 
@@ -269,8 +298,7 @@ that promises not to take the focus should have to say when it did.
 * **What opened.** Every receipt of input that went out names the dialogs,
   alerts, menus and popups open after it in `surfaces` (`[]` when none is).
 
-The Linux build answers every one of these `accessibility_unavailable` until it
-reads controls (M86 L1).
+The Linux build answers all of these through AT-SPI (M86 L1).
 
 ## Every action says what evidence it wants back
 
@@ -321,11 +349,10 @@ binary is installed separately, this is what keeps them from silently drifting.
 
 The handshake's `actions` and `capabilities.input_methods` list only what that
 build can do. The macOS build lists every verb and both input methods
-(`foreground_hid`, `ax`). The Linux build lists `elements`, which it reads through
-AT-SPI, and neither `ax` nor the actions that act through the accessibility API,
-wait on it or need a bound window — `inspect`, the verbs on a reference,
-`wait_for`, `select_target` and `release_target` — so a caller that offers what
-`hello` lists never offers a verb whose every use is a refusal.
+(`foreground_hid`, `ax`). The Linux build lists both input methods too, and every
+verb but `inspect`, `select_target` and `release_target`, which it does not
+answer, so a caller that offers what `hello` lists never offers a verb whose every
+use is a refusal.
 
 ## Installation
 
@@ -346,13 +373,18 @@ embedder that manages its own signed install passes an explicit `:binary_path` t
 macOS-first. **Apple-Silicon macOS** is the primary, fully-featured target
 (capture, input, accessibility `inspect` + `elements`, non-prompting permission
 probe, idle detection). **Linux/X11** supports capture + input + `wait_for_change`
-+ `paste` (the paste chord is Ctrl+V), and `elements` through AT-SPI (see "Controls
-have names"). `inspect`, the verbs on a reference and `wait_for` are macOS-only
-and answer `accessibility_unavailable` on Linux rather than an empty success; the
-Linux build's `hello` does not list them (see "The version handshake"). The permission `probe` works on both (on
-Linux it reports X11-vs-Wayland capability). **Wayland** and **Windows** are not
-supported yet: on Wayland `elements` still needs the X11 display it measures its
-view on.
++ `paste` (the paste chord is Ctrl+V), and `elements`, the verbs on a reference and
+`wait_for` through AT-SPI (see "Controls have names"). `inspect` is macOS-only;
+the Linux build's `hello` does not list it, and a request for it is
+`unknown_action` (see "The version handshake"). The permission `probe` works on
+both: on Linux it reports which display server answered its socket (`x11`,
+`wayland`, `none`) and whether an X endpoint answers (`x11_endpoint`, XWayland
+beside Wayland). A helper started with no display of its own (a daemon a systemd
+user unit started before login) reads `DISPLAY`, `WAYLAND_DISPLAY` and
+`XAUTHORITY`, and nothing else, from the user manager over the session bus and
+uses them for its own connections. **Wayland** pixels and **Windows** are not
+supported yet; on Wayland the controls are listed without positions and act by
+reference.
 
 `idle_ms` / `wait_for_idle` (operational, not model actions) report how long the
 human has been idle — a coexistence signal so a policy layer can yield the seat to

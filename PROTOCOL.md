@@ -6,8 +6,8 @@ unchanged: the tagged frames, the generations, `mutation_seq`, `deadline_ms`, ob
 `check` kinds `image` and `none`. The README describes the protocol-11 surface in prose.
 
 Protocol 12 is M86 stage P2: the model's surface, defined once for macOS and Linux. The macOS build answers all of
-it. The Linux build answers the same wire from M86 L1; until then its `hello` lists only the pixel actions, and the
-refusals only Linux will answer are already named here, so L1 adds a backend and no second break.
+it. The Linux build answers the same wire through AT-SPI from M86 L1, all but `inspect` and the bound windows, and
+the refusals only Linux answers are named here with the rest.
 
 Every example is one JSON line on the wire, shown wrapped. Envelope fields (`sidecar_generation`,
 `session_generation`, `authorization_generation`, `mutation_seq`, `deadline_ms`) are left out of the examples where
@@ -29,9 +29,12 @@ they are as protocol 11 had them.
 - `protocol_version` is 12. A library at 12 refuses any other sidecar, as before.
 - `actions` lists only what this build can do (protocol 11 rule, M86 F1).
   - **macOS:** the list above.
-  - **Linux, until L1:** the pixel actions only: `screenshot`, `left_click`, `right_click`, `double_click`,
-    `mouse_move`, `left_click_drag`, `scroll`, `type`, `key`, `wait`, `wait_for_change`, `paste`, `windows`.
-    `input_methods` is `["foreground_hid"]`.
+  - **Linux:** the list above without `inspect`, `select_target` and `release_target`. A request for `inspect` is
+    `unknown_action`: a Linux session does not place every control (GTK 4, Wayland), so no control is read at a
+    point.
+- `input_methods` is `["foreground_hid","ax"]` on both builds. `ax` is the wire's name for acting through the
+  platform's accessibility API, whichever it is: macOS's AX API, or AT-SPI on Linux. A receipt's `input_method` is
+  `"ax"` for every verb on a reference on both.
 - `type` is listed on both builds because it types at the focus. Its `element_ref` form (§4.7) is offered where
   `capabilities.input_methods` contains `"ax"`.
 - The `semantic` check with `until` (§5.2) is offered where `wait_for` is listed.
@@ -65,6 +68,16 @@ The scopes, on macOS:
 | `focused` | The application's focused element (`AXFocusedUIElement`), and what is inside it. | yes |
 | `menu` | Every menu open in the application (§6.2): a context menu, a pop-up's menu, a menu-bar menu. | no |
 | `dialog` | Every dialog or alert open in the application (§6.2), sheets included. | no |
+
+The scopes, on Linux (AT-SPI):
+
+| Scope | Root of the walk | Root listed |
+|---|---|---|
+| `app` | The application's root on the accessibility bus: the application whose window reads `ACTIVE`, or the bound window's. | no |
+| `window` | The application's window (`frame`) that reads `ACTIVE`. | no |
+| `focused` | The node that reads `FOCUSED` inside that window, found breadth first among at most 512 nodes (AT-SPI has no focused-element query). | yes |
+| `menu` | Every menu open in the application (§6.2). | no |
+| `dialog` | Every dialog or alert open in the application (§6.2). | no |
 
 A scope whose root does not exist (no focused window, nothing focused, no menu or dialog open) is refused
 `scope_not_found`, with a detail that names what is missing.
@@ -112,7 +125,7 @@ One entry per listed node:
 | `selected`, `focused` | only when `true` | |
 | `path` | when it has ancestors with labels | Up to three ancestor labels, nearest last. |
 | `hidden` | skeleton cut nodes only | How many children this node hides at the cut. |
-| `bounds`, `x`, `y` | **optional** | The control's rectangle and click point in this reply's pixels. Absent where the platform reports no position (GNOME Wayland); then nothing may be clicked by point, and no caller may synthesise one. The macOS build always sends them. |
+| `bounds`, `x`, `y` | **optional** | The control's rectangle and click point in this reply's pixels. Absent where the platform reports no position: every GTK 4 control (its screen extents are all 0, 0, on X11 too) and every control on a Wayland session. Then nothing may be clicked by point, and no caller may synthesise one. On a session that places nothing, a listing needs no display, and its observation has no pixels: every point named against it is `point_outside_observation`. The macOS build always sends them. |
 
 Reply fields beside `elements`:
 
@@ -225,6 +238,9 @@ is refused `state_unreadable`, nothing sent.
 Moves keyboard focus to the control, inside a window that is already active, and **never activates a window**.
 The control's application must be the one in front and the control's window its focused window, else
 `focus_refused`, nothing sent. macOS route: `AXFocused` settable; write `AXFocused = true`; read back `AXFocused`.
+Linux route: `Component.GrabFocus` on a node that lists `Component` and reads `FOCUSABLE`, once the control's window
+reads `ACTIVE`; read back `FOCUSED`. Never on GTK 4, which answers `GrabFocus` `NotSupported`: there `focus` is not
+listed.
 
 ### 4.2 `select`
 
@@ -233,7 +249,9 @@ The control's application must be the one in front and the control's window its 
 ```
 
 Selects this item in its container. macOS route: `AXSelected` settable on the item (write `true`), else the
-container's `AXSelectedChildren` settable (write `[item]`). Read back `AXSelected`.
+container's `AXSelectedChildren` settable (write `[item]`). Read back `AXSelected`. Linux route: the container's
+`Selection.SelectChild(i)`, `i` the item's own `GetIndexInParent`, where the container lists `Selection`; read back
+`SELECTED`. An AT-SPI item never selects itself.
 
 ### 4.3 `toggle`
 
@@ -243,7 +261,9 @@ container's `AXSelectedChildren` settable (write `[item]`). Read back `AXSelecte
 ```
 
 `on` (required, boolean) is the state the control should end in. macOS route: `AXPress` with a readable check state
-(`AXValue` 0/1 on a `checkbox`, `switch` or `radio`). Read the state; press only if it differs; read it back.
+(`AXValue` 0/1 on a `checkbox`, `switch` or `radio`). Read the state; press only if it differs; read it back. Linux
+route: the control's press (§4.6), its state the `CHECKED` bit; Qt's `Toggle` action is its press on a check box,
+radio or toggle button. A GTK 4 check box names no action, so it lists no `toggle`.
 
 ### 4.4 `expand` and `collapse`
 
@@ -253,7 +273,9 @@ container's `AXSelectedChildren` settable (write `[item]`). Read back `AXSelecte
 ```
 
 macOS route: `AXExpanded` or `AXDisclosing` settable (write it), or a `disclosure` with `AXPress` and a readable
-`AXValue`. Read the expanded state; act only if it differs; read it back.
+`AXValue`. Read the expanded state; act only if it differs; read it back. Linux route: a node that reads `EXPANDABLE`
+does its own expanding action (`expand or contract` on GTK 3, `listitem.toggle-expand` on GTK 4), else its press; the
+state is the `EXPANDED` bit. AT-SPI has no expanded attribute to write.
 
 ### 4.5 `scroll_to`
 
@@ -264,12 +286,19 @@ macOS route: `AXExpanded` or `AXDisclosing` settable (write it), or a `disclosur
 
 Brings the control into view. macOS route: the control's own `AXScrollToVisible` action. The read-back is the
 control's frame: moved is `changed`, the same is `not_observed` (it was already in view), unreadable is `unknown`.
-It reports no `state_before`/`state_after`.
+It reports no `state_before`/`state_after`. Linux route: Chromium's `Component.ScrollTo(ANYWHERE)`; on GTK 3 and
+GTK 4, the vertical scroll bar of the nearest scroll pane above the node (at most eight parents up) is set through its
+`Value` by how far the node lies outside the pane, both read in window coordinates. Qt has no route, so `scroll_to`
+is not listed there.
 
 ### 4.6 `set_value` and `press`
 
 As protocol 9 to 11, advertised in `verbs` (`set_value` where protocol 11 said `settable`, `press` where it listed
-`press`). `set_value`'s effect stays `verified` or `not_observed`.
+`press`). `set_value`'s effect stays `verified` or `not_observed`. Linux routes: `press` is `Action.DoAction(i)`, `i`
+the index the first action named `click`, `press`, `activate`, `jump`, `check` or `open` (any case) was read at by
+`GetName(i)`, never `doDefault` and never by `GetActions`; `set_value` is `EditableText.SetTextContents` on a node
+that reads `EDITABLE`, else `Value.CurrentValue` on a slider, dial, spin button or scroll bar (text that is no number
+is refused before anything is sent).
 
 ### 4.7 `type` with `element_ref`
 
@@ -279,8 +308,9 @@ As protocol 9 to 11, advertised in `verbs` (`set_value` where protocol 11 said `
 ```
 
 Replaces the control's current selection with `text`, or inserts it at the caret when nothing is selected, with
-**no keyboard** (macOS route: `AXSelectedText` settable; write it). `observation_id` is required with `element_ref`
-and refused without it. The value is read before and after: different is `changed`, the same is `not_observed`,
+**no keyboard** (macOS route: `AXSelectedText` settable; write it. Linux route: `EditableText.DeleteText` over the
+selection `Text.GetSelection(0)` names, then `InsertText` at `CaretOffset`, on a node that reads `EDITABLE`).
+`observation_id` is required with `element_ref` and refused without it. The value is read before and after: different is `changed`, the same is `not_observed`,
 a secure or unreadable field is `unknown`. The reply carries `value` (the value after, never for a secure field).
 Without `element_ref`, `type` types at the focus as before.
 
@@ -289,7 +319,14 @@ Without `element_ref`, `type` types at the focus as before.
 `stale_element`, `element_disabled`, `ax_action_unsupported` (no route for this verb on this control),
 `state_unreadable`, `focus_refused`, `ax_action_failed` and `ax_timed_out` (the write itself; the second means it
 went out), `invalid_argument` (a missing or wrong `on`/`text`), plus the gate's and the observation's refusals.
-`ambiguous_element` and `identity_unknown` are named for Linux (§7).
+`ambiguous_element` and `identity_unknown` are Linux's (§7): there a reference is the object a listing read and its
+child-index path from the application, and before any write both are read again. The object at that path and the
+object itself, wherever its own parent still lists it, are each a candidate when they answer the listed role. One is
+the control; two (it moved, and another of its role took its place) are `ambiguous_element`; none is
+`stale_element`; a candidate that does not answer in time is read again at most twice, then `identity_unknown`. The
+object is at its place too when it says so (its `Parent` is the node at its place's parent, and its
+`GetIndexInParent` the index its place ends in): Qt answers every `GetChildAtIndex` of a table with a new object for
+the same cell. A `ServiceUnknown` error means the application quit.
 
 ## 5. Waiting on the tree
 
@@ -402,87 +439,96 @@ Not met by the deadline is an answer, not a failure:
 
 ### 6.1 Normalised roles
 
-`role` is one of these, on every platform. `native_role` carries the platform's own. The macOS column is what the
-macOS build maps; L1 fills the AT-SPI column the same way.
+`role` is one of these, on every platform. `native_role` carries the platform's own: on Linux the name of the
+`AtspiRole` constant its role number is, in words (`push button`, `check box`), never the toolkit's own
+`GetRoleName`, which GTK 4 and Chromium spell differently.
 
-| `role` | macOS role (subrole) |
-|---|---|
-| `button` | `AXButton` |
-| `menubutton` | `AXMenuButton` |
-| `checkbox` | `AXCheckBox` |
-| `switch` | `AXCheckBox` (`AXSwitch`, `AXToggle`) |
-| `radio` | `AXRadioButton` |
-| `tab` | `AXRadioButton` (`AXTabButton`), `AXTabButton` |
-| `textfield` | `AXTextField` (incl. `AXSecureTextField`, `AXSearchField`) |
-| `textarea` | `AXTextArea` |
-| `combobox` | `AXComboBox`, `AXPopUpButton` |
-| `menuitem` | `AXMenuItem`, `AXMenuBarItem` |
-| `link` | `AXLink` |
-| `slider` | `AXSlider` |
-| `stepper` | `AXIncrementor`, `AXStepper` |
-| `disclosure` | `AXDisclosureTriangle` |
-| `row` | `AXRow` (incl. `AXOutlineRow`, `AXTableRow`) |
-| `cell` | `AXCell` |
-| `column` | `AXColumn` |
-| `list` | `AXList` |
-| `table` | `AXTable` |
-| `tree` | `AXOutline` |
-| `scrollarea` | `AXScrollArea` |
-| `scrollbar` | `AXScrollBar` |
-| `splitter` | `AXSplitter` |
-| `toolbar` | `AXToolbar` |
-| `tablist` | `AXTabGroup` |
-| `group` | `AXGroup`, `AXSplitGroup`, `AXRadioGroup` |
-| `menu` | `AXMenu` |
-| `menubar` | `AXMenuBar` |
-| `window` | `AXWindow` |
-| `dialog` | `AXSheet`; `AXWindow` (`AXDialog`, `AXSystemDialog`) |
-| `alert` | any role (`AXApplicationAlert`, `AXApplicationAlertDialog`) |
-| `popup` | `AXPopover` |
-| `text` | `AXStaticText` |
-| `image` | `AXImage` |
-| `heading` | `AXHeading` |
-| `progress` | `AXProgressIndicator`, `AXBusyIndicator` |
-| `datefield` | `AXDateField`, `AXTimeField` |
-| `document` | `AXWebArea` |
-| `application` | `AXApplication` |
-| `unknown` | any other role; `native_role` says which |
+| `role` | macOS role (subrole) | AT-SPI role |
+|---|---|---|
+| `button` | `AXButton` | `push button` |
+| `menubutton` | `AXMenuButton` | `push button menu` |
+| `checkbox` | `AXCheckBox` | `check box` |
+| `switch` | `AXCheckBox` (`AXSwitch`, `AXToggle`) | `toggle button`, `switch` |
+| `radio` | `AXRadioButton` | `radio button` |
+| `tab` | `AXRadioButton` (`AXTabButton`), `AXTabButton` | `page tab` |
+| `textfield` | `AXTextField` (incl. `AXSecureTextField`, `AXSearchField`) | `entry`, `password text`, `text` (one line) |
+| `textarea` | `AXTextArea` | `text`, `entry` that reads `MULTI_LINE` |
+| `combobox` | `AXComboBox`, `AXPopUpButton` | `combo box` |
+| `menuitem` | `AXMenuItem`, `AXMenuBarItem` | `menu item`, `check menu item`, `radio menu item`, `tearoff menu item` |
+| `link` | `AXLink` | `link` |
+| `slider` | `AXSlider` | `slider`, `dial` |
+| `stepper` | `AXIncrementor`, `AXStepper` | `spin button` |
+| `disclosure` | `AXDisclosureTriangle` | — |
+| `row` | `AXRow` (incl. `AXOutlineRow`, `AXTableRow`) | `list item`, `tree item`, `table row` |
+| `cell` | `AXCell` | `table cell` |
+| `column` | `AXColumn` | — |
+| `list` | `AXList` | `list`, `list box` |
+| `table` | `AXTable` | `table` |
+| `tree` | `AXOutline` | `tree`, `tree table` |
+| `scrollarea` | `AXScrollArea` | `scroll pane` |
+| `scrollbar` | `AXScrollBar` | `scroll bar` |
+| `splitter` | `AXSplitter` | `split pane` |
+| `toolbar` | `AXToolbar` | `tool bar` |
+| `tablist` | `AXTabGroup` | `page tab list` |
+| `group` | `AXGroup`, `AXSplitGroup`, `AXRadioGroup` | `panel`, `filler`, `grouping`, `section`, `form` |
+| `menu` | `AXMenu` | `menu`, `popup menu` |
+| `menubar` | `AXMenuBar` | `menu bar` |
+| `window` | `AXWindow` | `frame`, `window` |
+| `dialog` | `AXSheet`; `AXWindow` (`AXDialog`, `AXSystemDialog`) | `dialog`, `file chooser`, `color chooser`, `font chooser` |
+| `alert` | any role (`AXApplicationAlert`, `AXApplicationAlertDialog`) | `alert`, `notification` |
+| `popup` | `AXPopover` | — |
+| `text` | `AXStaticText` | `label`, `static` |
+| `image` | `AXImage` | `image`, `icon` |
+| `heading` | `AXHeading` | `heading` |
+| `progress` | `AXProgressIndicator`, `AXBusyIndicator` | `progress bar`, `level bar` |
+| `datefield` | `AXDateField`, `AXTimeField` | `date editor` |
+| `document` | `AXWebArea` | `document frame`, `document web`, `document text`, `document email`, `document spreadsheet`, `document presentation` |
+| `application` | `AXApplication` | `application` |
+| `unknown` | any other role; `native_role` says which | any other role |
 
 The check state of a `checkbox`, `switch` or `radio` is its `AXValue` (0 or 1); the expanded state of a
-`disclosure` is its `AXValue`; every other control's expanded state is `AXExpanded`, else `AXDisclosing`.
+`disclosure` is its `AXValue`; every other control's expanded state is `AXExpanded`, else `AXDisclosing`. On Linux
+each state is its AT-SPI state bit: `CHECKED`, `EXPANDED` (on a node that reads `EXPANDABLE`), `SELECTED`,
+`FOCUSED`; `enabled` is `SENSITIVE` (GTK 4 sets `ENABLED` on nothing).
 
 ### 6.2 Surface kinds
 
-| `kind` | macOS `native_kind` | Where the macOS build finds it |
-|---|---|---|
-| `dialog` | `AXSheet`, `AXDialog`, `AXSystemDialog` | A window's sheet; a window whose subrole is a dialog |
-| `alert` | `AXApplicationAlertDialog`, `AXApplicationAlert` | A window or a window's child with that subrole |
-| `menu` | `AXMenu` | A menu that is a child of the application or of a window (a context menu, a pop-up's menu), or the menu of a menu-bar item that reads selected |
-| `popup` | `AXPopover` | A window's child |
+| `kind` | macOS `native_kind` | Where the macOS build finds it | Linux `native_kind` |
+|---|---|---|---|
+| `dialog` | `AXSheet`, `AXDialog`, `AXSystemDialog` | A window's sheet; a window whose subrole is a dialog | `dialog`, `file chooser`, `color chooser`, `font chooser` |
+| `alert` | `AXApplicationAlertDialog`, `AXApplicationAlert` | A window or a window's child with that subrole | `alert`, `notification` |
+| `menu` | `AXMenu` | A menu that is a child of the application or of a window (a context menu, a pop-up's menu), or the menu of a menu-bar item that reads selected | `menu`, `popup menu` |
+| `popup` | `AXPopover` | A window's child | none |
 
 The macOS build looks two levels down from the application (its windows and their children) and into the menu
 bar, and reads at most 64 nodes doing so. A dialog drawn inside web content is not a surface here.
 
+The Linux build looks the same two levels down, the same 64 nodes at most, and for the menu bar inside each window
+rather than on the application: directly among the window's children (Qt), or inside a box among them (GTK 3). A
+menu-bar item is open while it reads `SELECTED`; a GTK 3 one is the menu itself. A dialog or alert is a child of the
+application, and a context menu the menu inside the window a toolkit puts up for it. A node that does not read
+`SHOWING` is no surface, and nothing below it is looked at: GTK 3 keeps a menu's window after it closes, and Qt every
+menu it has made.
+
 ### 6.3 Which verbs a control lists
 
-| Verb | Listed when (macOS) |
-|---|---|
-| `press` | its own actions include `AXPress` |
-| `set_value` | `AXValue` is settable |
-| `type` | `AXSelectedText` is settable |
-| `focus` | `AXFocused` is settable |
-| `select` | `AXSelected` is settable, or its container's `AXSelectedChildren` is |
-| `toggle` | a `checkbox`, `switch` or `radio` with `AXPress` and a readable check state |
-| `expand`, `collapse` | `AXExpanded` or `AXDisclosing` is settable, or a `disclosure` with `AXPress` and a readable value |
-| `scroll_to` | its own actions include `AXScrollToVisible` |
+| Verb | Listed when (macOS) | Listed when (Linux) |
+|---|---|---|
+| `press` | its own actions include `AXPress` | one of its actions is named `click`, `press`, `activate`, `jump`, `check` or `open` (any case), or `Toggle` on a check box, radio or toggle button |
+| `set_value` | `AXValue` is settable | it lists `EditableText` and reads `EDITABLE`, or it lists `Value` and is a slider, dial, spin button or scroll bar |
+| `type` | `AXSelectedText` is settable | it lists `EditableText` and `Text` and reads `EDITABLE` |
+| `focus` | `AXFocused` is settable | it lists `Component` and reads `FOCUSABLE`, and is not GTK 4 |
+| `select` | `AXSelected` is settable, or its container's `AXSelectedChildren` is | its container lists `Selection` |
+| `toggle` | a `checkbox`, `switch` or `radio` with `AXPress` and a readable check state | a `checkbox`, `switch` or `radio` with a press and a readable `CHECKED` |
+| `expand`, `collapse` | `AXExpanded` or `AXDisclosing` is settable, or a `disclosure` with `AXPress` and a readable value | it reads `EXPANDABLE` and has an expanding action or a press |
+| `scroll_to` | its own actions include `AXScrollToVisible` | Chromium: it lists `Component`; GTK: it sits inside a scroll pane; Qt: never |
 
 `focus` is listed by route; whether the control's window is active is decided at the action (`focus_refused`).
 A pointer action by `element_ref` (`left_click` and the rest) needs only `bounds` and is not a verb here.
 
 ## 7. Refusals
 
-Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux build answers at first; they are named
-now so L1 changes no wire.
+Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux build answers.
 
 **Frames and arguments**
 
@@ -546,10 +592,10 @@ now so L1 changes no wire.
 | `ax_action_failed` | The application refused the message. Nothing went out. |
 | `ax_timed_out` | The message went out and no answer came; never repeated. |
 | `scope_not_found` | An `elements` scope has no root: no focused window, nothing focused, no menu or dialog open. A condition reads such a scope as empty instead (§5.1). |
-| `accessibility_unavailable` | A build with no accessibility API (the Linux build until L1) was asked to read or act on controls. |
+| `accessibility_unavailable` | A build with no accessibility API (neither macOS nor Linux) was asked to read or act on controls. |
 | `ambiguous_element` | Linux: re-validation found several candidates for one reference. |
 | `identity_unknown` | Linux: a candidate stayed unreadable after two re-reads. |
-| `toolkit_accessibility_off` | Linux: the application's toolkit publishes no tree (Qt without `QT_ACCESSIBILITY`, Chromium without an assistive client); the detail names the switch. |
+| `toolkit_accessibility_off` | Linux: the application in front publishes no tree until it is asked, and its tree stayed empty after `elements` waited for it (Qt without `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`; Chromium without `--force-renderer-accessibility` and `ACCESSIBILITY_ENABLED=1`); the detail names the switch. An application that is not on the accessibility bus at all leaves no window reading `ACTIVE` there, and `elements`' note names the switches instead. |
 
 **Input on Linux**
 

@@ -2159,9 +2159,9 @@ opened rides the receipt.
 
 `protocol_version` is `12`. `actions` lists twenty-six verbs: the nineteen of
 protocol 11 with `focus`, `select`, `toggle`, `expand`, `collapse`, `scroll_to`
-and `wait_for` after `set_value`. The Linux build lists none of the seven, and
-`elements`, `press`, `set_value` and `inspect` stay off it too. A test proves
-that on each platform.
+and `wait_for` after `set_value`. The Linux build lists them all but `inspect`
+and the bound windows' two (the M86 L1 section). A test proves that on each
+platform.
 
 ## 2. Every scope once, a find, a skeleton and a drill (read only)
 
@@ -2322,5 +2322,201 @@ against both builds (with `"protocol_version": 12` for the P2 one):
 * **Menus inside web content and custom popovers.** The surface scan reads the
   application's windows, their children and the menu bar, at most 64 nodes. A
   dialog drawn inside a web page is not a surface.
-* **Linux.** Nothing here touches Linux accessibility. The Linux build refuses
-  every one of these `accessibility_unavailable` until L1.
+* **Linux.** Nothing here touches Linux accessibility: the M86 L1 section below
+  runs the same verbs through AT-SPI.
+
+# Live check — controls on Linux through AT-SPI (M86 L1)
+
+**What this is for.** The Linux build now lists controls with normalised roles
+and verbs, acts on them through AT-SPI (`press`, `set_value`, `type` by
+reference, `select`, `toggle`, `expand`, `collapse`, `focus`, `scroll_to`), waits
+on the tree, and names the menus and dialogs an action opened. Every rule is
+tested against fake AT-SPI servers, and every verb has run against the GTK 3,
+GTK 4 and Qt fixture apps in private containers (`fixtures/linux/spike/spike.sh`,
+stages `verbs` and `verbs-jammy`), judged by what each fixture recorded. None of
+it has run on a real GNOME desktop. This section runs it once on yours: Pop!_OS
+22.04, GNOME 42, an X11 session, at-spi2-core 2.44 and the ATK bridge 2.38 that
+aborts an application asked `Action.GetActions`.
+
+Expected outcome in one line: the fixture apps survive every listing and every
+verb, each verb changes its control and the fixture records it, and the probe
+names the X11 session by its socket.
+
+> **Steps 3, 4 and 5 POST REAL INPUT** through the accessibility bus to the
+> fixture apps: presses, text, selections, a menu and a dialog. Steps 1, 2 and 6
+> read only. Nothing here may be run by an agent. Run it yourself, at the machine,
+> with nothing confidential on screen. The fixture apps run on your desktop for
+> this check only; everywhere else they run in a private container.
+
+## 0. Preconditions
+
+* **The build**, from the branch with L1 on it:
+
+  ```sh
+  cd ~/src/compux && git switch feat/m86
+  (cd native/compux && cargo build --release)
+  CX=$PWD/native/compux/target/release/compux
+  ```
+
+* **The GTK fixture apps** (`python3-gi`, `gir1.2-gtk-3.0` and `gir1.2-gtk-4.0`;
+  22.04 ships GTK 4.6, and packages no PyQt6, so the Qt fixture runs in the
+  containers only). Each in its own terminal, each writing what happened to its
+  state file:
+
+  ```sh
+  python3 fixtures/linux/fixture_gtk3.py --state-file /tmp/gtk3.json
+  python3 fixtures/linux/fixture_gtk4.py --state-file /tmp/gtk4.json
+  ```
+
+  A GTK 4 application joins the accessibility bus only if the bus was up when it
+  started; on a GNOME login it always is.
+* `cx.py` from the slice-2 section, with `"protocol_version": 12` in its `hello`.
+  Every request below names its listing's `observation_id` (the `O` of the
+  `elements` line before it), so the script's own `ADDRESSED` list does not
+  matter. Keep one session for a whole step:
+
+  ```sh
+  python3 /tmp/cx.py "$CX"
+  ```
+
+* To read what a fixture recorded: `python3 -m json.tool /tmp/gtk3.json | tail -20`.
+
+## 1. The handshake and the probe (10 seconds, fails fastest)
+
+```json
+{"action":"probe"}
+```
+
+`hello` says `"protocol_version": 12`, `capabilities.input_methods` is
+`["foreground_hid","ax"]`, and `actions` lists twenty-three verbs: every one the
+Mac lists but `inspect`, `select_target` and `release_target`. The probe says
+`"display_server": "x11"`, `"x11_endpoint": true`, and capture and input `true`.
+Then `{"action":"inspect","x":1,"y":1,"observation_id":"x"}` answers
+`unknown_action`.
+
+Now the helper with no display of its own, as a daemon started before login has
+it (read only: it reads three names from the user manager, sets nothing):
+
+```sh
+env -u DISPLAY -u WAYLAND_DISPLAY -u XAUTHORITY python3 /tmp/cx.py "$CX" '{"action":"probe"}' </dev/null
+```
+
+Its stderr says `took ["DISPLAY", "XAUTHORITY"] from the user manager` (the names
+only, never a value), and the probe says `x11` again. `systemctl --user
+show-environment | grep -c DISPLAY` should be at least 1 for this to hold; if it
+is 0, GNOME did not import the display into the user manager, and the probe
+answers `none`: write that down.
+
+## 2. The GTK 3 fixture survives a listing (read only)
+
+With **Compux Fixture GTK3** in front:
+
+```json
+{"action":"elements"}
+{"action":"elements","scope":"window"}
+{"action":"elements","query":{"name":"save"}}
+```
+
+* The fixture is still running after each (its terminal shows no `SIGABRT`, and
+  `pgrep -f fixture_gtk3` still answers): the ATK bridge 2.38 aborts an
+  application asked `GetActions`, and compux never asks it.
+* Roles are normalised (`button`, `checkbox`, `textfield`, `slider`, `row`,
+  `cell`, `tab`) beside the AT-SPI `native_role` (`push button`, `check box`, …),
+  and every control has `bounds` and a click point.
+* The Fruit and History rows are named by their labels (`Apple`, `Entry 1`), the
+  pop-up button is named `GTK3 pop-up button` and lists none of its items, and no
+  History row below the list's visible end is listed.
+* The find lists both Save buttons with their `path`s (Document, Sidebar).
+* `verbs`: the button `press`; the checkbox `press`, `toggle` and `focus`; the
+  text field `set_value`, `type` and `focus`; the Folders cells `expand` and
+  `collapse`; the Fruit rows and the tabs `select`.
+
+## 3. Each verb once, on GTK 3 (POSTS INPUT)
+
+Take a fresh `{"action":"elements","scope":"window"}` and use its id as `O` and
+its references below. After each, read `/tmp/gtk3.json`.
+
+* **`{"action":"press","observation_id":"O","element_ref":"<GTK3 button>"}`**: the
+  fixture records `gtk3.button press`, and the pointer never moved.
+* **`{"action":"toggle","observation_id":"O","element_ref":"<GTK3 checkbox>","on":true}`**:
+  `effect` `changed`, `state_before` `off`, `state_after` `on`; the fixture records
+  `toggle on`. **Send it again**: `dispatch` `not_sent`, `already` `true`.
+* **`{"action":"set_value","observation_id":"O","element_ref":"<GTK3 text field>","value":"hello"}`**:
+  `effect` `verified`; the fixture records `set_value hello`.
+* **`{"action":"type","observation_id":"O","element_ref":"<Search>","text":"abc"}`**:
+  no key events; the field shows `abc`, the reply's `value` says so.
+* **`{"action":"focus","observation_id":"O","element_ref":"<Search>"}`**: the caret
+  is in the field, the fixture records `search focus`. **Bring another window to
+  the front and send it again**: `focus_refused`, and the fixture window stays
+  behind. Focus never activates a window.
+* **`{"action":"select","observation_id":"O","element_ref":"<Banana>"}`** and
+  **the same on the `Advanced` tab**: each recorded as `select`.
+* **`{"action":"expand","observation_id":"O","element_ref":"<Documents>"}`** and
+  **`collapse` on `Projects`**: recorded as `expand Documents`, `collapse Projects`.
+* **`{"action":"set_value","observation_id":"O","element_ref":"<Volume>","value":"75"}`**:
+  recorded as `set_value 75`.
+* **`{"action":"scroll_to","observation_id":"O","element_ref":"<the last History row listed>"}`**:
+  the list scrolls that row fully into view, `effect` `changed`; again,
+  `not_observed`.
+* **`press` on `GTK3 disabled button`**: `element_disabled`, nothing recorded.
+
+## 4. A menu and a dialog, on GTK 3 (POSTS INPUT)
+
+* **`press` on `Actions`** (the menu bar's menu), then at once
+  `{"action":"wait_for","until":{"kind":"menu_open"}}`: `met` `true`. Then
+  `{"action":"elements","scope":"menu"}` lists `Export Report` and `Print Preview`;
+  **press `Export Report`** in that listing: the fixture records
+  `menu activate Export Report`.
+* **`{"action":"press","observation_id":"O","element_ref":"<Clear All…>","check":{"kind":"semantic","until":{"kind":"appears","role":"button","name":"Cancel","scope":"dialog"}}}`**:
+  `receipt.check.until` is `met`, and `receipt.surfaces` names the dialog (GTK 3
+  makes it an `alert`, `native_kind` `alert`). `{"action":"elements","scope":"dialog"}`
+  lists OK and Cancel; **press Cancel**: recorded as `dialog cancel`.
+
+## 5. The GTK 4 fixture (POSTS INPUT)
+
+With **Compux Fixture GTK4** in front, `{"action":"elements","scope":"window"}`:
+
+* Every control is listed **without** `bounds`, `x` and `y` (GTK 4 answers every
+  screen position at 0, 0, on X11 too), and the reply says nothing is wrong.
+* The check box lists no `toggle` and the fields no `focus` (GTK 4 names no action
+  on a check box and refuses `GrabFocus`). A `toggle` on it answers
+  `ax_action_unsupported`, nothing sent.
+* **`press` the GTK4 button, `set_value` the text field, `select` Banana and the
+  Advanced tab, `expand` the `Documents` button in Folders** (the row named
+  Documents selects; the button inside it expands): each recorded in
+  `/tmp/gtk4.json`.
+* **`scroll_to` on `Entry 200`** (GTK 4 lists every row of its list): the list
+  scrolls to its end, and the fixture records `far_list scroll bottom`.
+* **`press` on `Clear All…`**, then `{"action":"elements","scope":"dialog"}`. In
+  the containers (Openbox) no GTK 4 window reads ACTIVE while its dialog is open,
+  so this answers `scope_not_found`. Write down what GNOME does: a listing of the
+  dialog means Mutter gives a dialog opened by an accessibility press the focus.
+  Close the dialog by hand.
+* A GTK 4 menu-bar item names no action: `press` on `Actions` answers
+  `ax_action_unsupported`.
+
+## 6. The numbers
+
+`{"action":"elements"}` five times on each fixture, and write down
+`ax_messages` and how long the reply took (the script prints each reply as it
+arrives; a stopwatch is enough):
+
+| Fixture | listed | `ax_messages` | time |
+|---|---|---|---|
+| GTK 3 | | | |
+| GTK 4 | | | |
+
+## 7. What this check still cannot prove
+
+* **Qt on this desktop.** 22.04 packages no PyQt6; the Qt fixture ran in the
+  containers only. There Qt lists no `Selection` (no `select`; a tab is pressed),
+  a tree cell's one action toggles its selection (no `expand`), a menu-bar item
+  names only `ShowMenu`, and there is no `scroll_to`.
+* **Wayland.** Controls on a Wayland session are listed without positions and act
+  by reference; nothing here runs one. Pixels on Wayland are L2's.
+* **Chromium and Electron.** `scroll_to` through `Component.ScrollTo` and the
+  `toolkit_accessibility_off` refusal are tested against fakes only here.
+* **An application that is not on the accessibility bus** (a Qt one without
+  `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`, a GTK 4 one started before the bus) leaves
+  no window reading ACTIVE there: `elements` says so and names the switches, but
+  cannot name the application until the window list arrives (L3).
