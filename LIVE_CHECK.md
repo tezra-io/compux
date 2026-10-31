@@ -2391,6 +2391,18 @@ names the X11 session by its socket.
 `["foreground_hid","ax"]`, and `actions` lists twenty-three verbs: every one the
 Mac lists but `inspect`, `select_target` and `release_target`. The probe says
 `"display_server": "x11"`, `"x11_endpoint": true`, and capture and input `true`.
+It also says what a doctor shows of accessibility, read only (no event
+registered, no application read, nothing set):
+
+- `accessibility_bus.state` is `"answering"`, `applications` about as many as
+  the accessible applications you have open, and `status` is read (both `false`
+  unless a screen reader or another assistive technology runs);
+- `accessibility_packages` is `{"source": "dpkg", "at_spi2_core": "2.44.0-3",
+  "atk_bridge": "2.38.0-3"}`, the versions `dpkg -l at-spi2-core
+  libatk-bridge2.0-0` prints;
+- `toolkit_notes` has a `qt` note while `status` reads both `false`, and a
+  `chromium` note always.
+
 Then `{"action":"inspect","x":1,"y":1,"observation_id":"x"}` answers
 `unknown_action`.
 
@@ -2509,9 +2521,9 @@ arrives; a stopwatch is enough):
 ## 7. What this check still cannot prove
 
 * **Qt on this desktop.** 22.04 packages no PyQt6; the Qt fixture ran in the
-  containers only. There Qt lists no `Selection` (no `select`; a tab is pressed),
-  a tree cell's one action toggles its selection (no `expand`), a menu-bar item
-  names only `ShowMenu`, and there is no `scroll_to`.
+  containers only. There a menu-bar item opens by its `ShowMenu`, list and tree
+  items are selected by their own `Toggle` (Qt lists no `Selection`; a tab is
+  pressed), a tree cell has no `expand`, and there is no `scroll_to`.
 * **Wayland.** Controls on a Wayland session are listed without positions and act
   by reference; nothing here runs one. Pixels on Wayland are L2's.
 * **Chromium and Electron.** `scroll_to` through `Component.ScrollTo` and the

@@ -183,6 +183,7 @@ pub const SELECTED: u32 = 23;
 pub const SENSITIVE: u32 = 24;
 pub const SHOWING: u32 = 25;
 pub const VERTICAL: u32 = 29;
+pub const CHECKABLE: u32 = 41;
 
 /// A role number as a word. A number newer than this table is still named, by its
 /// number, rather than passed off as one this table knows.

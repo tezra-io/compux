@@ -6,7 +6,7 @@
 //! it reads. Nothing is inferred from what its role suggests (agent-desktop L3-19:
 //! the toolkits name their actions differently, and none names `expand`).
 
-use super::vocabulary::{self, EDITABLE, EXPANDABLE, FOCUSABLE};
+use super::vocabulary::{self, CHECKABLE, EDITABLE, EXPANDABLE, FOCUSABLE, SELECTABLE};
 use crate::ax::{Expander, Routes, PRESS, SCROLL_TO_VISIBLE};
 
 /// The action names that press a control, compared without case: GTK `click`,
@@ -17,8 +17,13 @@ const PRESS_NAMES: [&str; 6] = ["click", "press", "activate", "jump", "check", "
 
 /// Qt names a check box's press `Toggle` (L3-19). Only a control that carries a
 /// check state is pressed by it: on a Qt list item the same name toggles the
-/// selection.
+/// selection, and is that item's `select` ([`selector`]).
 const TOGGLE: &str = "toggle";
+
+/// Qt opens a menu title, on its menu bar or as an item with a submenu, only with
+/// `ShowMenu`. Pressing a menu title is opening it, so it is the press of a Qt menu
+/// item that holds its menu, and of nothing else.
+const SHOW_MENU: &str = "showmenu";
 
 /// The actions that expand and collapse the node they belong to, in one toggle:
 /// a GTK 3 tree cell's and a GTK 4 tree row's. A node with neither is expanded by
@@ -90,6 +95,8 @@ pub struct Read<'a> {
     pub toolkit: Toolkit,
     /// It sits inside a scroll pane.
     pub scrolled: bool,
+    /// How many children it has: a Qt menu title holds its menu as one.
+    pub children: usize,
 }
 
 /// The index of the action that presses this node: the first press name it
@@ -99,6 +106,7 @@ pub fn press(read: &Read<'_>) -> Option<i32> {
         vocabulary::role(read.role).as_str(),
         "check box" | "radio button" | "toggle button" | "switch" | "check menu item"
     );
+    let menu_title = holds_its_menu(read);
     read.actions
         .iter()
         .find(|(_, name)| {
@@ -106,8 +114,16 @@ pub fn press(read: &Read<'_>) -> Option<i32> {
                 .iter()
                 .any(|press| press.eq_ignore_ascii_case(name))
                 || (checkable && TOGGLE.eq_ignore_ascii_case(name))
+                || (menu_title && SHOW_MENU.eq_ignore_ascii_case(name))
         })
         .map(|(index, _)| *index)
+}
+
+/// A Qt menu item that holds its menu as a child: a menu-bar title, or an item
+/// with a submenu.
+fn holds_its_menu(read: &Read<'_>) -> bool {
+    let menu = matches!(vocabulary::role(read.role).as_str(), "menu item" | "menu");
+    read.toolkit == Toolkit::Qt && menu && read.children > 0
 }
 
 /// The index of the action that expands and collapses this node, when it reads
@@ -122,6 +138,23 @@ pub fn expander(read: &Read<'_>) -> Option<i32> {
             .any(|expanding| expanding.eq_ignore_ascii_case(name))
     });
     own.map(|(index, _)| *index).or_else(|| press(read))
+}
+
+/// The index of the action that selects this item by itself: Qt's `Toggle`, on
+/// an item that reads SELECTABLE and not CHECKABLE, since Qt's views and tab lists
+/// list no `Selection`. It toggles the selection, so `select` sends it only while
+/// the item reads not selected (`semantic` reads that first), and it is never a
+/// `toggle` route.
+pub fn selector(read: &Read<'_>) -> Option<i32> {
+    let selectable =
+        vocabulary::has(read.states, SELECTABLE) && !vocabulary::has(read.states, CHECKABLE);
+    if read.toolkit != Toolkit::Qt || !selectable {
+        return None;
+    }
+    read.actions
+        .iter()
+        .find(|(_, name)| TOGGLE.eq_ignore_ascii_case(name))
+        .map(|(index, _)| *index)
 }
 
 /// Whether `scroll_to` has a route: `Component.ScrollTo` on Chromium, and on GTK
@@ -144,8 +177,9 @@ pub fn settable(read: &Read<'_>) -> bool {
     text || number
 }
 
-/// The writes the node takes. An item never selects itself on AT-SPI: its
-/// container's `Selection` does ([`super::atspi`] asks the container).
+/// The writes the node takes. An item selects itself only on Qt, through its
+/// `Toggle` ([`selector`]); everywhere else its container's `Selection` does
+/// ([`super::atspi`] asks the container).
 pub fn routes(read: &Read<'_>) -> Routes {
     let editable = vocabulary::has(read.states, EDITABLE);
     Routes {
@@ -154,7 +188,7 @@ pub fn routes(read: &Read<'_>) -> Routes {
         focus: read.component
             && vocabulary::has(read.states, FOCUSABLE)
             && read.toolkit != Toolkit::Gtk4,
-        select: false,
+        select: selector(read).is_some(),
         expand: expander(read).map(|_| Expander::Action),
         text: read.editable_text && read.text && editable,
     }
@@ -235,7 +269,79 @@ mod tests {
             actions,
             toolkit: Toolkit::Gtk3,
             scrolled: false,
+            children: 0,
         }
+    }
+
+    const MENU_ITEM: u32 = 35;
+    const COMBO_BOX: u32 = 11;
+
+    /// A Qt node's read.
+    fn qt<'a>(role: u32, states: &'a [u32], actions: &'a [(i32, String)]) -> Read<'a> {
+        Read {
+            toolkit: Toolkit::Qt,
+            ..read(role, states, actions)
+        }
+    }
+
+    // Qt opens a menu title only with `ShowMenu`: pressing a menu-bar title, or a
+    // menu item with a submenu, is opening it. It is a press only on a Qt menu
+    // item that holds its menu; a combo box presses with `Press`, and the name
+    // means nothing elsewhere.
+    #[test]
+    fn show_menu_presses_a_qt_menu_item_that_holds_its_menu_and_nothing_else() {
+        let title = named(&["ShowMenu"]);
+        let holding = Read {
+            children: 1,
+            ..qt(MENU_ITEM, &[], &title)
+        };
+        assert_eq!(press(&holding), Some(0));
+        assert!(seam_actions(&holding).contains(&PRESS.to_string()));
+
+        assert_eq!(press(&qt(MENU_ITEM, &[], &title)), None, "no menu held");
+        let gtk = Read {
+            children: 1,
+            ..read(MENU_ITEM, &[], &title)
+        };
+        assert_eq!(press(&gtk), None, "not Qt");
+        let combo = named(&["ShowMenu", "Press"]);
+        let combo_box = Read {
+            children: 1,
+            ..qt(COMBO_BOX, &[], &combo)
+        };
+        assert_eq!(press(&combo_box), Some(1), "a combo box presses with Press");
+        let button = Read {
+            children: 1,
+            ..qt(PUSH_BUTTON, &[], &title)
+        };
+        assert_eq!(press(&button), None, "only a menu item");
+    }
+
+    // Qt's views and tab lists have no Selection. Its `Toggle` selects an item
+    // that reads SELECTABLE and not CHECKABLE: the route `select` takes there, and
+    // never a press or a toggle on it.
+    #[test]
+    fn toggle_selects_a_qt_item_that_is_selectable_and_not_checkable() {
+        let toggle = named(&["Toggle"]);
+        let selectable = words(&[SELECTABLE, SENSITIVE, SHOWING]);
+        let cell = qt(TABLE_CELL, &selectable, &toggle);
+
+        assert_eq!(selector(&cell), Some(0));
+        assert!(routes(&cell).select);
+        assert_eq!(press(&cell), None);
+        assert_eq!(expander(&cell), None);
+
+        let checkable = words(&[SELECTABLE, CHECKABLE, SENSITIVE, SHOWING]);
+        assert_eq!(selector(&qt(TABLE_CELL, &checkable, &toggle)), None);
+        assert_eq!(selector(&qt(TABLE_CELL, &words(&[SHOWING]), &toggle)), None);
+        assert_eq!(
+            selector(&read(TABLE_CELL, &selectable, &toggle)),
+            None,
+            "not Qt"
+        );
+        let other = named(&["SetFocus"]);
+        assert_eq!(selector(&qt(TABLE_CELL, &selectable, &other)), None);
+        assert!(!routes(&qt(CHECK_BOX, &checkable, &toggle)).select);
     }
 
     // L3-20, L18-16: Chromium's press is the first of its press names, read by

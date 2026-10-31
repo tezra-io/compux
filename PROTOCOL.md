@@ -251,7 +251,10 @@ listed.
 Selects this item in its container. macOS route: `AXSelected` settable on the item (write `true`), else the
 container's `AXSelectedChildren` settable (write `[item]`). Read back `AXSelected`. Linux route: the container's
 `Selection.SelectChild(i)`, `i` the item's own `GetIndexInParent`, where the container lists `Selection`; read back
-`SELECTED`. An AT-SPI item never selects itself.
+`SELECTED`. A Qt item, whose views and tab lists list no `Selection`, selects itself with its own `Toggle` action
+where it reads `SELECTABLE` and not `CHECKABLE`: the action toggles the selection, so it is sent only while the item
+reads not selected, and a read-back that is still not selected is `not_observed`. That action is never a `toggle`
+route. No other AT-SPI item selects itself.
 
 ### 4.3 `toggle`
 
@@ -515,11 +518,11 @@ menu it has made.
 
 | Verb | Listed when (macOS) | Listed when (Linux) |
 |---|---|---|
-| `press` | its own actions include `AXPress` | one of its actions is named `click`, `press`, `activate`, `jump`, `check` or `open` (any case), or `Toggle` on a check box, radio or toggle button |
+| `press` | its own actions include `AXPress` | one of its actions is named `click`, `press`, `activate`, `jump`, `check` or `open` (any case), `Toggle` on a check box, radio or toggle button, or `ShowMenu` on a Qt menu item that holds its menu (a menu-bar title, or an item with a submenu: pressing a menu title opens it) |
 | `set_value` | `AXValue` is settable | it lists `EditableText` and reads `EDITABLE`, or it lists `Value` and is a slider, dial, spin button or scroll bar |
 | `type` | `AXSelectedText` is settable | it lists `EditableText` and `Text` and reads `EDITABLE` |
 | `focus` | `AXFocused` is settable | it lists `Component` and reads `FOCUSABLE`, and is not GTK 4 |
-| `select` | `AXSelected` is settable, or its container's `AXSelectedChildren` is | its container lists `Selection` |
+| `select` | `AXSelected` is settable, or its container's `AXSelectedChildren` is | its container lists `Selection`; on Qt, it reads `SELECTABLE` and not `CHECKABLE` and has a `Toggle` action |
 | `toggle` | a `checkbox`, `switch` or `radio` with `AXPress` and a readable check state | a `checkbox`, `switch` or `radio` with a press and a readable `CHECKED` |
 | `expand`, `collapse` | `AXExpanded` or `AXDisclosing` is settable, or a `disclosure` with `AXPress` and a readable value | it reads `EXPANDABLE` and has an expanding action or a press |
 | `scroll_to` | its own actions include `AXScrollToVisible` | Chromium: it lists `Component`; GTK: it sits inside a scroll pane; Qt: never |

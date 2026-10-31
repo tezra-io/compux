@@ -226,13 +226,18 @@ GTK. A reference is found again before every action, by its place in the tree an
 by the object itself: two candidates are `ambiguous_element`, one that stays
 unreadable after two more reads is `identity_unknown`. `inspect` is macOS-only.
 
+Two Qt routes are Qt's own. A Qt menu title (a menu-bar item, or an item with a
+submenu) names only `ShowMenu`, and pressing it opens its menu. Qt's item views
+and tab list list no `Selection`: a list or tree item that reads `SELECTABLE` and
+not `CHECKABLE` is selected by its own `Toggle`, sent only while it reads not
+selected, since the action toggles the selection.
+
 What the toolkits do not offer, measured on the fixture apps (`fixtures/linux`,
 `spike.sh` stage `verbs`), and so not listed there: a GTK 4 check box names no
 action (no `toggle`) and refuses `GrabFocus` (no `focus`); a GTK 4 menu-bar item
-names no action and a Qt one only `ShowMenu`, so neither menu opens by reference;
-Qt's item views and tab list list no `Selection` (no `select`; a Qt tab is
-pressed), its tree cells' one action toggles their selection (no `expand`), and Qt
-has no `scroll_to`.
+names no action, so its menu does not open by reference; a Qt tab is pressed (no
+`select`), a Qt tree cell's one action toggles its selection (no `expand`), and
+Qt has no `scroll_to`.
 
 Nothing on Linux switches accessibility on for the person. An application in
 front whose toolkit publishes no tree until it is asked, and whose tree stays

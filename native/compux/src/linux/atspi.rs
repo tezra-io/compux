@@ -233,6 +233,8 @@ pub(super) struct Known {
     pub toolkit: Toolkit,
     pub scrolled: bool,
     pub frame: Option<Frame>,
+    /// How many children it said it has.
+    pub children: usize,
 }
 
 impl Known {
@@ -247,6 +249,7 @@ impl Known {
             actions: &self.actions,
             toolkit: self.toolkit,
             scrolled: self.scrolled,
+            children: self.children,
         }
     }
 
@@ -647,6 +650,7 @@ impl Real {
             toolkit,
             scrolled: place.scrolled,
             frame: frame.ok().flatten(),
+            children: count.unwrap_or(0),
         };
         // A combo box that is not open holds what a click would open, at places it
         // is not (Qt), or the selected option again (Chromium).

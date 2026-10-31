@@ -19,7 +19,7 @@ whose evidence is the reply itself (a refusal, a condition met, a surface on a
 receipt) say so in their expectation.
 
 Exit 0 when every step met its expectation, 1 otherwise; the JSON has each step's
-request, reply and verdict. The first step is `probe`, read as a doctor reads it.
+request, reply and verdict. The last step is `probe`, read as a doctor reads it.
 """
 
 import argparse
@@ -188,14 +188,16 @@ def steps_for(toolkit):
             ("scroll_to", None, "Entry 200", {}, ("event", "far_list", "scroll", "bottom")),
         ],
         "qt": [
-            # Qt's tab list and item views list no Selection: a tab is pressed.
+            # Qt's tab list and item views list no Selection: a tab is pressed, and
+            # a list or tree item is selected by its own Toggle.
             ("select", "tab", "Advanced", {}, ("unrouted",)),
             ("press", "tab", "About", {}, ("event", "tabs", "select", "About")),
             ("toggle", "checkbox", f"{label} checkbox", {"on": True},
              ("event", "checkbox", "toggle", "on")),
             ("focus", "textfield", "Search", {}, ("event", "search", "focus", None)),
-            ("select", "row", "Banana", {}, ("unrouted",)),
-            # A Qt tree cell's one action, Toggle, toggles its selection.
+            ("select", "row", "Banana", {}, ("event", "list", "select", "Banana")),
+            ("select", "cell", "Pictures", {}, ("event", "outline", "select", "Pictures")),
+            # That Toggle toggles the selection, so it never expands a tree cell.
             ("expand", "cell", "Documents", {}, ("unrouted",)),
             ("collapse", "cell", "Projects", {}, ("unrouted",)),
             ("scroll_to", "row", "Entry 14", {}, ("unrouted",)),
@@ -250,8 +252,8 @@ def run_step(helper, toolkit, state_path, step):
 
 
 # Whether the toolkit's menu-bar item can be pressed open: a GTK 4 menu-bar item
-# names no action, and Qt's names only ShowMenu.
-MENU_OPENS = {"gtk3": True, "gtk4": False, "qt": False}
+# names no action; Qt's names only ShowMenu, which is its press.
+MENU_OPENS = {"gtk3": True, "gtk4": False, "qt": True}
 
 
 def menu_flow(helper, toolkit, state_path):
@@ -369,11 +371,13 @@ def run(args):
     helper = Helper(args.binary, args.out + ".stderr")
     try:
         hello = helper.handshake()
-        results = [probe_check(helper)]
-        results += [run_step(helper, args.toolkit, args.state, step)
-                    for step in steps_for(args.toolkit)]
+        results = [run_step(helper, args.toolkit, args.state, step)
+                   for step in steps_for(args.toolkit)]
         results.append(menu_flow(helper, args.toolkit, args.state))
         results.append(dialog_flow(helper, args.toolkit, args.state))
+        # Last: a GTK 4 application can register after the first listing, and a
+        # probe before it did reads the bus empty.
+        results.append(probe_check(helper))
     finally:
         helper.close()
     return {"toolkit": args.toolkit, "hello_actions": hello.get("actions"),

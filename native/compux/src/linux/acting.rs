@@ -219,7 +219,13 @@ impl Real {
             }
             Write::SelectedText(text) => self.type_text(&bus, &at, text, limit),
             Write::SelectedChildren(item) => self.select_child(&bus, &at, item, limit),
-            Write::Selected | Write::Expand(..) => Err(no_route("that write")),
+            // Qt's item `Toggle`; `semantic` sends it only while the item reads
+            // not selected.
+            Write::Selected => {
+                let index = routes::selector(&known.read()).ok_or_else(|| no_route("select"))?;
+                self.do_action(&bus, &at, index, limit)
+            }
+            Write::Expand(..) => Err(no_route("that write")),
         }
     }
 
@@ -451,12 +457,16 @@ mod tests {
     use crate::ax::{Ax, Handle, Write, PRESS, SCROLL_TO_VISIBLE};
     use crate::gate::SystemClock;
     use crate::linux::atspi::Real;
+    use std::sync::Arc;
+
+    use crate::gate::Gate;
     use crate::linux::fake::{
         self, Desktop, Fake, Life, Node, ACTIVE, APP, CHECKED, EDITABLE, EXPANDABLE, EXPANDED,
         FOCUSABLE, FOCUSED, PID, SELECTABLE, SELECTED, VERTICAL,
     };
     use crate::semantic::{self, Op, Verb};
     use crate::tree::{self, Walk};
+    use crate::wire::Effect;
 
     const TIMEOUT: Duration = Duration::from_millis(200);
     const WRITE_MS: u64 = 500;
@@ -676,6 +686,98 @@ mod tests {
 
         assert_eq!(fake.sent("DoAction"), vec!["/w/bold 0"]);
         assert_eq!(ax.states(bold, true).expect("reads").on, Some(true));
+    }
+
+    /// A window of a Qt application holding these nodes.
+    fn qt_window(top: &[&str], nodes: Vec<(&str, Node)>) -> Desktop {
+        let mut desktop = fake::one_window(top, nodes);
+        desktop.put(
+            APP,
+            fake::ROOT,
+            Node::of(75)
+                .named("qt")
+                .holding(APP, &["/w"])
+                .made_with("Qt", "6.4.2"),
+        );
+        desktop
+    }
+
+    // Qt's views have no Selection. `select` sends a selectable item's own
+    // `Toggle`, only while the item reads not selected, and reads SELECTED back:
+    // an item that turned selected changed, one that did not is not observed, and
+    // one already selected is sent nothing. `toggle` never takes that action.
+    #[test]
+    fn select_sends_a_qt_items_toggle_only_while_it_reads_not_selected() {
+        let item = |name: &str, flips: Option<u32>, bits: &[u32]| Node {
+            flips,
+            ..Node::of(56)
+                .named(name)
+                .at(10, 10, 80, 20)
+                .reading(bits)
+                .acting(&[Ok("Toggle")])
+        };
+        let (fake, ax) = reader(qt_window(
+            &["/w/banana", "/w/cherry", "/w/stuck"],
+            vec![
+                ("/w/banana", item("Banana", Some(SELECTED), &[SELECTABLE])),
+                ("/w/cherry", item("Cherry", None, &[SELECTABLE, SELECTED])),
+                ("/w/stuck", item("Stuck", None, &[SELECTABLE])),
+            ],
+        ));
+        let found = walk(&ax);
+        let (banana, cherry, stuck) = (
+            listed(&found, "Banana"),
+            listed(&found, "Cherry"),
+            listed(&found, "Stuck"),
+        );
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+
+        let selecting = plan(&ax, banana, Verb::Select).expect("a route");
+        assert!(!selecting.already());
+        semantic::send(&ax, banana, &selecting, WRITE_MS).expect("sent");
+        let selected = semantic::judge(&gate, &ax, banana, &selecting);
+        assert!(plan(&ax, cherry, Verb::Select).expect("a route").already());
+        let unmoved = plan(&ax, stuck, Verb::Select).expect("a route");
+        semantic::send(&ax, stuck, &unmoved, WRITE_MS).expect("sent");
+        let unseen = semantic::judge(&gate, &ax, stuck, &unmoved);
+
+        assert_eq!(selected.effect, Effect::Changed);
+        assert_eq!(unseen.effect, Effect::NotObserved);
+        assert_eq!(fake.sent("DoAction"), vec!["/w/banana 0", "/w/stuck 0"]);
+        assert!(fake.sent("SelectChild").is_empty());
+        assert_eq!(
+            plan(&ax, cherry, Verb::Toggle(false)).err().as_deref(),
+            Some("ax_action_unsupported")
+        );
+    }
+
+    // A Qt menu title opens with `ShowMenu`, which is its press: it holds its menu.
+    #[test]
+    fn a_qt_menu_title_is_pressed_by_show_menu() {
+        let (fake, ax) = reader(qt_window(
+            &["/w/bar"],
+            vec![
+                (
+                    "/w/bar",
+                    Node::of(34).at(0, 0, 300, 24).holding(APP, &["/w/actions"]),
+                ),
+                (
+                    "/w/actions",
+                    Node::of(35)
+                        .named("Actions")
+                        .at(0, 0, 60, 24)
+                        .acting(&[Ok("ShowMenu")])
+                        .holding(APP, &["/w/menu"]),
+                ),
+                ("/w/menu", Node::of(41)),
+            ],
+        ));
+        let found = walk(&ax);
+        let actions = listed(&found, "Actions");
+
+        ax.perform(actions, PRESS, WRITE_MS).expect("opened");
+
+        assert_eq!(fake.sent("DoAction"), vec!["/w/actions 0"]);
     }
 
     // L4-6: a GTK 3 expander's one action is `activate`. Expand sends it only while
