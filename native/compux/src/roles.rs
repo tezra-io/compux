@@ -78,6 +78,10 @@ const ALERT_SUBROLES: [&str; 2] = ["AXApplicationAlert", "AXApplicationAlertDial
 /// The subroles that make a window a dialog. A sheet is one by its role.
 const DIALOG_SUBROLES: [&str; 2] = ["AXDialog", "AXSystemDialog"];
 
+/// The one subrole the Linux reader gives: a text node that reads MULTI_LINE, which
+/// AT-SPI's role number alone does not tell from a one-line field.
+pub const MULTI_LINE: &str = "multi line";
+
 /// The normalised role for a platform role and subrole (PROTOCOL.md §6.1).
 pub fn normalise(role: &str, subrole: Option<&str>) -> &'static str {
     if subrole.is_some_and(|subrole| ALERT_SUBROLES.contains(&subrole)) {
@@ -87,6 +91,7 @@ pub fn normalise(role: &str, subrole: Option<&str>) -> &'static str {
         ("AXWindow", Some(subrole)) if DIALOG_SUBROLES.contains(&subrole) => "dialog",
         ("AXCheckBox", Some("AXSwitch" | "AXToggle")) => "switch",
         ("AXRadioButton", Some("AXTabButton")) => "tab",
+        ("text" | "entry", Some(MULTI_LINE)) => "textarea",
         _ => by_role(role),
     }
 }
@@ -131,6 +136,56 @@ fn by_role(role: &str) -> &'static str {
         "AXDateField" | "AXTimeField" => "datefield",
         "AXWebArea" => "document",
         "AXApplication" => "application",
+        _ => by_atspi_role(role),
+    }
+}
+
+/// The normalised role an AT-SPI role names, by the `AtspiRole` constant's own
+/// name as the Linux reader spells it (`linux::vocabulary`). A toggle button is a
+/// switch, as macOS's toggle subrole is; a text node is a one-line field unless the
+/// reader says it reads MULTI_LINE.
+fn by_atspi_role(role: &str) -> &'static str {
+    match role {
+        "push button" => "button",
+        "push button menu" => "menubutton",
+        "check box" => "checkbox",
+        "toggle button" | "switch" => "switch",
+        "radio button" => "radio",
+        "page tab" => "tab",
+        "entry" | "password text" | "text" => "textfield",
+        "combo box" => "combobox",
+        "menu item" | "check menu item" | "radio menu item" | "tearoff menu item" => "menuitem",
+        "link" => "link",
+        "slider" | "dial" => "slider",
+        "spin button" => "stepper",
+        "list item" | "tree item" | "table row" => "row",
+        "table cell" => "cell",
+        "list" | "list box" => "list",
+        "table" => "table",
+        "tree" | "tree table" => "tree",
+        "scroll pane" => "scrollarea",
+        "scroll bar" => "scrollbar",
+        "split pane" => "splitter",
+        "tool bar" => "toolbar",
+        "page tab list" => "tablist",
+        "panel" | "filler" | "grouping" | "section" | "form" => "group",
+        "menu" | "popup menu" => "menu",
+        "menu bar" => "menubar",
+        "frame" | "window" => "window",
+        "dialog" | "file chooser" | "color chooser" | "font chooser" => "dialog",
+        "alert" | "notification" => "alert",
+        "label" | "static" => "text",
+        "image" | "icon" => "image",
+        "heading" => "heading",
+        "progress bar" | "level bar" => "progress",
+        "date editor" => "datefield",
+        "document frame"
+        | "document web"
+        | "document text"
+        | "document email"
+        | "document spreadsheet"
+        | "document presentation" => "document",
+        "application" => "application",
         _ => "unknown",
     }
 }
@@ -299,6 +354,104 @@ mod tests {
         ];
         for (role, normalised) in rest {
             assert_eq!(normalise(role, None), normalised, "{role}");
+        }
+    }
+
+    // Every AT-SPI role the contract maps, by the constant's own name as the Linux
+    // reader spells it (`linux::vocabulary`), with the one refinement the reader
+    // adds: a text node that reads MULTI_LINE.
+    #[test]
+    fn every_mapped_atspi_role_normalises_as_the_contract_says() {
+        let table: [(&str, Option<&str>, &str); 63] = [
+            ("push button", None, "button"),
+            ("push button menu", None, "menubutton"),
+            ("check box", None, "checkbox"),
+            ("toggle button", None, "switch"),
+            ("switch", None, "switch"),
+            ("radio button", None, "radio"),
+            ("page tab", None, "tab"),
+            ("entry", None, "textfield"),
+            ("password text", None, "textfield"),
+            ("text", None, "textfield"),
+            ("text", Some(MULTI_LINE), "textarea"),
+            ("entry", Some(MULTI_LINE), "textarea"),
+            ("combo box", None, "combobox"),
+            ("menu item", None, "menuitem"),
+            ("check menu item", None, "menuitem"),
+            ("radio menu item", None, "menuitem"),
+            ("tearoff menu item", None, "menuitem"),
+            ("link", None, "link"),
+            ("slider", None, "slider"),
+            ("dial", None, "slider"),
+            ("spin button", None, "stepper"),
+            ("list item", None, "row"),
+            ("tree item", None, "row"),
+            ("table row", None, "row"),
+            ("table cell", None, "cell"),
+            ("list", None, "list"),
+            ("list box", None, "list"),
+            ("table", None, "table"),
+            ("tree", None, "tree"),
+            ("tree table", None, "tree"),
+            ("scroll pane", None, "scrollarea"),
+            ("scroll bar", None, "scrollbar"),
+            ("split pane", None, "splitter"),
+            ("tool bar", None, "toolbar"),
+            ("page tab list", None, "tablist"),
+            ("panel", None, "group"),
+            ("filler", None, "group"),
+            ("grouping", None, "group"),
+            ("section", None, "group"),
+            ("form", None, "group"),
+            ("menu", None, "menu"),
+            ("popup menu", None, "menu"),
+            ("menu bar", None, "menubar"),
+            ("frame", None, "window"),
+            ("window", None, "window"),
+            ("dialog", None, "dialog"),
+            ("file chooser", None, "dialog"),
+            ("alert", None, "alert"),
+            ("notification", None, "alert"),
+            ("label", None, "text"),
+            ("static", None, "text"),
+            ("image", None, "image"),
+            ("icon", None, "image"),
+            ("heading", None, "heading"),
+            ("progress bar", None, "progress"),
+            ("level bar", None, "progress"),
+            ("date editor", None, "datefield"),
+            ("document web", None, "document"),
+            ("document frame", None, "document"),
+            ("document text", None, "document"),
+            ("application", None, "application"),
+            ("ruler", None, "unknown"),
+            ("role 131", None, "unknown"),
+        ];
+        for (role, subrole, normalised) in table {
+            assert_eq!(normalise(role, subrole), normalised, "{role} {subrole:?}");
+        }
+    }
+
+    // The surfaces an AT-SPI tree names, by kind and by the role that made each
+    // one; a frame or a plain window is not one.
+    #[test]
+    fn atspi_surfaces_are_named_by_kind_and_by_their_role() {
+        for (role, kind) in [
+            ("dialog", "dialog"),
+            ("file chooser", "dialog"),
+            ("alert", "alert"),
+            ("notification", "alert"),
+            ("menu", "menu"),
+            ("popup menu", "menu"),
+        ] {
+            assert_eq!(
+                surface(role, None),
+                Some((kind, role.to_string())),
+                "{role}"
+            );
+        }
+        for role in ["frame", "window", "menu bar", "push button"] {
+            assert_eq!(surface(role, None), None, "{role}");
         }
     }
 

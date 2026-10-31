@@ -115,10 +115,11 @@ const INTERACTIVE: &[&str] = &[
 /// list the whole tree.
 ///
 /// Then AT-SPI's, as `GetName(i)` names them: the press names (click, press,
-/// activate, jump, check, open, clickAncestor) and Qt's toggle and stepping names
-/// (L3-19). Not `doDefault`, which Chromium advertises on plain text where it does
-/// nothing (L18-16), nor `showContextMenu`, `ShowMenu` or `SetFocus`. The toolkits disagree on case, so these are compared
-/// without it.
+/// activate, jump, check, open) and Qt's toggle and stepping names (L3-19). Not
+/// `doDefault`, which Chromium advertises on plain text where it does nothing
+/// (L18-16), nor `clickAncestor`, Chromium's text inside a link or a clickable div,
+/// whose ancestor is the control, nor `showContextMenu`, `ShowMenu` or `SetFocus`.
+/// The toolkits disagree on case, so these are compared without it.
 const PRIMARY_ACTIONS: &[&str] = &[
     "AXPress",
     "AXConfirm",
@@ -132,7 +133,6 @@ const PRIMARY_ACTIONS: &[&str] = &[
     "jump",
     "check",
     "open",
-    "clickAncestor",
     "toggle",
     "increase",
     "decrease",
@@ -202,8 +202,8 @@ pub struct Node {
     /// selects its children.
     pub routes: Routes,
     pub states: States,
-    /// `None` where the platform says nothing about where it is. The macOS walk
-    /// lists no such node; the field is optional for the platforms that cannot.
+    /// `None` where the platform places nothing (GTK 4, a Wayland session). The
+    /// macOS walk lists no such node.
     pub frame: Option<Frame>,
     /// Up to three ancestor labels, nearest last.
     pub path: Vec<String>,
@@ -639,8 +639,9 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// List a node the shape asked for, if it says where it is: a listing gives
-    /// every node it lists a click point. Only then is it asked which writes it
+    /// List a node the shape asked for, if it says where it is — or is on screen
+    /// where the platform places nothing, which is listed with no click point.
+    /// Only then is it asked which writes it
     /// takes, what its states read and — unless it is secure — what its value is: a
     /// message each, and the walk passes many more nodes than it lists. `value` is
     /// the value a find already read, so it is not asked twice. Otherwise the
@@ -654,7 +655,10 @@ impl<'a> Walker<'a> {
         hidden: Option<usize>,
         value: Option<Option<String>>,
     ) -> Option<Retained> {
-        let (Some(role), Some(frame)) = (facts.role, facts.frame) else {
+        let Some(role) = facts
+            .role
+            .filter(|_| facts.frame.is_some() || facts.placeless)
+        else {
             return Some(element);
         };
         let handle = element.handle();
@@ -685,7 +689,7 @@ impl<'a> Walker<'a> {
             hidden,
             under,
             role,
-            frame: Some(frame),
+            frame: facts.frame,
             element,
         });
         None
@@ -958,16 +962,7 @@ mod tests {
         }
 
         for primary in [
-            "click",
-            "Press",
-            "press",
-            "activate",
-            "jump",
-            "check",
-            "open",
-            "clickAncestor",
-            "Toggle",
-            "Increase",
+            "click", "Press", "press", "activate", "jump", "check", "open", "Toggle", "Increase",
             "Decrease",
         ] {
             assert!(
@@ -975,12 +970,15 @@ mod tests {
                 "{primary} makes a control"
             );
         }
+        // `clickAncestor` is Chromium's text inside a link or a clickable div: the
+        // ancestor is the control, and the text would list it twice (L18-16).
         for secondary in [
             "showContextMenu",
             "ShowMenu",
             "SetFocus",
             "doDefault",
             "menu",
+            "clickAncestor",
         ] {
             assert!(
                 !eligible(Some("panel"), &[secondary.to_string()]),
@@ -1006,6 +1004,33 @@ mod tests {
         assert_eq!(labels(&found), vec!["Save", "Open"]);
         assert!(found.nodes[0].actions_partial);
         assert!(!found.nodes[1].actions_partial);
+    }
+
+    // A platform that places nothing (GTK 4, a Wayland session) says so, and its
+    // controls are listed with no frame; a node with no frame on a platform that
+    // places its nodes is not on screen, and is not.
+    #[test]
+    fn a_control_the_platform_cannot_place_is_listed_without_a_frame() {
+        let (_recorder, ax) = platform(vec![
+            Scripted {
+                placeless: true,
+                ..Scripted::of("push button")
+            },
+            Scripted {
+                label: Some("Offscreen".to_string()),
+                ..Scripted::of("push button")
+            },
+            Scripted {
+                placeless: true,
+                ..acting("push button", "Placed", &["click"])
+            },
+        ]);
+
+        let found = whole(&ax);
+
+        assert_eq!(labels(&found), vec!["-", "Placed"]);
+        assert_eq!(found.nodes[0].frame, None);
+        assert_eq!(found.nodes[1].frame, Some(frame(0.0, 0.0)));
     }
 
     // A subrole is never a role, and a password field is listed like any other

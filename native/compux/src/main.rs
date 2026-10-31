@@ -377,6 +377,11 @@ fn main() {
     #[cfg(target_os = "macos")]
     disclaim::become_responsible();
 
+    // Linux: a helper started with no display takes the session's from the user
+    // manager, before compux starts a thread of its own.
+    #[cfg(target_os = "linux")]
+    linux::display::adopt_from_user_manager();
+
     // One serialized writer shared by the control reader, the action worker and
     // the capture observer thread (§8.4a): every response, acknowledgement, ack
     // and event frame goes through `emitter`, so two writers can never split each
@@ -451,9 +456,9 @@ struct Worker {
     /// produces. Held here because a badge is restarted from inside an action, and
     /// a restart needs everything the first start needed.
     emitter: capture::Emitter,
-    /// Whether `ax` is an accessibility API at all. The Linux build's is not (until
-    /// M86 L1), and every action that reads or acts on controls answers
-    /// `accessibility_unavailable` there rather than a refusal about the control.
+    /// Whether `ax` is an accessibility API at all. A build for a system with none
+    /// answers `accessibility_unavailable` to every action that reads or acts on
+    /// controls, rather than a refusal about the control.
     accessibility: bool,
     /// An action's semantic `until`, read BEFORE its input and taken by its check:
     /// whether the condition already held.
@@ -686,11 +691,19 @@ fn before_dispatch(
     gate: &Gate,
     worker: &mut Worker,
 ) -> Result<(), Failure> {
-    if !worker.accessibility && reads_controls(request) && !only_lists(request) {
+    if !worker.accessibility && reads_controls(request) {
         return Err(Failure::new(
             "accessibility_unavailable",
             "this build has no accessibility API, so it cannot read or act on controls by name; \
              work in the image instead"
+                .to_string(),
+        ));
+    }
+    if POINT_ACTIONS.contains(&request.action.as_str()) && !points_readable() {
+        return Err(Failure::new(
+            "unknown_action",
+            "this build cannot read the control under a point: this session does not place \
+             every control on the screen; list them with `elements` instead"
                 .to_string(),
         ));
     }
@@ -709,12 +722,6 @@ fn before_dispatch(
 /// What a reply needs to reach the caller before its deadline: a wait gives this
 /// much back rather than answer late.
 const DEADLINE_MARGIN_MS: u64 = 250;
-
-/// Is this request a listing a reader answers on its own: `elements`, in a build
-/// that reads controls without acting on them?
-fn only_lists(request: &wire::Request) -> bool {
-    controls_readable() && READING_ACTIONS.contains(&request.action.as_str())
-}
 
 /// Does this request read or act on controls through the accessibility API? A
 /// check that waits on the tree does, whatever the action.
@@ -894,17 +901,7 @@ fn answering(
         ));
     }
 
-    let facts =
-        match ax.facts(entry.element.handle()) {
-            Ok(facts) => facts,
-            Err(ax::Unread::NoAnswer) => return Err(Failure::new(
-                "stale_element",
-                "that control did not answer within the accessibility timeout, so it could not \
-                 be checked and nothing was sent; take `elements` again"
-                    .to_string(),
-            )),
-            Err(_gone_or_refused) => return Err(no_longer_there()),
-        };
+    let facts = ax.identify(entry.element.handle()).map_err(unidentified)?;
     match facts.role.clone() {
         Some(role) if role != entry.role => Err(Failure::new(
             "stale_element",
@@ -916,6 +913,33 @@ fn answering(
         )),
         Some(_) => Ok(facts),
         None => Err(no_longer_there()),
+    }
+}
+
+/// Why a reference could not be found again, in the caller's words. Each says
+/// nothing was sent, because nothing was.
+fn unidentified(identity: ax::Identity) -> Failure {
+    match identity {
+        ax::Identity::Unread(ax::Unread::NoAnswer) => Failure::new(
+            "stale_element",
+            "that control did not answer within the accessibility timeout, so it could not \
+             be checked and nothing was sent; take `elements` again"
+                .to_string(),
+        ),
+        ax::Identity::Unread(_gone_or_refused) => no_longer_there(),
+        ax::Identity::Ambiguous => Failure::new(
+            "ambiguous_element",
+            "the list changed under that reference: the control moved and another of its \
+             role took its place, so either could be the one you were shown and nothing was \
+             sent; take `elements` again"
+                .to_string(),
+        ),
+        ax::Identity::Unknown => Failure::new(
+            "identity_unknown",
+            "that control stopped answering while it was being checked, three reads in a row, \
+             so nothing was sent; take `elements` again"
+                .to_string(),
+        ),
     }
 }
 
@@ -1107,16 +1131,16 @@ const ACCESSIBILITY_ACTIONS: [&str; 11] = [
     "wait_for",
 ];
 
-/// Of those, the one that lists controls, which every build with an accessibility
-/// reader answers: macOS, and Linux through AT-SPI.
-const READING_ACTIONS: [&str; 1] = ["elements"];
+/// Of those, the one that reads the control under a point, which only macOS
+/// answers: a Linux session places no GTK 4 control, and nothing on Wayland.
+const POINT_ACTIONS: [&str; 1] = ["inspect"];
 
 /// The verbs that bind a window.
 const TARGET_ACTIONS: [&str; 2] = ["select_target", "release_target"];
 
-/// The verbs this build can really serve: `elements` only where there is a reader,
-/// the other accessibility ones only where there is an accessibility API that acts,
-/// the window ones only where a window can be bound.
+/// The verbs this build can really serve: the accessibility ones only where there
+/// is an accessibility API, `inspect` only where it can read a point, the window
+/// ones only where a window can be bound.
 fn advertised_actions() -> Vec<&'static str> {
     ACTIONS
         .into_iter()
@@ -1125,13 +1149,13 @@ fn advertised_actions() -> Vec<&'static str> {
         .collect()
 }
 
-/// Whether this build answers an action that reads or acts on controls: every one
-/// where it acts through an accessibility API, only the listing where it reads one.
-/// An action that is neither is always served.
+/// Whether this build answers an action that reads or acts on controls. An action
+/// that does neither is always served.
 fn accessibility_served(action: &str) -> bool {
-    !ACCESSIBILITY_ACTIONS.contains(&action)
-        || accessibility_supported()
-        || (controls_readable() && READING_ACTIONS.contains(&action))
+    if !ACCESSIBILITY_ACTIONS.contains(&action) {
+        return true;
+    }
+    accessibility_supported() && (points_readable() || !POINT_ACTIONS.contains(&action))
 }
 
 /// How an action can reach the machine in this build: `ax` only where there is an
@@ -1144,17 +1168,16 @@ fn input_methods() -> Vec<&'static str> {
     }
 }
 
-/// Does this build act through an accessibility API? Off macOS every verb that acts
-/// on a control answers a typed refusal; [M86] L1 flips this for Linux with its
-/// verbs.
+/// Does this build read and act on controls through an accessibility API? macOS,
+/// and Linux through AT-SPI (M86 L1). Elsewhere every verb that reads or acts on a
+/// control answers a typed refusal.
 fn accessibility_supported() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", target_os = "linux"))
 }
 
-/// Does this build read an application's controls? macOS, and Linux through AT-SPI
-/// (M86 L1, the reading half).
-fn controls_readable() -> bool {
-    cfg!(any(target_os = "macos", target_os = "linux"))
+/// Can this build read the control under a point?
+fn points_readable() -> bool {
+    cfg!(target_os = "macos")
 }
 
 /// Can this build bind a window at all?
@@ -1197,13 +1220,30 @@ fn indicator_presence(launcher: &Arc<dyn indicator::Launcher>) -> &'static str {
 /// capture works but synthetic input is discarded. Surfaced by the consumer's
 /// diagnostics (a doctor/setup surface); the model never calls this.
 fn probe() -> Result<Value, Failure> {
-    Ok(json!({
+    let reply = json!({
         "ok": true,
         "platform": std::env::consts::OS,
         "display_server": display_server(),
         "screen_capture": screen_capture_ok(),
         "input_control": input_control_ok(),
-    }))
+    });
+    Ok(with_x11_endpoint(reply))
+}
+
+/// Linux: whether an X endpoint answers, beside Wayland (XWayland) or as the
+/// session itself, since that is all an X client of this helper can reach.
+#[cfg(target_os = "linux")]
+fn with_x11_endpoint(mut reply: Value) -> Value {
+    if let Some(object) = reply.as_object_mut() {
+        let endpoint = linux::display::Server::here().x11_endpoint();
+        object.insert("x11_endpoint".to_string(), json!(endpoint));
+    }
+    reply
+}
+
+#[cfg(not(target_os = "linux"))]
+fn with_x11_endpoint(reply: Value) -> Value {
+    reply
 }
 
 // --- request_permissions (operational grant PROMPT, NOT a model action) -------
@@ -1432,26 +1472,21 @@ fn input_control_ok() -> bool {
 
 // Linux: X11 is permissive (no TCC — any local client may capture/inject); Wayland
 // deliberately blocks global capture + injection (no uniform API). Capability tracks
-// the display server; a real capture/input still fails loud per action.
+// the display server, decided by which socket answers; a real capture/input still
+// fails loud per action.
 #[cfg(target_os = "linux")]
 fn display_server() -> &'static str {
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        "wayland"
-    } else if std::env::var_os("DISPLAY").is_some() {
-        "x11"
-    } else {
-        "none"
-    }
+    linux::display::Server::here().name()
 }
 
 #[cfg(target_os = "linux")]
 fn screen_capture_ok() -> bool {
-    display_server() == "x11"
+    linux::display::Server::here() == linux::display::Server::X11
 }
 
 #[cfg(target_os = "linux")]
 fn input_control_ok() -> bool {
-    display_server() == "x11"
+    linux::display::Server::here() == linux::display::Server::X11
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -4410,10 +4445,65 @@ fn listing_frame(
         return Ok((display, named.geometry, named.region));
     }
     let view = view(request, gate, worker)?;
-    let geom = view.geometry(gate, worker)?;
-    let display = view.display(worker)?;
-    let region = viewing_region(request, &geom, worker)?;
-    Ok((display, geom, region))
+    drawn_in(&view, request, gate, worker)
+}
+
+/// The frame a listing's click points are drawn in: the view's display, or no
+/// frame at all on a session that places nothing, where a listing needs no
+/// display and no capture. A bound window always has its frame.
+fn drawn_in(
+    view: &View,
+    request: &wire::Request,
+    gate: &Gate,
+    worker: &mut Worker,
+) -> Result<(Display, Geometry, Region), Failure> {
+    if view.bound.is_some() || worker.ax.places() {
+        let geom = view.geometry(gate, worker)?;
+        let display = view.display(worker)?;
+        let region = viewing_region(request, &geom, worker)?;
+        return Ok((display, geom, region));
+    }
+    if request
+        .body
+        .get("region")
+        .is_some_and(|region| !region.is_null())
+    {
+        return Err(Failure::new(
+            "invalid_argument",
+            "this session gives no screen positions, so there is no image a region could \
+             be read in; list without one"
+                .to_string(),
+        ));
+    }
+    Ok(no_frame())
+}
+
+/// The frame of a session that places nothing: no display, no pixels, and a
+/// region with nothing in it, so every point named against it is outside.
+fn no_frame() -> (Display, Geometry, Region) {
+    let facts = MonitorFacts {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        scale_factor: 1.0,
+    };
+    let geometry = Geometry {
+        phys_w: 0,
+        phys_h: 0,
+        logical_w: 0.0,
+        logical_h: 0.0,
+        origin_x: 0.0,
+        origin_y: 0.0,
+        scale_factor: 1.0,
+    };
+    let region = Region {
+        x: 0.0,
+        y: 0.0,
+        w: 0.0,
+        h: 0.0,
+    };
+    (Display { facts, id: 0 }, geometry, region)
 }
 
 /// A listing's observation: no picture, so nothing for a later check to compare
@@ -4425,7 +4515,12 @@ fn mint_semantic(
     region: Region,
     elements: Option<Rc<ax::Elements>>,
 ) -> Observation {
-    let (sent_w, sent_h) = crop_rect(&geometry, &region).sent_dims();
+    // A frame with no pixels sends none, so no point can be read off it.
+    let (sent_w, sent_h) = if geometry.phys_w == 0 {
+        (0, 0)
+    } else {
+        crop_rect(&geometry, &region).sent_dims()
+    };
     worker.observations.mint(observation::Minting {
         kind: Kind::Semantic,
         display_id: display.id,
@@ -4646,9 +4741,8 @@ fn elements(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result
     }
 
     let view = view(request, gate, worker)?;
-    let geom = view.geometry(gate, worker)?;
-    let display = &view.display(worker)?;
-    let region = viewing_region(request, &geom, worker)?;
+    let (display, geom, region) = drawn_in(&view, request, gate, worker)?;
+    let display = &display;
 
     // A request with none of protocol 12's parameters reads exactly what protocol
     // 11 read, its settling for an application whose tree is still empty included.
@@ -6000,17 +6094,6 @@ mod tests {
         );
     }
 
-    /// The verbs whose every use needs the accessibility API or a bound window's
-    /// stream, which only the macOS build has.
-    const MACOS_ONLY_ACTIONS: [&str; 6] = [
-        "inspect",
-        "elements",
-        "press",
-        "set_value",
-        "select_target",
-        "release_target",
-    ];
-
     fn advertised(hello: &Value) -> Vec<&str> {
         hello["actions"]
             .as_array()
@@ -6022,22 +6105,13 @@ mod tests {
 
     // F1: the handshake lists only what THIS build can do. The engine builds the
     // model's verbs from it, and a verb that always refuses is a verb the model is
-    // invited to waste a turn on. The Linux build reads controls (M86 L1, the
-    // reading half) and acts on none of them yet, and binds no window.
+    // invited to waste a turn on. The Linux build lists and acts on controls through
+    // AT-SPI (M86 L1), answers no `inspect`, and binds no window.
     #[cfg(target_os = "linux")]
     #[test]
-    fn on_linux_the_handshake_offers_elements_and_nothing_that_acts_on_a_control() {
+    fn on_linux_the_handshake_offers_the_controls_and_their_verbs_and_no_inspect() {
         let v = hello(&test_launcher()).unwrap();
 
-        for absent in MACOS_ONLY_ACTIONS
-            .into_iter()
-            .filter(|action| *action != "elements")
-        {
-            assert!(
-                !advertised(&v).contains(&absent),
-                "{absent} is not offered on Linux"
-            );
-        }
         assert_eq!(
             advertised(&v),
             vec![
@@ -6055,13 +6129,42 @@ mod tests {
                 "paste",
                 "elements",
                 "windows",
+                "press",
+                "set_value",
+                "focus",
+                "select",
+                "toggle",
+                "expand",
+                "collapse",
+                "scroll_to",
+                "wait_for",
             ]
         );
         assert_eq!(
             v["capabilities"]["input_methods"],
-            json!(["foreground_hid"]),
-            "`ax` is how an action reaches a control, and none does on Linux yet"
+            json!(["foreground_hid", "ax"]),
+            "`ax` is how an action reaches a control, on both systems"
         );
+    }
+
+    // The probe says which display server answered, and whether an X endpoint
+    // answers, as or beside it. Pixels are offered on X11 alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_the_probe_says_which_display_answered() {
+        let v = probe().unwrap();
+
+        let server = v["display_server"].as_str().expect("a display server");
+        assert!(["x11", "wayland", "none"].contains(&server), "{v}");
+        let endpoint = v["x11_endpoint"]
+            .as_bool()
+            .expect("whether an X endpoint answers");
+        assert!(
+            endpoint || server != "x11",
+            "an X11 session is its own endpoint: {v}"
+        );
+        assert_eq!(v["screen_capture"], json!(server == "x11"), "{v}");
+        assert_eq!(v["input_control"], json!(server == "x11"), "{v}");
     }
 
     // And the macOS build offers every verb it offered before, in the same order.
@@ -6101,9 +6204,6 @@ mod tests {
                 "release_target",
             ]
         );
-        for present in MACOS_ONLY_ACTIONS {
-            assert!(advertised(&v).contains(&present));
-        }
         assert_eq!(
             v["capabilities"]["input_methods"],
             json!(["foreground_hid", "ax"])
@@ -6669,7 +6769,7 @@ mod tests {
         assert!(frame["actions"].is_array());
         assert_eq!(
             frame["capabilities"]["input_methods"],
-            if cfg!(target_os = "macos") {
+            if cfg!(any(target_os = "macos", target_os = "linux")) {
                 json!(["foreground_hid", "ax"])
             } else {
                 json!(["foreground_hid"])
@@ -7171,6 +7271,27 @@ mod tests {
         assert!(app.performed().is_empty(), "none of these sent anything");
     }
 
+    // On Linux a reference is also a place in the tree. Two candidates for it, or
+    // one that stays unreadable, are refusals of their own, and nothing is sent.
+    #[test]
+    fn a_reference_with_two_candidates_or_no_readable_one_is_refused_by_name() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        for (identity, code) in [
+            (ax::Identity::Ambiguous, "ambiguous_element"),
+            (ax::Identity::Unknown, "identity_unknown"),
+        ] {
+            let app = fixture_app();
+            let (mut worker, observation) = worker_listing(&gate, &app);
+            app.identifies_as(0, identity);
+
+            let frame = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+
+            assert_eq!(frame["error"], json!(code), "{frame}");
+            assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"));
+            assert!(app.performed().is_empty());
+        }
+    }
+
     // A reference nobody minted, and one against an image that listed no controls
     // at all. Both are `stale_element`: the next move is to take a list.
     #[test]
@@ -7629,17 +7750,14 @@ mod tests {
         );
     }
 
-    // M86 L1, the reading half: on Linux `elements` lists the controls of the
-    // application whose window reads ACTIVE, read through AT-SPI by the shared walk,
-    // with references, click points and what the walk cost — from a fake desktop,
-    // never the one this test runs on.
+    /// A desktop whose one application, this test process (so `/proc` can vouch
+    /// for it and the listing can hand out references), has an ACTIVE window with
+    /// a Save button in it.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn on_linux_elements_lists_the_controls_of_the_application_in_front() {
-        use crate::linux::fake::{Desktop, Fake, Node, ACTIVE, ENABLED, SENSITIVE, SHOWING};
+    fn linux_desktop_with_a_save_button() -> linux::fake::Desktop {
+        use crate::linux::fake::{Desktop, Node, ACTIVE, ENABLED, SENSITIVE, SHOWING};
 
         const APP: &str = ":1.10";
-        // A process `/proc` can vouch for, so the listing can hand out references.
         let me = std::process::id();
         let mut desktop = Desktop::with_applications(vec![(
             APP,
@@ -7665,7 +7783,22 @@ mod tests {
                 .at(100, 200, 80, 24)
                 .acting(&[Ok("click")]),
         );
-        let (fake, bus) = Fake::start(desktop, Duration::from_millis(200));
+        desktop
+    }
+
+    // M86 L1: on Linux `elements` lists the controls of the application whose
+    // window reads ACTIVE, read through AT-SPI by the shared walk, with references,
+    // verbs, click points and what the walk cost — from a fake desktop, never the
+    // one this test runs on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_elements_lists_the_controls_of_the_application_in_front() {
+        use crate::linux::fake::Fake;
+
+        let (fake, bus) = Fake::start(
+            linux_desktop_with_a_save_button(),
+            Duration::from_millis(200),
+        );
         let platform: Rc<dyn ax::Ax> = Rc::new(linux::atspi::Real::over(bus));
         let gate = Gate::new("boot-test".to_string(), Arc::new(SystemClock::new()));
         let facts = MonitorFacts {
@@ -7692,11 +7825,11 @@ mod tests {
             payload["elements"],
             json!([{
                 "element_ref": "e1",
-                "role": "unknown",
+                "role": "button",
                 "native_role": "push button",
                 "label": "Save",
                 "enabled": true,
-                "verbs": [],
+                "verbs": ["press"],
                 "bounds": { "x": 100, "y": 200, "w": 80, "h": 24 },
                 "path": ["fixture", "Fixture"],
                 "x": 140,
@@ -7712,6 +7845,69 @@ mod tests {
         assert!(payload["ax_activation"]
             .as_str()
             .is_some_and(|note| note.starts_with("read ")));
+    }
+
+    /// A screen no test may take a frame of.
+    #[cfg(target_os = "linux")]
+    struct NoFrames;
+
+    #[cfg(target_os = "linux")]
+    impl Frames for NoFrames {
+        fn capture(&self, display_id: u32) -> Result<image::RgbaImage, Failure> {
+            panic!("display {display_id} was captured on a session that places nothing")
+        }
+    }
+
+    // A session that places nothing (Wayland, or no display in reach) still lists
+    // its controls: without bounds or click points, without asking for a display
+    // or a frame, and in an observation no point can be read off. Its references
+    // still act.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_a_session_that_places_nothing_lists_its_controls_without_a_display() {
+        use crate::linux::fake::Fake;
+
+        let (fake, bus) = Fake::start(
+            linux_desktop_with_a_save_button(),
+            Duration::from_millis(200),
+        );
+        let platform: Rc<dyn ax::Ax> = Rc::new(linux::atspi::Real::over(bus).without_positions());
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let mut worker = Worker {
+            displays: ScriptedDisplays::none(),
+            ..frames_worker(&gate, platform, Rc::new(NoFrames))
+        };
+
+        let mut list = running("elements", None);
+        list.body = json!({"action": "elements"});
+        let listed = served(&list, &gate, &mut worker);
+
+        assert_eq!(listed["ok"], json!(true), "{listed}");
+        let save = &listed["elements"][0];
+        assert_eq!(save["label"], json!("Save"), "{listed}");
+        assert_eq!(save["verbs"], json!(["press"]));
+        for placed in ["bounds", "x", "y"] {
+            assert!(
+                save.get(placed).is_none(),
+                "{placed} on a placeless control: {save}"
+            );
+        }
+        let id = listed["observation_id"].as_str().expect("an observation");
+        let observation = worker.observations.resolve(id).expect("held").clone();
+
+        let mut click = at_element("left_click", &observation, "e1");
+        click.element_ref = None;
+        click.body = json!({"action": "left_click", "x": 0, "y": 0, "observation_id": id});
+        let clicked = served(&click, &gate, &mut worker);
+        assert_eq!(
+            clicked["error"],
+            json!("point_outside_observation"),
+            "{clicked}"
+        );
+
+        let pressed = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+        assert_eq!(pressed["ok"], json!(true), "{pressed}");
+        assert_eq!(fake.sent("DoAction"), vec!["/w/save 0".to_string()]);
     }
 
     // A walk that stopped early SAYS it stopped early. Without that a caller reads
@@ -10154,10 +10350,25 @@ mod tests {
         assert_eq!(refused.code, "unknown_action");
     }
 
-    // Off macOS (until L1) every action that reads or acts on controls says the
-    // build has no accessibility API, rather than refusing the control. The Linux
-    // build lists controls (its own tests), and acts on none yet.
-    #[cfg(not(target_os = "macos"))]
+    // The Linux handshake does not offer `inspect`, and a caller that sends it
+    // anyway is told so before anything is read or captured.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_inspect_is_an_action_this_build_does_not_have() {
+        let refused =
+            dispatch(json!({"action": "inspect", "x": 1, "y": 1, "observation_id": "o-1"}))
+                .expect_err("not on Linux");
+
+        assert_eq!(refused.code, "unknown_action");
+        assert!(refused
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("elements")));
+    }
+
+    // Off macOS and Linux every action that reads or acts on controls says the
+    // build has no accessibility API, rather than refusing the control.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn off_macos_every_control_action_says_there_is_no_accessibility() {
         for body in [

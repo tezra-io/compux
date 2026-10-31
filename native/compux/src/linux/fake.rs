@@ -38,11 +38,23 @@ pub const FAILED: &str = "org.freedesktop.DBus.Error.Failed";
 
 /// AT-SPI state bits a script sets.
 pub const ACTIVE: u32 = 1;
+pub const CHECKED: u32 = 4;
 pub const EDITABLE: u32 = 7;
 pub const ENABLED: u32 = 8;
+pub const EXPANDABLE: u32 = 9;
+pub const EXPANDED: u32 = 10;
+pub const FOCUSABLE: u32 = 11;
+pub const FOCUSED: u32 = 12;
+pub const MULTI_LINE: u32 = 17;
+pub const SELECTABLE: u32 = 22;
+pub const SELECTED: u32 = 23;
 pub const SENSITIVE: u32 = 24;
 pub const SHOWING: u32 = 25;
+pub const VERTICAL: u32 = 29;
 pub const VISIBLE: u32 = 30;
+
+/// `ATSPI_RELATION_LABELLED_BY`.
+pub const LABELLED_BY: u32 = 2;
 
 /// What a node does when it is asked anything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +91,21 @@ pub struct Node {
     pub refuses: Vec<&'static str>,
     /// An application root's `ToolkitName` and `Version`.
     pub toolkit: (&'static str, &'static str),
+    /// `GetExtents` in window coordinates, where it differs from the screen's.
+    pub window_extents: Option<(i32, i32, i32, i32)>,
+    /// `Value`'s range.
+    pub range: (f64, f64),
+    /// The state bit `DoAction` flips, whichever action is done.
+    pub flips: Option<u32>,
+    /// Where `Component.ScrollTo` moves it.
+    pub scrolls_to: Option<(i32, i32, i32, i32)>,
+    /// The caret, and the one text selection, in characters.
+    pub caret: i32,
+    pub selection: Option<(i32, i32)>,
+    /// `GetRelationSet`: (relation type, targets as (bus name, path)).
+    pub relations: Vec<(u32, Vec<(String, String)>)>,
+    /// Members it answers `false` to: it took the call and did nothing.
+    pub declines: Vec<&'static str>,
 }
 
 impl Node {
@@ -98,7 +125,27 @@ impl Node {
             life: Life::Alive,
             refuses: Vec::new(),
             toolkit: ("", ""),
+            window_extents: None,
+            range: (0.0, 100.0),
+            flips: None,
+            scrolls_to: None,
+            caret: 0,
+            selection: None,
+            relations: Vec::new(),
+            declines: Vec::new(),
         }
+    }
+
+    /// With these state bits set as well.
+    pub fn reading(mut self, bits: &[u32]) -> Node {
+        self.states.extend_from_slice(bits);
+        self
+    }
+
+    /// Listing these interfaces as well, by their short names.
+    pub fn listing(mut self, interfaces: &[&'static str]) -> Node {
+        self.interfaces.extend_from_slice(interfaces);
+        self
     }
 
     pub fn named(self, name: &str) -> Node {
@@ -147,6 +194,32 @@ impl Node {
     }
 }
 
+/// The application most tests script, and its process.
+pub const APP: &str = ":1.10";
+pub const PID: i32 = 4711;
+
+/// One application (`APP`, process `PID`) with one active window `/w` holding
+/// `top`, and every other node at its path.
+pub fn one_window(top: &[&str], nodes: Vec<(&str, Node)>) -> Desktop {
+    let mut desktop = Desktop::with_applications(vec![(
+        APP,
+        PID as u32,
+        Node::of(75).named("fixture").holding(APP, &["/w"]),
+    )]);
+    let window = Node {
+        states: vec![ACTIVE, ENABLED, SENSITIVE, SHOWING, VISIBLE],
+        ..Node::of(23)
+            .named("Fixture")
+            .at(0, 0, 800, 600)
+            .holding(APP, top)
+    };
+    desktop.put(APP, "/w", window);
+    for (path, node) in nodes {
+        desktop.put(APP, path, node);
+    }
+    desktop
+}
+
 /// One call the fake received.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Call {
@@ -173,6 +246,8 @@ pub struct Desktop {
     pub quit: Vec<String>,
     /// What `org.a11y.Bus.GetAddress` answers, for the session-bus half.
     pub address: String,
+    /// The systemd user manager's `Environment`, for the session-bus half.
+    pub manager_environment: Vec<String>,
     pub calls: Vec<Call>,
 }
 
@@ -248,6 +323,24 @@ impl Fake {
         self.desktop().calls.clone()
     }
 
+    /// The calls of one member, as `path argument`, in order.
+    pub fn sent(&self, member: &str) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .filter(|call| call.member == member)
+            .map(|call| format!("{} {}", call.path, call.argument))
+            .collect()
+    }
+
+    /// What one node is scripted as now, writes included.
+    pub fn node(&self, bus: &str, path: &str) -> Node {
+        self.desktop()
+            .nodes
+            .get(&(bus.to_string(), path.to_string()))
+            .expect("a scripted node")
+            .clone()
+    }
+
     /// Change what one node answers from now on.
     pub fn change(&self, bus: &str, path: &str, edit: impl FnOnce(&mut Node)) {
         let mut desktop = self.desktop();
@@ -289,7 +382,10 @@ async fn serve(mut calls: MessageStream, server: Connection, desktop: Arc<Mutex<
             let mut desktop = desktop.lock().unwrap_or_else(|e| e.into_inner());
             let call = call_of(&header, &message);
             desktop.calls.push(call.clone());
-            answer(&desktop, &call, &message)
+            match written(&mut desktop, &call, &message) {
+                Some(reply) => reply,
+                None => answer(&desktop, &call, &message),
+            }
         };
         if let Err(error) = send(&server, &header, reply).await {
             eprintln!("fake desktop: a reply failed: {error}");
@@ -343,12 +439,21 @@ fn first_argument(message: &Message) -> String {
                     .map(|(start, _)| start.to_string())
             })
             .unwrap_or_default(),
+        // A coordinate type (`GetExtents`) or a scroll type (`ScrollTo`).
+        Some('u') => body
+            .deserialize::<(u32,)>()
+            .map(|(kind,)| kind.to_string())
+            .unwrap_or_default(),
         _ => String::new(),
     }
 }
 
 /// What the desktop answers to one call.
 enum Reply {
+    Flag(bool),
+    Range((i32, i32)),
+    Count(i32),
+    Relations(Vec<(u32, Vec<(String, String)>)>),
     Role(u32),
     Text(String),
     Words(Vec<u32>),
@@ -362,7 +467,215 @@ enum Reply {
     Silence,
 }
 
+/// A call that changes the desktop, or asks where a node sits: answered here, with
+/// the desktop to change. `None` for every other call.
+fn written(desktop: &mut Desktop, call: &Call, message: &Message) -> Option<Reply> {
+    let writes = [
+        "DoAction",
+        "SetTextContents",
+        "InsertText",
+        "DeleteText",
+        "GrabFocus",
+        "SelectChild",
+        "ScrollTo",
+        "Set",
+        "GetIndexInParent",
+    ];
+    let parent = call.member == "Get" && property_name(message) == "Parent";
+    if !writes.contains(&call.member.as_str()) && !parent {
+        return None;
+    }
+    if let Some(refusal) = unanswerable(desktop, call) {
+        return Some(refusal);
+    }
+    let key = (call.bus.clone(), call.path.clone());
+    if parent {
+        return Some(match parent_of(desktop, &key) {
+            Some((bus, at)) => Reply::Property(Value::from((bus, path(&at)))),
+            None => Reply::Error(FAILED),
+        });
+    }
+    if call.member == "GetIndexInParent" {
+        return Some(match index_in_parent(desktop, &key) {
+            Some(index) => Reply::Count(index),
+            None => Reply::Count(-1),
+        });
+    }
+    let declined = desktop.nodes[&key].declines.contains(&call.member.as_str());
+    if declined {
+        return Some(Reply::Flag(false));
+    }
+    Some(write(desktop, &key, call, message))
+}
+
+/// Why a call to this node gets no answer of its own, if it does not: its
+/// application quit, it is not there, it is destroyed or silent, or it refuses.
+fn unanswerable(desktop: &Desktop, call: &Call) -> Option<Reply> {
+    if desktop.quit.contains(&call.bus) {
+        return Some(Reply::Error(SERVICE_UNKNOWN));
+    }
+    let Some(node) = desktop.nodes.get(&(call.bus.clone(), call.path.clone())) else {
+        return Some(Reply::Error(UNKNOWN_OBJECT));
+    };
+    match node.life {
+        Life::Destroyed => return Some(Reply::Error(UNKNOWN_OBJECT)),
+        Life::Silent => return Some(Reply::Silence),
+        Life::Alive => {}
+    }
+    if node.refuses.contains(&call.member.as_str()) {
+        return Some(Reply::Error(UNKNOWN_OBJECT));
+    }
+    None
+}
+
+/// One write, done to the scripted node, answered `true` as a toolkit does.
+fn write(desktop: &mut Desktop, key: &(String, String), call: &Call, message: &Message) -> Reply {
+    let body = message.body();
+    match call.member.as_str() {
+        "SelectChild" => {
+            let Ok((index,)) = body.deserialize::<(i32,)>() else {
+                return Reply::Error(FAILED);
+            };
+            select_child(desktop, key, index)
+        }
+        "Set" => {
+            let Ok((_, name, value)) = body.deserialize::<(String, String, Value<'_>)>() else {
+                return Reply::Error(FAILED);
+            };
+            let node = desktop.nodes.get_mut(key).expect("checked above");
+            match (name.as_str(), f64::try_from(&value)) {
+                ("CurrentValue", Ok(number)) => {
+                    node.value = number;
+                    Reply::Nothing
+                }
+                _ => Reply::Error(FAILED),
+            }
+        }
+        _ => {
+            let node = desktop.nodes.get_mut(key).expect("checked above");
+            edit(node, call, message)
+        }
+    }
+}
+
+/// A write to the node itself.
+fn edit(node: &mut Node, call: &Call, message: &Message) -> Reply {
+    let body = message.body();
+    match call.member.as_str() {
+        "DoAction" => {
+            if let Some(bit) = node.flips {
+                flip(&mut node.states, bit);
+            }
+            Reply::Flag(true)
+        }
+        "SetTextContents" => match body.deserialize::<(String,)>() {
+            Ok((text,)) => {
+                node.text = text;
+                Reply::Flag(true)
+            }
+            Err(_) => Reply::Error(FAILED),
+        },
+        "InsertText" => match body.deserialize::<(i32, String, i32)>() {
+            Ok((at, text, _)) => {
+                node.text = spliced(&node.text, at, at, &text);
+                Reply::Flag(true)
+            }
+            Err(_) => Reply::Error(FAILED),
+        },
+        "DeleteText" => match body.deserialize::<(i32, i32)>() {
+            Ok((start, end)) => {
+                node.text = spliced(&node.text, start, end, "");
+                node.selection = None;
+                node.caret = start;
+                Reply::Flag(true)
+            }
+            Err(_) => Reply::Error(FAILED),
+        },
+        "GrabFocus" => {
+            if !node.states.contains(&FOCUSED) {
+                node.states.push(FOCUSED);
+            }
+            Reply::Flag(true)
+        }
+        "ScrollTo" => {
+            if let Some(extents) = node.scrolls_to {
+                node.extents = extents;
+            }
+            Reply::Flag(true)
+        }
+        _ => Reply::Error(UNKNOWN_METHOD),
+    }
+}
+
+/// `Selection.SelectChild(index)`: that child selected, every other one not.
+fn select_child(desktop: &mut Desktop, key: &(String, String), index: i32) -> Reply {
+    let children = desktop.nodes[key].children.clone();
+    let Some(chosen) = usize::try_from(index).ok().and_then(|at| children.get(at)) else {
+        return Reply::Flag(false);
+    };
+    for child in &children {
+        if let Some(node) = desktop.nodes.get_mut(child) {
+            node.states.retain(|bit| *bit != SELECTED);
+            if child == chosen {
+                node.states.push(SELECTED);
+            }
+        }
+    }
+    Reply::Flag(true)
+}
+
+fn flip(states: &mut Vec<u32>, bit: u32) {
+    if states.contains(&bit) {
+        states.retain(|set| *set != bit);
+    } else {
+        states.push(bit);
+    }
+}
+
+/// `text` with the characters from `start` to `end` replaced by `with`.
+fn spliced(text: &str, start: i32, end: i32, with: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let clamp = |at: i32| usize::try_from(at).unwrap_or(0).min(chars.len());
+    let (start, end) = (clamp(start), clamp(end));
+    let mut out: String = chars[..start].iter().collect();
+    out.push_str(with);
+    out.extend(chars[end.max(start)..].iter());
+    out
+}
+
+/// The node that lists this one as a child.
+fn parent_of(desktop: &Desktop, key: &(String, String)) -> Option<(String, String)> {
+    desktop
+        .nodes
+        .iter()
+        .find(|(_, node)| node.children.contains(key))
+        .map(|(parent, _)| parent.clone())
+}
+
+fn index_in_parent(desktop: &Desktop, key: &(String, String)) -> Option<i32> {
+    let parent = parent_of(desktop, key)?;
+    let place = desktop.nodes[&parent]
+        .children
+        .iter()
+        .position(|child| child == key)?;
+    i32::try_from(place).ok()
+}
+
+fn property_name(message: &Message) -> String {
+    message
+        .body()
+        .deserialize::<(String, String)>()
+        .map(|(_, name)| name)
+        .unwrap_or_default()
+}
+
 fn answer(desktop: &Desktop, call: &Call, message: &Message) -> Reply {
+    if call.bus == "org.freedesktop.systemd1" {
+        return match call.argument.as_str() {
+            "Environment" => Reply::Property(Value::from(desktop.manager_environment.clone())),
+            _ => Reply::Error(UNKNOWN_METHOD),
+        };
+    }
     match call.interface.as_str() {
         "org.a11y.Bus" => Reply::Text(desktop.address.clone()),
         "org.a11y.atspi.Registry" => registration(call),
@@ -424,7 +737,16 @@ fn method(node: &Node, call: &Call) -> Reply {
             None => Reply::Error(FAILED),
         },
         "GetChildren" => Reply::Children(node.children.clone()),
+        "GetExtents" if call.argument == "1" => {
+            Reply::Extents(node.window_extents.unwrap_or(node.extents))
+        }
         "GetExtents" => Reply::Extents(node.extents),
+        "GetRelationSet" => Reply::Relations(node.relations.clone()),
+        "GetNSelections" => Reply::Count(i32::from(node.selection.is_some())),
+        "GetSelection" => match node.selection {
+            Some(range) if index == 0 => Reply::Range(range),
+            _ => Reply::Error(FAILED),
+        },
         "GetName" => match node.actions.get(index) {
             Some(Ok(name)) => Reply::Text(name.to_string()),
             Some(Err(error)) => Reply::Error(error),
@@ -452,6 +774,9 @@ fn property(node: &Node, message: &Message) -> Reply {
         "ChildCount" => Value::from(node.children.len() as i32),
         "NActions" => Value::from(node.actions.len() as i32),
         "CurrentValue" => Value::from(node.value),
+        "MinimumValue" => Value::from(node.range.0),
+        "MaximumValue" => Value::from(node.range.1),
+        "CaretOffset" => Value::from(node.caret),
         "ToolkitName" => Value::from(node.toolkit.0),
         "Version" => Value::from(node.toolkit.1),
         _ => return Reply::Error(UNKNOWN_OBJECT),
@@ -483,6 +808,19 @@ fn path(text: &str) -> OwnedObjectPath {
 /// `GetExtents` answer ONE struct, not its fields as arguments.
 async fn send(server: &Connection, header: &Header<'_>, reply: Reply) -> zbus::Result<()> {
     match reply {
+        Reply::Flag(flag) => server.reply(header, &flag).await,
+        Reply::Range(range) => server.reply(header, &range).await,
+        Reply::Count(count) => server.reply(header, &count).await,
+        Reply::Relations(relations) => {
+            let relations: Vec<(u32, Vec<(String, OwnedObjectPath)>)> = relations
+                .into_iter()
+                .map(|(kind, targets)| {
+                    let targets = targets.into_iter().map(|(bus, at)| (bus, path(&at)));
+                    (kind, targets.collect())
+                })
+                .collect();
+            server.reply(header, &relations).await
+        }
         Reply::Role(number) => server.reply(header, &number).await,
         Reply::Text(text) => server.reply(header, &text).await,
         Reply::Words(words) => server.reply(header, &words).await,

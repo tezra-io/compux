@@ -151,15 +151,22 @@ const ROLES: [&str; 131] = [
 /// The role numbers this reader acts on.
 pub const COMBO_BOX: u32 = 11;
 pub const DIAL: u32 = 15;
+pub const LABEL: u32 = 29;
+pub const LIST_ITEM: u32 = 32;
 pub const PASSWORD_TEXT: u32 = 40;
 pub const PROGRESS_BAR: u32 = 42;
 pub const SCROLL_BAR: u32 = 48;
+pub const SCROLL_PANE: u32 = 49;
 pub const SLIDER: u32 = 51;
 pub const SPIN_BUTTON: u32 = 52;
+pub const TABLE_CELL: u32 = 56;
 pub const TERMINAL: u32 = 60;
 pub const TEXT: u32 = 61;
 pub const ENTRY: u32 = 79;
+pub const TABLE_ROW: u32 = 90;
+pub const TREE_ITEM: u32 = 91;
 pub const LEVEL_BAR: u32 = 103;
+pub const STATIC: u32 = 116;
 
 /// The state bits this reader acts on.
 pub const ACTIVE: u32 = 1;
@@ -170,10 +177,12 @@ pub const EXPANDABLE: u32 = 9;
 pub const EXPANDED: u32 = 10;
 pub const FOCUSABLE: u32 = 11;
 pub const FOCUSED: u32 = 12;
+pub const MULTI_LINE: u32 = 17;
 pub const SELECTABLE: u32 = 22;
 pub const SELECTED: u32 = 23;
 pub const SENSITIVE: u32 = 24;
 pub const SHOWING: u32 = 25;
+pub const VERTICAL: u32 = 29;
 
 /// A role number as a word. A number newer than this table is still named, by its
 /// number, rather than passed off as one this table knows.
@@ -223,6 +232,17 @@ pub fn numeric(role: u32) -> bool {
 /// counts only while it is editable: a read-only one is content, not a field.
 pub fn textual(role: u32, editable: bool) -> bool {
     matches!(role, ENTRY | COMBO_BOX) || (matches!(role, TEXT | TERMINAL) && editable)
+}
+
+/// Whether a node is a row of a list, a tree or a table: what GTK leaves nameless
+/// and names by the label inside it.
+pub fn row(role: u32) -> bool {
+    matches!(role, LIST_ITEM | TREE_ITEM | TABLE_CELL | TABLE_ROW)
+}
+
+/// Whether a node is text that names what it sits in.
+pub fn caption(role: u32) -> bool {
+    matches!(role, LABEL | STATIC)
 }
 
 /// Whether a numeric control takes a new value. A progress or level bar only

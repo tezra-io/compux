@@ -1,0 +1,869 @@
+//! The Linux reader's writes: one AT-SPI call per verb, each the node's own route
+//! ([`super::routes`]), each answered as the seam's `Refusal` when it fails.
+//!
+//! A reply means the call was delivered, never that it took effect: every verb is
+//! read back above the seam (`semantic::judge`, `main.rs`'s `read_back`). And a
+//! refused verb is never retried another way: a node with no route is refused
+//! before anything here runs.
+
+use std::time::{Duration, Instant};
+
+use zbus::zvariant::{OwnedObjectPath, Value};
+use zbus::Connection;
+
+use super::atspi::{
+    area, Address, Failed, Known, Real, ACCESSIBLE, ACTION, COMPONENT, EDITABLE_TEXT, PROPERTIES,
+    SELECTION, TEXT, VALUE,
+};
+use super::routes::{self, Toolkit};
+use super::vocabulary::{self, SCROLL_BAR, SCROLL_PANE, VERTICAL};
+use crate::ax::{Expander, Frame, Handle, Refusal, Write, PRESS, SCROLL_TO_VISIBLE};
+
+/// `ATSPI_SCROLL_ANYWHERE`: bring the node into view however it fits.
+const SCROLL_ANYWHERE: u32 = 6;
+
+/// `ATSPI_COORD_TYPE_WINDOW`: the coordinates GTK 4 gets right (L0(a)), and GTK 3
+/// as well.
+const WINDOW: u32 = 1;
+
+/// How far up a node's ancestors the scroll pane it sits in is looked for.
+const MAX_SCROLL_HOPS: usize = 8;
+
+/// How many of a scroll pane's children are looked at for its vertical bar.
+const MAX_PANE_CHILDREN: usize = 8;
+
+/// What a call that did not do what it was sent for means for the receipt: only a
+/// call that may have arrived — no answer in time, or a connection that failed
+/// under it — says it went out.
+fn refused(why: Failed, what: &str) -> Refusal {
+    match why {
+        Failed::Late => Refusal::new(
+            true,
+            format!("{what}: no answer in time, so it may have landed"),
+        ),
+        Failed::Lost => Refusal::new(
+            true,
+            format!("{what}: the accessibility bus failed under it, so it may have landed"),
+        ),
+        Failed::Quit => Refusal::new(false, format!("{what}: the application is gone")),
+        Failed::Suspect => Refusal::new(
+            false,
+            format!("{what}: the application has no such object or call now"),
+        ),
+        Failed::Other => Refusal::new(false, format!("{what}: the application refused it")),
+    }
+}
+
+/// A toolkit call that answers whether it did it.
+fn answered(done: Result<bool, Failed>, what: &str) -> Result<(), Refusal> {
+    match done {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Refusal::new(
+            false,
+            format!("{what}: the application declined it"),
+        )),
+        Err(why) => Err(refused(why, what)),
+    }
+}
+
+/// Nothing was sent: there is no route for this on the node.
+fn no_route(what: &str) -> Refusal {
+    Refusal::new(false, format!("this control has no route for {what}"))
+}
+
+fn gone() -> Refusal {
+    Refusal::new(false, "that control is no longer held")
+}
+
+fn no_bus() -> Refusal {
+    Refusal::new(false, "the accessibility bus is not open")
+}
+
+/// What is left of a deadline, for the next call.
+fn left(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+impl Real {
+    /// The node's last read, where it is, and the bus: what every write starts
+    /// from.
+    fn target(&self, handle: Handle) -> Result<(Known, Address, Connection), Refusal> {
+        let known = self.known(handle).ok_or_else(gone)?;
+        let at = self.address(handle).ok_or_else(gone)?;
+        let bus = self.bus().ok_or_else(no_bus)?;
+        Ok((known, at, bus))
+    }
+
+    /// `press` and `scroll_to` as the seam names them: the node's press action, or
+    /// the scroll its toolkit has.
+    pub(super) fn act(&self, handle: Handle, action: &str, limit: Duration) -> Result<(), Refusal> {
+        let (known, at, bus) = self.target(handle)?;
+        let read = known.read();
+        match action {
+            PRESS => {
+                let index = routes::press(&read).ok_or_else(|| no_route("press"))?;
+                self.do_action(&bus, &at, index, limit)
+            }
+            SCROLL_TO_VISIBLE if routes::scrolls(&read) && known.toolkit == Toolkit::Chromium => {
+                let done = async_io::block_on(self.call_within(
+                    &bus,
+                    &at,
+                    (COMPONENT, "ScrollTo"),
+                    &(SCROLL_ANYWHERE,),
+                    limit,
+                ));
+                answered(done, "scroll_to")
+            }
+            SCROLL_TO_VISIBLE if routes::scrolls(&read) => self.scroll_bar(&bus, &at, limit),
+            other => Err(no_route(other)),
+        }
+    }
+
+    /// `Action.DoAction` on the action at `index`.
+    fn do_action(
+        &self,
+        bus: &Connection,
+        at: &Address,
+        index: i32,
+        limit: Duration,
+    ) -> Result<(), Refusal> {
+        let done =
+            async_io::block_on(self.call_within(bus, at, (ACTION, "DoAction"), &(index,), limit));
+        answered(done, "the action")
+    }
+
+    /// `set_value`: a field's text whole, through `EditableText`, or a number
+    /// through `Value`. Text that is no number is refused before a slider is sent
+    /// anything.
+    pub(super) fn set(&self, handle: Handle, value: &str, limit: Duration) -> Result<(), Refusal> {
+        let (known, at, bus) = self.target(handle)?;
+        if !routes::settable(&known.read()) {
+            return Err(no_route("set_value"));
+        }
+        if known.interfaces.editable_text {
+            let done = async_io::block_on(self.call_within(
+                &bus,
+                &at,
+                (EDITABLE_TEXT, "SetTextContents"),
+                &(value,),
+                limit,
+            ));
+            return answered(done, "set_value");
+        }
+        let number: f64 = value.trim().parse().map_err(|_| {
+            Refusal::new(
+                false,
+                format!("this control takes a number, and {value:?} is none"),
+            )
+        })?;
+        let written: Result<(), Failed> = async_io::block_on(self.call_within(
+            &bus,
+            &at,
+            (PROPERTIES, "Set"),
+            &(VALUE, "CurrentValue", Value::from(number)),
+            limit,
+        ));
+        written.map_err(|why| refused(why, "set_value"))
+    }
+
+    /// One write a verb sends: focus, an expander's action, text at the caret, or
+    /// an item selected through its container. An item never selects itself on
+    /// AT-SPI.
+    pub(super) fn written(
+        &self,
+        handle: Handle,
+        write: Write<'_>,
+        limit: Duration,
+    ) -> Result<(), Refusal> {
+        let (known, at, bus) = self.target(handle)?;
+        match write {
+            Write::Focused => {
+                let done = async_io::block_on(self.call_within(
+                    &bus,
+                    &at,
+                    (COMPONENT, "GrabFocus"),
+                    &(),
+                    limit,
+                ));
+                answered(done, "focus")
+            }
+            Write::Expand(Expander::Action, _) => {
+                let index = routes::expander(&known.read()).ok_or_else(|| no_route("expand"))?;
+                self.do_action(&bus, &at, index, limit)
+            }
+            Write::SelectedText(text) => self.type_text(&bus, &at, text, limit),
+            Write::SelectedChildren(item) => self.select_child(&bus, &at, item, limit),
+            Write::Selected | Write::Expand(..) => Err(no_route("that write")),
+        }
+    }
+
+    /// `type` by reference: delete the selection where there is one, then insert
+    /// the text where it began, or at the caret. Once a deletion went out, a
+    /// failure after it says so: the field has already changed.
+    fn type_text(
+        &self,
+        bus: &Connection,
+        at: &Address,
+        text: &str,
+        limit: Duration,
+    ) -> Result<(), Refusal> {
+        let deadline = Instant::now() + limit;
+        let selections: i32 = async_io::block_on(self.call(bus, at, TEXT, "GetNSelections", &()))
+            .map_err(|why| refused(why, "reading the selection"))?;
+        let insert_at = if selections > 0 {
+            self.delete_selection(bus, at, deadline)?
+        } else {
+            async_io::block_on(self.property::<i32>(bus, at, TEXT, "CaretOffset"))
+                .map_err(|why| refused(why, "reading the caret"))?
+        };
+        let length = i32::try_from(text.chars().count()).unwrap_or(i32::MAX);
+        let done = async_io::block_on(self.call_within(
+            bus,
+            at,
+            (EDITABLE_TEXT, "InsertText"),
+            &(insert_at, text, length),
+            left(deadline),
+        ));
+        match (answered(done, "type"), selections > 0) {
+            (Err(refusal), true) => Err(Refusal::new(
+                true,
+                format!("the selection was deleted, and then {}", refusal.detail()),
+            )),
+            (outcome, _) => outcome,
+        }
+    }
+
+    /// Delete the first selection, and answer where it began.
+    fn delete_selection(
+        &self,
+        bus: &Connection,
+        at: &Address,
+        deadline: Instant,
+    ) -> Result<i32, Refusal> {
+        let (start, end): (i32, i32) =
+            async_io::block_on(self.call(bus, at, TEXT, "GetSelection", &(0i32,)))
+                .map_err(|why| refused(why, "reading the selection"))?;
+        let done = async_io::block_on(self.call_within(
+            bus,
+            at,
+            (EDITABLE_TEXT, "DeleteText"),
+            &(start, end),
+            left(deadline),
+        ));
+        answered(done, "deleting the selection")?;
+        Ok(start)
+    }
+
+    /// `Selection.SelectChild` on the container, at the item's own index in it.
+    fn select_child(
+        &self,
+        bus: &Connection,
+        container: &Address,
+        item: Handle,
+        limit: Duration,
+    ) -> Result<(), Refusal> {
+        let item = self.address(item).ok_or_else(gone)?;
+        let index: i32 = async_io::block_on(self.accessible(bus, &item, "GetIndexInParent"))
+            .map_err(|why| refused(why, "reading where the item is"))?;
+        if index < 0 {
+            return Err(Refusal::new(false, "the item is in no container now"));
+        }
+        let done = async_io::block_on(self.call_within(
+            bus,
+            container,
+            (SELECTION, "SelectChild"),
+            &(index,),
+            limit,
+        ));
+        answered(done, "select")
+    }
+
+    /// `scroll_to` on GTK, which has no ScrollTo of its own: the vertical scroll
+    /// bar of the scroll pane the node sits in moves by how far the node lies
+    /// outside the pane, in window coordinates. A node already inside it moves
+    /// nothing, and nothing is sent.
+    fn scroll_bar(&self, bus: &Connection, at: &Address, limit: Duration) -> Result<(), Refusal> {
+        let deadline = Instant::now() + limit;
+        let pane = async_io::block_on(self.scroll_pane_of(bus, at))
+            .ok_or_else(|| Refusal::new(false, "no scroll pane holds this control now"))?;
+        let bar = async_io::block_on(self.vertical_bar(bus, &pane))
+            .ok_or_else(|| Refusal::new(false, "its scroll pane has no vertical scroll bar"))?;
+        let (node, view) = (
+            async_io::block_on(self.window_frame(bus, at)),
+            async_io::block_on(self.window_frame(bus, &pane)),
+        );
+        let (Some(node), Some(view)) = (node, view) else {
+            return Err(Refusal::new(
+                false,
+                "it or its scroll pane would not say where it is",
+            ));
+        };
+        let delta = outside(&node, &view);
+        if delta == 0.0 {
+            return Ok(());
+        }
+        let (now, low, high) = async_io::block_on(self.range(bus, &bar))
+            .map_err(|why| refused(why, "reading the scroll bar"))?;
+        let target = (now + delta).clamp(low, high);
+        let written: Result<(), Failed> = async_io::block_on(self.call_within(
+            bus,
+            &bar,
+            (PROPERTIES, "Set"),
+            &(VALUE, "CurrentValue", Value::from(target)),
+            left(deadline),
+        ));
+        written.map_err(|why| refused(why, "scroll_to"))
+    }
+
+    /// The nearest scroll pane above a node, [`MAX_SCROLL_HOPS`] parents up at most.
+    async fn scroll_pane_of(&self, bus: &Connection, at: &Address) -> Option<Address> {
+        let mut node = at.clone();
+        for _ in 0..MAX_SCROLL_HOPS {
+            let parent: (String, OwnedObjectPath) =
+                self.property(bus, &node, ACCESSIBLE, "Parent").await.ok()?;
+            node = Address::of_child(parent)?;
+            let role: u32 = self.accessible(bus, &node, "GetRole").await.ok()?;
+            if role == SCROLL_PANE {
+                return Some(node);
+            }
+        }
+        None
+    }
+
+    /// A scroll pane's vertical scroll bar.
+    async fn vertical_bar(&self, bus: &Connection, pane: &Address) -> Option<Address> {
+        for child in self.children_of(bus, pane, MAX_PANE_CHILDREN).await.ok()? {
+            let role: Result<u32, Failed> = self.accessible(bus, &child, "GetRole").await;
+            if role != Ok(SCROLL_BAR) {
+                continue;
+            }
+            let states: Vec<u32> = self.accessible(bus, &child, "GetState").await.ok()?;
+            if vocabulary::has(&states, VERTICAL) {
+                return Some(child);
+            }
+        }
+        None
+    }
+
+    async fn window_frame(&self, bus: &Connection, at: &Address) -> Option<Frame> {
+        let extents: (i32, i32, i32, i32) = self
+            .call(bus, at, COMPONENT, "GetExtents", &(WINDOW,))
+            .await
+            .ok()?;
+        area(extents)
+    }
+
+    /// A Value's current, minimum and maximum.
+    async fn range(&self, bus: &Connection, at: &Address) -> Result<(f64, f64, f64), Failed> {
+        let now: f64 = self.property(bus, at, VALUE, "CurrentValue").await?;
+        let low: f64 = self.property(bus, at, VALUE, "MinimumValue").await?;
+        let high: f64 = self.property(bus, at, VALUE, "MaximumValue").await?;
+        Ok((now, low, high))
+    }
+}
+
+/// How far a node lies outside the view it scrolls in, downward positive: 0 when
+/// it is inside.
+fn outside(node: &Frame, view: &Frame) -> f64 {
+    let (top, bottom) = (view.y, view.y + view.h);
+    if node.y < top {
+        node.y - top
+    } else if node.y + node.h > bottom {
+        node.y + node.h - bottom
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+mod scrolling {
+    use super::*;
+
+    fn frame(y: f64, h: f64) -> Frame {
+        Frame {
+            x: 0.0,
+            y,
+            w: 80.0,
+            h,
+        }
+    }
+
+    #[test]
+    fn a_node_outside_its_view_is_that_far_outside_and_one_inside_is_not() {
+        let view = frame(100.0, 100.0);
+        assert_eq!(outside(&frame(1000.0, 20.0), &view), 820.0);
+        assert_eq!(outside(&frame(40.0, 20.0), &view), -60.0);
+        assert_eq!(outside(&frame(120.0, 20.0), &view), 0.0);
+        assert_eq!(outside(&frame(180.0, 20.0), &view), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use crate::ax::{Ax, Handle, Write, PRESS, SCROLL_TO_VISIBLE};
+    use crate::gate::SystemClock;
+    use crate::linux::atspi::Real;
+    use crate::linux::fake::{
+        self, Desktop, Fake, Life, Node, ACTIVE, APP, CHECKED, EDITABLE, EXPANDABLE, EXPANDED,
+        FOCUSABLE, FOCUSED, PID, SELECTABLE, SELECTED, VERTICAL,
+    };
+    use crate::semantic::{self, Op, Verb};
+    use crate::tree::{self, Walk};
+
+    const TIMEOUT: Duration = Duration::from_millis(200);
+    const WRITE_MS: u64 = 500;
+    const OTHER: &str = ":1.11";
+    const OTHER_PID: u32 = 4712;
+
+    fn reader(desktop: Desktop) -> (Fake, Rc<dyn Ax>) {
+        let (fake, bus) = Fake::start(desktop, TIMEOUT);
+        let ax: Rc<dyn Ax> = Rc::new(Real::over(bus));
+        (fake, ax)
+    }
+
+    fn walk(ax: &Rc<dyn Ax>) -> Walk {
+        tree::walk(ax, PID, &SystemClock::new(), u64::MAX)
+    }
+
+    /// The listed control with this label.
+    fn listed(found: &Walk, label: &str) -> Handle {
+        found
+            .nodes
+            .iter()
+            .find(|node| node.label.as_deref() == Some(label))
+            .unwrap_or_else(|| panic!("{label} is listed"))
+            .element
+            .handle()
+    }
+
+    fn plan(ax: &Rc<dyn Ax>, handle: Handle, verb: Verb) -> Result<semantic::Plan, String> {
+        let facts = ax.facts(handle).map_err(|why| format!("{why:?}"))?;
+        semantic::plan(ax, handle, PID, &facts, false, &verb).map_err(|failure| failure.code)
+    }
+
+    fn field(name: &str, text: &str) -> Node {
+        Node {
+            text: text.to_string(),
+            ..Node::of(61)
+                .named(name)
+                .at(10, 10, 200, 24)
+                .reading(&[EDITABLE, FOCUSABLE])
+                .listing(&["Text", "EditableText"])
+        }
+    }
+
+    // L3-20, L18-16: press is DoAction on the index its press name was read at by
+    // GetName(i). GetActions is never sent, and `doDefault` is never done.
+    #[test]
+    fn ledger_l3_20_press_does_the_action_at_the_index_its_name_was_read_at() {
+        let (fake, ax) = reader(fake::one_window(
+            &["/w/new_tab"],
+            vec![(
+                "/w/new_tab",
+                Node::of(43).named("New Tab").at(10, 10, 80, 24).acting(&[
+                    Ok("doDefault"),
+                    Ok("showContextMenu"),
+                    Ok("press"),
+                ]),
+            )],
+        ));
+        let found = walk(&ax);
+        let tab = listed(&found, "New Tab");
+
+        ax.perform(tab, PRESS, WRITE_MS).expect("pressed");
+
+        assert_eq!(fake.sent("DoAction"), vec!["/w/new_tab 2"]);
+        assert!(fake.sent("GetActions").is_empty());
+    }
+
+    // A field's text is written whole, a slider's number through Value, and each
+    // is read back by what it now holds. Text that is no number is refused before
+    // anything is sent to a slider.
+    #[test]
+    fn set_value_writes_a_fields_text_and_a_sliders_number() {
+        let slider = Node {
+            value: 50.0,
+            ..Node::of(51)
+                .named("Volume")
+                .at(10, 40, 200, 24)
+                .listing(&["Value"])
+        };
+        let (fake, ax) = reader(fake::one_window(
+            &["/w/name", "/w/volume"],
+            vec![("/w/name", field("Name", "ada")), ("/w/volume", slider)],
+        ));
+        let found = walk(&ax);
+        let (name, volume) = (listed(&found, "Name"), listed(&found, "Volume"));
+
+        ax.set_value(name, "grace", WRITE_MS).expect("written");
+        ax.set_value(volume, "75", WRITE_MS).expect("written");
+        let refused = ax
+            .set_value(volume, "loud", WRITE_MS)
+            .expect_err("no number");
+
+        assert_eq!(fake.sent("SetTextContents"), vec!["/w/name grace"]);
+        assert_eq!(ax.value(name).as_deref(), Some("grace"));
+        assert_eq!(fake.node(APP, "/w/volume").value, 75.0);
+        assert_eq!(ax.value(volume).as_deref(), Some("75"));
+        assert!(!refused.sent());
+        assert_eq!(fake.sent("Set").len(), 1, "the refused one sent nothing");
+    }
+
+    // `type` by reference: the selection is deleted, then the text inserted at the
+    // caret; with nothing selected, only inserted at the caret.
+    #[test]
+    fn type_replaces_the_selection_then_inserts_at_the_caret() {
+        let selected = Node {
+            selection: Some((6, 11)),
+            caret: 11,
+            ..field("Greeting", "hello world")
+        };
+        let at_caret = Node {
+            caret: 2,
+            ..field("Code", "abef")
+        };
+        let (fake, ax) = reader(fake::one_window(
+            &["/w/greeting", "/w/code"],
+            vec![("/w/greeting", selected), ("/w/code", at_caret)],
+        ));
+        let found = walk(&ax);
+
+        ax.write(
+            listed(&found, "Greeting"),
+            Write::SelectedText("there"),
+            WRITE_MS,
+        )
+        .expect("typed");
+        ax.write(listed(&found, "Code"), Write::SelectedText("cd"), WRITE_MS)
+            .expect("typed");
+
+        assert_eq!(fake.node(APP, "/w/greeting").text, "hello there");
+        assert_eq!(fake.node(APP, "/w/code").text, "abcdef");
+        assert_eq!(fake.sent("DeleteText"), vec!["/w/greeting 6"]);
+    }
+
+    // `select` asks the container's Selection for the item's own index, and the
+    // item is read back as selected.
+    #[test]
+    fn select_asks_the_container_for_the_items_index() {
+        let item = |name: &str, y: i32| {
+            Node::of(32)
+                .named(name)
+                .at(10, y, 80, 20)
+                .reading(&[SELECTABLE])
+        };
+        let (fake, ax) = reader(fake::one_window(
+            &["/w/list"],
+            vec![
+                (
+                    "/w/list",
+                    Node::of(98)
+                        .named("Fruit")
+                        .listing(&["Selection"])
+                        .holding(APP, &["/w/apple", "/w/banana"]),
+                ),
+                ("/w/apple", item("Apple", 10)),
+                ("/w/banana", item("Banana", 30)),
+            ],
+        ));
+        let found = walk(&ax);
+        let banana = listed(&found, "Banana");
+
+        let planned = plan(&ax, banana, Verb::Select).expect("a route");
+        semantic::send(&ax, banana, &planned, WRITE_MS).expect("selected");
+
+        assert_eq!(fake.sent("SelectChild"), vec!["/w/list 1"]);
+        assert!(fake.node(APP, "/w/banana").states.contains(&SELECTED));
+        assert_eq!(
+            ax.states(banana, false).expect("reads").selected,
+            Some(true)
+        );
+    }
+
+    // toggle reads the check state first and presses only when it differs.
+    #[test]
+    fn toggle_presses_only_when_the_state_differs() {
+        let check = Node {
+            flips: Some(CHECKED),
+            ..Node::of(7)
+                .named("Bold")
+                .at(10, 10, 80, 24)
+                .acting(&[Ok("click")])
+        };
+        let (fake, ax) = reader(fake::one_window(&["/w/bold"], vec![("/w/bold", check)]));
+        let found = walk(&ax);
+        let bold = listed(&found, "Bold");
+
+        assert!(plan(&ax, bold, Verb::Toggle(false))
+            .expect("a route")
+            .already());
+        let on = plan(&ax, bold, Verb::Toggle(true)).expect("a route");
+        assert!(!on.already());
+        semantic::send(&ax, bold, &on, WRITE_MS).expect("pressed");
+
+        assert_eq!(fake.sent("DoAction"), vec!["/w/bold 0"]);
+        assert_eq!(ax.states(bold, true).expect("reads").on, Some(true));
+    }
+
+    // L4-6: a GTK 3 expander's one action is `activate`. Expand sends it only while
+    // the expander reads collapsed, and reads EXPANDED back.
+    #[test]
+    fn ledger_l4_6_expand_sends_the_one_action_only_while_collapsed() {
+        let expander = Node {
+            flips: Some(EXPANDED),
+            ..Node::of(62)
+                .named("Details")
+                .at(10, 10, 80, 24)
+                .reading(&[EXPANDABLE])
+                .acting(&[Ok("activate")])
+        };
+        let (fake, ax) = reader(fake::one_window(
+            &["/w/details"],
+            vec![("/w/details", expander)],
+        ));
+        let found = walk(&ax);
+        let details = listed(&found, "Details");
+
+        assert!(plan(&ax, details, Verb::Collapse)
+            .expect("a route")
+            .already());
+        let open = plan(&ax, details, Verb::Expand).expect("a route");
+        assert!(matches!(open.op, Op::Expand(_, true)));
+        semantic::send(&ax, details, &open, WRITE_MS).expect("expanded");
+
+        assert_eq!(fake.sent("DoAction"), vec!["/w/details 0"]);
+        assert_eq!(
+            ax.states(details, false).expect("reads").expanded,
+            Some(true)
+        );
+        assert!(plan(&ax, details, Verb::Expand).expect("a route").already());
+    }
+
+    /// The window `/w` reading ACTIVE or not, with a focusable field in it.
+    fn focus_desktop(active: bool) -> Desktop {
+        let mut desktop = fake::one_window(&["/w/name"], vec![("/w/name", field("Name", ""))]);
+        if !active {
+            desktop
+                .nodes
+                .get_mut(&(APP.to_string(), "/w".to_string()))
+                .expect("the window")
+                .states
+                .retain(|bit| *bit != ACTIVE);
+        }
+        desktop
+    }
+
+    // L4-16: GrabFocus can activate an inactive window. focus is refused unless the
+    // control's frame reads ACTIVE, and nothing is sent.
+    #[test]
+    fn ledger_l4_16_focus_never_activates_a_window() {
+        let (fake, ax) = reader(focus_desktop(false));
+        let found = walk(&ax);
+
+        let refused = plan(&ax, listed(&found, "Name"), Verb::Focus);
+
+        assert_eq!(refused.err().as_deref(), Some("focus_refused"));
+        assert!(fake.sent("GrabFocus").is_empty());
+    }
+
+    // L28-20: another application's popup holds the grab, so the target frame does
+    // not read ACTIVE — whatever the window manager says is active. focus is
+    // refused and nothing is sent.
+    #[test]
+    fn ledger_l28_20_focus_is_refused_while_another_application_holds_the_grab() {
+        let mut desktop = focus_desktop(false);
+        desktop.pids.insert(OTHER.to_string(), OTHER_PID);
+        desktop.put(
+            OTHER,
+            fake::ROOT,
+            Node::of(75)
+                .named("menu-holder")
+                .holding(OTHER, &["/popup"]),
+        );
+        desktop.put(OTHER, "/popup", Node::of(69).named("").reading(&[ACTIVE]));
+        desktop
+            .nodes
+            .get_mut(&(fake::REGISTRY.to_string(), fake::ROOT.to_string()))
+            .expect("the registry")
+            .children
+            .push((OTHER.to_string(), fake::ROOT.to_string()));
+        let (fake, ax) = reader(desktop);
+        let found = walk(&ax);
+
+        let refused = plan(&ax, listed(&found, "Name"), Verb::Focus);
+
+        assert_eq!(refused.err().as_deref(), Some("focus_refused"));
+        assert!(fake.sent("GrabFocus").is_empty());
+    }
+
+    // Inside the active window, focus is GrabFocus, and FOCUSED reads back.
+    #[test]
+    fn focus_grabs_the_focus_inside_the_active_window() {
+        let (fake, ax) = reader(focus_desktop(true));
+        let found = walk(&ax);
+        let name = listed(&found, "Name");
+
+        let planned = plan(&ax, name, Verb::Focus).expect("a route");
+        semantic::send(&ax, name, &planned, WRITE_MS).expect("focused");
+
+        assert_eq!(fake.sent("GrabFocus"), vec!["/w/name "]);
+        assert!(fake.node(APP, "/w/name").states.contains(&FOCUSED));
+    }
+
+    // scroll_to: Chromium scrolls the node itself into view.
+    #[test]
+    fn scroll_to_asks_chromium_to_scroll_the_node_into_view() {
+        let mut desktop = fake::one_window(
+            &["/w/far"],
+            vec![(
+                "/w/far",
+                Node {
+                    scrolls_to: Some((10, 300, 80, 24)),
+                    ..Node::of(43)
+                        .named("Far")
+                        .at(10, 900, 80, 24)
+                        .acting(&[Ok("press")])
+                },
+            )],
+        );
+        desktop.put(
+            APP,
+            fake::ROOT,
+            Node::of(75)
+                .named("chromium")
+                .holding(APP, &["/w"])
+                .made_with("Chromium", "120.0"),
+        );
+        let (fake, ax) = reader(desktop);
+        let found = walk(&ax);
+
+        ax.perform(listed(&found, "Far"), SCROLL_TO_VISIBLE, WRITE_MS)
+            .expect("scrolled");
+
+        assert_eq!(fake.sent("ScrollTo"), vec!["/w/far 6"], "ANYWHERE");
+    }
+
+    // scroll_to on GTK moves the vertical scroll bar of the scroll pane the node
+    // sits in, by how far the node lies outside the pane, in window coordinates.
+    #[test]
+    fn scroll_to_moves_the_gtk_scroll_bar_by_how_far_the_node_lies_outside() {
+        let mut desktop = fake::one_window(
+            &["/w/pane"],
+            vec![
+                (
+                    "/w/pane",
+                    Node {
+                        window_extents: Some((0, 100, 200, 100)),
+                        ..Node::of(49)
+                            .at(0, 0, 0, 0)
+                            .holding(APP, &["/w/view", "/w/bar"])
+                    },
+                ),
+                ("/w/view", Node::of(68).holding(APP, &["/w/near", "/w/far"])),
+                (
+                    "/w/near",
+                    Node {
+                        window_extents: Some((0, 120, 80, 20)),
+                        ..Node::of(32).named("Near").at(0, 0, 0, 0)
+                    },
+                ),
+                (
+                    "/w/far",
+                    Node {
+                        window_extents: Some((0, 1000, 80, 20)),
+                        ..Node::of(32).named("Far").at(0, 0, 0, 0)
+                    },
+                ),
+                (
+                    "/w/bar",
+                    Node {
+                        value: 0.0,
+                        range: (0.0, 3900.0),
+                        ..Node::of(48)
+                            .at(0, 0, 0, 0)
+                            .reading(&[VERTICAL])
+                            .listing(&["Value"])
+                    },
+                ),
+            ],
+        );
+        desktop.put(
+            APP,
+            fake::ROOT,
+            Node::of(75)
+                .named("gtk4")
+                .holding(APP, &["/w"])
+                .made_with("GTK", "4.14.2"),
+        );
+        let (fake, ax) = reader(desktop);
+        let found = walk(&ax);
+
+        ax.perform(listed(&found, "Far"), SCROLL_TO_VISIBLE, WRITE_MS)
+            .expect("scrolled");
+
+        // The pane ends at 200; the row ends at 1020.
+        assert_eq!(fake.node(APP, "/w/bar").value, 820.0);
+        ax.perform(listed(&found, "Near"), SCROLL_TO_VISIBLE, WRITE_MS)
+            .expect("already in view");
+        assert_eq!(fake.sent("Set").len(), 1, "a row in view moves nothing");
+    }
+
+    // A write to an application that quit never went out; one that got no answer
+    // in time did, and says so.
+    #[test]
+    fn a_write_to_a_gone_application_was_not_sent_and_one_that_timed_out_was() {
+        let (fake, ax) = reader(fake::one_window(
+            &["/w/a", "/w/b"],
+            vec![
+                (
+                    "/w/a",
+                    Node::of(43)
+                        .named("A")
+                        .at(10, 10, 80, 24)
+                        .acting(&[Ok("click")]),
+                ),
+                (
+                    "/w/b",
+                    Node::of(43)
+                        .named("B")
+                        .at(10, 40, 80, 24)
+                        .acting(&[Ok("click")]),
+                ),
+            ],
+        ));
+        let found = walk(&ax);
+        let (a, b) = (listed(&found, "A"), listed(&found, "B"));
+
+        fake.change(APP, "/w/b", |b| b.life = Life::Silent);
+        let late = ax.perform(b, PRESS, 100).expect_err("no answer");
+        fake.quits(APP);
+        let gone = ax.perform(a, PRESS, WRITE_MS).expect_err("gone");
+
+        assert!(late.sent(), "{}", late.detail());
+        assert!(!gone.sent(), "{}", gone.detail());
+    }
+
+    // A toolkit that took the call and did nothing answers false: refused, and not
+    // read as a press that may have landed.
+    #[test]
+    fn a_call_answered_false_is_a_refusal() {
+        let declining = Node {
+            declines: vec!["DoAction"],
+            ..Node::of(43)
+                .named("Stuck")
+                .at(10, 10, 80, 24)
+                .acting(&[Ok("click")])
+        };
+        let (_fake, ax) = reader(fake::one_window(&["/w/s"], vec![("/w/s", declining)]));
+        let found = walk(&ax);
+
+        let refused = ax
+            .perform(listed(&found, "Stuck"), PRESS, WRITE_MS)
+            .expect_err("declined");
+
+        assert!(!refused.sent());
+    }
+}

@@ -162,6 +162,22 @@ pub enum Unread {
     Refused,
 }
 
+/// Why a reference could not be found again before an action: a read that
+/// answered nothing, or — on Linux, where a reference is also a place in the tree —
+/// two candidates, or one that stayed unreadable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Identity {
+    Unread(Unread),
+    /// Two nodes answer for the reference: it moved, and another of its role took
+    /// its place.
+    // Only the Linux reader finds two candidates.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Ambiguous,
+    /// A candidate did not answer in time, three times.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Unknown,
+}
+
 /// Everything one node answers, in one call (M1).
 ///
 /// Each fact is optional where a platform may not have it. Its value and whether
@@ -190,6 +206,11 @@ pub struct Facts {
     pub actions_partial: bool,
     /// Where it is now, in global logical points.
     pub frame: Option<Frame>,
+    /// It is on screen, and the platform gives no position for it at all (GTK 4,
+    /// any Wayland session): it is listed without one. A node with no frame on a
+    /// platform that places its nodes is not on screen, and is not listed. Only the
+    /// Linux reader sets this.
+    pub placeless: bool,
 }
 
 /// Which attributes of one element may be written (protocol 12): the routes the
@@ -209,13 +230,19 @@ pub struct Routes {
     pub text: bool,
 }
 
-/// The two attributes an expandable element may answer its state on.
-// Only the macOS reader and the recording platform produce these.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// How an expandable element is expanded: one of the two attributes a macOS
+/// element may answer its state on, or on Linux its own toggle-style action.
+// Each reader produces its own, and the recording platform all three.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Expander {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Expanded,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Disclosing,
+    /// AT-SPI has no expanded attribute to write: the node's own toggle-style action
+    /// is sent, and only when its EXPANDED state differs from the one asked for.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Action,
 }
 
 /// One write route, asked on its own: a verb takes one route, and asking for all
@@ -330,11 +357,18 @@ pub trait Ax {
     /// One application's own windows, retained.
     fn windows(&self, owner: &Rc<dyn Ax>, pid: i32) -> Vec<Retained>;
 
-    /// Everything the element answers, in one call, or why it answered nothing. The
-    /// revalidation before an action reads this first: a reference that names
-    /// nothing, or answers a DIFFERENT role now, points at something the caller
-    /// never saw.
+    /// Everything the element answers, in one call, or why it answered nothing.
     fn facts(&self, handle: Handle) -> Result<Facts, Unread>;
+
+    /// What the element answers now, read to prove it is still the control the
+    /// caller was shown: the revalidation before an action reads this first, and a
+    /// reference that names nothing, or answers a DIFFERENT role now, points at
+    /// something the caller never saw. A macOS reference is the object itself, so
+    /// this is [`Ax::facts`]; the Linux reader also finds it again by its place in
+    /// the tree.
+    fn identify(&self, handle: Handle) -> Result<Facts, Identity> {
+        self.facts(handle).map_err(Identity::Unread)
+    }
 
     /// The element's value, bounded; `None` when it has none that is text, or will
     /// not say. Withheld at the SOURCE for a secure field, which answers `None`
@@ -393,6 +427,13 @@ pub trait Ax {
     /// (M7). A reply reports the difference across its own reads, which is the
     /// number the macOS reader's batching is measured by.
     fn messages(&self) -> u64;
+
+    /// Whether this session places controls on a screen at all. A Linux session on
+    /// Wayland, or with no display in reach, places none: its controls are listed
+    /// without bounds, and a listing there needs no display.
+    fn places(&self) -> bool {
+        true
+    }
 
     /// Which of the element's attributes may be written (protocol 12).
     fn routes(&self, handle: Handle) -> Routes;
@@ -979,6 +1020,8 @@ mod mac {
                 actions,
                 // One call names every action, or none are named.
                 actions_partial: false,
+                // macOS places every node it can see.
+                placeless: false,
             })
         }
     }
@@ -1302,6 +1345,13 @@ mod mac {
                 Write::Selected => (SELECTED, CFBoolean::true_value().as_CFType()),
                 Write::Expand(Expander::Expanded, to) => (EXPANDED, boolean(to)),
                 Write::Expand(Expander::Disclosing, to) => (DISCLOSING, boolean(to)),
+                // This reader never offers it: a macOS element answers an attribute.
+                Write::Expand(Expander::Action, _) => {
+                    return Err(Refusal::new(
+                        false,
+                        "a macOS element is expanded through an attribute, not an action",
+                    ))
+                }
                 Write::SelectedText(text) => (SELECTED_TEXT, CFString::new(text).as_CFType()),
                 Write::SelectedChildren(item) => {
                     let item = self.element(item).ok_or_else(gone)?;
@@ -2094,6 +2144,8 @@ pub struct Scripted {
     pub settable: bool,
     /// `None` is a node that will not say where it is.
     pub frame: Option<Frame>,
+    /// On screen where the platform places nothing.
+    pub placeless: bool,
     /// Its children, as indices into the same script, in order. A node no other
     /// node lists as a child is a child of the application.
     pub children: Vec<usize>,
@@ -2130,6 +2182,7 @@ impl Scripted {
             actions: self.actions.clone(),
             actions_partial: self.actions_partial,
             frame: self.frame,
+            placeless: self.placeless,
         }
     }
 
@@ -2145,6 +2198,7 @@ impl Scripted {
             actions_partial: false,
             settable: false,
             frame: None,
+            placeless: false,
             children: Vec::new(),
             cost_ms: 0,
             routes: Routes::default(),
@@ -2265,6 +2319,8 @@ struct Recorded {
     routes_asked: Vec<(usize, Route)>,
     /// Nodes whose facts, child count or uncounted copy answer this instead.
     facts_fail: std::collections::HashMap<usize, Unread>,
+    /// Nodes that cannot be found again before an action, and why.
+    identity_fail: std::collections::HashMap<usize, Identity>,
     count_fail: std::collections::HashMap<usize, Unread>,
     copy_fail: std::collections::HashMap<usize, Unread>,
     /// A node's page of children, by the index it starts at, that answers this.
@@ -2382,6 +2438,11 @@ impl Recorder {
     }
 
     /// The Nth node's facts answer this instead of its facts.
+    /// The node cannot be found again before an action, for this reason.
+    pub fn identifies_as(&self, index: usize, why: Identity) {
+        self.state().identity_fail.insert(index, why);
+    }
+
     pub fn fails_facts_for(&self, index: usize, why: Unread) {
         self.state().facts_fail.insert(index, why);
     }
@@ -2631,6 +2692,22 @@ impl Ax for Recorder {
                 ..Facts::default()
             }),
             Slot::Node(index) => Recorder::read(&mut state, index),
+        }
+    }
+
+    /// As a reader that finds a reference again by its place: what the test says
+    /// the search found, else the facts.
+    fn identify(&self, handle: Handle) -> Result<Facts, Identity> {
+        let found = {
+            let state = self.state();
+            match state.held.get(&handle.0) {
+                Some(Slot::Node(index)) => state.identity_fail.get(index).copied(),
+                _ => None,
+            }
+        };
+        match found {
+            Some(why) => Err(why),
+            None => self.facts(handle).map_err(Identity::Unread),
         }
     }
 
