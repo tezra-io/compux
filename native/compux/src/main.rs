@@ -48,10 +48,14 @@ use wire::Failure;
 /// the serialized `Emitter`. Isolated from the request/response core here.
 mod capture;
 
-/// Accessibility: the AX FFI and the tree walk, behind a trait narrow enough that
+/// Accessibility: the AX FFI behind a per-node trait narrow enough that
 /// everything above it — the element list, the references it hands out, the
 /// revalidation before an action — is tested with no OS call.
 mod ax;
+
+/// The tree walk above the accessibility seam: its budgets, which nodes it lists,
+/// children by page and the ancestor path, tested against scripted trees.
+mod tree;
 
 /// Held synthetic input: the press registry and the `Platform` seam every input
 /// sequence posts through, so nothing this process presses can outlive the action.
@@ -741,11 +745,14 @@ fn element_in<'a>(
 /// or whose pid another process now has — names nothing), then what the control
 /// says it is, then whether it will take input. Every refusal here is
 /// `dispatch: not_sent`, checked before anything is dispatched.
+///
+/// One read of the control answers all of it, and the facts it read are handed
+/// back, so the action that follows asks the application nothing twice.
 fn present(
     ax: &Rc<dyn ax::Ax>,
     observation: &Observation,
     entry: &ax::Entry,
-) -> Result<(), Failure> {
+) -> Result<ax::Facts, Failure> {
     let elements = observation
         .elements
         .as_deref()
@@ -760,14 +767,18 @@ fn present(
         ));
     }
 
-    let handle = entry.element.handle();
-    match ax.role(handle) {
-        None => Err(Failure::new(
-            "stale_element",
-            "that control is no longer there; take `elements` again and use a reference from \
-             the new list"
-                .to_string(),
-        )),
+    let facts =
+        match ax.facts(entry.element.handle()) {
+            Ok(facts) => facts,
+            Err(ax::Unread::NoAnswer) => return Err(Failure::new(
+                "stale_element",
+                "that control did not answer within the accessibility timeout, so it could not \
+                 be checked and nothing was sent; take `elements` again"
+                    .to_string(),
+            )),
+            Err(_gone_or_refused) => return Err(no_longer_there()),
+        };
+    match facts.role.clone() {
         Some(role) if role != entry.role => Err(Failure::new(
             "stale_element",
             format!(
@@ -776,14 +787,25 @@ fn present(
                 entry.role
             ),
         )),
-        Some(_same) if !ax.enabled(handle) => Err(Failure::new(
+        Some(_) if facts.enabled => Ok(facts),
+        Some(_disabled) => Err(Failure::new(
             "element_disabled",
             "that control is disabled, so it will not act; do not retry it — find what enables \
              it first"
                 .to_string(),
         )),
-        Some(_same) => Ok(()),
+        None => Err(no_longer_there()),
     }
+}
+
+/// A reference that answers nothing it could be checked by.
+fn no_longer_there() -> Failure {
+    Failure::new(
+        "stale_element",
+        "that control is no longer there; take `elements` again and use a reference from the \
+         new list"
+            .to_string(),
+    )
 }
 
 /// Everything [`present`] checks, plus the one capability this action needs — read
@@ -795,17 +817,16 @@ fn revalidate(
     observation: &Observation,
     entry: &ax::Entry,
     want: Capability,
-) -> Result<(), Failure> {
-    present(ax, observation, entry)?;
+) -> Result<ax::Facts, Failure> {
+    let facts = present(ax, observation, entry)?;
 
-    let handle = entry.element.handle();
     let capable = match want {
-        Capability::Press => ax.action_names(handle).iter().any(|name| name == ax::PRESS),
-        Capability::SetValue => ax.settable(handle),
+        Capability::Press => facts.actions.iter().any(|name| name == ax::PRESS),
+        Capability::SetValue => ax.settable(entry.element.handle()),
     };
 
     if capable {
-        Ok(())
+        Ok(facts)
     } else {
         Err(Failure::new(
             "ax_action_unsupported",
@@ -888,24 +909,21 @@ fn observe_ack(action: &str, ok: bool, error: Option<String>) -> Value {
 /// Identity + wire-version handshake performed once by `Compux.start/1`. Lets the
 /// consumer refuse a sidecar whose `protocol_version` its compiled-in encoder does
 /// not speak (the two-pin drift guard). `compux_version` is diagnostic; `actions`
-/// is the model-facing verb set (probe/hello are operational, excluded).
+/// is the model-facing verb set (probe/hello are operational, excluded), and it
+/// lists only what THIS build can do (F1): the engine builds the model's verbs
+/// from it, and a verb whose every use is a refusal is a turn wasted on it.
 fn hello(launcher: &Arc<dyn indicator::Launcher>) -> Result<Value, Failure> {
     Ok(json!({
         "ok": true,
         "protocol_version": PROTOCOL_VERSION,
         "compux_version": env!("CARGO_PKG_VERSION"),
-        "actions": [
-            "screenshot", "left_click", "right_click", "double_click", "mouse_move",
-            "left_click_drag", "scroll", "type", "key", "wait", "inspect",
-            "wait_for_change", "paste", "elements", "windows", "press", "set_value",
-            "select_target", "release_target"
-        ],
-        // Listed only because this build really has them: the two input methods
-        // an action can carry, the three controls the gate implements, and the
+        "actions": advertised_actions(),
+        // Listed only because this build really has them: the input methods an
+        // action can carry, the three controls the gate implements, and the
         // bounds of the observation table — a caller mirrors those numbers to know
         // which ids it may still address before it asks.
         "capabilities": {
-            "input_methods": ["foreground_hid", "ax"],
+            "input_methods": input_methods(),
             "controls": ["pause", "resume", "release"],
             "observations": {
                 "max": observation::MAX_OBSERVATIONS,
@@ -921,6 +939,61 @@ fn hello(launcher: &Arc<dyn indicator::Launcher>) -> Result<Value, Failure> {
             "indicator": indicator_presence(launcher),
         },
     }))
+}
+
+/// Every model-facing verb, in the order the handshake has always listed them.
+const ACTIONS: [&str; 19] = [
+    "screenshot",
+    "left_click",
+    "right_click",
+    "double_click",
+    "mouse_move",
+    "left_click_drag",
+    "scroll",
+    "type",
+    "key",
+    "wait",
+    "inspect",
+    "wait_for_change",
+    "paste",
+    "elements",
+    "windows",
+    "press",
+    "set_value",
+    "select_target",
+    "release_target",
+];
+
+/// The verbs that read or act through the accessibility API.
+const ACCESSIBILITY_ACTIONS: [&str; 4] = ["inspect", "elements", "press", "set_value"];
+
+/// The verbs that bind a window.
+const TARGET_ACTIONS: [&str; 2] = ["select_target", "release_target"];
+
+/// The verbs this build can really serve: the accessibility ones only where there
+/// is an accessibility API, the window ones only where a window can be bound.
+fn advertised_actions() -> Vec<&'static str> {
+    ACTIONS
+        .into_iter()
+        .filter(|action| accessibility_supported() || !ACCESSIBILITY_ACTIONS.contains(action))
+        .filter(|action| targets_supported() || !TARGET_ACTIONS.contains(action))
+        .collect()
+}
+
+/// How an action can reach the machine in this build: `ax` only where there is an
+/// accessibility API to carry it.
+fn input_methods() -> Vec<&'static str> {
+    if accessibility_supported() {
+        vec!["foreground_hid", "ax"]
+    } else {
+        vec!["foreground_hid"]
+    }
+}
+
+/// Does this build speak an accessibility API? Off macOS every accessibility verb
+/// answers a typed refusal, and [M86] L1 flips this with the Linux reader.
+fn accessibility_supported() -> bool {
+    cfg!(target_os = "macos")
 }
 
 /// Can this build bind a window at all?
@@ -2514,8 +2587,8 @@ fn aim(
         return point_in(observation, x, y);
     };
 
-    present(&worker.ax, observation, entry)?;
-    let bounds = worker.ax.bounds(entry.element.handle()).ok_or_else(|| {
+    let facts = present(&worker.ax, observation, entry)?;
+    let bounds = facts.frame.ok_or_else(|| {
         Failure::new(
             "stale_element",
             "that control no longer reports where it is, so there is nowhere to click; take \
@@ -3213,14 +3286,19 @@ fn press(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Va
     // badge check runs before anything is dispatched.
     let view = view(request, gate, worker)?;
     let entry = element_in(&observation, request)?;
-    revalidate(&worker.ax, &observation, entry, Capability::Press)?;
+    let since = gate.now_ms();
+    let facts = revalidate(&worker.ax, &observation, entry, Capability::Press)?;
 
     let handle = entry.element.handle();
-    let aimed = aimed_point(request, &worker.ax, handle);
+    let aimed = aimed_point(request, &facts);
     let before = worker.ax.frontmost_pid();
+    let timeout_ms = write_timeout(gate, since);
 
     let outcome = gate
-        .dispatch_message(|| worker.ax.perform(handle, ax::PRESS), went_out)
+        .dispatch_message(
+            || worker.ax.perform(handle, ax::PRESS, timeout_ms),
+            went_out,
+        )
         .map_err(barred)?;
     gate.input_complete();
     note_ax(gate, worker, before);
@@ -3262,14 +3340,16 @@ fn set_value(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resul
     let observation = observed(request, worker)?;
     let view = view(request, gate, worker)?;
     let entry = element_in(&observation, request)?;
-    revalidate(&worker.ax, &observation, entry, Capability::SetValue)?;
+    let since = gate.now_ms();
+    let facts = revalidate(&worker.ax, &observation, entry, Capability::SetValue)?;
 
     let (handle, secure) = (entry.element.handle(), entry.secure);
-    let aimed = aimed_point(request, &worker.ax, handle);
+    let aimed = aimed_point(request, &facts);
     let before = worker.ax.frontmost_pid();
+    let timeout_ms = write_timeout(gate, since);
 
     let outcome = gate
-        .dispatch_message(|| worker.ax.set_value(handle, &value), went_out)
+        .dispatch_message(|| worker.ax.set_value(handle, &value, timeout_ms), went_out)
         .map_err(barred)?;
     gate.input_complete();
     note_ax(gate, worker, before);
@@ -3281,7 +3361,7 @@ fn set_value(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resul
     let read_back = if secure {
         None
     } else {
-        worker.ax.value(handle)
+        read_back(gate, &worker.ax, handle, &value)
     };
     let verified = !secure && read_back.as_deref() == Some(value.as_str());
     gate.observed_effect(if verified {
@@ -3311,23 +3391,61 @@ fn set_value(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resul
 
 /// Where the control is, for the check image's executed-point marker.
 ///
-/// Read only when there is going to be an image to draw it on: an accessibility
-/// action aims at a name, not a place, so a bounds read it will not use is one
-/// more message to an application that may be slow to answer. Best effort even
-/// then — a control that will not say where it is still gets its action.
-fn aimed_point(
-    request: &wire::Request,
-    ax: &Rc<dyn ax::Ax>,
-    handle: ax::Handle,
-) -> Option<(i32, i32)> {
+/// Wanted only when there is going to be an image to draw it on: an accessibility
+/// action aims at a name, not a place. Taken from the read that revalidated the
+/// control a moment ago, so it costs no message. Best effort — a control that will
+/// not say where it is still gets its action.
+fn aimed_point(request: &wire::Request, facts: &ax::Facts) -> Option<(i32, i32)> {
     if request.check != wire::Check::Image {
         return None;
     }
 
-    ax.bounds(handle).map(|bounds| {
+    facts.frame.map(|bounds| {
         let (x, y) = bounds.centre();
         (x.round() as i32, y.round() as i32)
     })
+}
+
+/// The messaging timeout for this action's one write (M2): half of what is left of
+/// its accessibility budget, counted from the read that revalidated the control.
+fn write_timeout(gate: &Gate, since: u64) -> u64 {
+    let spent = gate.now_ms().saturating_sub(since);
+    ax::write_timeout_ms(ax::WRITE_BUDGET_MS.saturating_sub(spent))
+}
+
+/// How often a written value is read back, and for how long (M6). Some fields show
+/// a write a moment after it — a formatter, a binding that updates on the next turn
+/// of the run loop — so one read straight after it called a write that worked
+/// unobserved. At most `READ_BACK_CAP_MS / READ_BACK_POLL_MS` reads after the
+/// first; past the cap the receipt reports what the field holds instead.
+const READ_BACK_POLL_MS: u64 = 50;
+const READ_BACK_CAP_MS: u64 = 400;
+
+/// What a written field holds now: read until it shows `wanted` or the cap runs
+/// out. It never writes again.
+///
+/// Infallible on purpose, because it runs between the input latch and the check,
+/// where nothing may fail (the check is the last thing an action does). The waits
+/// go through the gate, so a pause during one ends the read-back at once: what the
+/// field held at the last read is the answer — `not_observed` unless it already
+/// matched — and the cancellation stays with the gate for the check that follows.
+fn read_back(gate: &Gate, ax: &Rc<dyn ax::Ax>, handle: ax::Handle, wanted: &str) -> Option<String> {
+    // The value alone: one message a look, not a node's whole facts.
+    let mut held = ax.value(handle);
+    let mut waited = 0;
+
+    while held.as_deref() != Some(wanted) && waited < READ_BACK_CAP_MS {
+        let started = gate.now_ms();
+        let paused = gate.sleep(READ_BACK_POLL_MS).is_err();
+        gate.record(Phase::Settle, gate.now_ms().saturating_sub(started));
+        if paused {
+            break;
+        }
+        waited += READ_BACK_POLL_MS;
+        held = ax.value(handle);
+    }
+
+    held
 }
 
 /// What only an accessibility action knows about its own receipt: the method that
@@ -3696,25 +3814,15 @@ fn element_after(
         )
     })?;
 
+    // A control that does not answer its role does not answer anything else either,
+    // and is reported as not there.
     let handle = entry.element.handle();
-    let mut after = json!({ "present": false });
-
-    if let Some(role) = worker.ax.role(handle) {
-        after = json!({
-            "present": true,
-            "role": role,
-            "enabled": worker.ax.enabled(handle),
-        });
-
-        if let (Some(object), Some(label)) = (after.as_object_mut(), worker.ax.label(handle)) {
-            object.insert("label".to_string(), json!(label));
+    let after = match worker.ax.facts(handle) {
+        Ok(facts) if facts.role.is_some() => {
+            described_after(&worker.ax, handle, entry.secure, facts)
         }
-        if let (false, Some(object), Some(value)) =
-            (entry.secure, after.as_object_mut(), worker.ax.value(handle))
-        {
-            object.insert("value".to_string(), json!(ax::bounded_value(value)));
-        }
-    }
+        _not_there => json!({ "present": false }),
+    };
 
     gate.observed_check(wire::Checked {
         kind: wire::Check::Semantic,
@@ -3723,6 +3831,32 @@ fn element_after(
     });
 
     Ok(json!({ "ok": true, "element_after": after }))
+}
+
+/// A control that is still there, as `element_after` publishes it: its facts, and
+/// its value from a read of its own — never asked of a secure field.
+fn described_after(
+    ax: &Rc<dyn ax::Ax>,
+    handle: ax::Handle,
+    secure: bool,
+    facts: ax::Facts,
+) -> Value {
+    let mut after = json!({
+        "present": true,
+        "role": facts.role,
+        "enabled": facts.enabled,
+    });
+    let value = if secure { None } else { ax.value(handle) };
+
+    if let Some(object) = after.as_object_mut() {
+        if let Some(label) = facts.label {
+            object.insert("label".to_string(), json!(label));
+        }
+        if let Some(value) = value {
+            object.insert("value".to_string(), json!(ax::bounded_value(value)));
+        }
+    }
+    after
 }
 
 // --- windows ----------------------------------------------------------------
@@ -3928,7 +4062,7 @@ fn elements(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result
 /// pixels of the image this reply names. The frame the walk read is in global
 /// logical points and stays inside this process: one reply, one coordinate space.
 fn element_value(
-    node: &ax::Node,
+    node: &tree::Node,
     reference: Option<&str>,
     point: (i64, i64),
     geom: &Geometry,
@@ -3994,11 +4128,8 @@ fn elements_for(
     region: &Region,
     gate: &Gate,
 ) -> Result<(Value, Option<Rc<ax::Elements>>), Failure> {
-    Ok(publish_elements(
-        interactive_in_view(ax, geom, region, gate)?,
-        geom,
-        region,
-    ))
+    let viewed = interactive_in_view(ax, geom, region, gate)?;
+    Ok(publish_elements(viewed, geom, region))
 }
 
 /// One read, as the wire publishes it. Shared by the application listing and the
@@ -4033,7 +4164,9 @@ fn publish_elements(
         });
     }
 
-    let mut payload = json!({ "ok": true, "elements": items });
+    // What the read cost in accessibility messages (M7), so the batching the
+    // macOS reader does is a number the owner can read on a real application.
+    let mut payload = json!({ "ok": true, "elements": items, "ax_messages": viewed.messages });
     if let Some(object) = payload.as_object_mut() {
         if let Some(note) = viewed.note {
             object.insert("ax_activation".to_string(), json!(note));
@@ -4069,8 +4202,10 @@ fn elements_rooted(
         .ok_or_else(|| Failure::from("target_unavailable"))?;
 
     let clock = gate.clock();
-    let deadline = gate.now_ms().saturating_add(ax::WALK_BUDGET_MS);
-    let found = ax::walk_from(ax, root, clock.as_ref(), deadline);
+    let before = ax.messages();
+    let deadline = gate.now_ms().saturating_add(tree::WALK_BUDGET_MS);
+    let found = tree::walk_from(ax, root, clock.as_ref(), deadline);
+    let messages = ax.messages() - before;
 
     let in_view: Vec<ViewNode> = found
         .nodes
@@ -4086,13 +4221,14 @@ fn elements_rooted(
         owner: Some((target.pid, target.started_at)),
         truncated: found.truncated,
         note: Some(format!("read {} — {}", target.app, target.title)),
+        messages,
     };
 
     Ok(publish_elements(viewed, geom, region))
 }
 
 /// An interactive AX node paired with its click point in sent-image space.
-type ViewNode = (ax::Node, (i64, i64));
+type ViewNode = (tree::Node, (i64, i64));
 
 /// What one accessibility read found: the controls inside the view with their
 /// click points, the application they came from (and when that process started,
@@ -4103,6 +4239,10 @@ struct Viewed {
     owner: Option<(i32, u64)>,
     truncated: Option<&'static str>,
     note: Option<String>,
+    /// What the walk whose list this is cost in accessibility messages (M7), and
+    /// that walk alone: an empty tree is walked again and again while it settles,
+    /// and only the last walk's list is the one published.
+    messages: u64,
 }
 
 impl Viewed {
@@ -4115,18 +4255,27 @@ impl Viewed {
             owner: None,
             truncated: None,
             note: Some(note),
+            messages: 0,
         }
     }
 }
 
-/// One walk of ONE application: the controls whose centres fall inside this view
-/// (as sent-space points), the TOTAL interactive count the walk saw before the
-/// view filter, and why it stopped early if it did.
-///
-/// The total is what distinguishes "the app's tree is gated or empty" (activation
-/// territory) from "the app has controls, just none inside this region" (nothing
-/// to activate). Shared by `elements` and the `marks` overlay so the two can never
-/// disagree about what is there.
+/// One walk of ONE application, cut to this view.
+struct InView {
+    /// The controls whose centres fall inside this view, with their sent-space
+    /// points.
+    nodes: Vec<ViewNode>,
+    /// How many controls the walk saw before the view filter: what distinguishes
+    /// "the app's tree is gated or empty" (activation territory) from "the app has
+    /// controls, just none inside this region" (nothing to activate).
+    total: usize,
+    truncated: Option<&'static str>,
+    /// What this one walk cost in accessibility messages.
+    messages: u64,
+}
+
+/// One walk of ONE application, cut to this view. Shared by `elements` and the
+/// `marks` overlay so the two can never disagree about what is there.
 ///
 /// Every node the view filter drops releases the reference the walk retained for
 /// it, because dropping a node IS releasing it.
@@ -4136,13 +4285,15 @@ fn in_view_nodes(
     geom: &Geometry,
     region: &Region,
     gate: &Gate,
-) -> (Vec<ViewNode>, usize, Option<&'static str>) {
+) -> InView {
     let clock = gate.clock();
-    let deadline = gate.now_ms().saturating_add(ax::WALK_BUDGET_MS);
-    let found = ax::walk(ax, pid, clock.as_ref(), deadline);
+    let before = ax.messages();
+    let deadline = gate.now_ms().saturating_add(tree::WALK_BUDGET_MS);
+    let found = tree::walk(ax, pid, clock.as_ref(), deadline);
+    let messages = ax.messages() - before;
     let total = found.nodes.len();
 
-    let in_view = found
+    let nodes = found
         .nodes
         .into_iter()
         .filter_map(|node| {
@@ -4151,7 +4302,12 @@ fn in_view_nodes(
         })
         .collect();
 
-    (in_view, total, found.truncated)
+    InView {
+        nodes,
+        total,
+        truncated: found.truncated,
+        messages,
+    }
 }
 
 /// The application to read accessibility from: the one OWNING the window the
@@ -4353,9 +4509,12 @@ fn overlap_area(a: &Region, b: &Region) -> f64 {
 /// Bounded settle for a lazily-built accessibility tree: Chromium switches web
 /// accessibility on when an AX client starts querying it, then needs a moment
 /// to build the tree — so an empty first walk re-queries on a short cadence
-/// instead of concluding emptiness from one look.
+/// instead of concluding emptiness from one look. 2.4 s in all, because Chromium
+/// asks for its complete mode through a two-second debounce after the switch is
+/// written (M5), and a window shorter than that reports a tree that was about to
+/// appear as absent.
 const AX_SETTLE_POLL_MS: u64 = 300;
-const AX_SETTLE_POLLS: u32 = 5;
+const AX_SETTLE_POLLS: u32 = 8;
 
 /// B4, revised on live evidence: enumerate the TARGET app's tree rooted at its
 /// own application element. Activation (one typed attempt —
@@ -4377,76 +4536,131 @@ fn interactive_in_view(
         Ok(target) => target,
         Err(note) => return Ok(Viewed::nothing(note)),
     };
+    Ok(read_application(
+        ax_platform,
+        &target,
+        geom,
+        region,
+        gate,
+        activate_accessibility,
+    ))
+}
 
+/// The portable half of [`interactive_in_view`], which only has to say WHICH
+/// application: walk it, and only if its tree walked to nothing at all, ask it to
+/// expose one (`activate`) and poll until it appears.
+fn read_application(
+    ax_platform: &Rc<dyn ax::Ax>,
+    target: &TargetApp,
+    geom: &Geometry,
+    region: &Region,
+    gate: &Gate,
+    activate: fn(i32) -> Result<String, String>,
+) -> Viewed {
     // The reference that outlives this reply is only usable while the process it
     // came from is still THAT process, so the start time is read once, here,
     // against the same pid the walk is about to use.
     let started_at = ax_platform.process_started_at(target.pid);
     let owner = started_at.map(|started_at| (target.pid, started_at));
 
-    let (found, total, truncated) = in_view_nodes(ax_platform, target.pid, geom, region, gate);
-    if !found.is_empty() {
-        return Ok(Viewed {
-            nodes: found,
+    let first = in_view_nodes(ax_platform, target.pid, geom, region, gate);
+    if !first.nodes.is_empty() {
+        return Viewed {
+            nodes: first.nodes,
             owner,
-            truncated,
+            truncated: first.truncated,
             note: Some(format!("read {}", target.app)),
-        });
+            messages: first.messages,
+        };
     }
-    if total > 0 {
+    if first.total > 0 {
         let note = format!(
-            "{}: {total} interactive element(s) in the app, none inside this view",
-            target.app
+            "{}: {} interactive element(s) in the app, none inside this view",
+            target.app, first.total
         );
-        return Ok(Viewed::nothing(note));
+        return Viewed {
+            messages: first.messages,
+            ..Viewed::nothing(note)
+        };
     }
 
-    let attempt = activate_accessibility(target.pid);
+    let attempt = attempt_note(&activate(target.pid));
+    match settle(ax_platform, target.pid, geom, region, gate, first) {
+        Ok((walked, waited)) => settled_view(target, owner, &attempt, walked, waited),
+        Err(last) => Viewed {
+            messages: last.messages,
+            ..Viewed::nothing(format!("{}: cancelled while the tree settled", target.app))
+        },
+    }
+}
+
+/// Walk an empty tree again on a short cadence until it has controls in it or
+/// the poll runs out: the last walk, and how long it waited for it.
+///
+/// Up to 2.4 seconds, reached from `elements` AND from any `marks: true`
+/// screenshot, so it is a checkpoint site: a pause during a check image stops
+/// waiting for a tree the caller no longer wants, and answers the last walk it
+/// took (`Err`). Read-only, so the caller answers with an empty set and a note
+/// rather than a cancelled action.
+fn settle(
+    ax_platform: &Rc<dyn ax::Ax>,
+    pid: i32,
+    geom: &Geometry,
+    region: &Region,
+    gate: &Gate,
+    first: InView,
+) -> Result<(InView, u64), InView> {
+    let mut last = first;
     for poll in 1..=AX_SETTLE_POLLS {
-        // Up to 1.5 seconds, reached from `elements` AND from any `marks: true`
-        // screenshot, so it is a checkpoint site: a pause during a check image
-        // stops waiting for a tree the caller no longer wants. Read-only, so it
-        // answers with an empty set and a note rather than a cancelled action.
         if gate.sleep(AX_SETTLE_POLL_MS).is_err() {
-            let note = format!("{}: cancelled while the tree settled", target.app);
-            return Ok(Viewed::nothing(note));
+            return Err(last);
         }
-        let (again, again_total, truncated) =
-            in_view_nodes(ax_platform, target.pid, geom, region, gate);
-        let waited = u64::from(poll) * AX_SETTLE_POLL_MS;
-        if !again.is_empty() {
-            let note = format!(
-                "{}: tree appeared after {waited}ms ({})",
-                target.app,
-                attempt_note(&attempt)
-            );
-            return Ok(Viewed {
-                nodes: again,
-                owner,
-                truncated,
-                note: Some(note),
-            });
-        }
-        if again_total > 0 {
-            // The tree came alive; this view just contains none of it — more
-            // polling cannot change that.
-            let note = format!(
-                "{}: tree appeared after {waited}ms ({}), but its {again_total} element(s) \
-                 are outside this view",
-                target.app,
-                attempt_note(&attempt)
-            );
-            return Ok(Viewed::nothing(note));
+        last = in_view_nodes(ax_platform, pid, geom, region, gate);
+        if last.total > 0 {
+            return Ok((last, u64::from(poll) * AX_SETTLE_POLL_MS));
         }
     }
+    Ok((last, u64::from(AX_SETTLE_POLLS) * AX_SETTLE_POLL_MS))
+}
 
-    let waited = u64::from(AX_SETTLE_POLLS) * AX_SETTLE_POLL_MS;
-    let note = format!(
-        "{}: no accessibility elements — {}; tree still empty after {waited}ms",
-        target.app,
-        attempt_note(&attempt)
-    );
-    Ok(Viewed::nothing(note))
+/// What a settled tree came to, with the note that says how it got there.
+fn settled_view(
+    target: &TargetApp,
+    owner: Option<(i32, u64)>,
+    attempt: &str,
+    walked: InView,
+    waited: u64,
+) -> Viewed {
+    if !walked.nodes.is_empty() {
+        return Viewed {
+            nodes: walked.nodes,
+            owner,
+            truncated: walked.truncated,
+            note: Some(format!(
+                "{}: tree appeared after {waited}ms ({attempt})",
+                target.app
+            )),
+            messages: walked.messages,
+        };
+    }
+    let note = if walked.total > 0 {
+        // The tree came alive; this view just contains none of it — more polling
+        // cannot change that.
+        format!(
+            "{}: tree appeared after {waited}ms ({attempt}), but its {} element(s) are \
+             outside this view",
+            target.app, walked.total
+        )
+    } else {
+        format!(
+            "{}: no accessibility elements — {attempt}; tree still empty after {waited}ms",
+            target.app
+        )
+    };
+    Viewed {
+        messages: walked.messages,
+        ..Viewed::nothing(note)
+    }
 }
 
 /// Which application this view is about, when there is one.
@@ -4476,18 +4690,20 @@ fn view_target(_geom: &Geometry, _region: &Region) -> Result<Result<TargetApp, S
 /// Ask one application to expose its accessibility tree, where that is a thing
 /// that can be asked.
 #[cfg(target_os = "macos")]
-fn activate_accessibility(pid: i32) -> Result<&'static str, String> {
+fn activate_accessibility(pid: i32) -> Result<String, String> {
     ax::activate_accessibility(pid)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn activate_accessibility(_pid: i32) -> Result<&'static str, String> {
+fn activate_accessibility(_pid: i32) -> Result<String, String> {
     Err("no accessibility API on this platform".to_string())
 }
 
-fn attempt_note(attempt: &Result<&'static str, String>) -> String {
+/// What an activation did, in the note's words: the attribute and whether this
+/// process switched it on or found it on already, or why it would not.
+fn attempt_note(attempt: &Result<String, String>) -> String {
     match attempt {
-        Ok(attribute) => format!("{attribute} activated"),
+        Ok(done) => done.clone(),
         Err(reason) => format!("activation refused: {reason}"),
     }
 }
@@ -4954,17 +5170,6 @@ mod tests {
         assert_eq!(overlap_area(&a, &partial), 25.0);
     }
 
-    /// The two typed rejections fall through to the second attribute; every
-    /// other AXError is terminal.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn attribute_rejection_codes() {
-        assert!(ax::attribute_rejected(-25205));
-        assert!(ax::attribute_rejected(-25208));
-        assert!(!ax::attribute_rejected(-25204));
-        assert!(!ax::attribute_rejected(0));
-    }
-
     #[test]
     fn a_window_is_clipped_to_the_display_it_overlaps() {
         let g = ultrawide_geom();
@@ -5208,6 +5413,103 @@ mod tests {
         assert_eq!(
             v["capabilities"]["observations"],
             json!({ "max": observation::MAX_OBSERVATIONS, "ttl_ms": observation::TTL_MS })
+        );
+    }
+
+    /// The verbs whose every use needs the accessibility API or a bound window's
+    /// stream, which only the macOS build has.
+    const MACOS_ONLY_ACTIONS: [&str; 6] = [
+        "inspect",
+        "elements",
+        "press",
+        "set_value",
+        "select_target",
+        "release_target",
+    ];
+
+    fn advertised(hello: &Value) -> Vec<&str> {
+        hello["actions"]
+            .as_array()
+            .expect("a list of actions")
+            .iter()
+            .map(|action| action.as_str().expect("an action name"))
+            .collect()
+    }
+
+    // F1: the handshake lists only what THIS build can do. The engine builds the
+    // model's verbs from it, and a verb that always refuses is a verb the model is
+    // invited to waste a turn on.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn off_macos_the_handshake_offers_no_accessibility_and_no_bound_windows() {
+        let v = hello(&test_launcher()).unwrap();
+
+        for absent in MACOS_ONLY_ACTIONS {
+            assert!(
+                !advertised(&v).contains(&absent),
+                "{absent} is not offered off macOS"
+            );
+        }
+        assert_eq!(
+            advertised(&v),
+            vec![
+                "screenshot",
+                "left_click",
+                "right_click",
+                "double_click",
+                "mouse_move",
+                "left_click_drag",
+                "scroll",
+                "type",
+                "key",
+                "wait",
+                "wait_for_change",
+                "paste",
+                "windows",
+            ]
+        );
+        assert_eq!(
+            v["capabilities"]["input_methods"],
+            json!(["foreground_hid"])
+        );
+    }
+
+    // And the macOS build offers every verb it offered before, in the same order.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_macos_the_handshake_offers_every_verb_and_both_input_methods() {
+        let v = hello(&test_launcher()).unwrap();
+
+        assert_eq!(
+            advertised(&v),
+            vec![
+                "screenshot",
+                "left_click",
+                "right_click",
+                "double_click",
+                "mouse_move",
+                "left_click_drag",
+                "scroll",
+                "type",
+                "key",
+                "wait",
+                "inspect",
+                "wait_for_change",
+                "paste",
+                "elements",
+                "windows",
+                "press",
+                "set_value",
+                "select_target",
+                "release_target",
+            ]
+        );
+        for present in MACOS_ONLY_ACTIONS {
+            assert!(advertised(&v).contains(&present));
+        }
+        assert_eq!(
+            v["capabilities"]["input_methods"],
+            json!(["foreground_hid", "ax"])
         );
     }
 
@@ -5769,7 +6071,11 @@ mod tests {
         assert!(frame["actions"].is_array());
         assert_eq!(
             frame["capabilities"]["input_methods"],
-            json!(["foreground_hid", "ax"]),
+            if cfg!(target_os = "macos") {
+                json!(["foreground_hid", "ax"])
+            } else {
+                json!(["foreground_hid"])
+            },
             "a caller reads which methods this build really has"
         );
         assert_eq!(
@@ -5943,7 +6249,7 @@ mod tests {
         let platform: Rc<dyn ax::Ax> = recorder.clone();
         let mut worker = worker_with(gate, platform.clone());
 
-        let found = ax::walk(&platform, FIXTURE_PID, gate.clock().as_ref(), u64::MAX);
+        let found = tree::walk(&platform, FIXTURE_PID, gate.clock().as_ref(), u64::MAX);
         let entries: Vec<ax::Entry> = found
             .nodes
             .into_iter()
@@ -6332,7 +6638,7 @@ mod tests {
         // its SUBROLE. Setting the role here instead is the mistake that published
         // every password field's value, so the fixture models the real shape.
         app.change(1, |element| {
-            element.subrole = Some(ax::SECURE_SUBROLE.to_string());
+            element.subrole = Some(ax::SECURE_TEXT_FIELD.to_string());
         });
         let (mut worker, observation) = worker_listing(&gate, &app);
 
@@ -6359,6 +6665,114 @@ mod tests {
         assert_eq!(frame["error"], json!("ax_action_unsupported"));
         assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"));
         assert!(frame["detail"].as_str().unwrap().contains("type or paste"));
+    }
+
+    // M6: some fields show a written value a moment after the write — a formatter,
+    // a binding that updates on the next turn of the run loop. One read straight
+    // after it called a write that worked unobserved, so the read-back is taken
+    // again every 50 ms until it matches.
+    #[test]
+    fn a_set_value_reads_back_until_a_slow_field_shows_the_value() {
+        let clock = StepClock::new();
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.commits_after(3);
+
+        let frame = served(&set_to(&observation, "e2", "grace"), &gate, &mut worker);
+
+        assert_eq!(frame["verified"], json!(true));
+        assert_eq!(frame["receipt"]["effect"], json!("verified"));
+        assert_eq!(frame["value"], json!("grace"));
+        assert_eq!(
+            frame["receipt"]["timings_ms"]["settle"],
+            json!(150),
+            "three waits of 50 ms, and not one more once it matched"
+        );
+    }
+
+    // A field that never shows it is read for 400 ms and no longer, and the reply
+    // says what it holds instead.
+    #[test]
+    fn a_set_value_stops_reading_back_after_four_hundred_milliseconds() {
+        let clock = StepClock::new();
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.commits_after(1_000);
+
+        let frame = served(&set_to(&observation, "e2", "grace"), &gate, &mut worker);
+
+        assert_eq!(frame["ok"], json!(true));
+        assert_eq!(frame["verified"], json!(false));
+        assert_eq!(frame["receipt"]["effect"], json!("not_observed"));
+        assert_eq!(frame["value"], json!("ada"), "what it still holds");
+        assert_eq!(frame["receipt"]["timings_ms"]["settle"], json!(400));
+    }
+
+    // The wait goes through the gate, so a pause during it stops it at once. The
+    // write had already gone out, and the receipt says so and claims no effect.
+    #[test]
+    fn a_pause_while_reading_back_stops_the_wait_and_reports_the_write_sent() {
+        let clock = PauseOnSleep::new(1);
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        clock.arm(&gate);
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.commits_after(1_000);
+        let platform: Rc<dyn ax::Ax> = app.clone();
+        let before = platform.messages();
+
+        let frame = served(&set_to(&observation, "e2", "grace"), &gate, &mut worker);
+        clock.disarm();
+
+        assert_eq!(frame["receipt"]["dispatch"], json!("sent"));
+        assert_eq!(frame["receipt"]["effect"], json!("not_observed"));
+        assert_eq!(frame["verified"], json!(false));
+        assert_eq!(app.performed().len(), 1, "one write, never repeated");
+        // The revalidation (its facts, and whether the value may be written), the
+        // foreground before and after, the write, and ONE read back — not the eight
+        // more a 400 ms wait would have taken.
+        assert_eq!(platform.messages() - before, 6);
+    }
+
+    // M2, through the actions rather than the arithmetic: a write is sent with half
+    // of what is left of its budget once the control has been revalidated, and
+    // never with less than a read gets, however slow the revalidation was.
+    #[test]
+    fn an_accessibility_write_gets_half_of_what_is_left_and_never_less_than_a_read() {
+        let press = |observation: &Observation| at_element("press", observation, "e1");
+        let set = |observation: &Observation| set_to(observation, "e2", "grace");
+
+        assert_eq!(sent_timeout(press, 0), 1_000, "revalidated at once");
+        assert_eq!(
+            sent_timeout(press, 600),
+            700,
+            "after 600 ms of revalidation"
+        );
+        assert_eq!(sent_timeout(set, 600), 700);
+        assert_eq!(
+            sent_timeout(set, 1_800),
+            ax::READ_TIMEOUT_MS,
+            "never less than a read"
+        );
+    }
+
+    /// The messaging timeout the one write a request made was sent with, when every
+    /// read of a control costs `read_ms`.
+    fn sent_timeout(request: impl Fn(&Observation) -> wire::Request, read_ms: u64) -> u64 {
+        let clock = StepClock::new();
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.costs_per_node(read_ms, clock.clone());
+
+        let frame = served(&request(&observation), &gate, &mut worker);
+
+        assert_eq!(frame["ok"], json!(true), "{frame}");
+        let performed = app.performed();
+        assert_eq!(performed.len(), 1, "{performed:?}");
+        performed[0].2
     }
 
     // The case the receipt exists for: the message went out and the answer never
@@ -6427,7 +6841,7 @@ mod tests {
         let listed = aim(&request, &observation, element, &worker).expect("a control to aim at");
         assert_eq!(listed, (140, 212), "the centre of the listed frame");
 
-        app.change(0, |element| element.frame = frame_at(500.0, 600.0));
+        app.change(0, |element| element.frame = Some(frame_at(500.0, 600.0)));
         let moved = aim(&request, &observation, element, &worker).expect("still a control to aim");
         assert_eq!(moved, (540, 612), "the centre of where it is NOW");
     }
@@ -6464,18 +6878,19 @@ mod tests {
         let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
         let app = fixture_app();
         let (mut worker, observation) = worker_listing(&gate, &app);
-        assert_eq!(app.counts(), (2, 0, 2));
+        // The walk held the application to read its children, and gave it back.
+        assert_eq!(app.counts(), (3, 1, 2));
 
         app.change(0, |element| element.enabled = false);
         served(&at_element("press", &observation, "e1"), &gate, &mut worker);
         served(&at_element("press", &observation, "e9"), &gate, &mut worker);
         served(&set_to(&observation, "e1", "nope"), &gate, &mut worker);
 
-        assert_eq!(app.counts(), (2, 0, 2), "a refusal is not a release");
+        assert_eq!(app.counts(), (3, 1, 2), "a refusal is not a release");
 
         drop(observation);
         drop(worker);
-        assert_eq!(app.counts(), (2, 2, 0), "and everything goes in the end");
+        assert_eq!(app.counts(), (3, 3, 0), "and everything goes in the end");
     }
 
     // The shape of one element on the wire. Written out in full because it is the
@@ -6483,12 +6898,19 @@ mod tests {
     // was read from the control itself rather than guessed from its role.
     #[test]
     fn an_element_is_published_with_everything_needed_to_name_and_judge_it() {
-        let app = fixture_app();
+        // The Save button inside a named toolbar inside a named document; the field
+        // beside the document, with no ancestry of its own.
+        let app = ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                ax::Scripted::group("Document", &[1]),
+                ax::Scripted::group("Toolbar", &[2]),
+                ax::Scripted::button("Save", frame_at(100.0, 200.0)),
+                ax::Scripted::field("Name", "ada", frame_at(100.0, 260.0)),
+            ],
+        );
         let platform: Rc<dyn ax::Ax> = app.clone();
         let clock = SystemClock::new();
-        app.change(0, |element| {
-            element.path = vec!["Document".to_string(), "Toolbar".to_string()]
-        });
 
         // A 1x display, so the bounds in this reply's pixels are the same numbers
         // as the frame the walk read; the mapping itself is `geometry`'s to prove.
@@ -6510,7 +6932,7 @@ mod tests {
         );
         let region = Region::full(&geom);
 
-        let found = ax::walk(&platform, FIXTURE_PID, &clock, u64::MAX);
+        let found = tree::walk(&platform, FIXTURE_PID, &clock, u64::MAX);
         let button = element_value(&found.nodes[0], Some("e1"), (140, 212), &geom, &region);
         let field = element_value(&found.nodes[1], Some("e2"), (140, 272), &geom, &region);
 
@@ -6560,7 +6982,8 @@ mod tests {
     // is the one wrong answer an element list can give.
     #[test]
     fn a_truncated_walk_is_named_on_the_reply() {
-        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let clock = StepClock::new();
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
         let app = fixture_app();
         let platform: Rc<dyn ax::Ax> = app.clone();
 
@@ -6569,6 +6992,7 @@ mod tests {
             owner: None,
             truncated: Some("time"),
             note: Some("read Fixture".to_string()),
+            messages: 0,
         };
         let mut payload = json!({ "ok": true, "elements": [] });
         if let (Some(object), Some(truncation)) = (payload.as_object_mut(), viewed.truncated) {
@@ -6577,16 +7001,183 @@ mod tests {
         assert_eq!(payload["truncated"], json!("time"));
 
         // And the budget that produces it is the walk's own, not the caller's.
-        app.costs_per_node(WALK_COST_MS);
-        let deadline = gate.now_ms().saturating_add(ax::WALK_BUDGET_MS);
-        let found = ax::walk(&platform, FIXTURE_PID, gate.clock().as_ref(), deadline);
+        app.costs_per_node(WALK_COST_MS, clock.clone());
+        let deadline = gate.now_ms().saturating_add(tree::WALK_BUDGET_MS);
+        let found = tree::walk(&platform, FIXTURE_PID, gate.clock().as_ref(), deadline);
         assert_eq!(found.truncated, Some("time"));
         assert_eq!(app.walks(), 1);
     }
 
-    /// More than the whole walk budget for one node, so the second one cannot be
-    /// reached.
-    const WALK_COST_MS: u64 = ax::WALK_BUDGET_MS - 1;
+    /// The whole walk budget for one node, so the second one cannot be reached: the
+    /// budget is checked before each node is read.
+    const WALK_COST_MS: u64 = tree::WALK_BUDGET_MS;
+
+    // M7: a listing says how many accessibility messages its read sent, beside the
+    // fields it always had, so the batching the macOS reader exists for is a number
+    // the owner can read on a real application.
+    #[test]
+    fn a_listing_says_how_many_accessibility_messages_its_read_sent() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let worker = bound_worker(&gate);
+        let app = ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                ax::Scripted {
+                    label: Some("Window 20".to_string()),
+                    children: vec![1, 2],
+                    ..ax::Scripted::of("AXWindow")
+                },
+                ax::Scripted::button("Save", frame_at(100.0, 200.0)),
+                ax::Scripted::field("Name", "ada", frame_at(100.0, 260.0)),
+            ],
+        );
+        app.windows_are(&[0]);
+        let platform: Rc<dyn ax::Ax> = app.clone();
+        let windows = ax::application_windows(&platform, FIXTURE_PID);
+        let (geom, region) = one_to_one();
+
+        let (payload, listed) = elements_rooted(
+            &platform,
+            windows[0].handle(),
+            &geom,
+            &region,
+            &gate,
+            &worker,
+        )
+        .expect("a listing of the bound window");
+
+        assert_eq!(payload["elements"].as_array().map(Vec::len), Some(2));
+        assert!(listed.is_some());
+        // The window: its facts, its child count, one page. Each control: its facts,
+        // its value, whether that may be written, and its child count.
+        assert_eq!(payload["ax_messages"], json!(3 + 2 * 4));
+    }
+
+    // A read that found nothing still says what it cost.
+    #[test]
+    fn an_empty_listing_still_says_what_its_read_cost() {
+        let (geom, region) = one_to_one();
+        let viewed = Viewed {
+            nodes: Vec::new(),
+            owner: None,
+            truncated: None,
+            note: Some("Fixture: no accessibility elements".to_string()),
+            messages: 12,
+        };
+
+        let (payload, listed) = publish_elements(viewed, &geom, &region);
+
+        assert_eq!(payload["ax_messages"], json!(12));
+        assert!(listed.is_none());
+    }
+
+    // A tree still being built is walked again until it appears, and the reply's
+    // cost is the walk whose list it publishes. The empty walks before it are not
+    // the cost of that list, and a count that included them made the per-control
+    // cost of a Chromium listing look like the batching had not worked.
+    #[test]
+    fn a_settled_listing_counts_only_the_walk_it_publishes() {
+        let gate = Gate::new("boot-1".to_string(), StepClock::new());
+        let app = fixture_app();
+        app.empty_for(2);
+        let platform: Rc<dyn ax::Ax> = app.clone();
+        let (geom, region) = one_to_one();
+        let target = TargetApp {
+            pid: FIXTURE_PID,
+            app: "Fixture".to_string(),
+        };
+
+        let viewed = read_application(&platform, &target, &geom, &region, &gate, switched_on);
+
+        assert_eq!(viewed.nodes.len(), 2);
+        assert_eq!(
+            viewed.note.as_deref(),
+            Some("Fixture: tree appeared after 600ms (AXManualAccessibility activated)")
+        );
+        assert_eq!(app.walks(), 3, "two empty walks, then the tree");
+        // The application: its facts, its child count, one page. Each control: its
+        // facts, its value, whether that may be written, and its child count.
+        assert_eq!(viewed.messages, 3 + 2 * 4);
+    }
+
+    /// An activation that worked, for a test with no application to ask.
+    fn switched_on(_pid: i32) -> Result<String, String> {
+        Ok("AXManualAccessibility activated".to_string())
+    }
+
+    // A password field's value is never asked for, so it cannot reach a reply by
+    // any route: the listing names the field and carries no value for it, and the
+    // platform was never asked for one.
+    #[test]
+    fn a_password_fields_value_is_never_read_and_never_published() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let worker = bound_worker(&gate);
+        let app = ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                ax::Scripted {
+                    label: Some("Window 20".to_string()),
+                    children: vec![1, 2],
+                    ..ax::Scripted::of("AXWindow")
+                },
+                ax::Scripted::field("Name", "ada", frame_at(100.0, 200.0)),
+                ax::Scripted::secure_field("Password", "hunter2", frame_at(100.0, 260.0)),
+            ],
+        );
+        app.windows_are(&[0]);
+        let platform: Rc<dyn ax::Ax> = app.clone();
+        let windows = ax::application_windows(&platform, FIXTURE_PID);
+        let (geom, region) = one_to_one();
+
+        let (payload, _listed) = elements_rooted(
+            &platform,
+            windows[0].handle(),
+            &geom,
+            &region,
+            &gate,
+            &worker,
+        )
+        .expect("a listing of the bound window");
+
+        let elements = payload["elements"].as_array().expect("a list");
+        assert_eq!(elements.len(), 2, "the password field is listed");
+        assert_eq!(elements[0]["value"], json!("ada"));
+        assert!(elements[1].get("value").is_none(), "{payload}");
+        assert!(!payload.to_string().contains("hunter2"), "{payload}");
+        assert_eq!(app.values_read(), vec![1], "only the plain field was asked");
+    }
+
+    /// A 1x display, so a reply's pixels are the same numbers as the points read.
+    fn one_to_one() -> (Geometry, Region) {
+        let facts = MonitorFacts {
+            x: 0,
+            y: 0,
+            width: 1366,
+            height: 768,
+            scale_factor: 1.0,
+        };
+        let geom = Geometry::from_facts(
+            &facts,
+            geometry::Measurement {
+                frame_w: 1366,
+                frame_h: 768,
+                pixels_per_point: 1.0,
+            },
+            Host::MacOs,
+        );
+        let region = Region::full(&geom);
+        (geom, region)
+    }
+
+    // M5: Chromium asks for its complete accessibility mode through a two-second
+    // debounce after the switch is written, so the empty-tree poll must outlast it
+    // or the tree that was about to appear is reported as absent.
+    #[test]
+    fn the_empty_tree_poll_outlasts_chromiums_two_second_debounce() {
+        const CHROMIUM_DEBOUNCE_MS: u64 = 2_000;
+        let window = u64::from(AX_SETTLE_POLLS) * AX_SETTLE_POLL_MS;
+        assert!(window > CHROMIUM_DEBOUNCE_MS, "{window} ms of polling");
+    }
 
     // --- M42 slice 6: one action with its check, settled, and timed -----------
     //

@@ -1902,3 +1902,214 @@ here rather than working around it.
 * **Anything about a window on another display, or a display this machine does
   not have.** A window dragged between two panels of different backing scales is
   its own row.
+
+---
+
+# Live check — controls by action, batched reads, an honest handshake (M86 P1)
+
+**What this is for.** P1 moved the accessibility walk above the platform seam
+(`tree.rs`) and rebuilt the macOS reader under it. The walk's rules — its budgets,
+which nodes it lists, its pages and its paths — are proved without a screen
+against scripted trees (379 Rust tests). What no unit test can tell you is how
+many messages a REAL application costs now, whether the new listing rule finds
+controls the old one missed without losing any, and whether Chrome's accessibility
+switch is now recorded and given back. This section measures those on the fixture
+app and on Chrome, with the build before P1 and the build after it.
+
+Expected outcome in one line: the same handshake on the Mac, fewer messages per
+listed control, at least as many controls listed, and Chrome's switch reported as
+activated and turned off again when the helper exits.
+
+> **Step 5 POSTS REAL INPUT** (a `set_value`). **Step 4 changes Chrome's
+> accessibility mode** while the helper runs (it is turned off again when the
+> helper exits). Steps 1 to 3 read only. Nothing here may be run by an agent. Run
+> it yourself, at the machine, with nothing confidential on screen.
+
+## 0. Preconditions
+
+* **Two builds**, so every number below has a before and an after:
+
+  ```sh
+  cd /Users/sujshe/projects/compux
+  git switch main && (cd native/compux && cargo build --release) \
+    && cp native/compux/target/release/compux /tmp/compux-before
+  git switch feat/m86 && (cd native/compux && cargo build --release) \
+    && cp native/compux/target/release/compux /tmp/compux-after
+  ```
+
+  Both speak protocol 11: P1 adds a reply field and changes no shape.
+* **The fixture app** (`scripts/build_fixture_app.sh`) and **Chrome** with an
+  ordinary page open — a page with a form and a few links is best.
+* `cx.py` from the slice-2 section, and this timer, which takes eleven listings in
+  ONE helper and prints the median of the last ten beside what the last one said:
+
+  ```sh
+  cat > /tmp/cxlist.py <<'PYEOF'
+  import json, os, statistics, subprocess, sys, time
+
+  side = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          env=os.environ.copy(), text=True, bufsize=1)
+
+  def ask(frame):
+      side.stdin.write(json.dumps(frame) + "\n")
+      side.stdin.flush()
+      return json.loads(side.stdout.readline())
+
+  hello = ask({"type": "request", "request_id": "r0", "action": "hello",
+               "protocol_version": 11, "deadline_ms": 10000})
+  envelope = {"type": "request", "deadline_ms": 30000, "session_generation": 1,
+              "authorization_generation": 1,
+              "sidecar_generation": hello["sidecar_generation"]}
+
+  took = []
+  for n in range(1, 12):
+      started = time.monotonic()
+      reply = ask({**envelope, "request_id": "r%d" % n, "action": "elements"})
+      took.append((time.monotonic() - started) * 1000)
+
+  listed = len(reply.get("elements", []))
+  sent = reply.get("ax_messages")
+  print(json.dumps({
+      "listed": listed,
+      "ax_messages": sent,
+      "per_listed": round(sent / listed, 1) if sent and listed else None,
+      "p50_ms": round(statistics.median(took[1:])),
+      "truncated": reply.get("truncated"),
+      "ax_activation": reply.get("ax_activation"),
+  }))
+  side.stdin.close()
+  side.wait()
+  PYEOF
+  ```
+
+  The before build prints `"ax_messages": null`: it does not count.
+
+## 1. The handshake is unchanged on the Mac (10 seconds, fails fastest)
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py /tmp/compux-after </dev/null | head -1
+```
+
+`actions` lists the same nineteen verbs as before, in the same order, and
+`capabilities.input_methods` is `["foreground_hid", "ax"]`. On the Linux build the
+same handshake lists neither `ax` nor `inspect`, `elements`, `press`, `set_value`,
+`select_target` and `release_target`; that is proved by a test on each platform,
+and is worth one look on the Pop!_OS desktop only if you are already there
+(`hello` reads nothing from the screen).
+
+## 2. Messages per listed control (M1, M2, M3, M7)
+
+Bring the fixture window to the front, then:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cxlist.py /tmp/compux-before
+COMPUX_DISCLAIMED=1 python3 /tmp/cxlist.py /tmp/compux-after
+```
+
+* **`per_listed` on the after build should be about 5.5 or less on the fixture
+  window.** The reader before P1 spent ten or eleven messages on every control it
+  listed — role, title, description when there was no title, position, size,
+  subrole, value, enabled, action names, settable and the children array — before
+  counting a single node it passed over, so about 5.5 is M1's "at most half". The
+  after build spends one batched read, the action names, whether the value may be
+  written, the value (not for a secure field), the child count and a page of
+  children only when there are some: four to six. A higher figure is nodes passed
+  over (three or four messages each, before and after alike); paste the reply
+  rather than judging it.
+* **What `ax_messages` counts:** the messages of the ONE walk whose list the reply
+  returns. It leaves out the activation's own reads and writes, any `inspect`, and
+  the earlier walks of an empty-tree poll (step 4), so `per_listed` divides one
+  walk's cost by that walk's controls even on Chrome's first listing.
+* **`p50_ms` should be no worse after than before.** Write both down.
+* `truncated` should be absent on the fixture window on both builds.
+
+Then bring Chrome to the front and run both again. Chrome's figure is dominated by
+the web nodes the walk passes over, so record it rather than judging it against
+5.5; `truncated: "time"` or `"nodes"` there is worth writing down too.
+
+## 3. Controls listed, before and after (M4)
+
+From the same runs, compare `listed` for each application.
+
+* **The after build lists at least as many controls as the before build, and
+  usually more.** The new ones are nodes whose role is not one of the fixed fourteen
+  (an `AXGroup`, an `AXRow`, an `AXImage`) but whose own action list advertises
+  `AXPress`, `AXConfirm`, `AXPick`, `AXIncrement`, `AXDecrement` or `AXOpen`.
+  Expect `AXScrollBar` among them: a scroll bar advertises `AXIncrement` and
+  `AXDecrement`, so every scroll area adds up to two (vertical and horizontal).
+  To see which, run `{"action":"elements"}` through `cx.py` on each build and diff
+  the roles.
+* **Fewer on the after build is a regression.** With `truncated: "time"` it is a
+  slow application: a node that did not answer within 250 ms is skipped and the
+  listing says so. With no `truncated`, the likeliest cause is a node whose
+  batched read failed outright — it is not listed, though what is inside it still
+  is. Paste both listings, and note which controls are missing.
+
+## 4. Chrome's accessibility switch is recorded and given back (M5)
+
+Quit Chrome completely and start it again, so its accessibility mode starts off.
+Open the same page, bring it to the front, and run the after build once:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py /tmp/compux-after '{"action":"elements"}' </dev/null
+```
+
+* If the first walk found no controls, `ax_activation` names the switch that
+  worked — `AXManualAccessibility activated` or `AXEnhancedUserInterface
+  activated` — and how long the tree took to appear (up to 2400 ms now, to outlast
+  Chromium's two-second debounce). The before build said `activation refused:
+  AXError -25208` for the same Chrome, because Chrome applies
+  `AXEnhancedUserInterface` and answers "not implemented" anyway; the after build
+  reads the attribute back and believes that instead.
+* If the first walk already found controls, nothing was switched (the switch is
+  tried only on an empty tree) and this step proves nothing: quit Chrome and try
+  again with a fresh launch.
+* **It is turned off again when the helper exits.** With Xcode's Accessibility
+  Inspector pointed at Chrome's application element, `AXEnhancedUserInterface`
+  (or `AXManualAccessibility`) reads true while the helper runs — keep `cx.py`
+  open by leaving off `</dev/null` — and false a moment after you press ctrl-D.
+* **A switch that was already on is left on.** Turn VoiceOver on (cmd-F5), quit
+  and relaunch Chrome, and repeat the run. If the first walk is empty,
+  `ax_activation` now says `AXEnhancedUserInterface already on, left as it was`
+  (or the same for `AXManualAccessibility`), and after ctrl-D the Inspector still
+  reads it true: the helper never turns off a switch VoiceOver turned on. Turn
+  VoiceOver off again afterwards.
+
+## 5. A field that shows its value late now verifies (M6)
+
+**This step POSTS REAL INPUT.** In the fixture app, set its text field by
+reference through the after build:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py /tmp/compux-after
+{"action":"elements"}
+{"action":"set_value","observation_id":"<the id it printed>","element_ref":"<the text field>","value":"grace"}
+```
+
+`verified` is `true` and `receipt.effect` is `"verified"`, as before. On a field that
+formats or commits late — a number or date field, or a form field in Chrome — the
+before build often said `verified: false` with the right text arriving a moment
+later; the after build reads it back every 50 ms for up to 400 ms, and
+`receipt.timings_ms.settle` says how long it waited.
+
+## 6. The numbers
+
+| Application | Build | `listed` | `ax_messages` | `per_listed` | `p50_ms` | `truncated` |
+|---|---|---|---|---|---|---|
+| FixtureApp | before | | n/a | n/a | | |
+| FixtureApp | after | | | | | |
+| Chrome | before | | n/a | n/a | | |
+| Chrome | after | | | | | |
+
+## 7. What this check still cannot prove
+
+* **That every application answers a batched read.** The reader asks for seven
+  attributes in one `AXUIElementCopyMultipleAttributeValues`. A node whose
+  application fails that call outright is not listed (its children still are).
+  Step 3's comparison is what would show it.
+* **That the 250 ms read timeout is long enough everywhere.** A slow application
+  now costs a quarter of a second per message, not a second; a node that needs
+  longer is skipped rather than waited on, and the listing says `truncated:
+  "time"`. A slow application that lists fewer controls with that note is this.
+* **The Linux reader.** Nothing here touches Linux accessibility; P1 only makes the
+  Linux build stop offering it.

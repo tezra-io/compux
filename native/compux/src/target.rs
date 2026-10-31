@@ -582,9 +582,13 @@ fn matches_window(
     handle: crate::ax::Handle,
     window: &WindowFacts,
 ) -> bool {
-    let titled = ax.label(handle).unwrap_or_default() == window.title;
-    let placed = ax
-        .bounds(handle)
+    // A window that answers nothing it could be matched by is not the one.
+    let Ok(facts) = ax.facts(handle) else {
+        return false;
+    };
+    let titled = facts.label.unwrap_or_default() == window.title;
+    let placed = facts
+        .frame
         .map(|frame| {
             Bounds {
                 x: frame.x,

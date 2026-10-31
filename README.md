@@ -143,13 +143,52 @@ absent for a secure field. `actions` lists only what this build can really perfo
 only where the accessibility API says the value may be written. Nothing is
 inferred from a role name.
 
+A node is listed when its role is one a person operates (a button, a field, a
+checkbox, a link, a cell, …) **or** when its own action list advertises a primary
+action — `AXPress`, `AXConfirm`, `AXPick`, `AXIncrement`, `AXDecrement` or `AXOpen`.
+The second rule picks up the SwiftUI and web groups and rows that act like buttons;
+`AXShowMenu`, `AXScrollToVisible`, `AXRaise` and focus alone list nothing, because
+every container answers them.
+
+The walk is bounded: 14 levels deep, 250 controls, 3000 nodes visited, 250 children
+read from any one parent (128 to a page) and 1.5 seconds of wall clock. A listing
+that stopped at one of those says which in `truncated` — `"depth"`, `"nodes"` or
+`"time"` — so a partial tree is never passed off as the whole one. `"time"` also
+covers a node that did not answer within its own timeout: the walk skips it, still
+reads what is inside it, and says the listing is incomplete. A node that is gone
+takes its subtree with it and is not a truncation; a parent that will not count its
+children (Xcode's windows), or will not hand over a page of them, has its child list
+copied once instead.
+
+`ax_messages` says how many accessibility messages the read of the returned list
+sent. On macOS each node is read with one batched message for its role, subrole,
+title, description, enabled state and frame and one for its action names; only a
+node that is listed is asked, with a message each, whether its value may be written
+and — unless it is secure — its value. Every node is given a 250 ms messaging
+timeout before it is read; an application's windows and the application in front
+keep the one-second timeout they had before.
+
+An application whose tree walks to no controls at all is asked to switch its
+accessibility on (`AXManualAccessibility`, then `AXEnhancedUserInterface`), and the
+switch counts when the attribute reads back on, whatever the setter answered —
+Chrome applies `AXEnhancedUserInterface` and still answers
+`kAXErrorNotImplemented`. A switch that is already on — a screen reader turned it
+on — is left alone and never recorded, so the helper never turns it off under the
+client that needs it. The walk is then retried every 300 ms for up to 2.4 seconds,
+which outlasts Chromium's two-second debounce, and every switch the helper turned on
+is turned off again when it exits. `ax_activation` says what happened, and
+`ax_messages` counts only the last of those walks: the one whose list is returned.
+
 Two actions address a control rather than a point:
 
 * **`press/3`** performs the control's own press. The pointer does not move and it
   cannot miss.
 * **`set_value/4`** writes the value and reads it back: the receipt says
   `effect: "verified"` when the read-back matches, `"not_observed"` when it does
-  not (a secure field always reads back masked, so it never verifies).
+  not (a secure field is never read back, so it never verifies). A field that
+  shows a write a moment late is read again every 50 ms for up to 400 ms; a pause
+  during that wait ends it, and the receipt reports the write `sent` and its
+  effect `not_observed`.
 
 Both are offered only where the control advertises support and are refused
 `ax_action_unsupported` everywhere else — never silently replaced by a click,
@@ -215,6 +254,13 @@ settle's own polls included.
 `{:error, {:protocol_mismatch, _}}`. Because the encoder is compiled in but the
 binary is installed separately, this is what keeps them from silently drifting.
 
+The handshake's `actions` and `capabilities.input_methods` list only what that
+build can do. The macOS build lists every verb and both input methods
+(`foreground_hid`, `ax`); the Linux build lists neither `ax` nor the verbs that need
+the accessibility API or a bound window — `inspect`, `elements`, `press`,
+`set_value`, `select_target` and `release_target` — so a caller that offers what
+`hello` lists never offers a verb whose every use is a refusal.
+
 ## Installation
 
 ```elixir
@@ -239,7 +285,8 @@ return a typed error on Linux; the paste chord is Ctrl+V). The permission
 `probe` works on both (on Linux it reports X11-vs-Wayland capability).
 **Wayland**, **Linux accessibility**, and **Windows** are not supported yet. The
 accessibility actions `press` and `set_value` are macOS-only for the same reason
-`elements` is, and answer a typed error elsewhere rather than an empty success.
+`elements` is, and answer a typed error elsewhere rather than an empty success. The
+Linux build's `hello` does not list them (see "The version handshake").
 
 `idle_ms` / `wait_for_idle` (operational, not model actions) report how long the
 human has been idle — a coexistence signal so a policy layer can yield the seat to
@@ -279,9 +326,10 @@ never read.
 Alpha (`0.x`). The coordinate math is unit-tested (including the Retina
 physical-vs-logical regression, at both the backing scale and 1x); the wire
 protocol, handshake, and capture paths are verified on-device. The accessibility
-seam is a trait with a recording implementation, so the tree walk, the checks
-before an action and the retain/release balance of every element reference are
-tested with no OS call — but whether a `press` really presses, and whether it
+seam is a per-node trait with a recording implementation that scripts whole trees,
+and the tree walk sits above it (`tree.rs`), so the walk's budgets, which nodes it
+lists, its paging and its paths, the checks before an action and the
+retain/release balance of every element reference are tested with no OS call — but whether a `press` really presses, and whether it
 leaves the person's keyboard alone while it does, needs a real machine with the
 grants. `fixtures/macos/FixtureApp.swift` (built by `scripts/build_fixture_app.sh`,
 never shipped) is the application those runs are made against, and `LIVE_CHECK.md`
