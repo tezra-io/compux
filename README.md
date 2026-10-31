@@ -224,7 +224,9 @@ only inside the active window (never on GTK 4, which refuses it), and
 `scroll_to` is `Component.ScrollTo` on Chromium and the scroll bar's value on
 GTK. A reference is found again before every action, by its place in the tree and
 by the object itself: two candidates are `ambiguous_element`, one that stays
-unreadable after two more reads is `identity_unknown`. `inspect` is macOS-only.
+unreadable after two more reads is `identity_unknown`. On Qt an object is also
+found where it says it is, and only while its label is the one listed.
+`inspect` is macOS-only.
 
 Two Qt routes are Qt's own. A Qt menu title (a menu-bar item, or an item with a
 submenu) names only `ShowMenu`, and pressing it opens its menu. Qt's item views

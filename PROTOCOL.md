@@ -334,10 +334,12 @@ went out), `invalid_argument` (a missing or wrong `on`/`text`), plus the gate's 
 child-index path from the application, and before any write both are read again. The object at that path and the
 object itself, wherever its own parent still lists it, are each a candidate when they answer the listed role. One is
 the control; two (it moved, and another of its role took its place) are `ambiguous_element`; none is
-`stale_element`; a candidate that does not answer in time is read again at most twice, then `identity_unknown`. The
-object is at its place too when it says so (its `Parent` is the node at its place's parent, and its
+`stale_element`; a candidate that does not answer in time is read again at most twice, then `identity_unknown`. On
+Qt the object is at its place too when it says so (its `Parent` is the node at its place's parent, and its
 `GetIndexInParent` the index its place ends in): Qt answers every `GetChildAtIndex` of a table with a new object for
-the same cell. A `ServiceUnknown` error means the application quit.
+the same cell. Such an object is the control only while its label is the one listed; another (a sort put another item
+there) is `stale_element`. On every other toolkit its own account proves nothing: a destroyed GTK 3 or Chromium object
+keeps answering its old parent and index for a while. A `ServiceUnknown` error means the application quit.
 
 ## 5. Waiting on the tree
 
@@ -598,7 +600,7 @@ Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux bu
 | `stale_element` | The reference names nothing now: its process quit or its pid was reused, it is gone, its role changed, it did not answer in time, or the reply listed no such reference. Nothing sent. |
 | `element_disabled` | The control reads disabled. Nothing sent. |
 | `ax_action_unsupported` | The control has no route for this verb. Nothing sent, nothing clicked instead. |
-| `state_unreadable` | A verb could not read the state it acts from, so it could not decide whether or how to act. Nothing sent. That state is a toggle's or an expander's; on Linux also a scroll bar's range (or one that reads as no range), a field's selection or caret before `type`, and an item's place in its container before `select`. |
+| `state_unreadable` | A verb could not read the state it acts from, so it could not decide whether or how to act. Nothing sent. That state is a toggle's or an expander's; on Linux also a scroll bar's range (or one that reads as no range), a field's selection or caret before `type`, and an item's place in its container before `select`. On Linux the reads before a write are held to the verb's own time: reads that use it up end the verb here too. |
 | `focus_refused` | `focus` on a control whose window is not the active one. Nothing sent. |
 | `ax_action_failed` | The application refused the message. Nothing went out. |
 | `ax_timed_out` | The message went out and no answer came; never repeated. |
