@@ -30,12 +30,16 @@ request, reply and verdict.
 import argparse
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 
 CONTAINER_MARKERS = ("/.dockerenv", "/run/.containerenv")
 REPLY_TIMEOUT_S = 30
+# The most lines the helper may have written ahead of the reader.
+MAX_PENDING_LINES = 1000
 DEADLINE_MS = 10000
 # Bounded waits: tries x step.
 READY_TRIES = 25
@@ -52,16 +56,31 @@ def refuse_outside_a_container():
         sys.exit(2)
 
 
+class HelperFailed(RuntimeError):
+    """The helper itself failed: it exited, answered nothing in time, or wrote what
+    is not a reply. The run records it as a FAIL by that name."""
+
+
 class Helper:
-    """The compux helper on a pipe, one request at a time."""
+    """The compux helper on a pipe, one request at a time. Its replies are read on
+    a thread into a bounded queue, so a helper that writes nothing is waited for
+    REPLY_TIMEOUT_S, never for ever."""
 
     def __init__(self, binary, stderr_path):
         self.stderr = open(stderr_path, "w")
         self.proc = subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.stderr, text=True, bufsize=1)
+        self.lines = queue.Queue(maxsize=MAX_PENDING_LINES)
+        threading.Thread(target=self._read, daemon=True).start()
         self.next_id = 0
         self.next_seq = 0
         self.generations = {}
+
+    def _read(self):
+        """Every line the helper writes, then None when its output ends."""
+        for line in self.proc.stdout:
+            self.lines.put(line)
+        self.lines.put(None)
 
     def ask(self, action, mutation=False, **fields):
         self.next_id += 1
@@ -70,23 +89,34 @@ class Helper:
         if mutation:
             self.next_seq += 1
             frame["mutation_seq"] = self.next_seq
-        started = time.monotonic()
+        deadline = time.monotonic() + REPLY_TIMEOUT_S
         self.proc.stdin.write(json.dumps(frame) + "\n")
         self.proc.stdin.flush()
         while True:
-            line = self.proc.stdout.readline()
-            if not line:
-                raise RuntimeError(f"the helper exited during {action}")
-            reply = json.loads(line)
+            reply = self._next_reply(action, deadline)
             if reply.get("request_id") == frame["request_id"]:
                 return frame, reply
-            if time.monotonic() - started > REPLY_TIMEOUT_S:
-                raise RuntimeError(f"no reply to {action} in {REPLY_TIMEOUT_S} s")
+
+    def _next_reply(self, action, deadline):
+        """The helper's next line as a reply, waiting until `deadline` at most."""
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise HelperFailed(f"no reply to {action} in {REPLY_TIMEOUT_S} s")
+        try:
+            line = self.lines.get(timeout=left)
+        except queue.Empty:
+            raise HelperFailed(f"no reply to {action} in {REPLY_TIMEOUT_S} s") from None
+        if line is None:
+            raise HelperFailed(f"the helper exited during {action}")
+        try:
+            return json.loads(line)
+        except ValueError:
+            raise HelperFailed(f"the helper wrote no reply during {action}: {line[:200]!r}") from None
 
     def handshake(self):
         _, reply = self.ask("hello", session_generation=1, authorization_generation=1)
         if not reply.get("ok"):
-            raise RuntimeError(f"hello refused: {reply}")
+            raise HelperFailed(f"hello refused: {reply}")
         self.generations = {"sidecar_generation": reply.get("sidecar_generation"),
                             "session_generation": 1, "authorization_generation": 1}
         return reply
@@ -384,18 +414,28 @@ def fixture_listed(helper, toolkit):
             "listing": json.dumps(listing)[:2000] if listing else None}
 
 
+def run_all(helper, args, results):
+    """Every step, each result appended as it is decided, so a run the helper ends
+    keeps what it got to."""
+    ready = fixture_listed(helper, args.toolkit)
+    results.append(ready)
+    if not ready["passed"]:
+        return
+    results.append(probe_check(helper))
+    for step in steps_for(args.toolkit):
+        results.append(run_step(helper, args.toolkit, args.state, step))
+    results.append(menu_flow(helper, args.toolkit, args.state))
+    results.append(dialog_flow(helper, args.toolkit, args.state))
+
+
 def run(args):
     helper = Helper(args.binary, args.out + ".stderr")
+    hello, results = {}, []
     try:
         hello = helper.handshake()
-        ready = fixture_listed(helper, args.toolkit)
-        results = [ready]
-        if ready["passed"]:
-            results.append(probe_check(helper))
-            results += [run_step(helper, args.toolkit, args.state, step)
-                        for step in steps_for(args.toolkit)]
-            results.append(menu_flow(helper, args.toolkit, args.state))
-            results.append(dialog_flow(helper, args.toolkit, args.state))
+        run_all(helper, args, results)
+    except HelperFailed as why:
+        results.append({"flow": "helper", "passed": False, "why": str(why)})
     finally:
         helper.close()
     return {"toolkit": args.toolkit, "hello_actions": hello.get("actions"),
