@@ -2559,4 +2559,59 @@ mod tests {
 
         assert_eq!(kinds(&ax), vec![("menu", Some("Actions".to_string()))]);
     }
+
+    // Qt's menu-bar item is a menu item and never reads SELECTED: its menu is a
+    // popup menu below it, kept while closed and open while it reads SHOWING. The
+    // items of a closed menu are never read.
+    #[test]
+    fn a_qt_menu_bar_items_popup_menu_is_open_while_it_reads_showing() {
+        const MENU_BAR: u32 = 34;
+        const MENU_ITEM: u32 = 35;
+        const POPUP_MENU: u32 = 41;
+        let closed = |node: Node| Node {
+            states: vec![ENABLED, SENSITIVE],
+            ..node
+        };
+        let title = |name: &str, menu: &str| Node::of(MENU_ITEM).named(name).holding(APP, &[menu]);
+        let (fake, ax) = reader(desktop(
+            &["/w/bar", "/w/body"],
+            vec![
+                (
+                    "/w/bar",
+                    Node::of(MENU_BAR).holding(APP, &["/w/actions", "/w/view"]),
+                ),
+                ("/w/body", Node::of(PANEL)),
+                ("/w/actions", title("Actions", "/w/actions/menu")),
+                (
+                    "/w/actions/menu",
+                    closed(Node::of(POPUP_MENU).holding(APP, &["/w/export"])),
+                ),
+                ("/w/export", Node::of(MENU_ITEM).named("Export Report")),
+                ("/w/view", title("View", "/w/view/menu")),
+                (
+                    "/w/view/menu",
+                    closed(Node::of(POPUP_MENU).holding(APP, &["/w/zoom"])),
+                ),
+                ("/w/zoom", Node::of(MENU_ITEM).named("Zoom")),
+            ],
+        ));
+        let kinds = |ax: &Rc<dyn Ax>| -> Vec<(&'static str, String)> {
+            crate::semantic::surfaces(ax, PID)
+                .into_iter()
+                .map(|surface| (surface.kind, surface.native_kind))
+                .collect()
+        };
+        assert!(kinds(&ax).is_empty(), "no menu reads showing");
+
+        fake.change(APP, "/w/actions", |item| item.states.push(fake::FOCUSED));
+        fake.change(APP, "/w/actions/menu", |menu| {
+            menu.states.extend([SHOWING, VISIBLE])
+        });
+
+        assert_eq!(kinds(&ax), vec![("menu", "popup menu".to_string())]);
+        assert!(
+            calls_to(&fake.calls(), "/w/zoom").is_empty(),
+            "the closed menu's items were read"
+        );
+    }
 }

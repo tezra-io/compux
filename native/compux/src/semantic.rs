@@ -39,6 +39,15 @@ pub const MAX_SURFACE_NODES: usize = 64;
 /// and the children of a box among them, are looked at for one.
 const MENU_BAR_IN_WINDOW: bool = cfg!(target_os = "linux");
 
+/// Whether a menu-bar item that cannot be selected may hold its menu below it. On
+/// Linux, Qt's menu-bar item is a plain menu item that never reads SELECTED, and
+/// its menu is the popup menu below it, open while that menu reads SHOWING: a menu
+/// kept closed says it is hidden there. macOS's menu-bar item is not read for it.
+const MENU_BELOW_ITEM: bool = cfg!(target_os = "linux");
+
+/// The AT-SPI name of a menu item that is not itself a menu.
+const PLAIN_MENU_ITEM: &str = "menu item";
+
 fn invalid(detail: String) -> Failure {
     Failure::new("invalid_argument", detail)
 }
@@ -414,26 +423,44 @@ impl Scan<'_> {
         }
     }
 
-    /// A menu-bar item's menu is its child whether or not it is open, so only the
-    /// item that reads selected has one open. A GTK 3 menu-bar item is the menu
-    /// itself, and is the surface.
+    /// A menu-bar item's menu is its child whether or not it is open, so an item
+    /// that can be selected has one open only while it reads selected. One that
+    /// cannot be selected may hold a menu that shows while open.
     fn menu_of(&mut self, item: Retained) {
         if !self.counted() {
             return;
         }
         let selected = match self.ax.states(item.handle(), false) {
             Ok(states) => states.selected,
-            Err(why) => {
-                self.unread(why);
-                None
-            }
+            Err(why) => return self.unread(why),
         };
-        if selected != Some(true) {
-            return;
+        match selected {
+            Some(true) => self.selected_menu(item),
+            Some(false) => {}
+            None if MENU_BELOW_ITEM => self.menu_below(item),
+            None => {}
         }
+    }
+
+    /// A selected item's menu: the item itself (GTK 3), else its child.
+    fn selected_menu(&mut self, item: Retained) {
         let Some(item) = self.surface(item) else {
             return;
         };
+        for menu in self.kids(item.handle()) {
+            self.surface(menu);
+        }
+    }
+
+    /// A plain menu item's menu, kept only while it shows (Qt). Nothing below an
+    /// item of any other role is read: a GTK 3 menu's children are its items.
+    fn menu_below(&mut self, item: Retained) {
+        let plain = self
+            .facts(item.handle())
+            .is_some_and(|facts| facts.role.as_deref() == Some(PLAIN_MENU_ITEM));
+        if !plain {
+            return;
+        }
         for menu in self.kids(item.handle()) {
             self.surface(menu);
         }
