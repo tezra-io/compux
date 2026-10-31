@@ -12,7 +12,8 @@
 //!
 //! It RECORDS every call, including the two the reader must never make
 //! (`Action.GetActions` and `Properties.GetAll`), so a test asserts on what was
-//! asked, not only on what came back.
+//! asked, not only on what came back. A fake that was ever sent either of the two
+//! fails its test when it is dropped, whatever the test asserted.
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
@@ -25,6 +26,10 @@ use zbus::connection::Builder;
 use zbus::message::{Flags, Header, Type};
 use zbus::zvariant::{OwnedObjectPath, Value};
 use zbus::{Connection, Message, MessageStream};
+
+/// The calls the reader must never make: `Action.GetActions` aborts an application
+/// under ATK bridge 2.38, and `Properties.GetAll` kills a Qt 6.4 one.
+const FORBIDDEN: [&str; 2] = ["GetActions", "GetAll"];
 
 /// Where the registry lives, and the path every application's root answers at.
 pub const REGISTRY: &str = "org.a11y.atspi.Registry";
@@ -389,6 +394,17 @@ impl Drop for Fake {
             if serving.join().is_err() {
                 eprintln!("fake desktop: the serving thread panicked");
             }
+        }
+        let forbidden: Vec<String> = FORBIDDEN
+            .iter()
+            .flat_map(|member| {
+                let calls = self.sent(member).into_iter();
+                calls.map(move |call| format!("{member} to {call}"))
+            })
+            .collect();
+        // A test already failing says why itself; a second panic would abort.
+        if !forbidden.is_empty() && !std::thread::panicking() {
+            panic!("the fake desktop was sent what compux must never send: {forbidden:?}");
         }
     }
 }
