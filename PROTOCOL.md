@@ -37,7 +37,8 @@ they are as protocol 11 had them.
   and input can read a display from. Such a helper works by control only: its `actions` leave out every pixel verb
   (`screenshot`, the clicks, `mouse_move`, `left_click_drag`, `scroll`, `key`, `wait_for_change`, `paste`,
   `windows`), `input_methods` is `["ax"]`, `capture_methods` is `[]`, its listings carry no positions, and a pixel
-  request (or `type` without `element_ref`) is refused `pixels_unavailable` before anything is sent.
+  request (or `type` without `element_ref`, or any action asking for an image check) is refused `pixels_unavailable`
+  before anything is sent.
 - `input_methods` is `["foreground_hid","ax"]` on both builds. `ax` is the wire's name for acting through the
   platform's accessibility API, whichever it is: macOS's AX API, or AT-SPI on Linux. A receipt's `input_method` is
   `"ax"` for every verb on a reference on both.
@@ -612,7 +613,7 @@ Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux bu
 | Code | When |
 |---|---|
 | `text_outside_layout` | Linux: `type` text the active keymap cannot produce; use `paste`. |
-| `pixels_unavailable` | Linux: a pixel action (or `type` without `element_ref`) on a helper whose display was taken from the user manager: its capture and input reach only a display of its own. Nothing sent; work by control. |
+| `pixels_unavailable` | Linux: a pixel action (or `type` without `element_ref`, or an image check) on a helper whose display was taken from the user manager: its capture and input reach only a display of its own. Nothing sent; work by control. |
 | `consent_refused` | Linux: the person refused the portal's screen-capture or remote-desktop request. |
 | `consent_timeout` | Linux: the portal's request was not answered in time. |
 

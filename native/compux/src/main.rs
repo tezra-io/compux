@@ -770,10 +770,12 @@ fn before_dispatch(
 }
 
 /// Does this request capture the screen or post input to it? `type` does at the
-/// focus; by reference it acts through the accessibility API.
+/// focus (by reference it acts through the accessibility API), and any action does
+/// that asks for an image check.
 fn needs_pixels(request: &wire::Request) -> bool {
     let action = request.action.as_str();
-    PIXEL_ACTIONS.contains(&action) || (action == "type" && request.element_ref.is_none())
+    let typed_at_focus = action == "type" && request.element_ref.is_none();
+    PIXEL_ACTIONS.contains(&action) || typed_at_focus || request.check == wire::Check::Image
 }
 
 /// What a reply needs to reach the caller before its deadline: a wait gives this
@@ -6365,11 +6367,17 @@ mod tests {
         };
         let mut typed = running("type", Some(2));
         typed.body = json!({"action": "type", "text": "hi"});
-        for request in [
+        // A verb by reference that asks for an image check would capture after it
+        // acted: it is refused before anything is sent.
+        let mut pictured = running("press", Some(3));
+        pictured.check = wire::Check::Image;
+        let pixel_requests = [
             running("screenshot", None),
             running("left_click", Some(1)),
             typed,
-        ] {
+            pictured,
+        ];
+        for request in pixel_requests {
             let frame = served(&request, &gate, &mut worker);
             assert_eq!(frame["error"], json!("pixels_unavailable"), "{frame}");
         }
