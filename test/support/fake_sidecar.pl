@@ -48,17 +48,30 @@
 #     bare `{"ok":true}` with an `ax` receipt, and `set_value` answers `verified`
 #     plus the value it read back, with the `verified` effect that read-back earned
 #     — so a library regression that mis-read either is caught here.
+#   * VERBS (protocol 12): `elements` lists a button (`e1`, verbs press and focus)
+#     and a checkbox (`e2`, verbs toggle and focus, checked) in the helper's
+#     shape — a normalised `role` beside `native_role`, `verbs` in place of
+#     `actions`/`settable`. A verb the control has no route for is refused
+#     `ax_action_unsupported` with nothing sent, never clicked instead; `toggle`
+#     reads the state first and, already there, answers `ok` with a `not_sent`
+#     receipt that says `already`; a toggle that went out answers `changed` and the
+#     `surfaces` it found (none). A receipt with nothing sent carries no `surfaces`,
+#     as the helper's does not. `wait_for` answers a condition that never held:
+#     `ok`, `met: false`, because the wait ran;
 #
 # Autoflush ($| = 1) so each reply reaches the Port immediately (a block-buffered
 # write to a pipe would hang the reader).
 #
 # Request actions:
-#   hello         -> the identity handshake (protocol 11, a boot generation)
+#   hello         -> the identity handshake (protocol 12, a boot generation)
 #   screenshot    -> a 100x50 image that mints an observation and names it
-#   elements      -> one element (`e1`) in a fresh observation, as the helper lists it
+#   elements      -> two controls (`e1`, `e2`) in a fresh observation, as the helper
+#                    lists them
 #   left_click, right_click, double_click, mouse_move, left_click_drag, scroll,
 #   inspect       -> addressed: they resolve their observation or refuse
-#   press, set_value -> addressed by element_ref inside an observation
+#   press, set_value, focus, select, toggle, expand, collapse, scroll_to
+#                 -> addressed by element_ref inside an observation
+#   wait_for      -> a condition that never held (`met: false`)
 #   select_target -> bind a window: a target_id, its methods, a first observation
 #   release_target-> let the bound window go (ok whether or not one was bound)
 #   indicator     -> the ownership indicator's own Pause, as a session_event that
@@ -95,7 +108,7 @@ use strict;
 use warnings;
 $| = 1;
 
-my $PROTOCOL     = defined $ENV{FAKE_PROTOCOL_VERSION}   ? $ENV{FAKE_PROTOCOL_VERSION}   : 11;
+my $PROTOCOL     = defined $ENV{FAKE_PROTOCOL_VERSION}   ? $ENV{FAKE_PROTOCOL_VERSION}   : 12;
 my $BOOT         = defined $ENV{FAKE_SIDECAR_GENERATION} ? $ENV{FAKE_SIDECAR_GENERATION} : 'boot-test';
 my $CONTROL_MODE = defined $ENV{FAKE_CONTROL_MODE}       ? $ENV{FAKE_CONTROL_MODE}       : 'ack';
 
@@ -118,11 +131,18 @@ my $SENT_H = 50;
 # no rectangle of their own.
 my %ADDRESSED = map { $_ => 1 } qw(
     left_click right_click double_click mouse_move left_click_drag scroll inspect
-    press set_value
+    press set_value focus select toggle expand collapse scroll_to
 );
 
 # `wire::ELEMENT_ACTIONS`: addressed by a control and never by a point.
-my %ELEMENT_ONLY = map { $_ => 1 } qw(press set_value);
+my %ELEMENT_ONLY = map { $_ => 1 } qw(
+    press set_value focus select toggle expand collapse scroll_to
+);
+
+# The routes each listed control has, as `elements` lists them in `verbs`, and the
+# checkbox's state, which a toggle reads before it acts.
+my %VERBS = (e1 => { press => 1, focus => 1 }, e2 => { toggle => 1, focus => 1 });
+my $BOLD_ON = 1;
 
 # The one bound window, as the helper holds it: at most one, replaced on reselect.
 my $TARGET_COUNTER = 0;
@@ -293,8 +313,8 @@ sub ax_response {
     my $before = defined $named ? qq(,"observation_id_before":"$named") : '';
 
     if ($kind eq 'semantic') {
-        my $after = qq("element_after":{"present":true,"role":"AXButton",)
-            . qq("label":"Save","enabled":true});
+        my $after = qq("element_after":{"present":true,"role":"button",)
+            . qq("native_role":"AXButton","label":"Save","enabled":true});
         $extra = $extra eq '' ? $after : qq($extra,$after);
         $effect = 'not_observed' if $effect eq 'unknown';
     }
@@ -307,7 +327,38 @@ sub ax_response {
     print qq({"type":"response",$head,"ok":true,$extra)
         . qq("receipt":{"dispatch":"sent","effect":"$effect","input_method":"ax",)
         . qq("foreground_changed":false,)
-        . qq("timings_ms":{"input":1,"settle":0,"capture":0,"encode":0}$before,$check}}\n);
+        . qq("timings_ms":{"input":1,"settle":0,"capture":0,"encode":0}$before,$check,)
+        . qq("surfaces":[]}}\n);
+}
+
+# Protocol 12's toggle, the helper's order: the route, then the state read FIRST,
+# then the press only when the state differs. Already there, nothing is sent and
+# the receipt says so — with no `surfaces`, since nothing was looked at.
+sub toggle {
+    my ($id, $reference, $line) = @_;
+    my ($on) = $line =~ /"on":(true|false)/;
+    my $want = defined $on && $on eq 'true' ? 1 : 0;
+    my $before = $BOLD_ON ? 'on' : 'off';
+
+    if ($want == $BOLD_ON) {
+        my $head = envelope($id, $BOOT, 1);
+        print qq({"type":"response",$head,"ok":true,)
+            . qq("receipt":{"dispatch":"not_sent","effect":"not_observed","input_method":"ax",)
+            . qq("foreground_changed":false,"already":true,)
+            . qq("state_before":"$before","state_after":"$before",)
+            . qq("timings_ms":{"input":0,"settle":0,"capture":0,"encode":0},)
+            . qq("check":{"kind":"none"}}}\n);
+        return;
+    }
+
+    $BOLD_ON = $want;
+    my $after = $BOLD_ON ? 'on' : 'off';
+    my $head = envelope($id, $BOOT, 1);
+    print qq({"type":"response",$head,"ok":true,)
+        . qq("receipt":{"dispatch":"sent","effect":"changed","input_method":"ax",)
+        . qq("foreground_changed":false,"state_before":"$before","state_after":"$after",)
+        . qq("timings_ms":{"input":1,"settle":0,"capture":0,"encode":0},)
+        . qq("check":{"kind":"none"},"surfaces":[]}}\n);
 }
 
 # An action that dispatches input over the pointer, answered with the evidence it
@@ -399,9 +450,21 @@ sub request {
     if ($ADDRESSED{$action}) {
         return unless defined addressed($id, $action, $line);
 
+        # A verb this control has no route for is refused by name and nothing is
+        # sent: the helper never turns it into a click.
+        my ($reference) = $line =~ /"element_ref":"([^"]*)"/;
+        if ($ELEMENT_ONLY{$action} && $action ne 'set_value' && !$VERBS{$reference}{$action}) {
+            refuse($id, 'ax_action_unsupported',
+                "this control has no route for $action", $line);
+            return;
+        }
+
         # An accessibility action reports what it itself observed; a pointer
         # action addressed by a control still went out over the pointer.
-        if ($action eq 'press') {
+        if ($action eq 'toggle') {
+            toggle($id, $reference, $line);
+        }
+        elsif ($action eq 'press') {
             # The helper's own shape: no payload of its own, and a `not_observed`
             # effect, because a clean AX return is a dispatch result and not proof
             # that anything happened.
@@ -414,9 +477,17 @@ sub request {
             $value = '' unless defined $value;
             ax_response($id, qq("verified":true,"value":"$value"), 'verified', $line);
         }
+        elsif ($ELEMENT_ONLY{$action}) {
+            ax_response($id, '', 'not_observed', $line);
+        }
         else {
             checked_response($id, '"pong":true', $line);
         }
+        return;
+    }
+
+    if ($action eq 'wait_for') {
+        ok_response($id, '"met":false,"looks":2,"waited_ms":100', $line);
         return;
     }
 
@@ -424,12 +495,17 @@ sub request {
         $OBS_COUNTER++;
         my $obs = "fake-$OBS_COUNTER";
         $OBSERVED{$obs} = 1;
-        $ELEMENTS{$obs} = { e1 => 1 };
+        $ELEMENTS{$obs} = { e1 => 1, e2 => 1 };
+        my $checked = $BOLD_ON ? 'true' : 'false';
         ok_response($id,
-            qq("elements":[{"element_ref":"e1","role":"AXButton","label":"Save",)
-            . qq("enabled":true,"actions":["press"],"settable":false,)
+            qq("elements":[{"element_ref":"e1","role":"button","native_role":"AXButton",)
+            . qq("label":"Save","enabled":true,"verbs":["press","focus"],)
             . qq("bounds":{"x":10,"y":20,"w":60,"h":24},"path":["Document"],)
-            . qq("x":40,"y":32}],)
+            . qq("x":40,"y":32},)
+            . qq({"element_ref":"e2","role":"checkbox","native_role":"AXCheckBox",)
+            . qq("label":"Bold","enabled":true,"verbs":["toggle","focus"],"checked":$checked,)
+            . qq("bounds":{"x":10,"y":50,"w":60,"h":24},"path":["Document"],)
+            . qq("x":40,"y":62}],)
             . qq("observation_id":"$obs","observation_kind":"semantic",)
             . qq("captured_at_monotonic_ns":1),
             $line);

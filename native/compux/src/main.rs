@@ -41,6 +41,7 @@ use geometry::{
     crop_rect, sent_scale, to_logical, to_sent, Geometry, Host, Measured, MonitorFacts, Region,
 };
 use held::Platform as _;
+use listing::{in_view, insert_states, listed_nodes, published, ViewNode, Viewport};
 use observation::{Kind, Observation, Observations, ViewHash};
 use wire::Failure;
 
@@ -56,6 +57,17 @@ mod ax;
 /// The tree walk above the accessibility seam: its budgets, which nodes it lists,
 /// children by page and the ancestor path, tested against scripted trees.
 mod tree;
+
+/// Names (protocol 12): the normalised roles, the surface kinds and which verbs a
+/// control lists, as pure tables.
+mod roles;
+
+/// The verbs on a reference, the wait on the tree and the surfaces (protocol 12).
+mod semantic;
+
+/// A walk as the wire publishes it: entries, click points, references and what
+/// each listed control sits inside.
+mod listing;
 
 /// Held synthetic input: the press registry and the `Platform` seam every input
 /// sequence posts through, so nothing this process presses can outlive the action.
@@ -176,7 +188,19 @@ mod indicator;
 /// action WITHOUT one behaves byte for byte as it did at protocol 10: the
 /// display-level path is untouched, and it is also how the whole desktop stays
 /// reachable — there is no "desktop" target, there is the absence of one.
-const PROTOCOL_VERSION: u32 = 11;
+///
+/// v12 (M86 P2): controls before pixels. An `elements` listing names each control
+/// by a normalised `role` beside its `native_role`, lists the `verbs` it has a
+/// route for in place of `actions` and `settable`, and reports its states; it can
+/// be scoped (`window`, `app`, `focused`, `menu`, `dialog`), narrowed to a find
+/// (`query`), cut to a `skeleton`, or drilled into (`root`). New verbs act on a
+/// reference through the accessibility API alone — `focus`, `select`, `toggle`,
+/// `expand`, `collapse`, `scroll_to`, and `type` with an `element_ref` — each
+/// reading its state first and refusing rather than clicking where it has no route.
+/// `wait_for` and a check's `until` wait on the tree and never send input; every
+/// receipt of input that went out names the dialogs, alerts, menus and popups open
+/// after it. See `PROTOCOL.md`, `mod roles` and `mod semantic`.
+const PROTOCOL_VERSION: u32 = 12;
 
 /// The capture-stall self-reap (EX_TEMPFAIL), and NOTHING else.
 ///
@@ -422,6 +446,16 @@ struct Worker {
     /// produces. Held here because a badge is restarted from inside an action, and
     /// a restart needs everything the first start needed.
     emitter: capture::Emitter,
+    /// Whether `ax` is an accessibility API at all. The Linux build's is not (until
+    /// M86 L1), and every action that reads or acts on controls answers
+    /// `accessibility_unavailable` there rather than a refusal about the control.
+    accessibility: bool,
+    /// An action's semantic `until`, read BEFORE its input and taken by its check:
+    /// whether the condition already held.
+    until_held: Option<bool>,
+    /// When the request in hand must have answered, on the gate's clock, where it
+    /// named a `deadline_ms`: a wait never outlives it.
+    cutoff_ms: Option<u64>,
 }
 
 /// The serial action worker. One request at a time, to completion, on this thread.
@@ -437,6 +471,9 @@ fn run_worker(jobs: mpsc::Receiver<control::Job>, gate: &Gate, emitter: &capture
         target: None,
         target_generation: 0,
         emitter: emitter.clone(),
+        accessibility: accessibility_supported(),
+        until_held: None,
+        cutoff_ms: None,
     };
 
     for job in jobs {
@@ -493,7 +530,8 @@ fn serve(
 
     let outcome = handle(request, gate, emitter, worker);
     let done = gate.finish();
-    reply(request, gate, outcome, done)
+    let surfaces = surfaces_after(request, &done, worker);
+    reply(request, gate, outcome, done, surfaces)
 }
 
 /// Turn what the action did into the frame that reports it.
@@ -502,6 +540,7 @@ fn reply(
     gate: &Gate,
     outcome: Result<Value, Failure>,
     done: gate::Dispatched,
+    surfaces: Option<Vec<wire::Surface>>,
 ) -> Value {
     // The capture verbs answer in the computer-history `ack` family, byte for byte
     // as they did at protocol 6. Their client reads that shape and nothing else.
@@ -521,7 +560,8 @@ fn reply(
                 .get("observation_id")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let receipt = receipt(request, &done, after);
+            let receipt = receipt(request, &done, after)
+                .map(|receipt| receipt.reported(done.state, surfaces));
             wire::response(gate.envelope(), &request.request_id, payload, receipt)
         }
 
@@ -532,7 +572,8 @@ fn reply(
             // `unknown` where the truth is performed-unverified. The gate recorded
             // no check either, so the receipt claims no evidence: input that went
             // out and evidence that did not are two facts, both reported.
-            let receipt = receipt(request, &done, None);
+            let receipt =
+                receipt(request, &done, None).map(|receipt| receipt.reported(done.state, surfaces));
             // Every refusal that reaches here was cancelled (a pause sets both
             // flags), so a refusal code only ever lands in `detail` and never
             // stands in for the action's own error. A detail that merely repeats
@@ -580,6 +621,7 @@ fn handle(
     emitter: &capture::Emitter,
     worker: &mut Worker,
 ) -> Result<Value, Failure> {
+    before_dispatch(request, gate, worker)?;
     let req = &request.body;
 
     match request.action.as_str() {
@@ -602,6 +644,10 @@ fn handle(
         "double_click" => click(request, gate, worker, Button::Left, 2),
         "left_click_drag" => drag(request, gate, worker),
         "scroll" => scroll(request, gate, worker),
+        "type" if request.element_ref.is_some() => {
+            let verb = semantic::Verb::from_request("type", req)?;
+            verb_on(request, gate, worker, verb)
+        }
         "type" => type_text(request, gate, worker),
         "key" => key_chord(request, gate, worker),
         "wait" => wait(req, gate),
@@ -612,10 +658,59 @@ fn handle(
         "windows" => windows(req, gate, worker),
         "press" => press(request, gate, worker),
         "set_value" => set_value(request, gate, worker),
+        "focus" | "select" | "toggle" | "expand" | "collapse" | "scroll_to" => {
+            let verb = semantic::Verb::from_request(&request.action, req)?;
+            verb_on(request, gate, worker, verb)
+        }
+        "wait_for" => wait_for(request, gate, worker),
         "select_target" => select_target(request, gate, emitter, worker),
         "release_target" => release_target(worker),
-        other => Err(format!("unknown action: {other}").into()),
+        other => Err(Failure::new(
+            "unknown_action",
+            format!("{other} is not an action this build has"),
+        )),
     }
+}
+
+/// What every request settles before its action runs: a build with no
+/// accessibility API refuses one that reads controls, the request's deadline
+/// becomes the cutoff its waits are held to, and an action that waits on the tree
+/// reads its condition once before any input (§5.2).
+fn before_dispatch(
+    request: &wire::Request,
+    gate: &Gate,
+    worker: &mut Worker,
+) -> Result<(), Failure> {
+    if !worker.accessibility && reads_controls(request) {
+        return Err(Failure::new(
+            "accessibility_unavailable",
+            "this build has no accessibility API, so it cannot read or act on controls by name; \
+             work in the image instead"
+                .to_string(),
+        ));
+    }
+    let deadline_ms = request.body.get("deadline_ms").and_then(Value::as_u64);
+    worker.cutoff_ms = deadline_ms.map(|left| {
+        gate.now_ms()
+            .saturating_add(left.saturating_sub(DEADLINE_MARGIN_MS))
+    });
+    worker.until_held = None;
+    if let (Some(until), false) = (&request.until, request.action == "wait_for") {
+        worker.until_held = Some(held_before(request, until, gate, worker)?);
+    }
+    Ok(())
+}
+
+/// What a reply needs to reach the caller before its deadline: a wait gives this
+/// much back rather than answer late.
+const DEADLINE_MARGIN_MS: u64 = 250;
+
+/// Does this request read or act on controls through the accessibility API? A
+/// check that waits on the tree does, whatever the action.
+fn reads_controls(request: &wire::Request) -> bool {
+    ACCESSIBILITY_ACTIONS.contains(&request.action.as_str())
+        || (request.action == "type" && request.element_ref.is_some())
+        || request.until.is_some()
 }
 
 // --- addressing: which image a request's coordinates are in ------------------
@@ -753,6 +848,27 @@ fn present(
     observation: &Observation,
     entry: &ax::Entry,
 ) -> Result<ax::Facts, Failure> {
+    let facts = answering(ax, observation, entry)?;
+    if facts.enabled {
+        Ok(facts)
+    } else {
+        Err(Failure::new(
+            "element_disabled",
+            "that control is disabled, so it will not act; do not retry it — find what enables \
+             it first"
+                .to_string(),
+        ))
+    }
+}
+
+/// Is this still the control the caller was shown: the same process, and the
+/// same role? What [`present`] checks before it asks whether the control will act,
+/// and all a drill asks of the control it reads inside.
+fn answering(
+    ax: &Rc<dyn ax::Ax>,
+    observation: &Observation,
+    entry: &ax::Entry,
+) -> Result<ax::Facts, Failure> {
     let elements = observation
         .elements
         .as_deref()
@@ -787,13 +903,7 @@ fn present(
                 entry.role
             ),
         )),
-        Some(_) if facts.enabled => Ok(facts),
-        Some(_disabled) => Err(Failure::new(
-            "element_disabled",
-            "that control is disabled, so it will not act; do not retry it — find what enables \
-             it first"
-                .to_string(),
-        )),
+        Some(_) => Ok(facts),
         None => Err(no_longer_there()),
     }
 }
@@ -942,7 +1052,7 @@ fn hello(launcher: &Arc<dyn indicator::Launcher>) -> Result<Value, Failure> {
 }
 
 /// Every model-facing verb, in the order the handshake has always listed them.
-const ACTIONS: [&str; 19] = [
+const ACTIONS: [&str; 26] = [
     "screenshot",
     "left_click",
     "right_click",
@@ -960,12 +1070,31 @@ const ACTIONS: [&str; 19] = [
     "windows",
     "press",
     "set_value",
+    "focus",
+    "select",
+    "toggle",
+    "expand",
+    "collapse",
+    "scroll_to",
+    "wait_for",
     "select_target",
     "release_target",
 ];
 
 /// The verbs that read or act through the accessibility API.
-const ACCESSIBILITY_ACTIONS: [&str; 4] = ["inspect", "elements", "press", "set_value"];
+const ACCESSIBILITY_ACTIONS: [&str; 11] = [
+    "inspect",
+    "elements",
+    "press",
+    "set_value",
+    "focus",
+    "select",
+    "toggle",
+    "expand",
+    "collapse",
+    "scroll_to",
+    "wait_for",
+];
 
 /// The verbs that bind a window.
 const TARGET_ACTIONS: [&str; 2] = ["select_target", "release_target"];
@@ -2466,36 +2595,29 @@ fn collect_marks(
         }
     };
 
-    let truncated = viewed.nodes.len().saturating_sub(MAX_MARKS);
+    // A badge needs a place: a control the platform places nowhere gets none.
+    let placed: Vec<(tree::Node, (i64, i64))> = viewed
+        .nodes
+        .into_iter()
+        .filter_map(|(node, point)| point.map(|point| (node, point)))
+        .collect();
+    let truncated = placed.len().saturating_sub(MAX_MARKS);
     let names = viewed.owner.is_some();
     let mut entries = Vec::new();
     let mut listed = Vec::new();
 
-    for (index, (node, (sx, sy))) in viewed.nodes.into_iter().take(MAX_MARKS).enumerate() {
+    for (index, (node, (sx, sy))) in placed.into_iter().take(MAX_MARKS).enumerate() {
         let id = index + 1;
         let reference = ax::reference_for(index);
         overlay::badge(img, sx as i32, sy as i32, id);
-
-        // `label`, spelled exactly as an `elements` entry spells it: it is the same
-        // fact read from the same attributes, and two names for one fact is how a
-        // consumer ends up with two ways to read a control's name. (`inspect` keeps
-        // its own `title` and `description`, which are genuinely different AX
-        // attributes rather than this one under another name.)
-        let mut entry = json!({ "id": id, "role": node.role, "x": sx, "y": sy });
-        if let Some(object) = entry.as_object_mut() {
-            if names {
-                object.insert("element_ref".to_string(), json!(reference));
-            }
-            if let Some(label) = &node.label {
-                object.insert("label".to_string(), json!(label));
-            }
-        }
-        entries.push(entry);
+        let named = names.then_some(reference.as_str());
+        entries.push(mark_entry(id, &node, (sx, sy), named));
 
         listed.push(ax::Entry {
             reference,
             role: node.role,
             secure: node.secure,
+            under: None,
             element: node.element,
         });
     }
@@ -2507,6 +2629,28 @@ fn collect_marks(
         truncated_walk: viewed.truncated,
         elements: retained(viewed.owner, listed),
     }
+}
+
+/// One badge's entry: its number, the control's role and click point, and the
+/// reference it is named by where the reply hands those out.
+///
+/// `label` is spelled exactly as an `elements` entry spells it: it is the same fact
+/// read from the same attributes, and two names for one fact is how a consumer
+/// ends up with two ways to read a control's name. (`inspect` keeps its own
+/// `title` and `description`, which are genuinely different AX attributes rather
+/// than this one under another name.)
+fn mark_entry(id: usize, node: &tree::Node, point: (i64, i64), reference: Option<&str>) -> Value {
+    let (x, y) = point;
+    let mut entry = json!({ "id": id, "role": node.role, "x": x, "y": y });
+    if let Some(object) = entry.as_object_mut() {
+        if let Some(reference) = reference {
+            object.insert("element_ref".to_string(), json!(reference));
+        }
+        if let Some(label) = &node.label {
+            object.insert("label".to_string(), json!(label));
+        }
+    }
+    entry
 }
 
 /// The references one reply hands out, or `None` when it listed none — an empty
@@ -3391,6 +3535,86 @@ fn set_value(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resul
     Ok(payload)
 }
 
+/// A verb on a reference (protocol 12): `focus`, `select`, `toggle`, `expand`,
+/// `collapse`, `scroll_to`, and `type` by reference.
+///
+/// The control is re-validated, then its route for this verb read again and its
+/// state read first (`semantic::plan`); a control with no route is refused and
+/// never clicked instead, and one already in the state asked for is sent
+/// nothing and says so. Otherwise one message, through `dispatch_message` as
+/// `press` does, and the state or value read back.
+fn verb_on(
+    request: &wire::Request,
+    gate: &Gate,
+    worker: &mut Worker,
+    verb: semantic::Verb,
+) -> Result<Value, Failure> {
+    let observation = observed(request, worker)?;
+    let view = view(request, gate, worker)?;
+    let entry = element_in(&observation, request)?;
+    let since = gate.now_ms();
+    let facts = present(&worker.ax, &observation, entry)?;
+    let listed_by = observation
+        .elements
+        .as_deref()
+        .map(|elements| elements.pid)
+        .ok_or_else(|| Failure::from("stale_element"))?;
+
+    let handle = entry.element.handle();
+    // The revalidation is the fresher read: a field can turn secure after the walk
+    // that listed it.
+    let secure = entry.secure || facts.secure;
+    let plan = semantic::plan(&worker.ax, handle, listed_by, &facts, secure, &verb)?;
+    let acted = Acted {
+        named: Some(&observation),
+        executed: aimed_point(request, &facts),
+        element: Some(entry),
+    };
+
+    if plan.already() {
+        gate.used_input_method(wire::InputMethod::Ax);
+        noted(gate, &semantic::held(&plan), plan.state.is_some());
+        return post(request, Some(view), gate, worker, acted);
+    }
+
+    let before = worker.ax.frontmost_pid();
+    let timeout_ms = write_timeout(gate, since);
+    let outcome = gate
+        .dispatch_message(
+            || semantic::send(&worker.ax, handle, &plan, timeout_ms),
+            went_out,
+        )
+        .map_err(barred)?;
+    gate.input_complete();
+    note_ax(gate, worker, before);
+    outcome.map_err(ax_failure)?;
+
+    // Infallible, like every step between the latch and the check: a pause ends
+    // its polling and the last read is the answer.
+    let judged = semantic::judge(gate, &worker.ax, handle, &plan);
+    noted(gate, &judged, plan.state.is_some());
+    let mut payload = post(request, Some(view), gate, worker, acted)?;
+
+    // What a field holds after `type`, never for a secure one.
+    if let (Some(object), Some(value)) = (payload.as_object_mut(), judged.value) {
+        object.insert("value".to_string(), json!(value));
+    }
+    Ok(payload)
+}
+
+/// What a verb's read-back proved, for its receipt: the effect, and for a verb
+/// that reads a state, the state before and after.
+fn noted(gate: &Gate, judged: &semantic::Judged, reads_a_state: bool) {
+    gate.observed_effect(judged.effect);
+    if reads_a_state {
+        gate.observed_state(wire::StateChange {
+            already: judged.already,
+            before: judged.state_before,
+            after: judged.state_after,
+        });
+    }
+}
+
 /// Where the control is, for the check image's executed-point marker.
 ///
 /// Wanted only when there is going to be an image to draw it on: an accessibility
@@ -3561,11 +3785,15 @@ fn post(
                 kind: wire::Check::None,
                 settle: None,
                 changed: None,
+                until: None,
             });
             Ok(json!({ "ok": true }))
         }
 
-        wire::Check::Semantic => element_after(gate, worker, acted.element),
+        wire::Check::Semantic => match &request.until {
+            None => element_after(gate, worker, acted.element),
+            Some(until) => waited_after(request, until, gate, worker, acted.element),
+        },
 
         wire::Check::Image => check_image(request, view, gate, worker, acted),
     }
@@ -3596,16 +3824,7 @@ fn check_image(
     worker: &mut Worker,
     acted: Acted<'_>,
 ) -> Result<Value, Failure> {
-    let view = match view {
-        Some(view) => view,
-        None => View {
-            on: None,
-            index: display_index(&request.body),
-            geometry: None,
-            frames: worker.frames.clone(),
-            bound: None,
-        },
-    };
+    let view = view.unwrap_or_else(|| named_display(request, worker));
 
     // The transform before the first sample, because the rectangle the settle
     // watches has to be the rectangle that is then encoded — and a display's
@@ -3649,9 +3868,21 @@ fn check_image(
         kind: wire::Check::Image,
         settle: Some(settled.settle),
         changed,
+        until: None,
     });
 
     Ok(payload)
+}
+
+/// The display a request names, as the view of a check whose action named none.
+fn named_display(request: &wire::Request, worker: &Worker) -> View {
+    View {
+        on: None,
+        index: display_index(&request.body),
+        geometry: None,
+        frames: worker.frames.clone(),
+        bound: None,
+    }
 }
 
 /// The rectangle a check image covers: the whole of the observation the action was
@@ -3816,26 +4047,199 @@ fn element_after(
         )
     })?;
 
-    // A control that does not answer its role does not answer anything else either,
-    // and is reported as not there.
-    let handle = entry.element.handle();
-    let after = match worker.ax.facts(handle) {
-        Ok(facts) if facts.role.is_some() => {
-            // What it says now decides as well as what the listing said: a field
-            // can turn secure after the walk that listed it.
-            let secure = entry.secure || facts.secure;
-            described_after(&worker.ax, handle, secure, facts)
-        }
-        _not_there => json!({ "present": false }),
-    };
-
+    let after = reread(&worker.ax, entry);
     gate.observed_check(wire::Checked {
         kind: wire::Check::Semantic,
         settle: None,
         changed: None,
+        until: None,
     });
 
     Ok(json!({ "ok": true, "element_after": after }))
+}
+
+/// The control an action named, read again as `element_after` publishes it.
+fn reread(ax: &Rc<dyn ax::Ax>, entry: &ax::Entry) -> Value {
+    // A control that does not answer its role does not answer anything else either,
+    // and is reported as not there.
+    let handle = entry.element.handle();
+    match ax.facts(handle) {
+        Ok(facts) if facts.role.is_some() => {
+            // What it says now decides as well as what the listing said: a field
+            // can turn secure after the walk that listed it.
+            let secure = entry.secure || facts.secure;
+            described_after(ax, handle, secure, facts)
+        }
+        _not_there => json!({ "present": false }),
+    }
+}
+
+/// A semantic check that waits on the tree (protocol 12): the condition was read
+/// before the input, so one that already held says so and is not waited on;
+/// otherwise it is looked at until it holds or its timeout passes. An action that
+/// named a control also gets that control read again.
+fn waited_after(
+    request: &wire::Request,
+    until: &semantic::Until,
+    gate: &Gate,
+    worker: &mut Worker,
+    element: Option<&ax::Entry>,
+) -> Result<Value, Failure> {
+    let seen = match worker.until_held.take() {
+        Some(true) => wire::UntilSeen {
+            outcome: wire::UntilOutcome::HeldBefore,
+            looks: 0,
+            waited_ms: 0,
+            deadline_cut: false,
+        },
+        _ => {
+            let (scene, named) = scene_for(request, worker)?;
+            let (waited, cut) = waited_on(gate, worker, &scene, named.as_deref(), until)?;
+            wire::UntilSeen {
+                outcome: if waited.met {
+                    wire::UntilOutcome::Met
+                } else {
+                    wire::UntilOutcome::NotMet
+                },
+                looks: waited.looks,
+                waited_ms: waited.waited_ms,
+                deadline_cut: cut,
+            }
+        }
+    };
+
+    let mut payload = json!({ "ok": true });
+    if let (Some(object), Some(entry)) = (payload.as_object_mut(), element) {
+        object.insert("element_after".to_string(), reread(&worker.ax, entry));
+    }
+    gate.observed_check(wire::Checked {
+        kind: wire::Check::Semantic,
+        settle: None,
+        changed: None,
+        until: Some(seen),
+    });
+    Ok(payload)
+}
+
+/// Whether an action's condition already holds, read BEFORE its input (§5.2), in
+/// the application and listing the request names.
+fn held_before(
+    request: &wire::Request,
+    until: &semantic::Until,
+    gate: &Gate,
+    worker: &Worker,
+) -> Result<bool, Failure> {
+    let (scene, named) = scene_for(request, worker)?;
+    let clock = gate.clock();
+    let at = semantic::Looking {
+        ax: &worker.ax,
+        scene,
+        named: named.as_deref(),
+        clock: clock.as_ref(),
+    };
+    semantic::held_before(&at, until, gate.now_ms(), worker.cutoff_ms)
+}
+
+/// The wait on a condition (§5), in the application and listing the request
+/// names, held to the request's own deadline.
+fn waited_on(
+    gate: &Gate,
+    worker: &Worker,
+    scene: &semantic::Scene,
+    named: Option<&ax::Elements>,
+    until: &semantic::Until,
+) -> Result<(semantic::Waited, bool), Failure> {
+    let clock = gate.clock();
+    let at = semantic::Looking {
+        ax: &worker.ax,
+        scene: *scene,
+        named,
+        clock: clock.as_ref(),
+    };
+    semantic::wait_until(gate, &at, until, worker.cutoff_ms)
+}
+
+/// The application a condition reads, and the listing its references name: the
+/// bound window's when the request names one, else the listing's it names, else
+/// the one in front.
+fn scene_for(
+    request: &wire::Request,
+    worker: &Worker,
+) -> Result<(semantic::Scene, Option<Rc<ax::Elements>>), Failure> {
+    let named = match request.observation_id.as_deref() {
+        Some(id) => worker
+            .observations
+            .resolve(id)
+            .map_err(refused)?
+            .elements
+            .clone(),
+        None => None,
+    };
+    if request.target_id.is_some() {
+        let target = worker
+            .target
+            .as_ref()
+            .ok_or_else(|| Failure::from("target_unavailable"))?;
+        let scene = semantic::Scene {
+            pid: target.pid,
+            window: Some(target::ax_root(target)?),
+        };
+        return Ok((scene, named));
+    }
+    let pid = match named.as_deref() {
+        Some(elements) => Some(elements.pid),
+        None => worker.ax.frontmost_pid(),
+    };
+    let pid = pid.ok_or_else(|| {
+        Failure::new(
+            "scope_not_found",
+            "no application is in front to read, and the request names no listing".to_string(),
+        )
+    })?;
+    Ok((semantic::Scene { pid, window: None }, named))
+}
+
+/// Wait on the tree (protocol 12). Read-only: it sends nothing however long it
+/// looks. Not met by the deadline is an answer, not a failure; met on a condition
+/// that names what matched lists it, with references, in a new observation.
+fn wait_for(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
+    let until = request.until.as_ref().ok_or_else(|| {
+        Failure::new(
+            "invalid_argument",
+            "wait_for needs until: the condition to wait for".to_string(),
+        )
+    })?;
+    let (scene, named) = scene_for(request, worker)?;
+    let (waited, cut) = waited_on(gate, worker, &scene, named.as_deref(), until)?;
+
+    let mut payload = json!({
+        "ok": true,
+        "met": waited.met,
+        "looks": waited.looks,
+        "waited_ms": waited.waited_ms,
+    });
+    if let (Some(object), true) = (payload.as_object_mut(), cut) {
+        object.insert("deadline_cut".to_string(), json!(true));
+    }
+    let Some(found) = waited.found else {
+        return Ok(payload);
+    };
+
+    let (display, geom, region) = listing_frame(request, gate, worker)?;
+    let owner = worker
+        .ax
+        .process_started_at(scene.pid)
+        .map(|started_at| (scene.pid, started_at));
+    let view = Viewport {
+        geom: &geom,
+        region: &region,
+    };
+    let (placed, _hidden) = in_view(found.nodes, view.geom, view.region);
+    let (items, entries) = listed_nodes(placed, owner.is_some(), 0, None, &view);
+    merge_into(&mut payload, json!({ "elements": items }));
+    let observation = mint_semantic(worker, &display, geom, region, retained(owner, entries));
+    name_observation(&mut payload, &observation);
+    Ok(payload)
 }
 
 /// A control that is still there, as `element_after` publishes it: its facts, and
@@ -3846,12 +4250,18 @@ fn described_after(
     secure: bool,
     facts: ax::Facts,
 ) -> Value {
+    let native = facts.role.unwrap_or_default();
+    let kind = roles::normalise(&native, facts.subrole.as_deref());
     let mut after = json!({
         "present": true,
-        "role": facts.role,
+        "role": kind,
+        "native_role": native,
         "enabled": facts.enabled,
     });
     let value = if secure { None } else { ax.value(handle) };
+    let on = roles::has_check_state(kind) || kind == "disclosure";
+    // States that will not read are left out, as a listing leaves them out.
+    let states = ax.states(handle, on).unwrap_or_default();
 
     if let Some(object) = after.as_object_mut() {
         if let Some(label) = facts.label {
@@ -3860,8 +4270,195 @@ fn described_after(
         if let Some(value) = value {
             object.insert("value".to_string(), json!(ax::bounded_value(value)));
         }
+        if secure {
+            object.insert("secure".to_string(), json!(true));
+        }
+        insert_states(object, kind, &states);
     }
     after
+}
+
+// --- protocol 12: listings by scope, and what is open --------------------------
+
+/// One listing of a scope (protocol 12), as the wire publishes it: the scope it
+/// read, its controls and the references behind them, and for a skeleton what its
+/// cuts hide that could not be listed.
+fn scoped_listing(
+    ax: &Rc<dyn ax::Ax>,
+    scene: &semantic::Scene,
+    owner: Option<(i32, u64)>,
+    listing: &semantic::Listing,
+    view: &Viewport<'_>,
+    gate: &Gate,
+) -> Result<(Value, Option<Rc<ax::Elements>>), Failure> {
+    let scope = listing
+        .scope
+        .unwrap_or_else(|| semantic::Scope::default_for(scene));
+    let clock = gate.clock();
+    let before = ax.messages();
+    let deadline = gate.now_ms().saturating_add(tree::WALK_BUDGET_MS);
+    let found = semantic::walk_scope(ax, scene, scope, &listing.shape, clock.as_ref(), deadline)?;
+    let messages = ax.messages() - before;
+
+    let names = owner.is_some();
+    let (mut payload, entries) = published(found, messages, &listing.shape, names, 0, None, view);
+    merge_into(&mut payload, json!({ "scope": scope.as_str() }));
+    Ok((payload, retained(owner, entries)))
+}
+
+/// The application a scoped listing reads: the bound window's, else the one that
+/// owns the window in view, as protocol 11 read it.
+fn listing_scene(
+    view: &View,
+    geom: &Geometry,
+    region: &Region,
+    worker: &Worker,
+) -> Result<semantic::Scene, Failure> {
+    if view.bound.is_some() {
+        let target = worker
+            .target
+            .as_ref()
+            .ok_or_else(|| Failure::from("target_unavailable"))?;
+        return Ok(semantic::Scene {
+            pid: target.pid,
+            window: Some(target::ax_root(target)?),
+        });
+    }
+    match view_target(geom, region)? {
+        Ok(app) => Ok(semantic::Scene {
+            pid: app.pid,
+            window: None,
+        }),
+        Err(note) => Err(Failure::new("scope_not_found", note)),
+    }
+}
+
+/// The dialogs, alerts, menus and popups open once an action that sent input has
+/// run, for its receipt. `None` is "not looked": nothing was sent, the action earns
+/// no receipt, this build has no accessibility API, or there is no application to
+/// look in.
+fn surfaces_after(
+    request: &wire::Request,
+    done: &gate::Dispatched,
+    worker: &Worker,
+) -> Option<Vec<wire::Surface>> {
+    if !done.posted || !worker.accessibility || !wire::carries_mutation_seq(&request.action) {
+        return None;
+    }
+    let (scene, _named) = scene_for(request, worker).ok()?;
+    let open = semantic::surfaces(&worker.ax, scene.pid);
+    Some(
+        open.into_iter()
+            .map(|surface| wire::Surface {
+                kind: surface.kind,
+                native_kind: surface.native_kind,
+                label: surface.label,
+            })
+            .collect(),
+    )
+}
+
+/// Where a listing that answers a request is drawn: the named listing's own view
+/// when the request names one and no region, so the new click points are in the
+/// same pixels; otherwise the view an `elements` request reads.
+fn listing_frame(
+    request: &wire::Request,
+    gate: &Gate,
+    worker: &mut Worker,
+) -> Result<(Display, Geometry, Region), Failure> {
+    if let (Some(id), None) = (
+        request.observation_id.as_deref(),
+        request.body.get("region"),
+    ) {
+        let named = worker.observations.resolve(id).map_err(refused)?;
+        let display = Display {
+            facts: named.facts,
+            id: named.display_id,
+        };
+        return Ok((display, named.geometry, named.region));
+    }
+    let view = view(request, gate, worker)?;
+    let geom = view.geometry(gate, worker)?;
+    let display = view.display(worker)?;
+    let region = viewing_region(request, &geom, worker)?;
+    Ok((display, geom, region))
+}
+
+/// A listing's observation: no picture, so nothing for a later check to compare
+/// its view against — `changed` is absent on such a check, never false.
+fn mint_semantic(
+    worker: &mut Worker,
+    display: &Display,
+    geometry: Geometry,
+    region: Region,
+    elements: Option<Rc<ax::Elements>>,
+) -> Observation {
+    let (sent_w, sent_h) = crop_rect(&geometry, &region).sent_dims();
+    worker.observations.mint(observation::Minting {
+        kind: Kind::Semantic,
+        display_id: display.id,
+        facts: display.facts,
+        geometry,
+        region,
+        sent: (sent_w, sent_h),
+        elements,
+        view_hash: None,
+    })
+}
+
+/// Drill into a control of a listing (protocol 12): its subtree, listed as `shape`
+/// asks (a find, or a skeleton cut three levels below the root), with references
+/// numbered after the listing's last, in a new observation that keeps every
+/// reference of the listing outside that subtree. The root is re-validated first
+/// (its process and its role): one that names something else now is
+/// `stale_element`.
+fn drill(
+    request: &wire::Request,
+    root: &str,
+    shape: &tree::Shape,
+    gate: &Gate,
+    worker: &mut Worker,
+) -> Result<Value, Failure> {
+    let observation = observed(request, worker)?;
+    let named = observation.elements.clone().ok_or_else(no_longer_there)?;
+    let entry = named.get(root).ok_or_else(|| {
+        Failure::new(
+            "stale_element",
+            format!(
+                "{root} is not one of the {} controls that reply listed; take `elements` again",
+                named.len()
+            ),
+        )
+    })?;
+    answering(&worker.ax, &observation, entry)?;
+
+    let (display, geom, region) = listing_frame(request, gate, worker)?;
+    let clock = gate.clock();
+    let before = worker.ax.messages();
+    let deadline = gate.now_ms().saturating_add(tree::WALK_BUDGET_MS);
+    let handle = entry.element.handle();
+    let found = tree::walk_handle(&worker.ax, handle, shape, clock.as_ref(), deadline);
+    let messages = worker.ax.messages() - before;
+
+    let view = Viewport {
+        geom: &geom,
+        region: &region,
+    };
+    let first = named.next_index();
+    let (mut payload, entries) = published(found, messages, shape, true, first, Some(root), &view);
+    merge_into(&mut payload, json!({ "root": root }));
+
+    let mut held: Vec<Rc<ax::Entry>> = named
+        .entries()
+        .iter()
+        .filter(|kept| !listing::inside(&named, kept, root))
+        .cloned()
+        .collect();
+    held.extend(entries.into_iter().map(Rc::new));
+    let elements = ax::Elements::shared(named.pid, named.started_at, held);
+    let minted = mint_semantic(worker, &display, geom, region, Some(Rc::new(elements)));
+    name_observation(&mut payload, &minted);
+    Ok(payload)
 }
 
 // --- windows ----------------------------------------------------------------
@@ -4011,10 +4608,35 @@ fn logical_bounds_to_region(
 /// `screenshot` of that region would be, and the model addresses them the same way
 /// — and the references ride in the same observation, so they die with it.
 fn elements(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
+    let listing = semantic::listing(&request.body)?;
+    if let Some(root) = listing.root.as_deref() {
+        return drill(request, root, &listing.shape, gate, worker);
+    }
+
     let view = view(request, gate, worker)?;
     let geom = view.geometry(gate, worker)?;
     let display = &view.display(worker)?;
     let region = viewing_region(request, &geom, worker)?;
+
+    // A request with none of protocol 12's parameters reads exactly what protocol
+    // 11 read, its settling for an application whose tree is still empty included.
+    if listing != semantic::Listing::default() {
+        let scene = listing_scene(&view, &geom, &region, worker)?;
+        let owner = worker
+            .ax
+            .process_started_at(scene.pid)
+            .map(|started_at| (scene.pid, started_at));
+        let viewport = Viewport {
+            geom: &geom,
+            region: &region,
+        };
+        let (mut payload, listed) =
+            scoped_listing(&worker.ax, &scene, owner, &listing, &viewport, gate)?;
+        note_target(&mut payload, worker, view.bound.is_some())?;
+        let observation = mint_semantic(worker, display, geom, region, listed);
+        name_observation(&mut payload, &observation);
+        return Ok(payload);
+    }
 
     // On a bound window the walk starts at THAT window's accessibility element, so
     // a listing is the window's controls and not the application's. Without one
@@ -4035,94 +4657,10 @@ fn elements(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result
         Some(root) => elements_rooted(&worker.ax, root, &geom, &region, gate, worker)?,
     };
     note_target(&mut payload, worker, view.bound.is_some())?;
-
-    let (sent_w, sent_h) = crop_rect(&geom, &region).sent_dims();
-    let observation = worker.observations.mint(observation::Minting {
-        kind: Kind::Semantic,
-        display_id: display.id,
-        facts: display.facts,
-        geometry: geom,
-        region,
-        sent: (sent_w, sent_h),
-        elements: listed,
-        // A listing has no picture, so there is nothing for a later check to
-        // compare its view against: `changed` is absent on such a check, never
-        // false.
-        view_hash: None,
-    });
+    let observation = mint_semantic(worker, display, geom, region, listed);
     name_observation(&mut payload, &observation);
 
     Ok(payload)
-}
-
-/// One element, as the wire publishes it.
-///
-/// Everything here was read in the ONE traversal that found it: a second round of
-/// queries per element would double the cost of a list and could disagree with
-/// itself half way through. Nothing is inferred from the role — `actions` lists
-/// `press` only where the control's own action list does, and `settable` only
-/// where the accessibility API says the value may be written.
-///
-/// `bounds` is in the SAME pixels as the click point beside it, which is the
-/// pixels of the image this reply names. The frame the walk read is in global
-/// logical points and stays inside this process: one reply, one coordinate space.
-fn element_value(
-    node: &tree::Node,
-    reference: Option<&str>,
-    point: (i64, i64),
-    geom: &Geometry,
-    region: &Region,
-) -> Value {
-    let frame = node.frame;
-    let bounds = geometry::sent_rect(geom, region, frame.x, frame.y, frame.w, frame.h);
-
-    let mut item = json!({
-        "role": node.role,
-        "enabled": node.enabled,
-        "settable": node.settable,
-        "bounds": {
-            "x": bounds.x.round() as i64,
-            "y": bounds.y.round() as i64,
-            "w": bounds.w.round().max(1.0) as i64,
-            "h": bounds.h.round().max(1.0) as i64
-        },
-        // The click point in this reply's own pixels, unchanged since protocol 4:
-        // a caller that aims by coordinate keeps working exactly as it did.
-        "x": point.0,
-        "y": point.1
-    });
-
-    if let Some(object) = item.as_object_mut() {
-        // A reference this reply cannot resolve is worse than none: the control is
-        // still listed with its click point, but nothing offers a name that would
-        // come back `stale_element` the moment it was used. The one place that can
-        // happen is an application whose start time would not read, which is what
-        // `retained` refuses to build a table from.
-        if let Some(reference) = reference {
-            object.insert("element_ref".to_string(), json!(reference));
-            object.insert(
-                "actions".to_string(),
-                json!(if node.press {
-                    vec!["press"]
-                } else {
-                    Vec::new()
-                }),
-            );
-        }
-        if let Some(label) = &node.label {
-            object.insert("label".to_string(), json!(label));
-        }
-        // Absent for a secure field, which is the only way to tell "no value" from
-        // "a value nobody may read".
-        if let Some(value) = &node.value {
-            object.insert("value".to_string(), json!(value));
-        }
-        if !node.path.is_empty() {
-            object.insert("path".to_string(), json!(node.path));
-        }
-    }
-
-    item
 }
 
 /// The element list and the references behind it. Portable on purpose: only the
@@ -4149,25 +4687,8 @@ fn publish_elements(
     // published: `retained` needs the owning process's start time, and without it
     // there is no table to resolve them against.
     let names = viewed.owner.is_some();
-
-    let mut items = Vec::new();
-    let mut listed = Vec::new();
-    for (index, (node, point)) in viewed.nodes.into_iter().enumerate() {
-        let reference = ax::reference_for(index);
-        items.push(element_value(
-            &node,
-            names.then_some(reference.as_str()),
-            point,
-            geom,
-            region,
-        ));
-        listed.push(ax::Entry {
-            reference,
-            role: node.role,
-            secure: node.secure,
-            element: node.element,
-        });
-    }
+    let view = Viewport { geom, region };
+    let (items, listed) = listed_nodes(viewed.nodes, names, 0, None, &view);
 
     // What the read cost in accessibility messages (M7), so the batching the
     // macOS reader does is a number the owner can read on a real application.
@@ -4211,18 +4732,10 @@ fn elements_rooted(
     let deadline = gate.now_ms().saturating_add(tree::WALK_BUDGET_MS);
     let found = tree::walk_from(ax, root, clock.as_ref(), deadline);
     let messages = ax.messages() - before;
-
-    let in_view: Vec<ViewNode> = found
-        .nodes
-        .into_iter()
-        .filter_map(|node| {
-            let (centre_x, centre_y) = node.frame.centre();
-            to_sent(geom, region, centre_x, centre_y).map(|point| (node, point))
-        })
-        .collect();
+    let (placed, _outside) = in_view(found.nodes, geom, region);
 
     let viewed = Viewed {
-        nodes: in_view,
+        nodes: placed,
         owner: Some((target.pid, target.started_at)),
         truncated: found.truncated,
         note: Some(format!("read {} — {}", target.app, target.title)),
@@ -4231,9 +4744,6 @@ fn elements_rooted(
 
     Ok(publish_elements(viewed, geom, region))
 }
-
-/// An interactive AX node paired with its click point in sent-image space.
-type ViewNode = (tree::Node, (i64, i64));
 
 /// What one accessibility read found: the controls inside the view with their
 /// click points, the application they came from (and when that process started,
@@ -4297,15 +4807,7 @@ fn in_view_nodes(
     let found = tree::walk(ax, pid, clock.as_ref(), deadline);
     let messages = ax.messages() - before;
     let total = found.nodes.len();
-
-    let nodes = found
-        .nodes
-        .into_iter()
-        .filter_map(|node| {
-            let (centre_x, centre_y) = node.frame.centre();
-            to_sent(geom, region, centre_x, centre_y).map(|point| (node, point))
-        })
-        .collect();
+    let (nodes, _outside) = in_view(found.nodes, geom, region);
 
     InView {
         nodes,
@@ -4811,6 +5313,7 @@ mod tests {
     use super::*;
 
     use crate::held::{sweep_injected_failures, Call, Recorder, CLIPBOARD_RESTORE_DWELL_MS};
+    use crate::listing::element_value;
     use enigo::Direction;
 
     /// A launcher a test can ask about without a bundle: the badge is "there", and
@@ -4874,8 +5377,13 @@ mod tests {
         }
     }
 
+    /// A worker over this build's own accessibility platform: none at all off
+    /// macOS, exactly as production has it.
     fn idle_worker(gate: &Gate) -> Worker {
-        worker_with(gate, Rc::new(ax::Real::new()))
+        Worker {
+            accessibility: accessibility_supported(),
+            ..worker_with(gate, Rc::new(ax::Real::new()))
+        }
     }
 
     /// A worker over a given accessibility platform, so an action that acts on a
@@ -4913,6 +5421,9 @@ mod tests {
             target: None,
             target_generation: 0,
             emitter: capture::Emitter::capturing(),
+            accessibility: true,
+            until_held: None,
+            cutoff_ms: None,
         }
     }
 
@@ -4939,6 +5450,7 @@ mod tests {
             observation_id: body["observation_id"].as_str().map(str::to_string),
             element_ref: body["element_ref"].as_str().map(str::to_string),
             target_id: body["target_id"].as_str().map(str::to_string),
+            until: None,
             check: match body["check"].as_str() {
                 Some("image") => wire::Check::Image,
                 Some("semantic") => wire::Check::Semantic,
@@ -5505,6 +6017,13 @@ mod tests {
                 "windows",
                 "press",
                 "set_value",
+                "focus",
+                "select",
+                "toggle",
+                "expand",
+                "collapse",
+                "scroll_to",
+                "wait_for",
                 "select_target",
                 "release_target",
             ]
@@ -5933,6 +6452,7 @@ mod tests {
             element_ref: wire::addresses_an_element(action).then(|| "e1".to_string()),
             check: wire::Check::None,
             target_id: None,
+            until: None,
         }
     }
 
@@ -6113,7 +6633,13 @@ mod tests {
         let done = gate.finish();
 
         // ... and then `post` failed on its own capture.
-        let frame = reply(&request, &gate, Err(Failure::from("capture_stalled")), done);
+        let frame = reply(
+            &request,
+            &gate,
+            Err(Failure::from("capture_stalled")),
+            done,
+            None,
+        );
 
         assert_eq!(frame["ok"], json!(false));
         assert_eq!(frame["error"], json!("capture_stalled"));
@@ -6156,6 +6682,7 @@ mod tests {
             &gate,
             Err(Failure::new("capture_geometry_mismatch", detail)),
             done,
+            None,
         );
 
         assert_eq!(frame["ok"], json!(false));
@@ -6186,7 +6713,13 @@ mod tests {
         // the sequence failed here, so nothing latched
         let done = gate.finish();
 
-        let frame = reply(&request, &gate, Err(Failure::from("click: refused")), done);
+        let frame = reply(
+            &request,
+            &gate,
+            Err(Failure::from("click: refused")),
+            done,
+            None,
+        );
 
         assert_eq!(frame["receipt"]["dispatch"], json!("partial"));
     }
@@ -6263,6 +6796,7 @@ mod tests {
                 reference: ax::reference_for(index),
                 role: node.role,
                 secure: node.secure,
+                under: node.under.map(ax::reference_for),
                 element: node.element,
             })
             .collect();
@@ -6760,8 +7294,10 @@ mod tests {
         assert_eq!(app.performed().len(), 1, "one write, never repeated");
         // The revalidation (its facts, and whether the value may be written), the
         // foreground before and after, the write, and ONE read back — not the eight
-        // more a 400 ms wait would have taken.
-        assert_eq!(platform.messages() - before, 6);
+        // more a 400 ms wait would have taken. Then the look for what the write
+        // opened: the application's two children by count and page, and each one's
+        // facts and child count.
+        assert_eq!(platform.messages() - before, 6 + 2 + 2 * 2);
     }
 
     // M2, through the actions rather than the arithmetic: a write is sent with half
@@ -6961,18 +7497,30 @@ mod tests {
         let region = Region::full(&geom);
 
         let found = tree::walk(&platform, FIXTURE_PID, &clock, u64::MAX);
-        let button = element_value(&found.nodes[0], Some("e1"), (140, 212), &geom, &region);
-        let field = element_value(&found.nodes[1], Some("e2"), (140, 272), &geom, &region);
+        let button = element_value(
+            &found.nodes[0],
+            Some("e1"),
+            Some((140, 212)),
+            &geom,
+            &region,
+        );
+        let field = element_value(
+            &found.nodes[1],
+            Some("e2"),
+            Some((140, 272)),
+            &geom,
+            &region,
+        );
 
         assert_eq!(
             button,
             json!({
                 "element_ref": "e1",
-                "role": "AXButton",
+                "role": "button",
+                "native_role": "AXButton",
                 "label": "Save",
                 "enabled": true,
-                "actions": ["press"],
-                "settable": false,
+                "verbs": ["press"],
                 "bounds": { "x": 100, "y": 200, "w": 80, "h": 24 },
                 "path": ["Document", "Toolbar"],
                 "x": 140,
@@ -6980,8 +7528,11 @@ mod tests {
             })
         );
 
-        assert_eq!(field["actions"], json!([]), "it lists no press of its own");
-        assert_eq!(field["settable"], json!(true));
+        assert_eq!(
+            field["verbs"],
+            json!(["set_value"]),
+            "no press of its own, and a value that may be written"
+        );
         assert_eq!(field["value"], json!("ada"));
         assert!(
             field.get("path").is_none(),
@@ -6991,13 +7542,13 @@ mod tests {
         // A reply that cannot resolve references offers none. Listing `e1` beside
         // a table that would answer `stale_element` the moment it was used is a
         // promise this build cannot keep.
-        let unnamed = element_value(&found.nodes[0], None, (140, 212), &geom, &region);
+        let unnamed = element_value(&found.nodes[0], None, Some((140, 212)), &geom, &region);
         assert!(unnamed.get("element_ref").is_none());
         assert!(
-            unnamed.get("actions").is_none(),
+            unnamed.get("verbs").is_none(),
             "nothing may be offered on a control that cannot be named"
         );
-        assert_eq!(unnamed["role"], json!("AXButton"), "it is still listed");
+        assert_eq!(unnamed["role"], json!("button"), "it is still listed");
         assert_eq!(
             unnamed["x"],
             json!(140),
@@ -7077,8 +7628,9 @@ mod tests {
         assert_eq!(payload["elements"].as_array().map(Vec::len), Some(2));
         assert!(listed.is_some());
         // The window: its facts, its child count, one page. Each control: its facts,
-        // its value, whether that may be written, and its child count.
-        assert_eq!(payload["ax_messages"], json!(3 + 2 * 4));
+        // its value, its write routes, its states and its child count. Their window
+        // is asked once whether it selects its children.
+        assert_eq!(payload["ax_messages"], json!(3 + 2 * 5 + 1));
     }
 
     // A read that found nothing still says what it cost.
@@ -7124,8 +7676,9 @@ mod tests {
         );
         assert_eq!(app.walks(), 3, "two empty walks, then the tree");
         // The application: its facts, its child count, one page. Each control: its
-        // facts, its value, whether that may be written, and its child count.
-        assert_eq!(viewed.messages, 3 + 2 * 4);
+        // facts, its value, its write routes, its states and its child count. The
+        // application is asked once whether it selects its children.
+        assert_eq!(viewed.messages, 3 + 2 * 5 + 1);
     }
 
     /// An activation that worked, for a test with no application to ask.
@@ -7781,7 +8334,8 @@ mod tests {
 
             let after = &payload["element_after"];
             assert_eq!(after["present"], json!(true));
-            assert_eq!(after["role"], json!("AXTextField"));
+            assert_eq!(after["role"], json!("textfield"));
+            assert_eq!(after["native_role"], json!("AXTextField"));
             assert_eq!(after["enabled"], json!(true));
             // Which control was re-read, in the control's own words — so a consumer
             // can say so without keeping a copy of the listing. A secure field has
@@ -8308,7 +8862,7 @@ mod tests {
         let tails: Vec<&str> = source.split(latch).skip(1).collect();
         assert_eq!(
             tails.len(),
-            9,
+            10,
             "every action that dispatches input latches exactly once"
         );
 
@@ -8339,8 +8893,9 @@ mod tests {
 
         assert_eq!(
             allowed_seen,
-            ALLOWED.len() * 2,
-            "press and set_value, and nothing else, report an accessibility outcome"
+            ALLOWED.len() * 3,
+            "press, set_value and the verbs on a reference, and nothing else, report an \
+             accessibility outcome"
         );
     }
 
@@ -8354,5 +8909,1129 @@ mod tests {
         gate.record(Phase::Capture, 5);
 
         assert_eq!(gate.finish().timings.capture_ms, wire::MAX_TIMING_MS);
+    }
+
+    // --- protocol 12: the verbs on a reference, waits, surfaces --------------------
+
+    /// A gate of the boot the test requests name, so `serve` admits them.
+    fn boot_gate() -> Gate {
+        Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()))
+    }
+
+    /// A checkbox (e1), a field that takes focus and text (e2), a folder row that
+    /// expands, selects and scrolls into view (e3) and a button (e4).
+    fn controls_app() -> Rc<ax::Recorder> {
+        ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                ax::Scripted::checkbox("Bold", false, frame_at(100.0, 200.0)),
+                ax::Scripted {
+                    routes: ax::Routes {
+                        focus: true,
+                        text: true,
+                        ..ax::Routes::default()
+                    },
+                    states: ax::States {
+                        focused: Some(false),
+                        ..ax::States::default()
+                    },
+                    ..ax::Scripted::field("Name", "ada", frame_at(100.0, 260.0))
+                },
+                ax::Scripted {
+                    label: Some("Folder".to_string()),
+                    actions: vec!["AXConfirm".to_string(), ax::SCROLL_TO_VISIBLE.to_string()],
+                    frame: Some(frame_at(100.0, 320.0)),
+                    routes: ax::Routes {
+                        select: true,
+                        expand: Some(ax::Expander::Expanded),
+                        ..ax::Routes::default()
+                    },
+                    states: ax::States {
+                        expanded: Some(false),
+                        selected: Some(false),
+                        ..ax::States::default()
+                    },
+                    ..ax::Scripted::of("AXRow")
+                },
+                ax::Scripted::button("Save", frame_at(100.0, 380.0)),
+            ],
+        )
+    }
+
+    fn verb_at(
+        action: &str,
+        observation: &Observation,
+        reference: &str,
+        extra: Value,
+    ) -> wire::Request {
+        let mut request = at_element(action, observation, reference);
+        if let (Some(body), Some(extra)) = (request.body.as_object_mut(), extra.as_object()) {
+            body.extend(extra.clone());
+        }
+        request
+    }
+
+    fn performed_names(app: &ax::Recorder) -> Vec<String> {
+        app.performed()
+            .into_iter()
+            .map(|(_, what, _)| what)
+            .collect()
+    }
+
+    // The whole receipt of a verb that changed what it was asked to: it went
+    // through the accessibility API, its read-back shows the state it was asked
+    // for, and the state before and after are named.
+    #[test]
+    fn a_toggle_reads_the_state_first_presses_once_and_reads_it_back() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let frame = served(
+            &verb_at("toggle", &observation, "e1", json!({"on": true})),
+            &gate,
+            &mut worker,
+        );
+
+        assert_eq!(frame["ok"], json!(true), "{frame}");
+        assert_eq!(frame["receipt"]["dispatch"], json!("sent"));
+        assert_eq!(frame["receipt"]["input_method"], json!("ax"));
+        assert_eq!(frame["receipt"]["effect"], json!("changed"));
+        assert_eq!(frame["receipt"]["state_before"], json!("off"));
+        assert_eq!(frame["receipt"]["state_after"], json!("on"));
+        assert!(frame["receipt"].get("already").is_none());
+        assert_eq!(performed_names(&app), vec![ax::PRESS]);
+    }
+
+    // A state that already holds is not touched: nothing is sent, and the receipt
+    // says so rather than claiming a press.
+    #[test]
+    fn a_toggle_already_in_its_state_sends_nothing_and_says_so() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let frame = served(
+            &verb_at("toggle", &observation, "e1", json!({"on": false})),
+            &gate,
+            &mut worker,
+        );
+
+        assert_eq!(frame["ok"], json!(true), "{frame}");
+        assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"));
+        assert_eq!(frame["receipt"]["already"], json!(true));
+        assert_eq!(frame["receipt"]["state_before"], json!("off"));
+        assert_eq!(frame["receipt"]["state_after"], json!("off"));
+        assert_eq!(frame["receipt"]["effect"], json!("not_observed"));
+        assert!(
+            frame["receipt"].get("surfaces").is_none(),
+            "nothing sent, nothing looked at"
+        );
+        assert!(app.performed().is_empty());
+    }
+
+    // A control with no route for the verb is refused, and never clicked.
+    #[test]
+    fn a_verb_with_no_route_is_refused_and_never_becomes_a_click() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        for (action, reference, extra) in [
+            ("toggle", "e4", json!({"on": true})),
+            ("focus", "e4", json!({})),
+            ("select", "e1", json!({})),
+            ("expand", "e4", json!({})),
+            ("scroll_to", "e1", json!({})),
+            ("type", "e4", json!({"text": "x"})),
+        ] {
+            let frame = served(
+                &verb_at(action, &observation, reference, extra),
+                &gate,
+                &mut worker,
+            );
+            assert_eq!(
+                frame["error"],
+                json!("ax_action_unsupported"),
+                "{action}: {frame}"
+            );
+            assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"), "{action}");
+        }
+        assert!(app.performed().is_empty(), "{:?}", app.performed());
+    }
+
+    // A write the application took and did nothing with is reported as such: sent,
+    // and not observed.
+    #[test]
+    fn a_verb_whose_read_back_is_unchanged_is_not_observed() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.ignores_writes();
+
+        let frame = served(
+            &verb_at("toggle", &observation, "e1", json!({"on": true})),
+            &gate,
+            &mut worker,
+        );
+
+        assert_eq!(frame["receipt"]["dispatch"], json!("sent"));
+        assert_eq!(frame["receipt"]["effect"], json!("not_observed"));
+        assert_eq!(frame["receipt"]["state_after"], json!("off"));
+    }
+
+    // A state that will not read before the write refuses the verb; one that will
+    // not read after it is an effect nobody can claim.
+    #[test]
+    fn a_state_that_will_not_read_refuses_before_and_is_unknown_after() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.change(0, |bold| bold.states.on = None);
+
+        let frame = served(
+            &verb_at("toggle", &observation, "e1", json!({"on": true})),
+            &gate,
+            &mut worker,
+        );
+        assert_eq!(frame["error"], json!("state_unreadable"));
+        assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"));
+        assert!(app.performed().is_empty());
+    }
+
+    #[test]
+    fn focus_moves_the_keyboard_and_reads_it_back() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let frame = served(
+            &verb_at("focus", &observation, "e2", json!({})),
+            &gate,
+            &mut worker,
+        );
+
+        assert_eq!(frame["receipt"]["effect"], json!("changed"), "{frame}");
+        assert_eq!(frame["receipt"]["state_before"], json!("unfocused"));
+        assert_eq!(frame["receipt"]["state_after"], json!("focused"));
+        assert_eq!(frame["receipt"]["foreground_changed"], json!(false));
+        assert_eq!(performed_names(&app), vec!["write:Focused"]);
+    }
+
+    // Focus never brings a window forward, so a control whose window is not
+    // the active one is refused and nothing is sent.
+    #[test]
+    fn focus_in_a_window_that_is_not_active_is_refused() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.change(1, |name| name.in_focused_window = Some(false));
+
+        let frame = served(
+            &verb_at("focus", &observation, "e2", json!({})),
+            &gate,
+            &mut worker,
+        );
+
+        assert_eq!(frame["error"], json!("focus_refused"));
+        assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"));
+        assert!(app.performed().is_empty());
+    }
+
+    #[test]
+    fn expand_and_collapse_act_only_when_the_state_differs() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let collapsed = served(
+            &verb_at("collapse", &observation, "e3", json!({})),
+            &gate,
+            &mut worker,
+        );
+        assert_eq!(collapsed["receipt"]["already"], json!(true), "{collapsed}");
+        assert_eq!(collapsed["receipt"]["state_before"], json!("collapsed"));
+
+        let expanded = served(
+            &verb_at("expand", &observation, "e3", json!({})),
+            &gate,
+            &mut worker,
+        );
+        assert_eq!(
+            expanded["receipt"]["effect"],
+            json!("changed"),
+            "{expanded}"
+        );
+        assert_eq!(expanded["receipt"]["state_after"], json!("expanded"));
+        assert_eq!(performed_names(&app), vec!["write:Expand(Expanded, true)"]);
+    }
+
+    #[test]
+    fn select_writes_the_item_and_reads_it_back() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let frame = served(
+            &verb_at("select", &observation, "e3", json!({})),
+            &gate,
+            &mut worker,
+        );
+
+        assert_eq!(frame["receipt"]["effect"], json!("changed"), "{frame}");
+        assert_eq!(frame["receipt"]["state_after"], json!("selected"));
+        assert_eq!(performed_names(&app), vec!["write:Selected"]);
+    }
+
+    // An item that cannot select itself is selected through its container.
+    #[test]
+    fn select_goes_through_the_container_when_the_item_has_no_route() {
+        let gate = boot_gate();
+        let app = ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                ax::Scripted {
+                    selects_children: true,
+                    label: Some("Files".to_string()),
+                    children: vec![1],
+                    ..ax::Scripted::of("AXList")
+                },
+                ax::Scripted {
+                    label: Some("notes.txt".to_string()),
+                    actions: vec!["AXConfirm".to_string()],
+                    frame: Some(frame_at(100.0, 200.0)),
+                    states: ax::States {
+                        selected: Some(false),
+                        ..ax::States::default()
+                    },
+                    ..ax::Scripted::of("AXRow")
+                },
+            ],
+        );
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let frame = served(
+            &verb_at("select", &observation, "e1", json!({})),
+            &gate,
+            &mut worker,
+        );
+
+        assert_eq!(frame["receipt"]["effect"], json!("changed"), "{frame}");
+        let performed = performed_names(&app);
+        assert_eq!(performed.len(), 1);
+        assert!(
+            performed[0].starts_with("write:SelectedChildren"),
+            "{performed:?}"
+        );
+        assert_eq!(
+            app.counts().2,
+            1,
+            "the container was given back; the listing holds its row"
+        );
+    }
+
+    #[test]
+    fn scroll_to_reads_where_the_control_is_afterwards() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let still = served(
+            &verb_at("scroll_to", &observation, "e3", json!({})),
+            &gate,
+            &mut worker,
+        );
+        assert_eq!(
+            still["receipt"]["effect"],
+            json!("not_observed"),
+            "already in view: {still}"
+        );
+        assert!(
+            still["receipt"].get("state_before").is_none(),
+            "scroll_to has no state"
+        );
+
+        app.scrolls_to(2, frame_at(100.0, 40.0));
+        let moved = served(
+            &verb_at("scroll_to", &observation, "e3", json!({})),
+            &gate,
+            &mut worker,
+        );
+        assert_eq!(moved["receipt"]["effect"], json!("changed"));
+        assert_eq!(
+            performed_names(&app),
+            vec![ax::SCROLL_TO_VISIBLE, ax::SCROLL_TO_VISIBLE]
+        );
+    }
+
+    // Typing by reference uses no keyboard, and reports what the field holds after.
+    #[test]
+    fn type_by_reference_writes_the_selection_and_reports_the_value() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let frame = served(
+            &verb_at("type", &observation, "e2", json!({"text": "!"})),
+            &gate,
+            &mut worker,
+        );
+
+        assert_eq!(frame["ok"], json!(true), "{frame}");
+        assert_eq!(frame["receipt"]["input_method"], json!("ax"));
+        assert_eq!(frame["receipt"]["effect"], json!("changed"));
+        assert_eq!(frame["value"], json!("ada!"));
+        assert_eq!(performed_names(&app), vec![r#"write:SelectedText("!")"#]);
+    }
+
+    // A password field is typed into and never read, before or after.
+    #[test]
+    fn type_by_reference_into_a_secure_field_never_reads_it() {
+        let gate = boot_gate();
+        let app = ax::Recorder::new(
+            FIXTURE_PID,
+            vec![ax::Scripted {
+                routes: ax::Routes {
+                    text: true,
+                    ..ax::Routes::default()
+                },
+                ..ax::Scripted::secure_field("Password", "hunter2", frame_at(100.0, 200.0))
+            }],
+        );
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let frame = served(
+            &verb_at("type", &observation, "e1", json!({"text": "x"})),
+            &gate,
+            &mut worker,
+        );
+
+        assert_eq!(frame["ok"], json!(true), "{frame}");
+        assert_eq!(frame["receipt"]["input_method"], json!("ax"));
+        assert_eq!(frame["receipt"]["effect"], json!("unknown"), "{frame}");
+        assert!(frame.get("value").is_none());
+        assert!(app.values_read().is_empty(), "{:?}", app.values_read());
+        assert_eq!(performed_names(&app), vec![r#"write:SelectedText("x")"#]);
+    }
+
+    // What a receipt's check says when the action also waited on the tree: the
+    // condition is read BEFORE the input, so one that already held says so rather
+    // than claiming the action made it hold.
+    #[test]
+    fn a_semantic_until_is_read_before_the_input_and_waited_on_after() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        let waiting = |value: Value| {
+            let mut request = verb_at("type", &observation, "e2", json!({"text": "!"}));
+            request.check = wire::Check::Semantic;
+            request.until = Some(Box::new(
+                semantic::parse_until(&value, true).expect("a condition"),
+            ));
+            request
+        };
+
+        let met = served(
+            &waiting(json!({"kind": "value", "element_ref": "e2", "value": "ada!"})),
+            &gate,
+            &mut worker,
+        );
+        assert_eq!(met["receipt"]["check"]["kind"], json!("semantic"), "{met}");
+        assert_eq!(met["receipt"]["check"]["until"], json!("met"));
+        assert_eq!(met["receipt"]["check"]["looks"], json!(1));
+        assert_eq!(met["element_after"]["role"], json!("textfield"));
+
+        let before = served(
+            &waiting(json!({"kind": "value", "element_ref": "e2", "value": "ada!"})),
+            &gate,
+            &mut worker,
+        );
+        assert_eq!(
+            before["receipt"]["check"]["until"],
+            json!("held_before"),
+            "it held before this input, so it shows nothing about it: {before}"
+        );
+
+        let never = served(
+            &waiting(json!({"kind": "appears", "name": "Never", "timeout_ms": 200})),
+            &gate,
+            &mut worker,
+        );
+        assert_eq!(
+            never["receipt"]["check"]["until"],
+            json!("not_met"),
+            "{never}"
+        );
+        assert_eq!(never["receipt"]["check"]["looks"], json!(3));
+        assert_eq!(never["receipt"]["dispatch"], json!("sent"));
+        assert_eq!(
+            performed_names(&app).len(),
+            3,
+            "one write per request, and the waits sent nothing"
+        );
+    }
+
+    #[test]
+    fn wait_for_answers_met_and_not_met_and_never_sends_input() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        let waiting = |value: Value| {
+            let mut request = running("wait_for", None);
+            request.observation_id = Some(observation.id.clone());
+            request.until = Some(Box::new(
+                semantic::parse_until(&value, true).expect("a condition"),
+            ));
+            request
+        };
+
+        let met = served(
+            &waiting(json!({"kind": "enabled", "element_ref": "e4"})),
+            &gate,
+            &mut worker,
+        );
+        assert_eq!(met["ok"], json!(true), "{met}");
+        assert_eq!(met["met"], json!(true));
+        assert_eq!(met["looks"], json!(1));
+        assert!(met.get("receipt").is_none(), "read-only");
+
+        let never = served(
+            &waiting(json!({"kind": "appears", "name": "Never", "timeout_ms": 300})),
+            &gate,
+            &mut worker,
+        );
+        assert_eq!(never["ok"], json!(true), "not met is an answer: {never}");
+        assert_eq!(never["met"], json!(false));
+        assert_eq!(never["looks"], json!(4));
+        assert!(app.performed().is_empty());
+    }
+
+    // A met wait for something to appear lists what matched, with references in a
+    // new observation, exactly as `elements` lists controls.
+    #[test]
+    fn a_met_wait_for_lists_what_appeared_with_references() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        let mut request = running("wait_for", None);
+        request.observation_id = Some(observation.id.clone());
+        request.until = Some(Box::new(
+            semantic::parse_until(
+                &json!({"kind": "appears", "role": "button", "name": "save"}),
+                true,
+            )
+            .expect("a condition"),
+        ));
+
+        let met = served(&request, &gate, &mut worker);
+
+        assert_eq!(met["met"], json!(true), "{met}");
+        assert_eq!(met["observation_kind"], json!("semantic"));
+        assert_ne!(met["observation_id"], json!(observation.id));
+        let listed = met["elements"].as_array().expect("a listing");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["label"], json!("Save"));
+        assert_eq!(listed[0]["element_ref"], json!("e1"));
+
+        let mut press = at_element("press", &observation, "e1");
+        press.observation_id = met["observation_id"].as_str().map(str::to_string);
+        let pressed = served(&press, &gate, &mut worker);
+        assert_eq!(
+            pressed["ok"],
+            json!(true),
+            "the new reference presses: {pressed}"
+        );
+    }
+
+    // What is open once an action has run rides its receipt: a sheet the press
+    // opened, nothing when nothing is, and nothing at all when nothing was sent.
+    #[test]
+    fn surfaces_ride_the_receipt_of_input_that_went_out() {
+        let gate = boot_gate();
+        let app = ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                ax::Scripted::button("Clear", frame_at(100.0, 200.0)),
+                ax::Scripted {
+                    label: Some("Document".to_string()),
+                    children: vec![2],
+                    ..ax::Scripted::of("AXWindow")
+                },
+                ax::Scripted {
+                    label: Some("Clear all items?".to_string()),
+                    ..ax::Scripted::of("AXSheet")
+                },
+            ],
+        );
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let pressed = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+        assert_eq!(
+            pressed["receipt"]["surfaces"],
+            json!([{"kind": "dialog", "native_kind": "AXSheet", "label": "Clear all items?"}]),
+            "{pressed}"
+        );
+
+        let refused = served(&at_element("press", &observation, "e9"), &gate, &mut worker);
+        assert!(
+            refused["receipt"].get("surfaces").is_none(),
+            "nothing sent: {refused}"
+        );
+
+        let none = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &none);
+        let pressed = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+        assert_eq!(
+            pressed["receipt"]["surfaces"],
+            json!([]),
+            "looked, nothing open"
+        );
+    }
+
+    // A build with no accessibility API never claims to have looked.
+    #[test]
+    fn a_build_with_no_accessibility_reports_no_surfaces() {
+        let gate = boot_gate();
+        let app = fixture_app();
+        let (mut worker, _observation) = worker_listing(&gate, &app);
+        worker.accessibility = false;
+        let done = gate::Dispatched {
+            posted: true,
+            input_complete: true,
+            ..gate::Dispatched::default()
+        };
+
+        assert_eq!(
+            surfaces_after(&running("key", Some(1)), &done, &worker),
+            None
+        );
+        worker.accessibility = true;
+        assert_eq!(
+            surfaces_after(&running("key", Some(1)), &done, &worker),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            surfaces_after(
+                &running("key", Some(1)),
+                &gate::Dispatched::default(),
+                &worker
+            ),
+            None,
+            "nothing sent"
+        );
+    }
+
+    // The controls as protocol 12 names them: a normalised role beside the native
+    // one, the verbs each has a route for in place of `actions` and `settable`, and
+    // the states that read.
+    #[test]
+    fn an_element_is_published_with_its_role_its_verbs_and_its_states() {
+        let app = controls_app();
+        let platform: Rc<dyn ax::Ax> = app.clone();
+        let (geom, region) = one_to_one();
+        let found = tree::walk(&platform, FIXTURE_PID, &SystemClock::new(), u64::MAX);
+
+        let bold = element_value(
+            &found.nodes[0],
+            Some("e1"),
+            Some((140, 212)),
+            &geom,
+            &region,
+        );
+        assert_eq!(bold["role"], json!("checkbox"));
+        assert_eq!(bold["native_role"], json!("AXCheckBox"));
+        assert_eq!(bold["verbs"], json!(["press", "toggle"]));
+        assert_eq!(bold["checked"], json!(false));
+        assert!(bold.get("actions").is_none() && bold.get("settable").is_none());
+        assert_eq!(
+            bold["bounds"],
+            json!({"x": 100, "y": 200, "w": 80, "h": 24})
+        );
+
+        let name = element_value(
+            &found.nodes[1],
+            Some("e2"),
+            Some((140, 272)),
+            &geom,
+            &region,
+        );
+        assert_eq!(name["role"], json!("textfield"));
+        assert_eq!(name["verbs"], json!(["set_value", "type", "focus"]));
+        assert!(name.get("focused").is_none(), "only said when true");
+        assert!(name.get("checked").is_none(), "a field has no check state");
+
+        let folder = element_value(
+            &found.nodes[2],
+            Some("e3"),
+            Some((140, 332)),
+            &geom,
+            &region,
+        );
+        assert_eq!(folder["role"], json!("row"));
+        assert_eq!(
+            folder["verbs"],
+            json!(["expand", "collapse", "select", "scroll_to"])
+        );
+        assert_eq!(folder["expanded"], json!(false));
+
+        let unnamed = element_value(&found.nodes[3], None, Some((140, 392)), &geom, &region);
+        assert!(
+            unnamed.get("verbs").is_none(),
+            "nothing offered on what cannot be named"
+        );
+
+        // A control the platform places nowhere has no bounds and no click point,
+        // and nothing synthesises one.
+        let mut nowhere = tree::walk(&platform, FIXTURE_PID, &SystemClock::new(), u64::MAX);
+        nowhere.nodes[3].frame = None;
+        let placeless = element_value(&nowhere.nodes[3], Some("e4"), None, &geom, &region);
+        for absent in ["bounds", "x", "y"] {
+            assert!(placeless.get(absent).is_none(), "{absent}: {placeless}");
+        }
+        assert_eq!(placeless["verbs"], json!(["press"]));
+    }
+
+    // The control a semantic check reads again is named as a listing names it.
+    #[test]
+    fn element_after_carries_the_normalised_role_and_the_states() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        let mut request = verb_at("toggle", &observation, "e1", json!({"on": true}));
+        request.check = wire::Check::Semantic;
+
+        let frame = served(&request, &gate, &mut worker);
+
+        assert_eq!(frame["element_after"]["role"], json!("checkbox"), "{frame}");
+        assert_eq!(frame["element_after"]["native_role"], json!("AXCheckBox"));
+        assert_eq!(frame["element_after"]["checked"], json!(true));
+    }
+
+    // A secure field says so wherever its value is withheld — in a listing and in
+    // the control read again — so a caller knows why there is none.
+    #[test]
+    fn a_secure_field_says_it_is_secure_where_its_value_is_withheld() {
+        let gate = boot_gate();
+        let app = ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                ax::Scripted::secure_field("Password", "hunter2", frame_at(100.0, 200.0)),
+                ax::Scripted::field("Name", "ada", frame_at(100.0, 260.0)),
+            ],
+        );
+        let platform: Rc<dyn ax::Ax> = app.clone();
+        let (geom, region) = one_to_one();
+        let found = tree::walk(&platform, FIXTURE_PID, &SystemClock::new(), u64::MAX);
+
+        let password = element_value(
+            &found.nodes[0],
+            Some("e1"),
+            Some((140, 212)),
+            &geom,
+            &region,
+        );
+        assert_eq!(password["secure"], json!(true), "{password}");
+        assert!(password.get("value").is_none());
+        let name = element_value(
+            &found.nodes[1],
+            Some("e2"),
+            Some((140, 272)),
+            &geom,
+            &region,
+        );
+        assert!(
+            name.get("secure").is_none(),
+            "said only of a secure field: {name}"
+        );
+
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        let mut request = set_to(&observation, "e1", "x");
+        request.check = wire::Check::Semantic;
+        let frame = served(&request, &gate, &mut worker);
+        assert_eq!(frame["element_after"]["secure"], json!(true), "{frame}");
+        assert!(frame["element_after"].get("value").is_none());
+    }
+
+    // A wait never outlives the request: what is left of its deadline bounds the
+    // wait however long the condition's own timeout, and the reply says the
+    // deadline is what ended it.
+    #[test]
+    fn a_wait_cut_short_by_the_request_deadline_says_so() {
+        let gate = boot_gate();
+        let app = controls_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        let never = || {
+            Box::new(
+                semantic::parse_until(&json!({"kind": "appears", "name": "Never"}), true)
+                    .expect("a condition"),
+            )
+        };
+
+        let mut waiting = running("wait_for", None);
+        waiting.observation_id = Some(observation.id.clone());
+        waiting.body = json!({"action": "wait_for", "deadline_ms": DEADLINE_MARGIN_MS + 100});
+        waiting.until = Some(never());
+        let cut = served(&waiting, &gate, &mut worker);
+        assert_eq!(cut["met"], json!(false), "{cut}");
+        assert_eq!(cut["deadline_cut"], json!(true));
+        assert!(cut["waited_ms"].as_u64().expect("waited") < 1_000, "{cut}");
+
+        let mut typing = verb_at("type", &observation, "e2", json!({"text": "!"}));
+        typing.body["deadline_ms"] = json!(DEADLINE_MARGIN_MS + 100);
+        typing.check = wire::Check::Semantic;
+        typing.until = Some(never());
+        let typed = served(&typing, &gate, &mut worker);
+        assert_eq!(
+            typed["receipt"]["check"]["until"],
+            json!("not_met"),
+            "{typed}"
+        );
+        assert_eq!(typed["receipt"]["check"]["deadline_cut"], json!(true));
+
+        let mut whole = running("wait_for", None);
+        whole.observation_id = Some(observation.id.clone());
+        whole.until = Some(Box::new(
+            semantic::parse_until(
+                &json!({"kind": "appears", "name": "Never", "timeout_ms": 100}),
+                true,
+            )
+            .expect("a condition"),
+        ));
+        let ran = served(&whole, &gate, &mut worker);
+        assert!(
+            ran.get("deadline_cut").is_none(),
+            "its own timeout ended it: {ran}"
+        );
+    }
+
+    // The look before the input is held to the request's deadline, as the wait
+    // after it is: a request with little left does not spend a whole walk on it.
+    #[test]
+    fn the_look_before_the_input_stops_at_the_request_deadline() {
+        let clock = StepClock::new();
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        let rows = (0..40)
+            .map(|row| ax::Scripted::button(&format!("Row {row}"), frame_at(100.0, row as f64)))
+            .collect();
+        let app = ax::Recorder::new(FIXTURE_PID, rows);
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.costs_per_node(100, clock.clone());
+        worker.cutoff_ms = Some(gate.now_ms() + 300);
+        let until = semantic::parse_until(&json!({"kind": "appears", "name": "Never"}), true)
+            .expect("a condition");
+        let mut request = at_element("press", &observation, "e1");
+        request.until = Some(Box::new(until.clone()));
+
+        let started = gate.now_ms();
+        let held = held_before(&request, &until, &gate, &worker).expect("a look");
+
+        assert!(!held);
+        let spent = gate.now_ms() - started;
+        assert!(spent < 1_000, "the look before the input took {spent} ms");
+    }
+
+    /// A card that presses (e1) holding two buttons (e2, e3), and a button beside
+    /// it (e4).
+    fn card_app() -> Rc<ax::Recorder> {
+        ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                ax::Scripted {
+                    label: Some("Card".to_string()),
+                    actions: vec![ax::PRESS.to_string()],
+                    frame: Some(frame_at(100.0, 100.0)),
+                    children: vec![1, 2],
+                    ..ax::Scripted::of("AXGroup")
+                },
+                ax::Scripted::button("One", frame_at(100.0, 200.0)),
+                ax::Scripted::button("Two", frame_at(100.0, 260.0)),
+                ax::Scripted::button("Elsewhere", frame_at(100.0, 320.0)),
+            ],
+        )
+    }
+
+    fn drill_into(observation: &Observation, root: &str) -> wire::Request {
+        let mut request = running("elements", None);
+        request.observation_id = Some(observation.id.clone());
+        request.body =
+            json!({"action": "elements", "observation_id": observation.id, "root": root});
+        request
+    }
+
+    // A drill replaces the drilled subtree's references and keeps every other one:
+    // the root and what is outside it stay valid in the new observation, the new
+    // ones are numbered after the listing's last, and the listing it named stays
+    // valid too.
+    #[test]
+    fn a_drill_replaces_only_the_drilled_subtrees_references() {
+        let gate = boot_gate();
+        let app = card_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let drilled = served(&drill_into(&observation, "e1"), &gate, &mut worker);
+
+        assert_eq!(drilled["ok"], json!(true), "{drilled}");
+        assert_eq!(drilled["root"], json!("e1"));
+        let refs: Vec<&str> = drilled["elements"]
+            .as_array()
+            .expect("a listing")
+            .iter()
+            .filter_map(|item| item["element_ref"].as_str())
+            .collect();
+        assert_eq!(refs, vec!["e5", "e6"]);
+
+        let new_id = drilled["observation_id"]
+            .as_str()
+            .expect("a new observation")
+            .to_string();
+        let press_in = |id: &str, reference: &str, worker: &mut Worker| {
+            let mut press = at_element("press", &observation, reference);
+            press.observation_id = Some(id.to_string());
+            served(&press, &gate, worker)
+        };
+        for kept in ["e1", "e4", "e5", "e6"] {
+            assert_eq!(
+                press_in(&new_id, kept, &mut worker)["ok"],
+                json!(true),
+                "{kept}"
+            );
+        }
+        assert_eq!(
+            press_in(&new_id, "e2", &mut worker)["error"],
+            json!("stale_element"),
+            "replaced by the drill"
+        );
+        assert_eq!(
+            press_in(&observation.id, "e2", &mut worker)["ok"],
+            json!(true),
+            "the listing it named is untouched"
+        );
+    }
+
+    /// A panel (e1) holding a button (e2) and, three groups down, another (e3).
+    fn nested_app() -> Rc<ax::Recorder> {
+        let group = |label: &str, child: usize, y: f64| ax::Scripted {
+            label: Some(label.to_string()),
+            frame: Some(frame_at(100.0, y)),
+            children: vec![child],
+            ..ax::Scripted::of("AXGroup")
+        };
+        ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                ax::Scripted {
+                    label: Some("Panel".to_string()),
+                    actions: vec![ax::PRESS.to_string()],
+                    frame: Some(frame_at(100.0, 100.0)),
+                    children: vec![1, 2],
+                    ..ax::Scripted::of("AXGroup")
+                },
+                ax::Scripted::button("Near", frame_at(100.0, 150.0)),
+                group("Outer", 3, 200.0),
+                group("Middle", 4, 220.0),
+                group("Inner", 5, 240.0),
+                ax::Scripted::button("Deep", frame_at(100.0, 260.0)),
+            ],
+        )
+    }
+
+    fn labels_of(payload: &Value) -> Vec<&str> {
+        payload["elements"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item["label"].as_str().unwrap_or("-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // A drill honours a skeleton: it cuts three levels below its root, lists the
+    // cut with what it hides, and says it is a skeleton.
+    #[test]
+    fn a_drilled_skeleton_cuts_three_levels_below_its_root() {
+        let gate = boot_gate();
+        let app = nested_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        let mut request = drill_into(&observation, "e1");
+        request.body["skeleton"] = json!(true);
+
+        let drilled = served(&request, &gate, &mut worker);
+
+        assert_eq!(drilled["ok"], json!(true), "{drilled}");
+        assert_eq!(labels_of(&drilled), vec!["Near", "Inner"]);
+        assert_eq!(drilled["elements"][1]["hidden"], json!(1));
+        assert_eq!(drilled["skeleton"], json!({"depth": 3, "hidden": 0}));
+    }
+
+    // A drill honours a find: only what matches inside its root is listed.
+    #[test]
+    fn a_drilled_find_lists_only_what_matches() {
+        let gate = boot_gate();
+        let app = nested_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        let mut request = drill_into(&observation, "e1");
+        request.body["query"] = json!({"name": "deep"});
+
+        let drilled = served(&request, &gate, &mut worker);
+
+        assert_eq!(drilled["ok"], json!(true), "{drilled}");
+        assert_eq!(labels_of(&drilled), vec!["Deep"]);
+        assert!(drilled.get("skeleton").is_none(), "{drilled}");
+    }
+
+    #[test]
+    fn a_drill_into_a_control_that_is_gone_is_stale() {
+        let gate = boot_gate();
+        let app = card_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.vanish(0);
+
+        let refused = served(&drill_into(&observation, "e1"), &gate, &mut worker);
+        assert_eq!(refused["error"], json!("stale_element"), "{refused}");
+
+        let unknown = served(&drill_into(&observation, "e9"), &gate, &mut worker);
+        assert_eq!(unknown["error"], json!("stale_element"));
+    }
+
+    // Every scope, as a listing publishes it: the scope it read, the references
+    // it hands out, and for a skeleton what it cut.
+    #[test]
+    fn a_scoped_listing_says_which_scope_it_read() {
+        let gate = boot_gate();
+        let app = ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                ax::Scripted {
+                    label: Some("Document".to_string()),
+                    frame: Some(frame_at(0.0, 0.0)),
+                    children: vec![1, 2],
+                    ..ax::Scripted::of("AXWindow")
+                },
+                ax::Scripted::button("Save", frame_at(100.0, 200.0)),
+                ax::Scripted {
+                    label: Some("Clear all items?".to_string()),
+                    frame: Some(frame_at(0.0, 0.0)),
+                    children: vec![3],
+                    ..ax::Scripted::of("AXSheet")
+                },
+                ax::Scripted::button("Clear", frame_at(100.0, 260.0)),
+            ],
+        );
+        app.focuses(Some(0), Some(1));
+        let platform: Rc<dyn ax::Ax> = app.clone();
+        let (geom, region) = one_to_one();
+        let view = Viewport {
+            geom: &geom,
+            region: &region,
+        };
+        let scene = semantic::Scene {
+            pid: FIXTURE_PID,
+            window: None,
+        };
+        let owner = Some((FIXTURE_PID, app.started_at()));
+        let listed = |scope: semantic::Scope, shape: tree::Shape| {
+            let listing = semantic::Listing {
+                scope: Some(scope),
+                shape,
+                root: None,
+            };
+            scoped_listing(&platform, &scene, owner, &listing, &view, &gate)
+                .unwrap_or_else(|failure| panic!("{}: {failure:?}", scope.as_str()))
+        };
+        let labels = |payload: &Value| -> Vec<String> {
+            payload["elements"]
+                .as_array()
+                .expect("a listing")
+                .iter()
+                .map(|item| item["label"].as_str().unwrap_or("-").to_string())
+                .collect()
+        };
+
+        let (dialog, references) = listed(semantic::Scope::Dialog, tree::Shape::default());
+        assert_eq!(dialog["scope"], json!("dialog"));
+        assert_eq!(labels(&dialog), vec!["Clear"]);
+        assert_eq!(references.map(|elements| elements.len()), Some(1));
+
+        let (window, _) = listed(semantic::Scope::Window, tree::Shape::default());
+        assert_eq!(labels(&window), vec!["Save", "Clear"]);
+
+        let (focused, _) = listed(semantic::Scope::Focused, tree::Shape::default());
+        assert_eq!(labels(&focused), vec!["Save"]);
+
+        let skeleton = tree::Shape {
+            skeleton: true,
+            ..tree::Shape::default()
+        };
+        let (cut, _) = listed(semantic::Scope::App, skeleton);
+        assert_eq!(cut["skeleton"], json!({"depth": 3, "hidden": 0}));
+
+        let find = tree::Shape {
+            query: Some(tree::Query {
+                role: Some("dialog".to_string()),
+                name: None,
+            }),
+            ..tree::Shape::default()
+        };
+        let (found, _) = listed(semantic::Scope::App, find);
+        assert_eq!(labels(&found), vec!["Clear all items?"]);
+        assert_eq!(found["elements"][0]["role"], json!("dialog"));
+        assert_eq!(found["elements"][0]["native_role"], json!("AXSheet"));
+
+        app.focuses(None, None);
+        let missing = semantic::Listing {
+            scope: Some(semantic::Scope::Focused),
+            shape: tree::Shape::default(),
+            root: None,
+        };
+        let refused = scoped_listing(&platform, &scene, owner, &missing, &view, &gate)
+            .expect_err("nothing is focused");
+        assert_eq!(refused.code, "scope_not_found");
+    }
+
+    #[test]
+    fn an_action_this_build_does_not_have_is_named_as_such() {
+        let refused = dispatch(json!({"action": "teleport"})).expect_err("no such action");
+        assert_eq!(refused.code, "unknown_action");
+    }
+
+    // Off macOS (until L1) every action that reads or acts on controls says the
+    // build has no accessibility API, rather than refusing the control.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn off_macos_every_control_action_says_there_is_no_accessibility() {
+        for body in [
+            json!({"action": "elements"}),
+            json!({"action": "inspect", "x": 1, "y": 1, "observation_id": "o-1"}),
+            json!({"action": "press", "element_ref": "e1", "observation_id": "o-1"}),
+            json!({"action": "focus", "element_ref": "e1", "observation_id": "o-1"}),
+            json!({"action": "toggle", "element_ref": "e1", "observation_id": "o-1", "on": true}),
+            json!({"action": "wait_for", "until": {"kind": "menu_open"}}),
+            json!({"action": "type", "text": "x", "element_ref": "e1", "observation_id": "o-1"}),
+        ] {
+            let refused = dispatch(body.clone()).expect_err(&body.to_string());
+            assert_eq!(refused.code, "accessibility_unavailable", "{body}");
+        }
+    }
+
+    // The handshake offers the new verbs exactly where controls can be read.
+    #[test]
+    fn the_new_verbs_are_offered_only_where_controls_can_be_read() {
+        for verb in [
+            "focus",
+            "select",
+            "toggle",
+            "expand",
+            "collapse",
+            "scroll_to",
+            "wait_for",
+        ] {
+            assert!(ACTIONS.contains(&verb), "{verb} is a verb");
+            assert!(
+                ACCESSIBILITY_ACTIONS.contains(&verb),
+                "{verb} needs an accessibility API"
+            );
+        }
     }
 }

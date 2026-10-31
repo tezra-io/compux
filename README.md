@@ -129,19 +129,21 @@ is always sent with its observation; alone it means nothing.
 
 ```json
 {
-  "element_ref": "e3", "role": "AXButton", "label": "Save",
-  "enabled": true, "actions": ["press"], "settable": false,
+  "element_ref": "e3", "role": "button", "native_role": "AXButton", "label": "Save",
+  "enabled": true, "verbs": ["press", "focus"],
   "bounds": {"x": 480, "y": 312, "w": 84, "h": 24},
   "path": ["Document", "Toolbar"], "x": 186, "y": 121
 }
 ```
 
-`path` is up to three ancestor labels, nearest last, which is what tells two
-buttons both labelled "Save" apart. `value` carries what a field holds, bounded and
-absent for a secure field. `actions` lists only what this build can really perform
-— `press`, and only where the control's own action list says so — and `settable`
-only where the accessibility API says the value may be written. Nothing is
-inferred from a role name.
+`role` is a normalised name every platform shares (`button`, `checkbox`,
+`textfield`, `row`, `dialog`, …) and `native_role` the platform's own. `path` is up
+to three ancestor labels, nearest last, which is what tells two buttons both
+labelled "Save" apart. `value` carries what a field holds, bounded; a secure field
+has none and says `"secure": true`. `verbs` lists exactly what this control has a
+route for, read from the control itself, and states ride beside it where they read
+(`checked`, `expanded`, `selected`, `focused`). Nothing is inferred from a role
+name.
 
 A node is listed when its role is one a person operates (a button, a field, a
 checkbox, a link, a cell, …) **or** when its own action list advertises a primary
@@ -163,8 +165,11 @@ copied once instead.
 `ax_messages` says how many accessibility messages the read of the returned list
 sent. On macOS each node is read with one batched message for its role, subrole,
 title, description, enabled state and frame and one for its action names; only a
-node that is listed is asked, with a message each, whether its value may be written
-and — unless it is secure — its value. Every node is given a 250 ms messaging
+node that is listed is asked which of its attributes may be written (one message
+per attribute: macOS has no batched form), what its states read, and — unless it is
+secure — its value. A verb on a reference asks only the one attribute it writes. A value is asked for only
+after the role and subrole say the field is not secure, so a password field's
+contents never leave the application. Every node is given a 250 ms messaging
 timeout before it is read; an application's windows and the application in front
 keep the one-second timeout they had before.
 
@@ -208,6 +213,36 @@ Every receipt says which method carried the action: `input_method` is `"ax"` for
 action also reports `foreground_changed`, read before and after, because an action
 that promises not to take the focus should have to say when it did.
 
+## Controls before pixels (protocol 12)
+
+`PROTOCOL.md` is the contract; in short:
+
+* **Where a listing looks.** `scope` is `window`, `app`, `focused`, `menu` or
+  `dialog`; `query` lists only what matches a role and/or a name, wherever it is;
+  `skeleton` stops three levels down and names what each cut hides; `root` drills
+  into one control of a listing, keeping the listing's other references, and takes
+  a `query` or a `skeleton` inside it.
+* **Verbs on a reference.** `focus/3`, `select/3`, `toggle/4`, `expand/3`,
+  `collapse/3`, `scroll_to/3`, and `type/3` with an `:element_ref`, each through
+  the accessibility API alone. Each reads its state first and acts only when it
+  differs (the receipt says `already` when it held), reads it back
+  (`effect: "changed"` when it shows what was asked), and is refused
+  `ax_action_unsupported` where the control has no route — never clicked
+  instead. `focus` never activates a window: `focus_refused` where the control's
+  window is not the active one.
+* **Waiting on the tree.** `wait_for/3` waits for a condition (`appears`,
+  `disappears`, `enabled`, `value`, `window_title`, `menu_open`, `menu_closed`,
+  `text`) and never sends input. Any input action can wait in the same request
+  with `check: %{"kind" => "semantic", "until" => condition}`; the condition is
+  read before the input, so a receipt says `met`, `not_met` or `held_before`. A
+  wait never outlives the request's deadline, and says `deadline_cut` when that
+  is what ended it.
+* **What opened.** Every receipt of input that went out names the dialogs,
+  alerts, menus and popups open after it in `surfaces` (`[]` when none is).
+
+The Linux build answers every one of these `accessibility_unavailable` until it
+reads controls (M86 L1).
+
 ## Every action says what evidence it wants back
 
 An action that dispatches input carries `:check`, and the reply's `receipt` says
@@ -224,9 +259,10 @@ which evidence it really came back with.
   floor between looks rather than a delay added to each one. The check's own image
   is an observation like any other, with rulers drawn and the executed point marked.
 * **`:semantic`** — for an action addressed by `element_ref`: the control is read
-  again and returned as `element_after` — `{present, role, label, enabled, value}`,
-  with `value` absent for a secure field and `{"present": false}` alone for a
-  control that no longer answers. No capture, and never visual evidence.
+  again and returned as `element_after` — `{present, role, native_role, label,
+  enabled, value}` and its states, with `value` absent for a secure field (which
+  says `"secure": true`) and `{"present": false}` alone for a control that no
+  longer answers. No capture, and never visual evidence.
 * **`:none`** — the receipt alone.
 
 ```json

@@ -43,7 +43,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use enigo::{Axis, Button, Direction, Key};
 
 use crate::held::Platform;
-use crate::wire::{Checked, ControlAction, Effect, Envelope, InputMethod, Request, Timings};
+use crate::wire::{
+    Checked, ControlAction, Effect, Envelope, InputMethod, Request, StateChange, Timings,
+};
 
 /// The coarsest a cancellation may be noticed inside a loop or a sleep of ours.
 pub const CHECKPOINT_MS: u64 = 25;
@@ -207,6 +209,8 @@ pub struct Dispatched {
     /// the action was refused, or it was cancelled before its check could finish —
     /// so the receipt reports what was dispatched and claims no evidence.
     pub check: Option<Checked>,
+    /// What a state-reading verb read before and after it acted (protocol 12).
+    pub state: Option<StateChange>,
 }
 
 struct InFlight {
@@ -222,6 +226,7 @@ struct InFlight {
     effect: Option<Effect>,
     foreground_changed: Option<bool>,
     check: Option<Checked>,
+    state: Option<StateChange>,
 }
 
 struct State {
@@ -338,6 +343,7 @@ impl Gate {
             effect: None,
             foreground_changed: None,
             check: None,
+            state: None,
         });
         self.cancelled.store(false, Ordering::SeqCst);
 
@@ -542,6 +548,15 @@ impl Gate {
         }
     }
 
+    /// What a state-reading verb read before and after it acted, and whether the
+    /// state already held (protocol 12).
+    pub fn observed_state(&self, change: StateChange) {
+        let mut state = self.lock();
+        if let Some(in_flight) = state.in_flight.as_mut() {
+            in_flight.state = Some(change);
+        }
+    }
+
     /// Is a request in flight? The reader asks before it hands over another, so a
     /// second action is refused now rather than queued behind work whose screen has
     /// moved on.
@@ -593,6 +608,7 @@ impl Gate {
                 effect: in_flight.effect,
                 foreground_changed: in_flight.foreground_changed,
                 check: in_flight.check,
+                state: in_flight.state,
             },
             None => Dispatched {
                 cancelled,
@@ -852,6 +868,7 @@ mod tests {
             element_ref: None,
             check: wire::Check::None,
             target_id: None,
+            until: None,
         }
     }
 

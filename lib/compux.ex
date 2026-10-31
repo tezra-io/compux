@@ -30,21 +30,25 @@ defmodule Compux do
   ## Controls have names, not only places
 
   `elements/2` gives each control an `element_ref` (`e1`, `e2`, … scoped to that
-  reply's observation) beside its role, label, value, whether it is enabled, what
-  it can do and where it is. A reference is always sent with its
+  reply's observation) beside its normalised `role` and `native_role`, label,
+  value, whether it is enabled, the `verbs` it has a route for and, where the
+  platform reports one, where it is. A reference is always sent with its
   `observation_id`; on its own it means nothing.
 
-      {:ok, list} = Compux.elements(cu)
+      {:ok, list} = Compux.elements(cu, query: %{"role" => "button", "name" => "Save"})
       image       = list["observation_id"]
-      [save | _]  = Enum.filter(list["elements"], &("press" in &1["actions"]))
+      [save | _]  = Enum.filter(list["elements"], &("press" in &1["verbs"]))
 
       :ok = Compux.press(cu, save["element_ref"], observation_id: image)
       :ok = Compux.click(cu, {:element, save["element_ref"]}, observation_id: image)
 
-  `press/3` and `set_value/4` do not touch the pointer at all, and are offered
-  only where the control itself advertises support. `click/3`, `move/3` and
-  `scroll/5` may take `{:element, ref}` instead of a point, and the sidecar
-  re-reads that control's bounds before it clicks its centre.
+  The verbs on a reference (`press/3`, `set_value/4`, `focus/3`, `select/3`,
+  `toggle/4`, `expand/3`, `collapse/3`, `scroll_to/3`, and `type/3` with
+  `:element_ref`) do not touch the pointer at all, and are offered only where the
+  control has a route for them; anywhere else they are refused and nothing is
+  sent, never replaced by a click. `click/3`, `move/3` and `scroll/5` may take
+  `{:element, ref}` instead of a point, and the sidecar re-reads that control's
+  bounds before it clicks its centre. `PROTOCOL.md` is the wire contract.
 
   ## One window, bound
 
@@ -78,9 +82,15 @@ defmodule Compux do
       the cap (`"timeout"`). `changed` says whether that view differs from the one
       you acted on — evidence about the view, never a verdict on the action.
     * `:semantic` — for an action addressed by `element_ref`: the control is read
-      again and returned as `element_after` (role, whether it is enabled, and its
-      value unless it is a secure field). No capture, so it is not visual evidence.
+      again and returned as `element_after` (role, whether it is enabled, its
+      states, and its value unless it is a secure field, which says
+      `"secure" => true` instead). No capture, so it is not visual evidence.
     * `:none` — the receipt alone.
+    * `%{"kind" => "semantic", "until" => condition}` — wait on the tree for a
+      condition (`wait_for/3` describes it). The condition is read once BEFORE the
+      input, so the receipt's `check.until` says `met`, `not_met`, or `held_before`
+      when it already held and so shows nothing about the action. A wait the
+      request's own deadline cut short also says `deadline_cut: true`.
 
   Left out, the action brings nothing back. Whatever the check says, the receipt's
   `dispatch` is about the INPUT and is decided before the check runs: evidence that
@@ -218,7 +228,7 @@ defmodule Compux do
   the press cannot miss.
 
   Offered only where the control's own action list advertises it — `elements`
-  says so per element in `actions`. Anywhere else this is refused
+  says so per element in `verbs`. Anywhere else this is refused
   `ax_action_unsupported` and nothing is dispatched; the sidecar never falls back
   to a click, because which one to send is the caller's decision.
   """
@@ -234,7 +244,7 @@ defmodule Compux do
   does not (a secure field reads back masked, so it never verifies).
 
   Offered only where the control reports its value as settable — `elements` says
-  so per element in `settable`. Anywhere else this is refused
+  so per element in `verbs`. Anywhere else this is refused
   `ax_action_unsupported`; `type` and `paste` remain for a field that is not.
   """
   @spec set_value(t(), String.t(), String.t(), keyword()) :: response()
@@ -242,6 +252,71 @@ defmodule Compux do
       when is_binary(element_ref) and is_binary(value) do
     params = %{"action" => "set_value", "element_ref" => element_ref, "value" => value}
     run(cu, put_addressed(params, opts), opts)
+  end
+
+  @doc """
+  Move keyboard focus to the control `element_ref` names. It never brings a window
+  forward: when the control's window is not the active one the sidecar refuses
+  `focus_refused` and sends nothing.
+  """
+  @spec focus(t(), String.t(), keyword()) :: response()
+  def focus(%__MODULE__{} = cu, element_ref, opts \\ []) when is_binary(element_ref),
+    do: run_verb(cu, "focus", element_ref, opts)
+
+  @doc "Select the row, tab, cell or item `element_ref` names, then read it back."
+  @spec select(t(), String.t(), keyword()) :: response()
+  def select(%__MODULE__{} = cu, element_ref, opts \\ []) when is_binary(element_ref),
+    do: run_verb(cu, "select", element_ref, opts)
+
+  @doc """
+  Bring the checkbox, switch or radio `element_ref` names to `on`. The state is read
+  first: a control already there sends nothing and its receipt says `already: true`.
+  """
+  @spec toggle(t(), String.t(), boolean(), keyword()) :: response()
+  def toggle(%__MODULE__{} = cu, element_ref, on, opts \\ [])
+      when is_binary(element_ref) and is_boolean(on) do
+    params = %{"action" => "toggle", "element_ref" => element_ref, "on" => on}
+    run(cu, put_addressed(params, opts), opts)
+  end
+
+  @doc "Expand the disclosure, tree row or combo box `element_ref` names (state read first)."
+  @spec expand(t(), String.t(), keyword()) :: response()
+  def expand(%__MODULE__{} = cu, element_ref, opts \\ []) when is_binary(element_ref),
+    do: run_verb(cu, "expand", element_ref, opts)
+
+  @doc "Collapse the control `element_ref` names (state read first)."
+  @spec collapse(t(), String.t(), keyword()) :: response()
+  def collapse(%__MODULE__{} = cu, element_ref, opts \\ []) when is_binary(element_ref),
+    do: run_verb(cu, "collapse", element_ref, opts)
+
+  @doc "Scroll the control `element_ref` names into view, by its own scroll area."
+  @spec scroll_to(t(), String.t(), keyword()) :: response()
+  def scroll_to(%__MODULE__{} = cu, element_ref, opts \\ []) when is_binary(element_ref),
+    do: run_verb(cu, "scroll_to", element_ref, opts)
+
+  @doc """
+  Wait on the accessibility tree until `until` holds or its `timeout_ms` (default
+  5000, at most 25 000) passes. Read-only: it sends no input, ever.
+
+  `until` is the wire's condition object, string keys: `"kind"` is one of
+  `appears`, `disappears`, `enabled`, `value`, `window_title`, `menu_open`,
+  `menu_closed` or `text`, beside the fields that kind needs (`role`/`name`,
+  `element_ref`, `value`, `contains`, `scope`). The `element_ref` kinds need the
+  `:observation_id` that listed the control.
+
+  A condition that never held is still `{:ok, %{"met" => false}}`: the wait ran.
+  The wait never outlives the request's own deadline; when that deadline is what
+  ended it, the reply also says `"deadline_cut" => true`.
+  """
+  @spec wait_for(t(), map(), keyword()) :: response()
+  def wait_for(%__MODULE__{} = cu, until, opts \\ []) when is_map(until) do
+    params =
+      %{"action" => "wait_for", "until" => until}
+      |> put_display(opts)
+      |> put_region(opts)
+      |> put_observation(opts)
+
+    run(cu, params, opts)
   end
 
   @doc "Press-drag from one pixel of the named image to another."
@@ -256,10 +331,20 @@ defmodule Compux do
     run(cu, put_addressed(params, opts), opts)
   end
 
-  @doc "Type a unicode string at the current focus."
+  @doc """
+  Type a unicode string at the current focus — or, with `:element_ref` and the
+  `:observation_id` that listed it, into that control through the accessibility
+  API, replacing its selection.
+  """
   @spec type(t(), String.t(), keyword()) :: response()
-  def type(%__MODULE__{} = cu, text, opts \\ []) when is_binary(text),
-    do: run(cu, %{"action" => "type", "text" => text}, opts)
+  def type(%__MODULE__{} = cu, text, opts \\ []) when is_binary(text) do
+    params =
+      %{"action" => "type", "text" => text}
+      |> maybe_put("element_ref", Keyword.get(opts, :element_ref))
+      |> put_observation(opts)
+
+    run(cu, params, opts)
+  end
 
   @doc ~S(Send a key chord, e.g. `"ctrl+s"` or `"cmd+shift+4"`.)
   @spec key(t(), String.t(), keyword()) :: response()
@@ -300,14 +385,26 @@ defmodule Compux do
   @doc """
   Enumerate the accessibility elements under the focused window or a `:region`, so
   the caller can target by control rather than by raw pixels. Read-only; macOS
-  only.
+  only until the Linux build lists controls.
 
   Each element carries an `element_ref` scoped to this reply's `observation_id`,
-  its `role`, its `label` (the control's title, else its description), its `value`
-  (bounded, and absent for a secure field), whether it is `enabled`, the `actions`
-  this build can perform on it, whether its value is `settable`, its `bounds`, a
-  `path` of up to three ancestor labels (nearest last, so two "Save" buttons are
-  tellable apart) and the click point `x`, `y` in this reply's pixels.
+  its normalised `role` and the platform's own `native_role`, its `label` (the
+  control's title, else its description), its `value` (bounded, and absent for a
+  secure field, which says `secure: true` instead), whether it is `enabled`, the `verbs` it has a route for, its
+  states where known (`checked`, `expanded`, `selected`, `focused`), a `path` of up
+  to three ancestor labels (nearest last, so two "Save" buttons are tellable
+  apart) and, where the platform reports them, its `bounds` and the click point
+  `x`, `y` in this reply's pixels.
+
+  Options beside `:region`, `:display` and `:observation_id`:
+    * `:scope` — where the walk starts: `:window`, `:app`, `:focused`, `:menu`,
+      `:dialog`.
+    * `:query` — `%{"role" => role, "name" => text}` (either or both): only the
+      matching nodes, wherever they are in the scope.
+    * `:skeleton` — `true` cuts the walk at depth 3; a cut container says how many
+      children it `hidden` and carries a reference to drill into.
+    * `:root` — drill into that reference of the listing `:observation_id` names;
+      a `:query` or `:skeleton` beside it applies inside that subtree.
 
   A walk that stopped at one of its bounds says so in `truncated` (`"nodes"`,
   `"depth"` or `"time"`); a reply without that key listed everything it found.
@@ -315,7 +412,14 @@ defmodule Compux do
   @spec elements(t(), keyword()) :: response()
   def elements(%__MODULE__{} = cu, opts \\ []) do
     params =
-      %{"action" => "elements"} |> put_display(opts) |> put_region(opts) |> put_observation(opts)
+      %{"action" => "elements"}
+      |> put_display(opts)
+      |> put_region(opts)
+      |> put_observation(opts)
+      |> maybe_put("scope", wire_name(Keyword.get(opts, :scope)))
+      |> maybe_put("query", Keyword.get(opts, :query))
+      |> maybe_put("skeleton", Keyword.get(opts, :skeleton))
+      |> maybe_put("root", Keyword.get(opts, :root))
 
     run(cu, params, opts)
   end
@@ -424,7 +528,7 @@ defmodule Compux do
     # refused by name in `Protocol.validate/1` instead of silently ignoring it.
     params =
       params
-      |> maybe_put("check", check_kind(Keyword.get(opts, :check)))
+      |> maybe_put("check", wire_name(Keyword.get(opts, :check)))
       |> maybe_put("target_id", Keyword.get(opts, :target_id))
 
     with {:ok, request} <- Protocol.validate(params) do
@@ -432,12 +536,19 @@ defmodule Compux do
     end
   end
 
-  # The kind as the wire spells it. An atom is the ergonomic form and a string is
-  # what a caller reading it off a config already has; anything else goes through
-  # unchanged so `Protocol.validate/1` refuses it by name rather than here.
-  defp check_kind(nil), do: nil
-  defp check_kind(kind) when is_atom(kind), do: Atom.to_string(kind)
-  defp check_kind(kind), do: kind
+  # A check kind or a scope as the wire spells it. An atom is the ergonomic form and
+  # a string is what a caller reading it off a config already has; anything else
+  # (a check's object form among them) goes through unchanged so
+  # `Protocol.validate/1` judges it by name rather than here.
+  defp wire_name(nil), do: nil
+  defp wire_name(name) when is_atom(name), do: Atom.to_string(name)
+  defp wire_name(name), do: name
+
+  # A verb on a reference that takes nothing but the control.
+  defp run_verb(cu, action, element_ref, opts) do
+    params = %{"action" => action, "element_ref" => element_ref}
+    run(cu, put_addressed(params, opts), opts)
+  end
 
   defp maybe_default_binary_path(Compux.PortDriver, opts) do
     if Keyword.has_key?(opts, :binary_path),

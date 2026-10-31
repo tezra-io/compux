@@ -2113,3 +2113,214 @@ later; the after build reads it back every 50 ms for up to 400 ms, and
   "time"`. A slow application that lists fewer controls with that note is this.
 * **The Linux reader.** Nothing here touches Linux accessibility; P1 only makes the
   Linux build stop offering it.
+
+# Live check — controls before pixels: scopes, verbs, waits, surfaces (M86 P2)
+
+**What this is for.** Protocol 12 adds scoped listings, finds, skeletons and
+drills, seven verbs on a reference that act through the accessibility API
+alone, waits on the tree, and the surfaces a receipt names. The unit tests
+script every rule against a recording platform on Linux, and the macOS reader
+behind them compiles and lints but has never run. This section runs each new
+thing once on a real Mac, against the fixture app, plus one web page for a slow
+control. It also measures what the new per-control reads cost.
+
+Expected outcome in one line: every scope lists what it names, every verb changes
+the control and reads it back (or says it already held), a wait answers `met`
+when the control arrives and `not_met` when it does not, and a sheet the action
+opened rides the receipt.
+
+> **Steps 3, 4 and 5 POST REAL INPUT**: accessibility writes and presses on the
+> fixture app, and one key press. Steps 1, 2 and 6 read only. Nothing here may be
+> run by an agent. Run it yourself, at the machine, with nothing confidential on
+> screen.
+
+## 0. Preconditions
+
+* **Two builds**, P1 (protocol 11) for the message counts in step 6 and P2:
+
+  ```sh
+  cd /Users/sujshe/projects/compux
+  git switch <the P1 commit> && (cd native/compux && cargo build --release) \
+    && cp native/compux/target/release/compux /tmp/compux-p1
+  git switch feat/m86 && (cd native/compux && cargo build --release) \
+    && cp native/compux/target/release/compux /tmp/compux-p2
+  ```
+
+* **The fixture app** (`scripts/build_fixture_app.sh`), in front, its window
+  showing the AppKit and SwiftUI controls.
+* `cx.py` from the slice-2 section, with `"protocol_version": 12` in its `hello`
+  for the P2 build. Every request below goes through it, one line at a time:
+
+  ```sh
+  COMPUX_DISCLAIMED=1 python3 /tmp/cx.py /tmp/compux-p2
+  ```
+
+## 1. The handshake (10 seconds, fails fastest)
+
+`protocol_version` is `12`. `actions` lists twenty-six verbs: the nineteen of
+protocol 11 with `focus`, `select`, `toggle`, `expand`, `collapse`, `scroll_to`
+and `wait_for` after `set_value`. The Linux build lists none of the seven, and
+`elements`, `press`, `set_value` and `inspect` stay off it too. A test proves
+that on each platform.
+
+## 2. Every scope once, a find, a skeleton and a drill (read only)
+
+```json
+{"action":"elements","scope":"window"}
+{"action":"elements","scope":"app"}
+{"action":"elements","scope":"focused"}
+{"action":"elements","query":{"role":"checkbox"}}
+{"action":"elements","query":{"name":"save"}}
+{"action":"elements","scope":"window","skeleton":true}
+{"action":"elements","root":"<a cut node's element_ref>","observation_id":"<the skeleton's id>"}
+```
+
+* Every entry has a normalised `role` (`button`, `checkbox`, `textfield`, …)
+  beside its `native_role`, and `verbs` in place of `actions` and `settable`.
+  The AppKit checkbox reads `checked`, and a secure field has `"secure": true`
+  and no `value`.
+* `window` is the fixture window's controls only, and the reply says
+  `"scope":"window"`. `app` adds the menu bar's. `focused` lists the focused
+  control first: click into the text field before you send it.
+* The find by role lists both checkboxes (AppKit and the SwiftUI toggle), and
+  nothing else. The find by name lists both Save buttons (Document, Sidebar)
+  with their `path`s.
+* The skeleton says `"skeleton":{"depth":3,"hidden":N}`. Some entries carry
+  `hidden`: those are the cuts. Drilling into one lists its contents numbered
+  after the skeleton's last reference, and `root` echoes the reference. A
+  reference from the skeleton outside that cut still presses with the drill's
+  `observation_id`. The same drill with `"skeleton":true` cuts again three levels
+  below its root, and with `"query":{"role":"button"}` lists only the buttons
+  inside it.
+* A scoped listing never asks an application to expose its tree. Quit and
+  reopen a Chromium-based browser, send `{"action":"elements","scope":"window"}`
+  with it in view first: note whether it lists anything and whether the reply
+  has an `ax_activation` (it must not). Then send `{"action":"elements"}`, which
+  may name the switch it turned on, and the scoped request again: it now lists
+  the browser's controls.
+* Open the sheet by hand (**Clear All…**), then send
+  `{"action":"elements","scope":"dialog"}`: it lists OK and Cancel, and nothing
+  else. Press Cancel by hand. The same request now answers `scope_not_found`.
+* Right-click the fixture window's context-menu area, and send
+  `{"action":"elements","scope":"menu"}` while the menu is open (keep `cx.py`
+  in a second terminal and paste quickly). It lists the menu's items. Press
+  Escape.
+
+## 3. Each verb once (POSTS INPUT)
+
+With a fresh `{"action":"elements","scope":"window"}` listing, and its id as
+`O`:
+
+```json
+{"action":"toggle","observation_id":"O","element_ref":"<AppKit checkbox>","on":true,"check":"semantic"}
+{"action":"toggle","observation_id":"O","element_ref":"<AppKit checkbox>","on":true}
+{"action":"focus","observation_id":"O","element_ref":"<AppKit text field>"}
+{"action":"type","observation_id":"O","element_ref":"<AppKit text field>","text":"ada"}
+{"action":"type","observation_id":"O","element_ref":"<AppKit secure field>","text":"x"}
+{"action":"select","observation_id":"O","element_ref":"<a row of the AppKit list>"}
+{"action":"scroll_to","observation_id":"O","element_ref":"<the far list's bottom row>"}
+```
+
+* The first toggle: `receipt.effect` is `"changed"`, `state_before` is `"off"`,
+  `state_after` is `"on"`, and `element_after` says `"checked": true`. The box is
+  ticked on screen, and the pointer never moved.
+* The second toggle: `dispatch` is `"not_sent"`, `already` is `true`, and the box
+  is untouched.
+* `focus`: the caret is in the field and `state_after` is `"focused"`. Now bring
+  another app's window to the front and repeat it. The answer is `focus_refused`,
+  and the fixture window stays where it is: **focus never activates a window**.
+* `type` into the field: no key events (watch the keyboard viewer if you have
+  it). The field shows `ada` at the caret, the reply's `value` says what it
+  holds, and `effect` is `"changed"`. Into the secure field: the dots appear,
+  `effect` is `"unknown"`, and there is no `value`.
+* `select`: the row is highlighted, and `state_after` is `"selected"`.
+* `scroll_to`: the far list scrolls its bottom row into view, and `effect` is
+  `"changed"`. Again, now that it is in view: `"not_observed"`.
+* A verb with no route is refused: `{"action":"toggle", … the AppKit button …,
+  "on":true}` answers `ax_action_unsupported`, and nothing is pressed.
+* The fixture has no disclosure or outline row. Run `expand` and `collapse` once
+  on any outline in Finder's sidebar (a "Locations" or "Tags" header):
+  `state_before` and `state_after` name `expanded` and `collapsed`.
+
+## 4. A sheet rides the receipt (POSTS INPUT)
+
+```json
+{"action":"press","observation_id":"O","element_ref":"<Clear All…>"}
+```
+
+`receipt.surfaces` is
+`[{"kind":"dialog","native_kind":"AXSheet","label":"Clear all fields?"}]` (the
+label as the sheet gives it). Press Cancel by hand. A press with nothing opened
+answers `"surfaces":[]`, and a refused request (`element_ref` `e999`) carries no
+`surfaces` at all.
+
+Then the same in one request, waiting on the tree:
+
+```json
+{"action":"press","observation_id":"O","element_ref":"<Clear All…>","check":{"kind":"semantic","until":{"kind":"appears","role":"dialog"}}}
+```
+
+`receipt.check` is `{"kind":"semantic","until":"met","looks":N,"waited_ms":M}`
+with a small `N`. Leave the sheet open, and send the same request again: the
+condition held before the input, so it says `"held_before"` (and the press is
+answered by a modal window: note what `dispatch` says). Press Cancel by hand.
+
+## 5. Waiting on a slow control (POSTS INPUT)
+
+Open this page in Chrome. Its button turns enabled two seconds after it loads.
+
+```
+data:text/html,<button id=b disabled onclick="document.title='done'">Go</button><script>setTimeout(()=>b.disabled=false,2000)</script>
+```
+
+Reload, list it at once, and wait:
+
+```json
+{"action":"elements"}
+{"action":"wait_for","observation_id":"<that id>","until":{"kind":"enabled","element_ref":"<Go>"}}
+```
+
+`met` is `true` and `waited_ms` is between about 1000 and 2000. Reload and wait
+again with `"timeout_ms":500`: `met` is `false`, `looks` is 6, and there is no
+`deadline_cut`. Reload once more and send the wait with `"deadline_ms":1000`
+and `"timeout_ms":5000` beside it: `met` is `false` and `"deadline_cut": true`,
+because the request's own deadline ended it.
+
+Then press it and wait on the title in the same request:
+
+```json
+{"action":"press","observation_id":"<id>","element_ref":"<Go>","check":{"kind":"semantic","until":{"kind":"window_title","contains":"done"}}}
+```
+
+`until` is `"met"`.
+
+## 6. What the new reads cost
+
+With the fixture window in front, run `/tmp/cxlist.py` from the P1 section
+against both builds (with `"protocol_version": 12` for the P2 one):
+
+* **`per_listed` rises by about six to eight on P2.** Each listed control now
+  also costs its write routes (one `AXUIElementIsAttributeSettable` per route,
+  which has no batched form: five, or six for a control with no `AXExpanded` to
+  write), its states (one batched read), and, under a container that selects its
+  children, one question to that container per parent. Reading a value asks for
+  the role and subrole first (two messages) on both builds, since the secure-field
+  fix. Write both figures down. More than ten above P1 is worth pasting.
+* `p50_ms` should stay below a second on the fixture window.
+
+| Build | `listed` | `ax_messages` | `per_listed` | `p50_ms` |
+|---|---|---|---|---|
+| P1 | | | | |
+| P2 | | | | |
+
+## 7. What this check still cannot prove
+
+* **Every application's routes.** `AXSelectedText`, `AXSelectedChildren`,
+  `AXDisclosing` and `AXFocused` are settable where the application says so. An
+  application that says so and ignores the write reads back unchanged:
+  `not_observed`, never `changed`.
+* **Menus inside web content and custom popovers.** The surface scan reads the
+  application's windows, their children and the menu bar, at most 64 nodes. A
+  dialog drawn inside a web page is not a surface.
+* **Linux.** Nothing here touches Linux accessibility. The Linux build refuses
+  every one of these `accessibility_unavailable` until L1.

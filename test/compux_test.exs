@@ -198,6 +198,135 @@ defmodule CompuxTest do
     end
   end
 
+  # v12: the verbs on a reference, the listing's new options and the wait. Each
+  # request is compared WHOLE, so an option that leaked onto the wire is caught too.
+  describe "v12 verbs, listings and waits build the right request" do
+    setup do
+      {:ok, cu: start!()}
+    end
+
+    test "each plain verb sends exactly the control and the listing that named it", %{cu: cu} do
+      for {verb, action} <- [
+            {&Compux.focus/3, "focus"},
+            {&Compux.select/3, "select"},
+            {&Compux.expand/3, "expand"},
+            {&Compux.collapse/3, "collapse"},
+            {&Compux.scroll_to/3, "scroll_to"}
+          ] do
+        assert {:ok, _} = verb.(cu, "e3", observation_id: "7c1e-4")
+        assert_received {:executed, %{"action" => ^action} = request}
+
+        assert request == %{
+                 "action" => action,
+                 "element_ref" => "e3",
+                 "observation_id" => "7c1e-4"
+               }
+      end
+    end
+
+    test "a verb without the listing that named its control never reaches the driver",
+         %{cu: cu} do
+      assert {:error, reason} = Compux.focus(cu, "e3")
+      assert reason =~ "observation_id"
+      refute_received {:executed, %{"action" => "focus"}}
+    end
+
+    test "toggle names the state the control should end in", %{cu: cu} do
+      Compux.toggle(cu, "e5", false, observation_id: "7c1e-4", check: :semantic, target_id: "t1")
+      assert_received {:executed, %{"action" => "toggle"} = request}
+
+      assert request == %{
+               "action" => "toggle",
+               "element_ref" => "e5",
+               "on" => false,
+               "observation_id" => "7c1e-4",
+               "check" => "semantic",
+               "target_id" => "t1"
+             }
+    end
+
+    test "type goes into a control by reference, or at the focus as before", %{cu: cu} do
+      Compux.type(cu, "hello", element_ref: "e2", observation_id: "7c1e-4")
+      assert_received {:executed, %{"action" => "type"} = request}
+
+      assert request == %{
+               "action" => "type",
+               "text" => "hello",
+               "element_ref" => "e2",
+               "observation_id" => "7c1e-4"
+             }
+
+      assert {:error, reason} = Compux.type(cu, "hello", element_ref: "e2")
+      assert reason =~ "observation_id"
+      refute_received {:executed, %{"action" => "type"}}
+
+      Compux.type(cu, "hi")
+      assert_received {:executed, %{"action" => "type"} = request}
+      assert request == %{"action" => "type", "text" => "hi"}
+    end
+
+    test "elements takes a scope, a query, a skeleton and a root", %{cu: cu} do
+      Compux.elements(cu, scope: :dialog, query: %{"role" => "button", "name" => "Save"})
+      assert_received {:executed, %{"action" => "elements"} = request}
+
+      assert request == %{
+               "action" => "elements",
+               "scope" => "dialog",
+               "query" => %{"role" => "button", "name" => "Save"}
+             }
+
+      Compux.elements(cu, scope: "app", skeleton: true)
+      assert_received {:executed, %{"action" => "elements"} = request}
+      assert request == %{"action" => "elements", "scope" => "app", "skeleton" => true}
+
+      Compux.elements(cu, root: "e12", observation_id: "7c1e-4")
+      assert_received {:executed, %{"action" => "elements"} = request}
+      assert request == %{"action" => "elements", "root" => "e12", "observation_id" => "7c1e-4"}
+
+      assert {:error, reason} = Compux.elements(cu, scope: :desktop)
+      assert reason =~ "scope"
+      refute_received {:executed, %{"action" => "elements"}}
+    end
+
+    test "wait_for sends the condition and the listing its reference belongs to", %{cu: cu} do
+      until = %{"kind" => "enabled", "element_ref" => "e7", "timeout_ms" => 2000}
+      Compux.wait_for(cu, until, observation_id: "7c1e-4", target_id: "t1")
+      assert_received {:executed, %{"action" => "wait_for"} = request}
+
+      assert request == %{
+               "action" => "wait_for",
+               "until" => until,
+               "observation_id" => "7c1e-4",
+               "target_id" => "t1"
+             }
+
+      # It sends no input, so it has no evidence to ask for.
+      assert {:error, reason} = Compux.wait_for(cu, until, observation_id: "7c1e-4", check: :none)
+      assert reason =~ "check"
+      refute_received {:executed, %{"action" => "wait_for"}}
+    end
+
+    test "a condition that never held is still a wait that ran" do
+      not_met = %{"ok" => true, "met" => false, "looks" => 21, "waited_ms" => 2004}
+      cu = start!(responses: %{"wait_for" => {:ok, not_met}})
+
+      assert {:ok, ^not_met} = Compux.wait_for(cu, %{"kind" => "menu_open"})
+    end
+
+    test "any input action can wait on the tree after it, in one request", %{cu: cu} do
+      check = %{"kind" => "semantic", "until" => %{"kind" => "appears", "role" => "dialog"}}
+
+      Compux.key(cu, "cmd+s", check: check)
+      assert_received {:executed, %{"action" => "key"} = request}
+      assert request == %{"action" => "key", "chord" => "cmd+s", "check" => check}
+
+      bogus = %{"kind" => "image", "until" => %{"kind" => "menu_open"}}
+      assert {:error, reason} = Compux.key(cu, "cmd+s", check: bogus)
+      assert reason =~ "check"
+      refute_received {:executed, %{"action" => "key"}}
+    end
+  end
+
   describe "probe/1" do
     test "normalizes the sidecar probe response" do
       cu = start!()
@@ -312,9 +441,9 @@ defmodule CompuxTest do
 
       assert {:ok, list} = Compux.elements(cu)
       image = list["observation_id"]
-      [element] = list["elements"]
+      [element, _bold] = list["elements"]
       assert element["element_ref"] == "e1"
-      assert element["actions"] == ["press"]
+      assert element["verbs"] == ["press", "focus"]
 
       assert {:ok, pressed} = Compux.press(cu, element["element_ref"], observation_id: image)
       assert pressed["receipt"]["input_method"] == "ax"
@@ -338,6 +467,46 @@ defmodule CompuxTest do
 
       assert refusal["error"] == "stale_element"
       assert refusal["receipt"]["dispatch"] == "not_sent"
+
+      assert :ok = Compux.stop(cu)
+    end
+
+    # v12: a listing's controls come with a normalised role and their verbs, a
+    # toggle reads the state first, and what opened after the input rides on the
+    # receipt. Each field arrives as the helper wrote it.
+    test "lists controls by role and verb, toggles by state and reports surfaces" do
+      assert {:ok, cu} = Compux.start(binary_path: @fake)
+
+      assert {:ok, list} = Compux.elements(cu, scope: :window)
+      image = list["observation_id"]
+      [_save, bold] = list["elements"]
+      assert bold["role"] == "checkbox"
+      assert bold["native_role"] == "AXCheckBox"
+      assert bold["verbs"] == ["toggle", "focus"]
+      assert bold["checked"] == true
+
+      # Already on: nothing sent, and the receipt says why.
+      assert {:ok, held} = Compux.toggle(cu, "e2", true, observation_id: image)
+      assert held["receipt"]["dispatch"] == "not_sent"
+      assert held["receipt"]["already"] == true
+      assert held["receipt"]["state_before"] == "on"
+      refute Map.has_key?(held["receipt"], "surfaces"), "nothing sent, nothing looked at"
+
+      assert {:ok, flipped} = Compux.toggle(cu, "e2", false, observation_id: image)
+      assert flipped["receipt"]["dispatch"] == "sent"
+      assert flipped["receipt"]["effect"] == "changed"
+      assert flipped["receipt"]["state_after"] == "off"
+      assert flipped["receipt"]["surfaces"] == []
+
+      # No route on this control: refused, and never a click instead.
+      assert {:error, {:action_failed, refusal}} =
+               Compux.toggle(cu, "e1", true, observation_id: image)
+
+      assert refusal["error"] == "ax_action_unsupported"
+      assert refusal["receipt"]["dispatch"] == "not_sent"
+
+      assert {:ok, waited} = Compux.wait_for(cu, %{"kind" => "menu_open", "timeout_ms" => 100})
+      assert waited["met"] == false
 
       assert :ok = Compux.stop(cu)
     end

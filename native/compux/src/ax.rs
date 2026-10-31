@@ -48,6 +48,10 @@ use std::rc::Rc;
 /// gets a refusal has been lied to.
 pub const PRESS: &str = "AXPress";
 
+/// The action that brings an element into view (protocol 12, `scroll_to`). Every
+/// container answers it, so it never makes a node a control on its own.
+pub const SCROLL_TO_VISIBLE: &str = "AXScrollToVisible";
+
 /// A label or a value is carried so a caller can name a control and read the
 /// state of one it is about to change; neither is a way to read a document.
 /// Longer than this is cut and says so with a final ellipsis.
@@ -184,6 +188,79 @@ pub struct Facts {
     pub frame: Option<Frame>,
 }
 
+/// Which attributes of one element may be written (protocol 12): the routes the
+/// verbs on a reference take. Each is the platform's own answer for THIS element;
+/// nothing is inferred from its role.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Routes {
+    /// `AXValue`: `set_value`.
+    pub value: bool,
+    /// `AXFocused`: `focus`.
+    pub focus: bool,
+    /// `AXSelected` on the element itself: `select`.
+    pub select: bool,
+    /// The attribute that expands it, when one may be written: `expand`, `collapse`.
+    pub expand: Option<Expander>,
+    /// `AXSelectedText`: `type` by reference.
+    pub text: bool,
+}
+
+/// The two attributes an expandable element may answer its state on.
+// Only the macOS reader and the recording platform produce these.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expander {
+    Expanded,
+    Disclosing,
+}
+
+/// One write route, asked on its own: a verb takes one route, and asking for all
+/// of them costs a message each on macOS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    Focus,
+    Select,
+    Expand,
+    Text,
+}
+
+/// What one element's states read as, each `None` where it has no such state or
+/// would not say.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct States {
+    pub focused: Option<bool>,
+    pub selected: Option<bool>,
+    /// `AXExpanded`, else `AXDisclosing`.
+    pub expanded: Option<bool>,
+    /// `AXValue` read as a check state (0 or 1). Only asked for when the caller says
+    /// the element has one: a field's value is text, and a secure one is never read.
+    pub on: Option<bool>,
+}
+
+/// Which focus an application is asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    /// `AXFocusedWindow`.
+    Window,
+    /// `AXFocusedUIElement`.
+    Element,
+}
+
+/// One attribute write a verb sends. Each is read back by its caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Write<'a> {
+    /// `AXFocused = true`.
+    Focused,
+    /// `AXSelected = true`.
+    Selected,
+    /// `AXExpanded` or `AXDisclosing` set to this.
+    Expand(Expander, bool),
+    /// `AXSelectedText = text`: replaces the selection, or inserts at the caret.
+    SelectedText(&'a str),
+    /// On a container: `AXSelectedChildren = [item]`.
+    SelectedChildren(Handle),
+}
+
 /// A native reference this process is holding, and the platform to give it back
 /// to.
 ///
@@ -312,6 +389,35 @@ pub trait Ax {
     /// (M7). A reply reports the difference across its own reads, which is the
     /// number the macOS reader's batching is measured by.
     fn messages(&self) -> u64;
+
+    /// Which of the element's attributes may be written (protocol 12).
+    fn routes(&self, handle: Handle) -> Routes;
+
+    /// One of those routes, asked alone: only its field of the answer is read, and
+    /// the others are their defaults.
+    fn route(&self, handle: Handle, route: Route) -> Routes;
+
+    /// The element's states, in one read. `on` reads `AXValue` as a check state and
+    /// is asked only when `on` is true: never of a field, whose value is text.
+    fn states(&self, handle: Handle, on: bool) -> Result<States, Unread>;
+
+    /// Whether this container's `AXSelectedChildren` may be written: the route
+    /// `select` takes for an item that cannot select itself.
+    fn selects_children(&self, container: Handle) -> bool;
+
+    /// The element's parent, retained.
+    fn parent(&self, owner: &Rc<dyn Ax>, handle: Handle) -> Option<Retained>;
+
+    /// One attribute write. `timeout_ms` as [`Ax::perform`].
+    fn write(&self, handle: Handle, write: Write<'_>, timeout_ms: u64) -> Result<(), Refusal>;
+
+    /// Whether the element's window is its application's focused window. `None`
+    /// when either would not say, which is never read as yes.
+    fn in_focused_window(&self, handle: Handle) -> Option<bool>;
+
+    /// The application's focused window or focused element, retained; `None` when
+    /// it has none or will not say.
+    fn focused(&self, owner: &Rc<dyn Ax>, pid: i32, what: Focus) -> Option<Retained>;
 }
 
 /// One application's windows, retained through the platform that made them — which
@@ -333,6 +439,9 @@ pub struct Entry {
     /// than acted on.
     pub role: String,
     pub secure: bool,
+    /// The reference of the nearest listed control it sits inside, when there is
+    /// one: how a drill knows which of a listing's references it replaces.
+    pub under: Option<String>,
     pub element: Retained,
 }
 
@@ -346,11 +455,17 @@ pub struct Elements {
     /// The application the tree was read from, and when that process started.
     pub pid: i32,
     pub started_at: u64,
-    entries: Vec<Entry>,
+    /// Shared, so a drill's observation holds the references it keeps from the
+    /// listing it named without that listing letting go of them.
+    entries: Vec<Rc<Entry>>,
 }
 
 impl Elements {
     pub fn new(pid: i32, started_at: u64, entries: Vec<Entry>) -> Elements {
+        Elements::shared(pid, started_at, entries.into_iter().map(Rc::new).collect())
+    }
+
+    pub fn shared(pid: i32, started_at: u64, entries: Vec<Rc<Entry>>) -> Elements {
         Elements {
             pid,
             started_at,
@@ -362,6 +477,23 @@ impl Elements {
         self.entries
             .iter()
             .find(|entry| entry.reference == reference)
+            .map(|entry| entry.as_ref())
+    }
+
+    /// Every entry, shared.
+    pub fn entries(&self) -> &[Rc<Entry>] {
+        &self.entries
+    }
+
+    /// The index the next reference is numbered from: the highest reference number
+    /// this table holds (`e5` is index 4, so `e6` is next), so a drill never mints
+    /// a name its listing already used.
+    pub fn next_index(&self) -> usize {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.reference.strip_prefix('e')?.parse::<usize>().ok())
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn len(&self) -> usize {
@@ -583,12 +715,13 @@ pub fn switched(code: i32, read_back: Option<bool>) -> Switched {
 #[cfg(target_os = "macos")]
 mod mac {
     use super::{
-        Ax, Facts, Frame, Handle, Refusal, Retained, Switched, Unread, CANNOT_COMPLETE,
-        INVALID_UI_ELEMENT, READ_TIMEOUT_MS,
+        Ax, Expander, Facts, Focus, Frame, Handle, Refusal, Retained, Route, Routes, States,
+        Switched, Unread, Write, CANNOT_COMPLETE, INVALID_UI_ELEMENT, READ_TIMEOUT_MS,
     };
     use core_foundation::array::CFArray;
     use core_foundation::base::{CFType, CFTypeRef, TCFType};
     use core_foundation::boolean::CFBoolean;
+    use core_foundation::number::CFNumber;
     use core_foundation::string::{CFString, CFStringRef};
     use std::collections::HashMap;
     use std::ffi::c_void;
@@ -671,6 +804,7 @@ mod mac {
         fn CFArrayGetValueAtIndex(array: CFTypeRef, index: isize) -> CFTypeRef;
         fn CFGetTypeID(cf: CFTypeRef) -> usize;
         fn CFArrayGetTypeID() -> usize;
+        fn CFEqual(cf1: CFTypeRef, cf2: CFTypeRef) -> u8;
     }
 
     // The AX attribute-name constants (`kAXRoleAttribute`, …) are header `extern
@@ -687,6 +821,23 @@ mod mac {
     const ENABLED: &str = "AXEnabled";
     const FOCUSED_APPLICATION: &str = "AXFocusedApplication";
     const WINDOWS: &str = "AXWindows";
+    // Protocol 12: the attributes the verbs on a reference read and write.
+    const FOCUSED: &str = "AXFocused";
+    const SELECTED: &str = "AXSelected";
+    const EXPANDED: &str = "AXExpanded";
+    const DISCLOSING: &str = "AXDisclosing";
+    const SELECTED_TEXT: &str = "AXSelectedText";
+    const SELECTED_CHILDREN: &str = "AXSelectedChildren";
+    const PARENT: &str = "AXParent";
+    const WINDOW: &str = "AXWindow";
+    const FOCUSED_WINDOW: &str = "AXFocusedWindow";
+    const FOCUSED_ELEMENT: &str = "AXFocusedUIElement";
+
+    /// What one batched read of an element's states asks for, in slot order;
+    /// [`STATES_ON`] adds the value as a check state, asked only of an element
+    /// that has one.
+    const STATES: [&str; 4] = [FOCUSED, SELECTED, EXPANDED, DISCLOSING];
+    const STATES_ON: [&str; 5] = [FOCUSED, SELECTED, EXPANDED, DISCLOSING, VALUE];
 
     /// What one batched read asks every node for (M1), in slot order. `AXValue` is
     /// NOT among them: a secure field's value is never read, and which fields are
@@ -751,15 +902,25 @@ mod mac {
         /// [`SHAPE`] as the attribute array one batched read sends, built once
         /// rather than seven strings and an array per node.
         shape: CFArray<CFString>,
+        /// [`STATES`] and [`STATES_ON`], built once for the same reason.
+        states: CFArray<CFString>,
+        states_on: CFArray<CFString>,
+    }
+
+    /// An attribute list as the array a batched read sends.
+    fn names(attributes: &[&str]) -> CFArray<CFString> {
+        let names: Vec<CFString> = attributes.iter().map(|name| CFString::new(name)).collect();
+        CFArray::from_CFTypes(&names)
     }
 
     impl Real {
         pub fn new() -> Real {
-            let names: Vec<CFString> = SHAPE.iter().map(|name| CFString::new(name)).collect();
             Real {
                 registry: Mutex::default(),
                 messages: AtomicU64::new(0),
-                shape: CFArray::from_CFTypes(&names),
+                shape: names(&SHAPE),
+                states: names(&STATES),
+                states_on: names(&STATES_ON),
             }
         }
 
@@ -1033,6 +1194,161 @@ mod mac {
         fn messages(&self) -> u64 {
             self.messages.load(Ordering::Relaxed)
         }
+
+        /// One `AXUIElementIsAttributeSettable` per route: there is no batched form.
+        fn routes(&self, handle: Handle) -> Routes {
+            let Some(element) = self.element(handle) else {
+                return Routes::default();
+            };
+            let settable = |attribute: &str| unsafe {
+                self.sent();
+                is_settable(&element, attribute)
+            };
+            unsafe { prepare(&element, READ_TIMEOUT_MS) };
+
+            Routes {
+                expand: expander(&settable),
+                value: settable(VALUE),
+                focus: settable(FOCUSED),
+                select: settable(SELECTED),
+                text: settable(SELECTED_TEXT),
+            }
+        }
+
+        /// One `AXUIElementIsAttributeSettable`; two for `expand` on an element
+        /// with no `AXExpanded` to write.
+        fn route(&self, handle: Handle, route: Route) -> Routes {
+            let Some(element) = self.element(handle) else {
+                return Routes::default();
+            };
+            let settable = |attribute: &str| unsafe {
+                self.sent();
+                is_settable(&element, attribute)
+            };
+            unsafe { prepare(&element, READ_TIMEOUT_MS) };
+
+            let none = Routes::default();
+            match route {
+                Route::Focus => Routes {
+                    focus: settable(FOCUSED),
+                    ..none
+                },
+                Route::Select => Routes {
+                    select: settable(SELECTED),
+                    ..none
+                },
+                Route::Expand => Routes {
+                    expand: expander(&settable),
+                    ..none
+                },
+                Route::Text => Routes {
+                    text: settable(SELECTED_TEXT),
+                    ..none
+                },
+            }
+        }
+
+        fn states(&self, handle: Handle, on: bool) -> Result<States, Unread> {
+            let element = self.element(handle).ok_or(Unread::Gone)?;
+            let (attributes, count) = if on {
+                (&self.states_on, STATES_ON.len())
+            } else {
+                (&self.states, STATES.len())
+            };
+            unsafe {
+                prepare(&element, READ_TIMEOUT_MS);
+                self.sent();
+                let slots = copy_batch(&element, attributes, count)?;
+                Ok(States {
+                    focused: flag(&slots[0]),
+                    selected: flag(&slots[1]),
+                    expanded: flag(&slots[2]).or_else(|| flag(&slots[3])),
+                    on: slots.get(4).and_then(check_state),
+                })
+            }
+        }
+
+        fn selects_children(&self, container: Handle) -> bool {
+            let Some(element) = self.element(container) else {
+                return false;
+            };
+            unsafe {
+                prepare(&element, READ_TIMEOUT_MS);
+                self.sent();
+                is_settable(&element, SELECTED_CHILDREN)
+            }
+        }
+
+        fn parent(&self, owner: &Rc<dyn Ax>, handle: Handle) -> Option<Retained> {
+            let element = self.element(handle)?;
+            unsafe {
+                prepare(&element, READ_TIMEOUT_MS);
+                self.sent();
+                let parent = copy_element_attr(&element, PARENT)?;
+                Some(Retained::new(self.hold(&parent), owner.clone()))
+            }
+        }
+
+        fn write(&self, handle: Handle, write: Write<'_>, timeout_ms: u64) -> Result<(), Refusal> {
+            let element = self.element(handle).ok_or_else(gone)?;
+            let (attribute, value): (&str, CFType) = match write {
+                Write::Focused => (FOCUSED, CFBoolean::true_value().as_CFType()),
+                Write::Selected => (SELECTED, CFBoolean::true_value().as_CFType()),
+                Write::Expand(Expander::Expanded, to) => (EXPANDED, boolean(to)),
+                Write::Expand(Expander::Disclosing, to) => (DISCLOSING, boolean(to)),
+                Write::SelectedText(text) => (SELECTED_TEXT, CFString::new(text).as_CFType()),
+                Write::SelectedChildren(item) => {
+                    let item = self.element(item).ok_or_else(gone)?;
+                    (
+                        SELECTED_CHILDREN,
+                        CFArray::from_CFTypes(&[item]).as_CFType(),
+                    )
+                }
+            };
+            let attribute = CFString::new(attribute);
+
+            unsafe {
+                prepare(&element, timeout_ms);
+                self.sent();
+                answered(AXUIElementSetAttributeValue(
+                    element.as_CFTypeRef(),
+                    attribute.as_concrete_TypeRef(),
+                    value.as_CFTypeRef(),
+                ))
+            }
+        }
+
+        fn in_focused_window(&self, handle: Handle) -> Option<bool> {
+            let element = self.element(handle)?;
+            unsafe {
+                prepare(&element, READ_TIMEOUT_MS);
+                self.sent();
+                let window = copy_element_attr(&element, WINDOW)?;
+                let mut pid: i32 = 0;
+                if AXUIElementGetPid(element.as_CFTypeRef(), &mut pid) != 0 || pid <= 0 {
+                    return None;
+                }
+                let app = application_element(pid)?;
+                prepare(&app, LOOKUP_TIMEOUT_MS);
+                self.sent();
+                let focused = copy_element_attr(&app, FOCUSED_WINDOW)?;
+                Some(CFEqual(window.as_CFTypeRef(), focused.as_CFTypeRef()) != 0)
+            }
+        }
+
+        fn focused(&self, owner: &Rc<dyn Ax>, pid: i32, what: Focus) -> Option<Retained> {
+            let app = application_element(pid)?;
+            let attribute = match what {
+                Focus::Window => FOCUSED_WINDOW,
+                Focus::Element => FOCUSED_ELEMENT,
+            };
+            unsafe {
+                prepare(&app, LOOKUP_TIMEOUT_MS);
+                self.sent();
+                let focused = copy_element_attr(&app, attribute)?;
+                Some(Retained::new(self.hold(&focused), owner.clone()))
+            }
+        }
     }
 
     impl Real {
@@ -1142,6 +1458,57 @@ mod mac {
         Ok((0..SHAPE.len()).map(|index| slot(array, index)).collect())
     }
 
+    /// One batched read of `count` attributes, each slot as [`slot`] reads it.
+    unsafe fn copy_batch(
+        element: &CFType,
+        attributes: &CFArray<CFString>,
+        count: usize,
+    ) -> Result<Vec<Option<CFType>>, Unread> {
+        let mut values_ref: CFTypeRef = std::ptr::null();
+
+        let err = AXUIElementCopyMultipleAttributeValues(
+            element.as_CFTypeRef(),
+            attributes.as_CFTypeRef(),
+            0,
+            &mut values_ref,
+        );
+        if err != 0 {
+            return Err(super::unread(err));
+        }
+        if values_ref.is_null() {
+            return Err(Unread::Refused);
+        }
+        let values = CFType::wrap_under_create_rule(values_ref);
+        let array = values.as_CFTypeRef();
+        if CFGetTypeID(array) != CFArrayGetTypeID() || CFArrayGetCount(array) != count as isize {
+            return Err(Unread::Refused);
+        }
+
+        Ok((0..count).map(|index| slot(array, index)).collect())
+    }
+
+    /// A check state: a number that is 0 or 1, or a boolean. Anything else is not
+    /// one.
+    fn check_state(value: &Option<CFType>) -> Option<bool> {
+        let value = value.as_ref()?;
+        if let Some(flag) = value.downcast::<CFBoolean>() {
+            return Some(bool::from(flag));
+        }
+        match value.downcast::<CFNumber>()?.to_i64()? {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    fn boolean(value: bool) -> CFType {
+        if value {
+            CFBoolean::true_value().as_CFType()
+        } else {
+            CFBoolean::false_value().as_CFType()
+        }
+    }
+
     /// One slot of a batched read. An attribute that failed is not a failure of the
     /// read: it comes back as an AXValue of `kAXValueAXErrorType`, and it means the
     /// same as an attribute the element does not have.
@@ -1248,6 +1615,18 @@ mod mac {
             &mut settable,
         );
         err == 0 && settable != 0
+    }
+
+    /// The attribute that expands an element, when one may be written: `AXExpanded`,
+    /// else `AXDisclosing`, which is only asked when the first is not.
+    fn expander(settable: &dyn Fn(&str) -> bool) -> Option<Expander> {
+        if settable(EXPANDED) {
+            Some(Expander::Expanded)
+        } else if settable(DISCLOSING) {
+            Some(Expander::Disclosing)
+        } else {
+            None
+        }
     }
 
     /// The action names the control advertises for ITSELF. An element with no
@@ -1547,7 +1926,9 @@ pub use mac::{
 /// tell "nothing there" from "not supported here" writes the wrong sentence.
 #[cfg(not(target_os = "macos"))]
 mod stub {
-    use super::{Ax, Facts, Handle, Refusal, Retained, Unread};
+    use super::{
+        Ax, Facts, Focus, Handle, Refusal, Retained, Route, Routes, States, Unread, Write,
+    };
     use std::rc::Rc;
 
     #[derive(Default)]
@@ -1635,6 +2016,43 @@ mod stub {
         fn messages(&self) -> u64 {
             0
         }
+
+        fn routes(&self, _handle: Handle) -> Routes {
+            Routes::default()
+        }
+
+        fn route(&self, _handle: Handle, _route: Route) -> Routes {
+            Routes::default()
+        }
+
+        fn states(&self, _handle: Handle, _on: bool) -> Result<States, Unread> {
+            Err(Unread::Gone)
+        }
+
+        fn selects_children(&self, _container: Handle) -> bool {
+            false
+        }
+
+        fn parent(&self, _owner: &Rc<dyn Ax>, _handle: Handle) -> Option<Retained> {
+            None
+        }
+
+        fn write(
+            &self,
+            _handle: Handle,
+            _write: Write<'_>,
+            _timeout_ms: u64,
+        ) -> Result<(), Refusal> {
+            Err(unsupported())
+        }
+
+        fn in_focused_window(&self, _handle: Handle) -> Option<bool> {
+            None
+        }
+
+        fn focused(&self, _owner: &Rc<dyn Ax>, _pid: i32, _what: Focus) -> Option<Retained> {
+            None
+        }
     }
 }
 
@@ -1669,6 +2087,15 @@ pub struct Scripted {
     /// What reading it costs on the recorder's clock, so a walk runs into its
     /// wall-clock budget without anything sleeping.
     pub cost_ms: u64,
+    /// Its writable attributes apart from `AXValue`, which `settable` answers.
+    pub routes: Routes,
+    /// Its states, as a read answers them; a write the recorder honours changes
+    /// them, and a press flips `on`.
+    pub states: States,
+    /// Whether it is a container whose `AXSelectedChildren` may be written.
+    pub selects_children: bool,
+    /// What it answers when asked whether its window is the focused one.
+    pub in_focused_window: Option<bool>,
 }
 
 #[cfg(test)]
@@ -1705,6 +2132,10 @@ impl Scripted {
             frame: None,
             children: Vec::new(),
             cost_ms: 0,
+            routes: Routes::default(),
+            states: States::default(),
+            selects_children: false,
+            in_focused_window: Some(true),
         }
     }
 
@@ -1744,6 +2175,20 @@ impl Scripted {
             label: Some(label.to_string()),
             children: children.to_vec(),
             ..Scripted::of("AXGroup")
+        }
+    }
+
+    /// A checkbox that is pressed to toggle, reading `on` as its check state.
+    pub fn checkbox(label: &str, on: bool, frame: Frame) -> Scripted {
+        Scripted {
+            states: States {
+                on: Some(on),
+                ..States::default()
+            },
+            ..Scripted {
+                role: "AXCheckBox".to_string(),
+                ..Scripted::button(label, frame)
+            }
         }
     }
 }
@@ -1801,6 +2246,8 @@ struct Recorded {
     copies: usize,
     /// The nodes whose value was asked for, in order.
     values_read: Vec<usize>,
+    /// The write routes asked of each node, in order: all of them for a listing.
+    routes_asked: Vec<(usize, Route)>,
     /// Nodes whose facts, child count or uncounted copy answer this instead.
     facts_fail: std::collections::HashMap<usize, Unread>,
     count_fail: std::collections::HashMap<usize, Unread>,
@@ -1813,6 +2260,14 @@ struct Recorded {
     /// still being built.
     empty_walks: usize,
     messages: u64,
+    /// The application's focused window and focused element, by index.
+    focused_window: Option<usize>,
+    focused_element: Option<usize>,
+    /// Writes and presses are taken and change nothing, so a read-back finds the
+    /// state as it was.
+    ignores_writes: bool,
+    /// Where a scroll into view moves a node to.
+    scrolls_to: Option<(usize, Frame)>,
 }
 
 /// A [`Ax`] that answers from a script, records what was asked of it, and counts
@@ -1948,6 +2403,11 @@ impl Recorder {
         self.state().values_read.clone()
     }
 
+    /// Every write route asked, by node, in order.
+    pub fn routes_asked(&self) -> Vec<(usize, Route)> {
+        self.state().routes_asked.clone()
+    }
+
     /// The first `walks` walks find the application with nothing in it, as a
     /// tree that is still being built answers.
     pub fn empty_for(&self, walks: usize) {
@@ -1978,6 +2438,78 @@ impl Recorder {
     /// Every page of children asked for, as `(start, count)`.
     pub fn pages(&self) -> Vec<(usize, usize)> {
         self.state().pages.clone()
+    }
+
+    /// The application's focused window and focused element, by index.
+    pub fn focuses(&self, window: Option<usize>, element: Option<usize>) {
+        let mut state = self.state();
+        state.focused_window = window;
+        state.focused_element = element;
+    }
+
+    /// Writes and presses from now on are taken and change nothing.
+    pub fn ignores_writes(&self) {
+        self.state().ignores_writes = true;
+    }
+
+    /// A scroll into view of the Nth node moves it to `frame`.
+    pub fn scrolls_to(&self, index: usize, frame: Frame) {
+        self.state().scrolls_to = Some((index, frame));
+    }
+
+    /// The node a handle names, when it names a scripted node.
+    fn node(state: &Recorded, handle: Handle) -> Option<usize> {
+        match state.held.get(&handle.0) {
+            Some(Slot::Node(index)) => Some(*index),
+            _ => None,
+        }
+    }
+
+    /// What a write does to the scripted tree, unless writes are ignored.
+    fn apply(state: &mut Recorded, index: usize, write: Write<'_>) {
+        if state.ignores_writes {
+            return;
+        }
+        let states = &mut state.elements[index].states;
+        match write {
+            Write::Focused => states.focused = Some(true),
+            Write::Selected => states.selected = Some(true),
+            Write::Expand(_, to) => states.expanded = Some(to),
+            Write::SelectedText(text) => {
+                let value = state.elements[index].value.clone().unwrap_or_default();
+                state.elements[index].value = Some(format!("{value}{text}"));
+            }
+            Write::SelectedChildren(item) => {
+                if let Some(item) = Recorder::node(state, item) {
+                    state.elements[item].states.selected = Some(true);
+                }
+            }
+        }
+    }
+
+    /// What a performed action does to the scripted tree: a press flips a check
+    /// state, a scroll into view moves the node it was scripted to move.
+    fn act(state: &mut Recorded, index: usize, action: &str) {
+        if state.ignores_writes {
+            return;
+        }
+        if action == PRESS {
+            let on = &mut state.elements[index].states.on;
+            *on = on.map(|on| !on);
+        }
+        if action == SCROLL_TO_VISIBLE {
+            if let Some((_, frame)) = state.scrolls_to.filter(|(node, _)| *node == index) {
+                state.elements[index].frame = Some(frame);
+            }
+        }
+    }
+
+    /// The node that lists this one as a child; `None` is the application.
+    fn parent_of(state: &Recorded, index: usize) -> Option<usize> {
+        state
+            .elements
+            .iter()
+            .position(|node| node.children.contains(&index))
     }
 
     fn retain(state: &mut Recorded, slot: Slot, owner: &Rc<dyn Ax>) -> Retained {
@@ -2190,6 +2722,9 @@ impl Ax for Recorder {
             .performed
             .push((handle, action.to_string(), timeout_ms));
         Recorder::acted(&mut state);
+        if let Some(index) = Recorder::node(&state, handle) {
+            Recorder::act(&mut state, index, action);
+        }
         Ok(())
     }
 
@@ -2252,6 +2787,121 @@ impl Ax for Recorder {
 
     fn messages(&self) -> u64 {
         self.state().messages
+    }
+
+    fn routes(&self, handle: Handle) -> Routes {
+        let mut state = self.state();
+        state.messages += 1;
+        let Some(index) = Recorder::node(&state, handle) else {
+            return Routes::default();
+        };
+        for route in [Route::Focus, Route::Select, Route::Expand, Route::Text] {
+            state.routes_asked.push((index, route));
+        }
+        Routes {
+            value: state.elements[index].settable,
+            ..state.elements[index].routes
+        }
+    }
+
+    fn route(&self, handle: Handle, route: Route) -> Routes {
+        let mut state = self.state();
+        state.messages += 1;
+        let Some(index) = Recorder::node(&state, handle) else {
+            return Routes::default();
+        };
+        state.routes_asked.push((index, route));
+        let all = state.elements[index].routes;
+        let none = Routes::default();
+        match route {
+            Route::Focus => Routes {
+                focus: all.focus,
+                ..none
+            },
+            Route::Select => Routes {
+                select: all.select,
+                ..none
+            },
+            Route::Expand => Routes {
+                expand: all.expand,
+                ..none
+            },
+            Route::Text => Routes {
+                text: all.text,
+                ..none
+            },
+        }
+    }
+
+    fn states(&self, handle: Handle, on: bool) -> Result<States, Unread> {
+        let mut state = self.state();
+        state.messages += 1;
+        let index = Recorder::node(&state, handle).ok_or(Unread::Gone)?;
+        if let Some(why) = state.facts_fail.get(&index) {
+            return Err(*why);
+        }
+        let states = state.elements[index].states;
+        Ok(States {
+            on: states.on.filter(|_| on),
+            ..states
+        })
+    }
+
+    fn selects_children(&self, container: Handle) -> bool {
+        let mut state = self.state();
+        state.messages += 1;
+        Recorder::node(&state, container)
+            .is_some_and(|index| state.elements[index].selects_children)
+    }
+
+    fn parent(&self, owner: &Rc<dyn Ax>, handle: Handle) -> Option<Retained> {
+        let mut state = self.state();
+        state.messages += 1;
+        let index = Recorder::node(&state, handle)?;
+        let slot = match Recorder::parent_of(&state, index) {
+            Some(parent) => Slot::Node(parent),
+            None => Slot::Application,
+        };
+        Some(Recorder::retain(&mut state, slot, owner))
+    }
+
+    fn write(&self, handle: Handle, write: Write<'_>, timeout_ms: u64) -> Result<(), Refusal> {
+        let mut state = self.state();
+        state.messages += 1;
+        if let Some(refusal) = state.fail_next.take() {
+            return Err(refusal);
+        }
+        let Some(index) = Recorder::node(&state, handle) else {
+            return Err(Refusal::new(
+                false,
+                "the recorder no longer holds that reference",
+            ));
+        };
+        state
+            .performed
+            .push((handle, format!("write:{write:?}"), timeout_ms));
+        Recorder::acted(&mut state);
+        Recorder::apply(&mut state, index, write);
+        Ok(())
+    }
+
+    fn in_focused_window(&self, handle: Handle) -> Option<bool> {
+        let mut state = self.state();
+        state.messages += 1;
+        Recorder::node(&state, handle).and_then(|index| state.elements[index].in_focused_window)
+    }
+
+    fn focused(&self, owner: &Rc<dyn Ax>, pid: i32, what: Focus) -> Option<Retained> {
+        if pid != self.pid {
+            return None;
+        }
+        let mut state = self.state();
+        state.messages += 1;
+        let index = match what {
+            Focus::Window => state.focused_window,
+            Focus::Element => state.focused_element,
+        }?;
+        Some(Recorder::retain(&mut state, Slot::Node(index), owner))
     }
 }
 
@@ -2519,6 +3169,7 @@ mod tests {
                     .and_then(|facts| facts.role)
                     .expect("a scripted role"),
                 secure: false,
+                under: None,
                 element,
             })
             .collect();

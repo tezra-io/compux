@@ -16,11 +16,19 @@
 //! not answer in time is skipped and its children still tried, and the listing
 //! says it is incomplete — a partial tree passed off as the whole one is how a
 //! caller concludes a control is not there.
+//!
+//! Protocol 12 (M86 P2) gives a walk a [`Shape`]: a find (`query`) lists the nodes
+//! that match wherever they are, a `skeleton` stops at depth three and names what
+//! it cut, and a walk may start from several roots (the open menus or dialogs) or
+//! list its root (the focused element). Every listed node also says which writes it
+//! takes and what its states read, which is what its `verbs` are decided from.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::ax::{Ax, Facts, Frame, Handle, Retained, Unread, PRESS};
+use crate::ax::{Ax, Facts, Frame, Handle, Retained, Routes, States, Unread};
 use crate::gate::Clock;
+use crate::roles;
 
 /// Wall-clock budget for ONE traversal, checked between nodes.
 ///
@@ -50,6 +58,9 @@ const CHILD_PAGE: usize = 128;
 /// "Save" buttons apart, not enough to be a second tree.
 const MAX_PATH_LABELS: usize = 3;
 const MAX_PATH_CHARS: usize = 60;
+
+/// How deep a skeleton reads below its root before it cuts (protocol 12).
+pub const SKELETON_DEPTH: usize = 3;
 
 /// The three reasons a walk stops early, in the words the wire uses.
 const TRUNCATED_NODES: &str = "nodes";
@@ -106,12 +117,36 @@ pub fn eligible(role: Option<&str>, actions: &[String]) -> bool {
             .any(|action| PRIMARY_ACTIONS.contains(&action.as_str()))
 }
 
+/// A find (protocol 12): the nodes whose normalised role is `role` and whose text
+/// contains `name`, ignoring case. Either may be left out, never both.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Query {
+    pub role: Option<String>,
+    pub name: Option<String>,
+}
+
+/// What a walk lists (protocol 12). The default is protocol 11's: every control,
+/// below a root that is not itself listed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Shape {
+    /// Only the nodes that match, control or not.
+    pub query: Option<Query>,
+    /// Read [`SKELETON_DEPTH`] deep and no further; a node there that has children
+    /// is listed as a cut, with how many it hides.
+    pub skeleton: bool,
+    /// List each root itself (the `focused` scope).
+    pub list_root: bool,
+}
+
 /// An interactive element, as one walk found it. Everything the wire publishes
 /// about a control is read once, here, so a reply is one traversal rather than a
 /// second round of queries per element.
 #[derive(Debug)]
 pub struct Node {
+    /// The platform's own role: `native_role` on the wire, and what a reference is
+    /// revalidated against.
     pub role: String,
+    pub subrole: Option<String>,
     /// Title, else description. NOT the value: a field's contents are its own
     /// field, and using them as a name made a text box look like its text.
     pub label: Option<String>,
@@ -119,20 +154,39 @@ pub struct Node {
     pub value: Option<String>,
     pub secure: bool,
     pub enabled: bool,
-    /// Its OWN action list contains `AXPress`. Never inferred from the role: a
-    /// control that looks pressable and is not would be a refusal the caller was
-    /// invited to expect.
-    pub press: bool,
-    /// The platform says its value may be written.
-    pub settable: bool,
-    pub frame: Frame,
+    /// Its OWN action names. Never inferred from the role: a control that looks
+    /// pressable and is not would be a refusal the caller was invited to expect.
+    pub actions: Vec<String>,
+    /// Which of its attributes may be written; `select` also when its container
+    /// selects its children.
+    pub routes: Routes,
+    pub states: States,
+    /// `None` where the platform says nothing about where it is. The macOS walk
+    /// lists no such node; the field is optional for the platforms that cannot.
+    pub frame: Option<Frame>,
     /// Up to three ancestor labels, nearest last.
     pub path: Vec<String>,
+    /// A skeleton's cut node: how many children it hides.
+    pub hidden: Option<usize>,
+    /// The nearest listed node it sits inside, as an index into the walk's nodes.
+    pub under: Option<usize>,
     pub element: Retained,
 }
 
+impl Node {
+    /// Its normalised role (PROTOCOL.md §6.1).
+    pub fn kind(&self) -> &'static str {
+        roles::normalise(&self.role, self.subrole.as_deref())
+    }
+
+    /// Exactly the verbs it has a route for.
+    pub fn verbs(&self) -> Vec<&'static str> {
+        roles::verbs(self.kind(), &self.actions, &self.routes, &self.states)
+    }
+}
+
 /// What one traversal answered.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Walk {
     pub nodes: Vec<Node>,
     /// Why it stopped before it had seen everything, as the wire spells it:
@@ -141,18 +195,14 @@ pub struct Walk {
     /// goes) or `"time"` (it ran out of its wall-clock budget, or a node did not
     /// answer within its own timeout). `None` means it saw the whole tree.
     pub truncated: Option<&'static str>,
+    /// Children behind skeleton cuts that could not be listed (no position).
+    pub hidden: usize,
 }
 
 /// Walk ONE application's tree from its own application element, held for as long
 /// as the walk reads through it.
 pub fn walk(ax: &Rc<dyn Ax>, pid: i32, clock: &dyn Clock, deadline_ms: u64) -> Walk {
-    let Some(root) = ax.application(ax, pid) else {
-        return Walk {
-            nodes: Vec::new(),
-            truncated: None,
-        };
-    };
-    walk_from(ax, root.handle(), clock, deadline_ms)
+    walk_app(ax, pid, &Shape::default(), clock, deadline_ms)
 }
 
 /// The same walk, from a root this process is already holding — the window a
@@ -160,26 +210,77 @@ pub fn walk(ax: &Rc<dyn Ax>, pid: i32, clock: &dyn Clock, deadline_ms: u64) -> W
 /// where it starts differs, which is what keeps a bound window's controls the
 /// window's rather than the whole application's.
 pub fn walk_from(ax: &Rc<dyn Ax>, root: Handle, clock: &dyn Clock, deadline_ms: u64) -> Walk {
-    let mut walker = Walker {
-        ax,
-        clock,
-        deadline_ms,
-        visited: 0,
-        truncated: None,
-        nodes: Vec::new(),
-        ancestors: Vec::new(),
-    };
-    walker.root(root);
+    walk_handle(ax, root, &Shape::default(), clock, deadline_ms)
+}
 
-    Walk {
-        nodes: walker.nodes,
-        truncated: walker.truncated,
+/// [`walk`], listing what `shape` asks for.
+pub fn walk_app(
+    ax: &Rc<dyn Ax>,
+    pid: i32,
+    shape: &Shape,
+    clock: &dyn Clock,
+    deadline_ms: u64,
+) -> Walk {
+    let Some(root) = ax.application(ax, pid) else {
+        return Walk::default();
+    };
+    walk_handle(ax, root.handle(), shape, clock, deadline_ms)
+}
+
+/// [`walk_from`], listing what `shape` asks for.
+pub fn walk_handle(
+    ax: &Rc<dyn Ax>,
+    root: Handle,
+    shape: &Shape,
+    clock: &dyn Clock,
+    deadline_ms: u64,
+) -> Walk {
+    let mut walker = Walker::new(ax, shape, clock, deadline_ms);
+    walker.root(root);
+    walker.done()
+}
+
+/// One walk over several roots in order — the open menus, the open dialogs — with
+/// one set of budgets. With `list_root` each root is listed itself.
+pub fn walk_roots(
+    ax: &Rc<dyn Ax>,
+    roots: Vec<Retained>,
+    shape: &Shape,
+    clock: &dyn Clock,
+    deadline_ms: u64,
+) -> Walk {
+    let mut walker = Walker::new(ax, shape, clock, deadline_ms);
+    for root in roots {
+        if shape.list_root {
+            walker.listed_root(root);
+        } else {
+            // Held until its own walk is done: what is listed below it was read
+            // through it.
+            walker.root(root.handle());
+        }
     }
+    walker.done()
+}
+
+/// Whether a node is what a find asks for: its normalised role, and its text — its
+/// label, or for static text its value — containing the name, ignoring case.
+pub fn matches(query: &Query, kind: &str, label: Option<&str>, value: Option<&str>) -> bool {
+    if query.role.as_deref().is_some_and(|role| role != kind) {
+        return false;
+    }
+    let Some(name) = &query.name else {
+        return true;
+    };
+    let needle = name.to_lowercase();
+    let says = |text: Option<&str>| text.is_some_and(|text| text.to_lowercase().contains(&needle));
+    // A field's value is what it holds, not what it is called.
+    says(label) || (kind == "text" && says(value))
 }
 
 /// One traversal in progress.
 struct Walker<'a> {
     ax: &'a Rc<dyn Ax>,
+    shape: &'a Shape,
     clock: &'a dyn Clock,
     deadline_ms: u64,
     visited: usize,
@@ -187,9 +288,44 @@ struct Walker<'a> {
     nodes: Vec<Node>,
     /// The labels of the nodes above the one being visited, outermost first.
     ancestors: Vec<String>,
+    /// The listed nodes above the one being visited, as indices into `nodes`.
+    listed: Vec<usize>,
+    /// Whether each container read so far selects its children, by handle: asked
+    /// once per container, not once per child.
+    selecting: HashMap<u64, bool>,
+    hidden: usize,
 }
 
-impl Walker<'_> {
+impl<'a> Walker<'a> {
+    fn new(
+        ax: &'a Rc<dyn Ax>,
+        shape: &'a Shape,
+        clock: &'a dyn Clock,
+        deadline_ms: u64,
+    ) -> Walker<'a> {
+        Walker {
+            ax,
+            shape,
+            clock,
+            deadline_ms,
+            visited: 0,
+            truncated: None,
+            nodes: Vec::new(),
+            ancestors: Vec::new(),
+            listed: Vec::new(),
+            selecting: HashMap::new(),
+            hidden: 0,
+        }
+    }
+
+    fn done(self) -> Walk {
+        Walk {
+            nodes: self.nodes,
+            truncated: self.truncated,
+            hidden: self.hidden,
+        }
+    }
+
     /// The application or window the walk starts from. Never listed — what a
     /// listing names is inside it — but its label is the outermost ancestor of
     /// everything that is.
@@ -205,7 +341,21 @@ impl Walker<'_> {
         }
     }
 
-    fn visit(&mut self, element: Retained, depth: usize) {
+    /// A root listed itself (the `focused` scope), read through its own parent so
+    /// it is asked, like any listed node, whether its container selects it. The
+    /// parent is held while it is visited.
+    fn listed_root(&mut self, root: Retained) {
+        let parent = self.ax.parent(self.ax, root.handle());
+        let through = parent.as_ref().map(Retained::handle);
+        self.visit(root, through, 0);
+        if let Some(parent) = through {
+            // The answer holds only while the parent does.
+            self.selecting.remove(&parent.0);
+        }
+    }
+
+    /// One node at `depth`, read through `parent`.
+    fn visit(&mut self, element: Retained, parent: Option<Handle>, depth: usize) {
         if self.stop(depth) {
             return;
         }
@@ -218,9 +368,98 @@ impl Walker<'_> {
             Ok(facts) => facts,
             Err(why) => return self.unanswered(why, handle, depth),
         };
+        if self.shape.skeleton && depth == SKELETON_DEPTH {
+            return self.cut(facts, element, parent);
+        }
         let label = facts.label.clone();
-        let _unlisted = self.collect(facts, element);
+        let before = self.nodes.len();
+        let _unlisted = self.consider(facts, element, parent, depth == 0);
+
+        // What is inside a listed node names it as the node it sits inside.
+        let listed = (self.nodes.len() > before).then_some(before);
+        self.listed.extend(listed);
         self.descend(handle, label, depth);
+        if listed.is_some() {
+            self.listed.pop();
+        }
+    }
+
+    /// A skeleton's last level. A node there with children is listed whatever it
+    /// is, as the cut the caller drills into, and its children are counted and not
+    /// read; one with none is listed as any node is. A cut that cannot be listed
+    /// still counts what it hides, so the caller knows the skeleton is not all.
+    fn cut(&mut self, facts: Facts, element: Retained, parent: Option<Handle>) {
+        let hidden = self.hidden_below(element.handle());
+        if hidden == 0 {
+            let _unlisted = self.consider(facts, element, parent, false);
+            return;
+        }
+        let before = self.nodes.len();
+        let _unlisted = self.collect(facts, element, parent, Some(hidden), None);
+        if self.nodes.len() == before {
+            self.hidden += hidden;
+        }
+    }
+
+    /// How many children a cut hides: its count, or one copy's length where it
+    /// will not count them. Never more than a walk would read of one parent.
+    fn hidden_below(&mut self, handle: Handle) -> usize {
+        let counted = match self.ax.child_count(handle) {
+            Ok(count) => Ok(count.min(MAX_CHILDREN)),
+            Err(Unread::Refused) => self
+                .ax
+                .children_uncounted(self.ax, handle, MAX_CHILDREN)
+                .map(|children| children.len()),
+            Err(why) => Err(why),
+        };
+        match counted {
+            Ok(count) => count,
+            Err(Unread::NoAnswer) => {
+                self.note(TRUNCATED_TIME);
+                0
+            }
+            // Gone, or it will not say: there is nothing to hide.
+            Err(Unread::Gone | Unread::Refused) => 0,
+        }
+    }
+
+    /// List this node if the walk's shape asks for it: by default a control (or
+    /// the root of a walk that lists its root), on a find only a match. Otherwise
+    /// the element comes back, so it stays held while its children are read.
+    fn consider(
+        &mut self,
+        facts: Facts,
+        element: Retained,
+        parent: Option<Handle>,
+        root: bool,
+    ) -> Option<Retained> {
+        let shape = self.shape;
+        let Some(query) = &shape.query else {
+            let wanted =
+                (root && shape.list_root) || eligible(facts.role.as_deref(), &facts.actions);
+            return if wanted {
+                self.collect(facts, element, parent, None, None)
+            } else {
+                Some(element)
+            };
+        };
+
+        let kind = roles::normalise(
+            facts.role.as_deref().unwrap_or(""),
+            facts.subrole.as_deref(),
+        );
+        // Static text is found by what it says, so a find by name reads its value;
+        // nothing else is asked for one unless it is listed.
+        let text = query.name.is_some() && kind == "text" && !facts.secure;
+        let value = if text {
+            self.ax.value(element.handle())
+        } else {
+            None
+        };
+        if !matches(query, kind, facts.label.as_deref(), value.as_deref()) {
+            return Some(element);
+        }
+        self.collect(facts, element, parent, None, text.then_some(value))
     }
 
     /// A node whose facts answered nothing. It is not listed — there is nothing to
@@ -248,6 +487,9 @@ impl Walker<'_> {
         if named {
             self.ancestors.pop();
         }
+        // The answer holds only while the parent does: once it is released, its
+        // handle may name something else.
+        self.selecting.remove(&parent.0);
     }
 
     /// One parent's children, at `depth`: by count and in pages, or in one copy
@@ -292,7 +534,7 @@ impl Walker<'_> {
             }
             read += page.len();
             for child in page {
-                self.visit(child, depth);
+                self.visit(child, Some(parent), depth);
             }
         }
 
@@ -322,7 +564,7 @@ impl Walker<'_> {
 
         // The ones already visited are released here, unvisited again.
         for child in children.into_iter().skip(visited) {
-            self.visit(child, depth);
+            self.visit(child, Some(parent), depth);
         }
         if more {
             self.note(TRUNCATED_NODES);
@@ -356,40 +598,86 @@ impl Walker<'_> {
         }
     }
 
-    /// List this node if it is a control the wire can name: eligible, and saying
-    /// where it is, because a listing gives every control a click point. Only then
-    /// is it asked whether its value may be written and — unless it is secure —
-    /// what the value is: a message each, and the walk passes many more nodes than
-    /// it lists. Otherwise the element comes back, so it stays held while its
-    /// children are read through it.
-    fn collect(&mut self, facts: Facts, element: Retained) -> Option<Retained> {
-        if !eligible(facts.role.as_deref(), &facts.actions) {
-            return Some(element);
-        }
+    /// List a node the shape asked for, if it says where it is: a listing gives
+    /// every node it lists a click point. Only then is it asked which writes it
+    /// takes, what its states read and — unless it is secure — what its value is: a
+    /// message each, and the walk passes many more nodes than it lists. `value` is
+    /// the value a find already read, so it is not asked twice. Otherwise the
+    /// element comes back, so it stays held while its children are read through
+    /// it.
+    fn collect(
+        &mut self,
+        facts: Facts,
+        element: Retained,
+        parent: Option<Handle>,
+        hidden: Option<usize>,
+        value: Option<Option<String>>,
+    ) -> Option<Retained> {
         let (Some(role), Some(frame)) = (facts.role, facts.frame) else {
             return Some(element);
         };
         let handle = element.handle();
+        let kind = roles::normalise(&role, facts.subrole.as_deref());
 
-        self.nodes.push(Node {
-            press: facts.actions.iter().any(|action| action == PRESS),
+        let value = match value {
+            Some(value) => value,
             // A secure field's value is never asked for: not asking is a stronger
             // guarantee than asking and throwing the answer away.
-            value: if facts.secure {
-                None
-            } else {
-                self.ax.value(handle)
-            },
-            settable: self.ax.settable(handle),
+            None if facts.secure => None,
+            None => self.ax.value(handle),
+        };
+        let routes = self.routes(handle, parent);
+        let states = self.states(handle, kind);
+        let under = self.listed.last().copied();
+
+        self.nodes.push(Node {
+            value,
+            routes,
+            states,
             secure: facts.secure,
             enabled: facts.enabled,
             label: facts.label,
             path: self.path(),
+            actions: facts.actions,
+            subrole: facts.subrole,
+            hidden,
+            under,
             role,
-            frame,
+            frame: Some(frame),
             element,
         });
         None
+    }
+
+    /// Which writes a listed node takes. An item that cannot select itself is
+    /// selected through its container, which is asked once for all its children.
+    fn routes(&mut self, handle: Handle, parent: Option<Handle>) -> Routes {
+        let routes = self.ax.routes(handle);
+        let Some(parent) = parent.filter(|_| !routes.select) else {
+            return routes;
+        };
+        let ax = self.ax;
+        let select = *self
+            .selecting
+            .entry(parent.0)
+            .or_insert_with(|| ax.selects_children(parent));
+        Routes { select, ..routes }
+    }
+
+    /// What a listed node's states read; its check state only where its role has
+    /// one, or it is a disclosure, whose value is whether it is open. A state that
+    /// did not answer is not reported and lists no verb that needs it; one that did
+    /// not answer in time is a listing that did not see everything.
+    fn states(&mut self, handle: Handle, kind: &str) -> States {
+        let on = roles::has_check_state(kind) || kind == "disclosure";
+        match self.ax.states(handle, on) {
+            Ok(states) => states,
+            Err(Unread::NoAnswer) => {
+                self.note(TRUNCATED_TIME);
+                States::default()
+            }
+            Err(Unread::Gone | Unread::Refused) => States::default(),
+        }
     }
 
     /// The ancestor labels worth carrying: the nearest three, nearest LAST,
@@ -578,10 +866,14 @@ mod tests {
         let found = whole(&ax);
 
         assert_eq!(labels(&found), vec!["Card", "Inbox", "Save"]);
-        assert!(found.nodes[0].press);
-        assert!(!found.nodes[1].press, "AXConfirm lists it, and is no press");
+        let presses = |node: &Node| node.actions.iter().any(|action| action == "AXPress");
+        assert!(presses(&found.nodes[0]));
         assert!(
-            !found.nodes[2].press,
+            !presses(&found.nodes[1]),
+            "AXConfirm lists it, and is no press"
+        );
+        assert!(
+            !presses(&found.nodes[2]),
             "a role lists it, and its own list has no press"
         );
     }
@@ -1224,9 +1516,10 @@ mod tests {
         whole(&ax);
 
         // The application: its facts, its child count, one page. Each control: its
-        // facts, its value, whether that may be written, and its child count — and
-        // no page for a leaf.
-        assert_eq!(ax.messages() - before, 3 + 2 * 4);
+        // facts, its value, which of its attributes may be written, its states and
+        // its child count — and no page for a leaf. Their shared parent is asked once
+        // whether it selects its children.
+        assert_eq!(ax.messages() - before, 3 + 2 * 5 + 1);
     }
 
     // A node the walk does not list is asked nothing past its facts and its child
@@ -1251,5 +1544,327 @@ mod tests {
             vec![1],
             "the button's, and no other"
         );
+    }
+
+    // --- protocol 12: what a walk lists -------------------------------------------
+
+    fn shaped(ax: &Rc<dyn Ax>, shape: &Shape) -> Walk {
+        walk_app(ax, PID, shape, &SystemClock::new(), u64::MAX)
+    }
+
+    fn query(role: Option<&str>, name: Option<&str>) -> Query {
+        Query {
+            role: role.map(str::to_string),
+            name: name.map(str::to_string),
+        }
+    }
+
+    fn find(role: Option<&str>, name: Option<&str>) -> Shape {
+        Shape {
+            query: Some(query(role, name)),
+            ..Shape::default()
+        }
+    }
+
+    fn skeleton() -> Shape {
+        Shape {
+            skeleton: true,
+            ..Shape::default()
+        }
+    }
+
+    /// A node of this role and label at a frame, with these children.
+    fn holding(role: &str, label: &str, children: &[usize]) -> Scripted {
+        Scripted {
+            label: Some(label.to_string()),
+            frame: Some(frame(0.0, 0.0)),
+            children: children.to_vec(),
+            ..Scripted::of(role)
+        }
+    }
+
+    // A find compares the normalised role exactly and the name as a substring of
+    // the node's text, ignoring case; static text is found by what it says.
+    #[test]
+    fn a_find_matches_a_normalised_role_and_a_name_ignoring_case() {
+        assert!(matches(
+            &query(Some("button"), None),
+            "button",
+            Some("Save"),
+            None
+        ));
+        assert!(matches(
+            &query(None, Some("SAV")),
+            "button",
+            Some("Save as…"),
+            None
+        ));
+        assert!(matches(
+            &query(Some("button"), Some("save")),
+            "button",
+            Some("Save"),
+            None
+        ));
+        assert!(!matches(
+            &query(Some("button"), Some("save")),
+            "link",
+            Some("Save"),
+            None
+        ));
+        assert!(!matches(&query(None, Some("save")), "button", None, None));
+        assert!(matches(
+            &query(None, Some("total")),
+            "text",
+            None,
+            Some("Total: 4")
+        ));
+        assert!(
+            !matches(
+                &query(None, Some("ada")),
+                "textfield",
+                Some("Name"),
+                Some("ada")
+            ),
+            "a field's value is what it holds, not what it is called"
+        );
+    }
+
+    // A find lists what matches wherever it is, whether or not it is a control, and
+    // nothing else — the controls that do not match included.
+    #[test]
+    fn a_find_lists_every_match_control_or_not_and_nothing_else() {
+        let (_recorder, ax) = platform(vec![
+            Scripted::group("Sidebar", &[1, 2]),
+            Scripted::button("Save", frame(0.0, 0.0)),
+            holding("AXStaticText", "Saved 3 files", &[]),
+            Scripted::field("Name", "ada", frame(0.0, 40.0)),
+        ]);
+
+        assert_eq!(
+            labels(&shaped(&ax, &find(None, Some("save")))),
+            vec!["Save", "Saved 3 files"]
+        );
+        assert_eq!(
+            labels(&shaped(&ax, &find(Some("text"), None))),
+            vec!["Saved 3 files"]
+        );
+        assert!(shaped(&ax, &find(Some("button"), Some("cancel")))
+            .nodes
+            .is_empty());
+    }
+
+    // Static text is found by its value, so a find by name reads the value of the
+    // static text it passes and of what it lists — never a field it does not list.
+    #[test]
+    fn a_find_by_name_reads_the_value_of_static_text_and_of_nothing_it_skips() {
+        let (recorder, ax) = platform(vec![
+            Scripted {
+                value: Some("Total: 4".to_string()),
+                frame: Some(frame(0.0, 0.0)),
+                ..Scripted::of("AXStaticText")
+            },
+            Scripted::field("Name", "ada", frame(0.0, 40.0)),
+        ]);
+
+        let found = shaped(&ax, &find(None, Some("total")));
+
+        assert_eq!(found.nodes.len(), 1);
+        assert_eq!(found.nodes[0].value.as_deref(), Some("Total: 4"));
+        assert_eq!(
+            recorder.values_read(),
+            vec![0],
+            "the field's value was never asked"
+        );
+    }
+
+    /// A window holding a sidebar that holds a list of two buttons — the list at
+    /// depth three — and a button beside the sidebar at depth two.
+    fn deep_window(list_frame: Option<Frame>) -> Vec<Scripted> {
+        vec![
+            holding("AXWindow", "Main", &[1, 5]),
+            holding("AXGroup", "Sidebar", &[2]),
+            Scripted {
+                frame: list_frame,
+                ..holding("AXList", "Files", &[3, 4])
+            },
+            Scripted::button("One", frame(0.0, 0.0)),
+            Scripted::button("Two", frame(0.0, 30.0)),
+            Scripted::button("Top", frame(0.0, 60.0)),
+        ]
+    }
+
+    // A skeleton reads three levels and stops; a node there with children is
+    // listed as a cut, whatever it is, and says how many it hides.
+    #[test]
+    fn a_skeleton_cuts_at_depth_three_and_names_what_it_hides() {
+        let (recorder, ax) = platform(deep_window(Some(frame(0.0, 0.0))));
+
+        let found = shaped(&ax, &skeleton());
+
+        assert_eq!(labels(&found), vec!["Files", "Top"]);
+        assert_eq!(found.nodes[0].hidden, Some(2));
+        assert_eq!(
+            found.nodes[1].hidden, None,
+            "a control above the cut is no cut"
+        );
+        assert_eq!(found.truncated, None, "a cut is not a truncation");
+        assert_eq!(found.hidden, 0);
+        // The application's, the window's and the sidebar's pages, and never the
+        // list's: what a cut hides is not read.
+        assert_eq!(recorder.pages(), vec![(0, 1), (0, 2), (0, 1)]);
+    }
+
+    // A cut with nowhere to click cannot be listed, and what it hides is still
+    // counted, so a caller knows the skeleton is not everything.
+    #[test]
+    fn a_cut_that_cannot_be_listed_is_still_counted() {
+        let (_recorder, ax) = platform(deep_window(None));
+
+        let found = shaped(&ax, &skeleton());
+
+        assert_eq!(labels(&found), vec!["Top"]);
+        assert_eq!(found.hidden, 2);
+    }
+
+    // A control AT the cut with nothing inside it is listed as any control is.
+    #[test]
+    fn a_control_at_the_cut_with_no_children_is_listed_as_a_control() {
+        let (_recorder, ax) = platform(vec![
+            holding("AXWindow", "Main", &[1]),
+            holding("AXGroup", "Toolbar", &[2]),
+            Scripted::button("Save", frame(0.0, 0.0)),
+        ]);
+
+        let found = shaped(&ax, &skeleton());
+
+        assert_eq!(labels(&found), vec!["Save"]);
+        assert_eq!(found.nodes[0].hidden, None);
+    }
+
+    // The focused scope lists its root and what is inside it, and each listed node
+    // names the listed node it sits inside.
+    #[test]
+    fn a_listed_root_comes_first_and_its_children_sit_inside_it() {
+        let (recorder, ax) = platform(vec![
+            holding("AXGroup", "Form", &[1]),
+            Scripted::button("Save", frame(0.0, 0.0)),
+        ]);
+        recorder.focuses(None, Some(0));
+        let focused = ax
+            .focused(&ax, PID, crate::ax::Focus::Element)
+            .expect("the scripted focus");
+        let shape = Shape {
+            list_root: true,
+            ..Shape::default()
+        };
+
+        let found = walk_roots(&ax, vec![focused], &shape, &SystemClock::new(), u64::MAX);
+
+        assert_eq!(labels(&found), vec!["Form", "Save"]);
+        assert_eq!(found.nodes[0].under, None);
+        assert_eq!(found.nodes[1].under, Some(0));
+        drop(found);
+        assert_eq!(recorder.counts().2, 0, "everything it held went back");
+    }
+
+    // Several roots — the open menus — are walked in order with one set of budgets.
+    #[test]
+    fn several_roots_are_walked_in_order() {
+        let (recorder, ax) = platform(vec![
+            holding("AXMenu", "File", &[1]),
+            acting("AXMenuItem", "Open", &["AXPress"]),
+            holding("AXMenu", "Edit", &[3]),
+            acting("AXMenuItem", "Copy", &["AXPress"]),
+        ]);
+        recorder.windows_are(&[2, 0]);
+        let roots = crate::ax::application_windows(&ax, PID);
+
+        let found = walk_roots(&ax, roots, &Shape::default(), &SystemClock::new(), u64::MAX);
+
+        assert_eq!(labels(&found), vec!["Copy", "Open"]);
+        assert_eq!(found.nodes[0].path, vec!["Edit"]);
+    }
+
+    // A listed node records the nearest listed node above it; one with none above
+    // it records none.
+    #[test]
+    fn a_listed_node_names_the_listed_node_it_sits_inside() {
+        let (_recorder, ax) = platform(vec![
+            Scripted {
+                children: vec![1],
+                ..acting("AXGroup", "Card", &["AXPress"])
+            },
+            holding("AXGroup", "Body", &[2]),
+            Scripted::button("Open", frame(0.0, 0.0)),
+            Scripted::button("Elsewhere", frame(0.0, 40.0)),
+        ]);
+
+        let found = whole(&ax);
+
+        assert_eq!(labels(&found), vec!["Card", "Open", "Elsewhere"]);
+        assert_eq!(found.nodes[1].under, Some(0), "through an unlisted group");
+        assert_eq!(found.nodes[2].under, None);
+    }
+
+    // A listed control says which writes it takes and what its states read; a
+    // check state is asked only of a control that has one.
+    #[test]
+    fn a_listed_control_carries_its_routes_and_its_states() {
+        let (_recorder, ax) = platform(vec![
+            Scripted {
+                routes: Routes {
+                    focus: true,
+                    ..Routes::default()
+                },
+                ..Scripted::checkbox("Bold", true, frame(0.0, 0.0))
+            },
+            Scripted {
+                states: States {
+                    on: Some(true),
+                    focused: Some(true),
+                    ..States::default()
+                },
+                ..Scripted::field("Name", "1", frame(0.0, 40.0))
+            },
+        ]);
+
+        let found = whole(&ax);
+
+        assert_eq!(found.nodes[0].states.on, Some(true));
+        assert!(found.nodes[0].routes.focus);
+        assert!(!found.nodes[0].routes.value);
+        assert!(found.nodes[1].routes.value, "AXValue is its own route");
+        assert_eq!(found.nodes[1].states.focused, Some(true));
+        assert_eq!(
+            found.nodes[1].states.on, None,
+            "a field's value is text, never read as a check state"
+        );
+    }
+
+    // An item that cannot select itself is selected through its container, and
+    // the container is asked once for all of its children.
+    #[test]
+    fn a_container_that_selects_its_children_gives_each_of_them_select() {
+        let (_recorder, ax) = platform(vec![
+            Scripted {
+                selects_children: true,
+                ..holding("AXList", "Files", &[1, 2])
+            },
+            acting("AXRow", "One", &["AXConfirm"]),
+            acting("AXRow", "Two", &["AXConfirm"]),
+            holding("AXGroup", "Other", &[4]),
+            acting("AXRow", "Three", &["AXConfirm"]),
+        ]);
+        let before = ax.messages();
+
+        let found = whole(&ax);
+        let spent = ax.messages() - before;
+
+        let select: Vec<bool> = found.nodes.iter().map(|node| node.routes.select).collect();
+        assert_eq!(select, vec![true, true, false]);
+        // The application: facts, count, page. The list and the group: facts, count,
+        // page each. Each row: facts, value, routes, states, count. Asked once each
+        // whether they select their children: the list and the group.
+        assert_eq!(spent, 3 + 2 * 3 + 3 * 5 + 2);
     }
 }
