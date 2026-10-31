@@ -2343,8 +2343,8 @@ verb, each verb changes its control and the fixture records it, and the probe
 names the X11 session by its socket.
 
 > **Steps 3, 4 and 5 POST REAL INPUT** through the accessibility bus to the
-> fixture apps: presses, text, selections, a menu and a dialog. Steps 1, 2 and 6
-> read only. Nothing here may be run by an agent. Run it yourself, at the machine,
+> fixture apps: presses, text, selections, a menu and a dialog. Steps 1, 2, 2a
+> and 6 read only (in 2a you click the fixture yourself). Nothing here may be run by an agent. Run it yourself, at the machine,
 > with nothing confidential on screen. The fixture apps run on your desktop for
 > this check only; everywhere else they run in a private container.
 
@@ -2445,6 +2445,37 @@ With **Compux Fixture GTK3** in front:
 * `verbs`: the button `press`; the checkbox `press`, `toggle` and `focus`; the
   text field `set_value`, `type` and `focus`; the Folders cells `expand` and
   `collapse`; the Fruit rows and the tabs `select`.
+
+## 2a. A removed GTK 3 row, read within 16 s (read only; one click by you)
+
+compux finds a reference by an object's own account of its place (its `Parent`
+and `GetIndexInParent`) on Qt only. A destroyed GTK 3 object was measured
+elsewhere to keep answering its old parent and index for about 16 s, and taking
+its word would bind a row the list no longer has. This step reads what a row of
+the GTK 3 fixture says right after its list drops it. The script reads the
+fixture's objects only (it refuses any other process), never sends
+`GetActions` or `GetAll`, and acts on nothing: the collapse is your click.
+
+With **Compux Fixture GTK3** running and Projects expanded in its Folders list
+(it starts expanded):
+
+```sh
+python3 fixtures/linux/removed_row.py --pid "$(pgrep -f 'fixture_gtk3.py --state-file /tmp/gtk3.json')"
+```
+
+It prints the row `Alpha` with `listed_there=yes`, then asks you to collapse
+Projects: **click Projects' triangle in the fixture window**, then press Enter in
+the terminal at once. For 20 s it prints, once a second, what the removed row
+says: its `parent`, `index`, whether that parent still lists it there, and its
+`states`.
+
+* In the containers (bridge 2.38 and 2.52) the removed row answered
+  `UnknownObject` to every read from the first second.
+* Write down what yours says, and when it changes. A row that answers its old
+  `parent` and an `index` with `listed_there=no` is the case the Qt-only rule
+  is for: compux calls it `stale_element`, never the row it was.
+
+Then expand Projects again by its triangle: step 3 collapses it.
 
 ## 3. Each verb once, on GTK 3 (POSTS INPUT)
 
