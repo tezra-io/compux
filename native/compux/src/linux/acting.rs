@@ -22,8 +22,8 @@ use crate::ax::{Expander, Frame, Handle, Refusal, Write, PRESS, SCROLL_TO_VISIBL
 /// `ATSPI_SCROLL_ANYWHERE`: bring the node into view however it fits.
 const SCROLL_ANYWHERE: u32 = 6;
 
-/// `ATSPI_COORD_TYPE_WINDOW`: the coordinates GTK 4 gets right (L0(a)), and GTK 3
-/// as well.
+/// `ATSPI_COORD_TYPE_WINDOW`: the coordinates GTK 4 gets right (measured on GTK
+/// 4.14 under Xvfb in a container), and GTK 3 as well.
 const WINDOW: u32 = 1;
 
 /// How far up a node's ancestors the scroll pane it sits in is looked for.

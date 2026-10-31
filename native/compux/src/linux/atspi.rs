@@ -36,6 +36,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -798,25 +799,51 @@ impl Real {
     async fn label_inside(&self, bus: &Connection, at: &Address, count: usize) -> Option<String> {
         let mut level = vec![(at.clone(), count)];
         for _ in 0..NAMING_DEPTH {
-            let mut below = Vec::new();
-            for (parent, count) in level {
-                for index in 0..count.min(NAMING_CHILDREN) {
-                    let Ok(Some(child)) = self.child_at(bus, &parent, index).await else {
-                        continue;
-                    };
-                    let role: Result<u32, Failed> = self.accessible(bus, &child, "GetRole").await;
-                    if role.is_ok_and(vocabulary::caption) {
-                        if let Ok(Some(name)) = self.words(bus, &child, "Name").await {
-                            return Some(name);
-                        }
-                        continue;
-                    }
-                    below.push((child.clone(), self.count(bus, &child).await.unwrap_or(0)));
-                }
+            match self.caption_in(bus, level).await {
+                ControlFlow::Break(name) => return Some(name),
+                ControlFlow::Continue(below) => level = below,
             }
-            level = below;
         }
         None
+    }
+
+    /// One level of that look: the name of the first caption among its nodes'
+    /// children, or the children one level down, each with its child count.
+    async fn caption_in(
+        &self,
+        bus: &Connection,
+        level: Vec<(Address, usize)>,
+    ) -> ControlFlow<String, Vec<(Address, usize)>> {
+        let mut below = Vec::new();
+        for (parent, count) in level {
+            below.extend(self.caption_among(bus, &parent, count).await?);
+        }
+        ControlFlow::Continue(below)
+    }
+
+    /// The first caption among one node's first [`NAMING_CHILDREN`] children, by
+    /// its name; else those children that are not captions, each with its count.
+    async fn caption_among(
+        &self,
+        bus: &Connection,
+        parent: &Address,
+        count: usize,
+    ) -> ControlFlow<String, Vec<(Address, usize)>> {
+        let mut inside = Vec::new();
+        for index in 0..count.min(NAMING_CHILDREN) {
+            let Ok(Some(child)) = self.child_at(bus, parent, index).await else {
+                continue;
+            };
+            let role: Result<u32, Failed> = self.accessible(bus, &child, "GetRole").await;
+            if !role.is_ok_and(vocabulary::caption) {
+                inside.push((child.clone(), self.count(bus, &child).await.unwrap_or(0)));
+                continue;
+            }
+            if let Ok(Some(name)) = self.words(bus, &child, "Name").await {
+                return ControlFlow::Break(name);
+            }
+        }
+        ControlFlow::Continue(inside)
     }
 
     /// One child slot, `None` when it holds nothing.
@@ -972,7 +999,11 @@ impl Real {
             })
     }
 
-    /// One node's children, in one `GetChildren`, the first `limit` of them.
+    /// One node's children, in one `GetChildren`, the first `limit` of them. The
+    /// reply is read whole before `limit` applies: only zbus's cap on a message
+    /// (128 MiB) bounds it. So this is for the registry, an application's windows,
+    /// and a node that will not count its children; a counted list is read a page
+    /// at a time (`page`).
     pub(super) async fn children_of(
         &self,
         bus: &Connection,
@@ -1031,7 +1062,8 @@ impl Real {
 
     /// Learn which toolkit an application was made with: GTK 4 has no global
     /// coordinates, on X11 too (it answers every `GetExtents` in screen coordinates
-    /// at (0, 0), L0(a)), and some routes are one toolkit's. The Application
+    /// at (0, 0), as measured on GTK 4.14 under Xvfb in a container), and some
+    /// routes are one toolkit's. The Application
     /// interface is read only when the root lists it; a toolkit that does not say
     /// is taken at its word.
     async fn learn_toolkit(&self, bus: &Connection, app: &Address) {
@@ -1186,28 +1218,57 @@ impl Real {
         let mut level = vec![(top.clone(), Vec::new())];
         let mut read = 0;
         while !level.is_empty() && read < MAX_FOCUS_SEARCH {
-            let mut below = Vec::new();
-            for (parent, path) in level {
-                let count = self.count(bus, &parent).await.unwrap_or(0);
-                let room = MAX_FOCUS_SEARCH.saturating_sub(read);
-                let children = self.page(bus, &parent, 0, count.min(room)).await;
-                for (index, child) in children.unwrap_or_default().into_iter().enumerate() {
-                    read += 1;
-                    let mut child_path = path.clone();
-                    child_path.push(index);
-                    let states: Vec<u32> = self
-                        .accessible(bus, &child, "GetState")
-                        .await
-                        .unwrap_or_default();
-                    if vocabulary::has(&states, FOCUSED) {
-                        return Some((child, child_path));
-                    }
-                    below.push((child, child_path));
-                }
-            }
+            let below = match self.focused_level(bus, level, read).await {
+                ControlFlow::Break(found) => return Some(found),
+                ControlFlow::Continue(below) => below,
+            };
+            read += below.len();
             level = below;
         }
         None
+    }
+
+    /// One level of that look: the node that reads FOCUSED among its nodes'
+    /// children, or every child read, each with its path, `read` nodes having been
+    /// read before.
+    async fn focused_level(
+        &self,
+        bus: &Connection,
+        level: Vec<(Address, Vec<usize>)>,
+        read: usize,
+    ) -> ControlFlow<(Address, Vec<usize>), Vec<(Address, Vec<usize>)>> {
+        let mut below = Vec::new();
+        for (parent, path) in level {
+            let room = MAX_FOCUS_SEARCH.saturating_sub(read + below.len());
+            below.extend(self.focused_among(bus, &parent, &path, room).await?);
+        }
+        ControlFlow::Continue(below)
+    }
+
+    /// The child of one node that reads FOCUSED, among its first `room` children;
+    /// else those children, each with its path.
+    async fn focused_among(
+        &self,
+        bus: &Connection,
+        parent: &Address,
+        path: &[usize],
+        room: usize,
+    ) -> ControlFlow<(Address, Vec<usize>), Vec<(Address, Vec<usize>)>> {
+        let count = self.count(bus, parent).await.unwrap_or(0);
+        let children = self.page(bus, parent, 0, count.min(room)).await;
+        let mut read = Vec::new();
+        for (index, child) in children.unwrap_or_default().into_iter().enumerate() {
+            let child_path = [path, &[index]].concat();
+            let states: Vec<u32> = self
+                .accessible(bus, &child, "GetState")
+                .await
+                .unwrap_or_default();
+            if vocabulary::has(&states, FOCUSED) {
+                return ControlFlow::Break((child, child_path));
+            }
+            read.push((child, child_path));
+        }
+        ControlFlow::Continue(read)
     }
 
     /// Take one kept answer from a reference, if it is held and the answer is kept.
@@ -2047,7 +2108,8 @@ mod tests {
     }
 
     // GTK 4 answers GetExtents in screen coordinates with every node at (0, 0)
-    // (L0(a): GTK 4.14 on X11; its window-relative extents are right). A frame read
+    // (measured on GTK 4.14 under Xvfb in a container; its window-relative extents
+    // are right). A frame read
     // that way would aim every click at the corner of the screen, so a GTK 4
     // application's controls are listed with no frame and no click point, and its
     // extents are never asked for. GTK 3's are placed.
