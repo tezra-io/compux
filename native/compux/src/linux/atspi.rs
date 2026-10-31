@@ -1631,7 +1631,7 @@ mod tests {
     // L3-6: GTK4 sets SENSITIVE and never ENABLED; a control with neither is
     // disabled.
     #[test]
-    fn a_control_is_enabled_by_either_bit_and_disabled_by_neither() {
+    fn ledger_l3_6_a_control_is_enabled_by_either_bit_and_disabled_by_neither() {
         let (_fake, ax) = reader(desktop(
             &["/w/gtk4", "/w/off"],
             vec![
