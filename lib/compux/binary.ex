@@ -6,9 +6,11 @@ defmodule Compux.Binary do
 
     1. **Dev build** — when `COMPUX_BUILD` is set, the local
        `native/compux/target/release/compux` (the `cargo build` loop).
-    2. **Cached download** — otherwise a per-target precompiled binary, downloaded
-       once from the GitHub release, verified against the committed sha256 in
-       `checksum-compux.exs`, and cached under the user cache dir.
+    2. **Cached download** — otherwise a per-target release artifact, downloaded once
+       from the GitHub release and verified against the committed sha256 in
+       `checksum-compux.exs`: a zipped, signed `Fermix.app` on macOS (extracted with
+       `ditto` so its code signature survives) or a bare-binary tarball on Linux. The
+       resolved path is the executable inside it.
 
   This is the standalone-consumer path. An embedder that manages its own signed
   install (verifying provenance itself) should skip this and pass an explicit
@@ -125,24 +127,26 @@ defmodule Compux.Binary do
 
   defp ensure_downloaded(opts) do
     with {:ok, target} <- target() do
-      cache = cache_path(opts, target)
-
-      if File.regular?(cache),
-        do: {:ok, cache},
-        else: download(target, cache, opts)
+      exec = cache_path(opts, target)
+      if File.regular?(exec), do: {:ok, exec}, else: download(target, opts)
     end
   end
 
-  defp download(target, cache, opts) do
+  defp download(target, opts) do
     checksums = Keyword.get(opts, :checksums, @checksums)
     fetch = Keyword.get(opts, :fetcher, &default_fetch/1)
 
     with {:ok, expected} <- expected_sha(checksums, target),
-         {:ok, tarball} <- fetch.(artifact_url(target)),
-         :ok <- verify(tarball, expected),
-         {:ok, binary} <- untar_binary(tarball) do
-      write_cache(cache, binary)
+         {:ok, archive} <- fetch.(artifact_url(target)),
+         :ok <- verify(archive, expected),
+         :ok <- extract(target, archive, artifact_root(opts, target)) do
+      resolve_exec(opts, target)
     end
+  end
+
+  defp resolve_exec(opts, target) do
+    exec = cache_path(opts, target)
+    if File.regular?(exec), do: {:ok, exec}, else: {:error, {:exec_missing, exec}}
   end
 
   defp expected_sha(checksums, target) do
@@ -160,39 +164,135 @@ defmodule Compux.Binary do
       else: {:error, {:checksum_mismatch, expected: expected, actual: actual}}
   end
 
-  defp untar_binary(tarball) do
-    case :erl_tar.extract({:binary, tarball}, [:memory, :compressed]) do
-      {:ok, entries} -> pick_binary(entries)
+  # macOS ships a zipped, signed `.app`; extract with `ditto` so the code signature
+  # (Contents/_CodeSignature/CodeResources + xattrs) survives — plain `:erl_tar`/`:zip`
+  # strips it and the bundle then fails Gatekeeper/TCC. Verify the signature after, to
+  # fail loud on a corrupt/tampered download (a second gate beyond the sha256).
+  #
+  # Extract into a STAGING sibling and only publish the verified bundle into `dest_dir`
+  # atomically: a ditto or codesign-verify failure must never leave an unverified app
+  # where `ensure_downloaded/1`'s `File.regular?` short-circuit would trust it on the
+  # next resolve (bypassing both integrity gates).
+  defp extract("macos-" <> _, archive, dest_dir) do
+    staging = dest_dir <> ".staging"
+    File.rm_rf!(staging)
+    File.mkdir_p!(staging)
+    zip = Path.join(staging, "download.zip")
+    File.write!(zip, archive)
+    app = Path.join(staging, "Fermix.app")
+
+    try do
+      with :ok <- ditto_extract(zip, staging),
+           :ok <- verify_signature(app) do
+        publish_app(app, dest_dir)
+      end
+    after
+      File.rm_rf(staging)
+    end
+  end
+
+  # Linux ships a bare-binary tarball — no signature to preserve, so `:erl_tar` is fine.
+  defp extract(_target, archive, dest_dir) do
+    File.mkdir_p!(dest_dir)
+
+    case :erl_tar.extract({:binary, archive}, [:memory, :compressed]) do
+      {:ok, entries} -> write_binary_entry(entries, dest_dir)
       {:error, reason} -> {:error, {:untar, reason}}
     end
   end
 
-  defp pick_binary(entries) do
-    case Enum.find(entries, &binary_entry?/1) do
-      {_name, binary} -> {:ok, binary}
-      nil -> {:error, {:binary_not_in_archive, @command}}
+  defp write_binary_entry(entries, dest_dir) do
+    case Enum.find(entries, fn {name, _bin} -> Path.basename(to_string(name)) == @command end) do
+      {_name, binary} ->
+        exec = Path.join(dest_dir, @command)
+        File.write!(exec, binary)
+        File.chmod!(exec, 0o755)
+        :ok
+
+      nil ->
+        {:error, {:binary_not_in_archive, @command}}
     end
   end
 
-  defp binary_entry?({name, _bin}), do: Path.basename(to_string(name)) == @command
-
-  defp write_cache(cache, binary) do
-    File.mkdir_p!(Path.dirname(cache))
-    File.write!(cache, binary)
-    File.chmod!(cache, 0o755)
-    {:ok, cache}
+  defp ditto_extract(zip, dest_dir) do
+    case System.cmd("ditto", ["-x", "-k", zip, dest_dir], stderr_to_stdout: true) do
+      {_out, 0} -> :ok
+      {out, code} -> {:error, {:ditto_failed, code, String.trim(out)}}
+    end
   end
 
+  defp verify_signature(app) do
+    case System.cmd("codesign", ["--verify", "--deep", "--strict", app], stderr_to_stdout: true) do
+      {_out, 0} -> :ok
+      {out, code} -> {:error, {:codesign_verify_failed, code, String.trim(out)}}
+    end
+  end
+
+  # Atomically move the VERIFIED bundle from staging into the cache dir (same
+  # filesystem → a rename, so a resolve never sees a half-written bundle).
+  #
+  # Replacing an EXISTING installed bundle deletes a registered, signed .app —
+  # the operation macOS App Management (kTCCServiceSystemPolicyAppBundles)
+  # guards. If the embedding process lacks that grant the delete/rename comes
+  # back :eperm/:eacces; surface it as a typed error naming the gate instead of
+  # raising a bare File.Error that reads like a disk fault.
+  defp publish_app(app, dest_dir) do
+    File.mkdir_p!(dest_dir)
+    final = Path.join(dest_dir, "Fermix.app")
+
+    case replace_bundle(app, final) do
+      :ok ->
+        :ok
+
+      {:error, posix} when posix in [:eperm, :eacces] ->
+        {:error, {:app_management_denied, final, posix}}
+
+      {:error, reason} ->
+        {:error, {:publish_failed, final, reason}}
+    end
+  end
+
+  defp replace_bundle(app, final) do
+    with {:ok, _removed} <- File.rm_rf(final),
+         :ok <- File.rename(app, final) do
+      :ok
+    else
+      {:error, reason, _file} -> {:error, reason}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # The installed executable: inside the `.app` on macOS, a bare binary elsewhere.
   defp cache_path(opts, target) do
-    root = Keyword.get(opts, :cache_dir, default_cache_dir())
-    Path.join([root, version(), target, @command])
+    Path.join([artifact_root(opts, target), exec_relpath(target)])
   end
+
+  # Directory a target's artifact extracts into (`<cache>/<version>/<target>/`).
+  defp artifact_root(opts, target) do
+    root = Keyword.get(opts, :cache_dir, default_cache_dir())
+    Path.join([root, version(), target])
+  end
+
+  defp exec_relpath("macos-" <> _), do: Path.join(["Fermix.app", "Contents", "MacOS", @command])
+  defp exec_relpath(_), do: @command
 
   defp default_cache_dir, do: :filename.basedir(:user_cache, "compux")
 
+  @doc """
+  Release artifact filename for a target: a zipped signed `.app` on macOS (its code
+  signature must survive extraction), a bare-binary tarball elsewhere. Public so the
+  `compux.checksum` task names artifacts identically.
+  """
+  @spec artifact_name(String.t(), String.t()) :: String.t()
+  def artifact_name(version, target),
+    do: "#{@command}-#{version}-#{target}.#{archive_ext(target)}"
+
+  defp archive_ext("macos-" <> _), do: "zip"
+  defp archive_ext(_), do: "tar.gz"
+
   defp artifact_url(target) do
     version = version()
-    "#{@release_base}/v#{version}/#{@command}-#{version}-#{target}.tar.gz"
+    "#{@release_base}/v#{version}/#{artifact_name(version, target)}"
   end
 
   # The loaded app version, resolved at runtime so it is correct no matter which
@@ -203,8 +303,18 @@ defmodule Compux.Binary do
     {:ok, _} = Application.ensure_all_started(:inets)
     {:ok, _} = Application.ensure_all_started(:ssl)
 
+    # customize_hostname_check is required for wildcard certs: GitHub serves
+    # release assets from release-assets.githubusercontent.com behind a
+    # *.githubusercontent.com cert, and Erlang's default DNS-ID matching
+    # rejects wildcards unless the HTTPS match function is supplied.
     http_opts = [
-      ssl: [verify: :verify_peer, cacerts: :public_key.cacerts_get()],
+      ssl: [
+        verify: :verify_peer,
+        cacerts: :public_key.cacerts_get(),
+        customize_hostname_check: [
+          match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
+        ]
+      ],
       autoredirect: true,
       connect_timeout: @connect_timeout_ms,
       timeout: @download_timeout_ms
