@@ -69,6 +69,11 @@ mod semantic;
 /// each listed control sits inside.
 mod listing;
 
+/// Linux accessibility: the AT-SPI reader behind `ax::Ax`, and the session and bus
+/// it reads through (M86 L1).
+#[cfg(target_os = "linux")]
+mod linux;
+
 /// Held synthetic input: the press registry and the `Platform` seam every input
 /// sequence posts through, so nothing this process presses can outlive the action.
 mod held;
@@ -681,7 +686,7 @@ fn before_dispatch(
     gate: &Gate,
     worker: &mut Worker,
 ) -> Result<(), Failure> {
-    if !worker.accessibility && reads_controls(request) {
+    if !worker.accessibility && reads_controls(request) && !only_lists(request) {
         return Err(Failure::new(
             "accessibility_unavailable",
             "this build has no accessibility API, so it cannot read or act on controls by name; \
@@ -704,6 +709,12 @@ fn before_dispatch(
 /// What a reply needs to reach the caller before its deadline: a wait gives this
 /// much back rather than answer late.
 const DEADLINE_MARGIN_MS: u64 = 250;
+
+/// Is this request a listing a reader answers on its own: `elements`, in a build
+/// that reads controls without acting on them?
+fn only_lists(request: &wire::Request) -> bool {
+    controls_readable() && READING_ACTIONS.contains(&request.action.as_str())
+}
 
 /// Does this request read or act on controls through the accessibility API? A
 /// check that waits on the tree does, whatever the action.
@@ -1096,17 +1107,31 @@ const ACCESSIBILITY_ACTIONS: [&str; 11] = [
     "wait_for",
 ];
 
+/// Of those, the one that lists controls, which every build with an accessibility
+/// reader answers: macOS, and Linux through AT-SPI.
+const READING_ACTIONS: [&str; 1] = ["elements"];
+
 /// The verbs that bind a window.
 const TARGET_ACTIONS: [&str; 2] = ["select_target", "release_target"];
 
-/// The verbs this build can really serve: the accessibility ones only where there
-/// is an accessibility API, the window ones only where a window can be bound.
+/// The verbs this build can really serve: `elements` only where there is a reader,
+/// the other accessibility ones only where there is an accessibility API that acts,
+/// the window ones only where a window can be bound.
 fn advertised_actions() -> Vec<&'static str> {
     ACTIONS
         .into_iter()
-        .filter(|action| accessibility_supported() || !ACCESSIBILITY_ACTIONS.contains(action))
+        .filter(|action| accessibility_served(action))
         .filter(|action| targets_supported() || !TARGET_ACTIONS.contains(action))
         .collect()
+}
+
+/// Whether this build answers an action that reads or acts on controls: every one
+/// where it acts through an accessibility API, only the listing where it reads one.
+/// An action that is neither is always served.
+fn accessibility_served(action: &str) -> bool {
+    !ACCESSIBILITY_ACTIONS.contains(&action)
+        || accessibility_supported()
+        || (controls_readable() && READING_ACTIONS.contains(&action))
 }
 
 /// How an action can reach the machine in this build: `ax` only where there is an
@@ -1119,10 +1144,17 @@ fn input_methods() -> Vec<&'static str> {
     }
 }
 
-/// Does this build speak an accessibility API? Off macOS every accessibility verb
-/// answers a typed refusal, and [M86] L1 flips this with the Linux reader.
+/// Does this build act through an accessibility API? Off macOS every verb that acts
+/// on a control answers a typed refusal; [M86] L1 flips this for Linux with its
+/// verbs.
 fn accessibility_supported() -> bool {
     cfg!(target_os = "macos")
+}
+
+/// Does this build read an application's controls? macOS, and Linux through AT-SPI
+/// (M86 L1, the reading half).
+fn controls_readable() -> bool {
+    cfg!(any(target_os = "macos", target_os = "linux"))
 }
 
 /// Can this build bind a window at all?
@@ -4324,7 +4356,7 @@ fn listing_scene(
             window: Some(target::ax_root(target)?),
         });
     }
-    match view_target(geom, region)? {
+    match view_target(&worker.ax, geom, region)? {
         Ok(app) => Ok(semantic::Scene {
             pid: app.pid,
             window: None,
@@ -5039,7 +5071,7 @@ fn interactive_in_view(
     region: &Region,
     gate: &Gate,
 ) -> Result<Viewed, Failure> {
-    let target = match view_target(geom, region)? {
+    let target = match view_target(ax_platform, geom, region)? {
         Ok(target) => target,
         Err(note) => return Ok(Viewed::nothing(note)),
     };
@@ -5176,7 +5208,11 @@ fn settled_view(
 /// is none (a desktop with nothing in front, a window listing the OS refused), or
 /// a typed failure because this platform has no accessibility API at all.
 #[cfg(target_os = "macos")]
-fn view_target(geom: &Geometry, region: &Region) -> Result<Result<TargetApp, String>, Failure> {
+fn view_target(
+    _ax: &Rc<dyn ax::Ax>,
+    geom: &Geometry,
+    region: &Region,
+) -> Result<Result<TargetApp, String>, Failure> {
     let candidates = match window_candidates(geom) {
         Ok(candidates) => candidates,
         Err(reason) => return Ok(Err(reason)),
@@ -5186,12 +5222,29 @@ fn view_target(geom: &Geometry, region: &Region) -> Result<Result<TargetApp, Str
         .ok_or_else(|| "no application window to target for accessibility".to_string()))
 }
 
-/// Linux has no accessibility API this build speaks. A typed failure, not an
-/// empty list: a caller that cannot tell "nothing there" from "not supported
-/// here" writes the wrong sentence about both.
-#[cfg(not(target_os = "macos"))]
-fn view_target(_geom: &Geometry, _region: &Region) -> Result<Result<TargetApp, String>, Failure> {
-    Err("element enumeration is only supported on macOS".into())
+/// On Linux, the application whose window reads ACTIVE on the accessibility bus.
+/// Not the window under the view, as on macOS: telling which X window a frame is
+/// takes the window list, which arrives with bound windows (M86 L3). The view still
+/// decides which of its controls are listed.
+#[cfg(target_os = "linux")]
+fn view_target(
+    ax: &Rc<dyn ax::Ax>,
+    _geom: &Geometry,
+    _region: &Region,
+) -> Result<Result<TargetApp, String>, Failure> {
+    Ok(linux::atspi::frontmost_application(ax).map(|(pid, app)| TargetApp { pid, app }))
+}
+
+/// No accessibility API this build speaks. A typed failure, not an empty list: a
+/// caller that cannot tell "nothing there" from "not supported here" writes the
+/// wrong sentence about both.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn view_target(
+    _ax: &Rc<dyn ax::Ax>,
+    _geom: &Geometry,
+    _region: &Region,
+) -> Result<Result<TargetApp, String>, Failure> {
+    Err("element enumeration is only supported on macOS and Linux".into())
 }
 
 /// Ask one application to expose its accessibility tree, where that is a thing
@@ -5201,7 +5254,21 @@ fn activate_accessibility(pid: i32) -> Result<String, String> {
     ax::activate_accessibility(pid)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Linux has no switch per application, and compux changes no accessibility setting
+/// for the person: a toolkit publishes its tree, or `doctor` says what is
+/// missing. The empty tree is still walked again while it settles — Chromium builds
+/// its tree after the first client reads it. A GTK 4 application's tree is there
+/// but lists nothing, having no screen positions, and the reason says so.
+#[cfg(target_os = "linux")]
+fn activate_accessibility(_pid: i32) -> Result<String, String> {
+    Err(
+        "nothing to switch on: a Linux toolkit publishes its own tree or none, \
+         and GTK 4 controls are not listed yet (no screen positions)"
+            .to_string(),
+    )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn activate_accessibility(_pid: i32) -> Result<String, String> {
     Err("no accessibility API on this platform".to_string())
 }
@@ -5955,16 +6022,20 @@ mod tests {
 
     // F1: the handshake lists only what THIS build can do. The engine builds the
     // model's verbs from it, and a verb that always refuses is a verb the model is
-    // invited to waste a turn on.
-    #[cfg(not(target_os = "macos"))]
+    // invited to waste a turn on. The Linux build reads controls (M86 L1, the
+    // reading half) and acts on none of them yet, and binds no window.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn off_macos_the_handshake_offers_no_accessibility_and_no_bound_windows() {
+    fn on_linux_the_handshake_offers_elements_and_nothing_that_acts_on_a_control() {
         let v = hello(&test_launcher()).unwrap();
 
-        for absent in MACOS_ONLY_ACTIONS {
+        for absent in MACOS_ONLY_ACTIONS
+            .into_iter()
+            .filter(|action| *action != "elements")
+        {
             assert!(
                 !advertised(&v).contains(&absent),
-                "{absent} is not offered off macOS"
+                "{absent} is not offered on Linux"
             );
         }
         assert_eq!(
@@ -5982,12 +6053,14 @@ mod tests {
                 "wait",
                 "wait_for_change",
                 "paste",
+                "elements",
                 "windows",
             ]
         );
         assert_eq!(
             v["capabilities"]["input_methods"],
-            json!(["foreground_hid"])
+            json!(["foreground_hid"]),
+            "`ax` is how an action reaches a control, and none does on Linux yet"
         );
     }
 
@@ -7554,6 +7627,91 @@ mod tests {
             json!(140),
             "with the point it can be clicked at"
         );
+    }
+
+    // M86 L1, the reading half: on Linux `elements` lists the controls of the
+    // application whose window reads ACTIVE, read through AT-SPI by the shared walk,
+    // with references, click points and what the walk cost — from a fake desktop,
+    // never the one this test runs on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_elements_lists_the_controls_of_the_application_in_front() {
+        use crate::linux::fake::{Desktop, Fake, Node, ACTIVE, ENABLED, SENSITIVE, SHOWING};
+
+        const APP: &str = ":1.10";
+        // A process `/proc` can vouch for, so the listing can hand out references.
+        let me = std::process::id();
+        let mut desktop = Desktop::with_applications(vec![(
+            APP,
+            me,
+            Node::of(75).named("fixture").holding(APP, &["/w"]),
+        )]);
+        desktop.put(
+            APP,
+            "/w",
+            Node {
+                states: vec![ACTIVE, ENABLED, SENSITIVE, SHOWING],
+                ..Node::of(23)
+                    .named("Fixture")
+                    .at(0, 0, 800, 600)
+                    .holding(APP, &["/w/save"])
+            },
+        );
+        desktop.put(
+            APP,
+            "/w/save",
+            Node::of(43)
+                .named("Save")
+                .at(100, 200, 80, 24)
+                .acting(&[Ok("click")]),
+        );
+        let (fake, bus) = Fake::start(desktop, Duration::from_millis(200));
+        let platform: Rc<dyn ax::Ax> = Rc::new(linux::atspi::Real::over(bus));
+        let gate = Gate::new("boot-test".to_string(), Arc::new(SystemClock::new()));
+        let facts = MonitorFacts {
+            x: 0,
+            y: 0,
+            width: 1366,
+            height: 768,
+            scale_factor: 1.0,
+        };
+        let geom = Geometry::from_facts(
+            &facts,
+            geometry::Measurement {
+                frame_w: 1366,
+                frame_h: 768,
+                pixels_per_point: 1.0,
+            },
+            Host::Linux,
+        );
+
+        let (payload, listed) =
+            elements_for(&platform, &geom, &Region::full(&geom), &gate).expect("a listing");
+
+        assert_eq!(
+            payload["elements"],
+            json!([{
+                "element_ref": "e1",
+                "role": "unknown",
+                "native_role": "push button",
+                "label": "Save",
+                "enabled": true,
+                "verbs": [],
+                "bounds": { "x": 100, "y": 200, "w": 80, "h": 24 },
+                "path": ["fixture", "Fixture"],
+                "x": 140,
+                "y": 212
+            }])
+        );
+        assert_eq!(listed.map(|listed| listed.len()), Some(1));
+        let walked = payload["ax_messages"].as_u64().expect("a count");
+        assert!(
+            walked > 0 && walked < fake.calls().len() as u64,
+            "the walk alone is counted, not the lookup of the application in front"
+        );
+        assert!(payload["ax_activation"]
+            .as_str()
+            .is_some_and(|note| note.starts_with("read ")));
     }
 
     // A walk that stopped early SAYS it stopped early. Without that a caller reads
@@ -9997,12 +10155,12 @@ mod tests {
     }
 
     // Off macOS (until L1) every action that reads or acts on controls says the
-    // build has no accessibility API, rather than refusing the control.
+    // build has no accessibility API, rather than refusing the control. The Linux
+    // build lists controls (its own tests), and acts on none yet.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn off_macos_every_control_action_says_there_is_no_accessibility() {
         for body in [
-            json!({"action": "elements"}),
             json!({"action": "inspect", "x": 1, "y": 1, "observation_id": "o-1"}),
             json!({"action": "press", "element_ref": "e1", "observation_id": "o-1"}),
             json!({"action": "focus", "element_ref": "e1", "observation_id": "o-1"}),

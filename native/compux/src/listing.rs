@@ -210,6 +210,11 @@ pub fn element_value(
     if let Some(hidden) = node.hidden {
         object.insert("hidden".to_string(), json!(hidden));
     }
+    // Only where it is true: some of the control's own actions could not be named,
+    // so what it can do may be more than its verbs say.
+    if node.actions_partial {
+        object.insert("actions_partial".to_string(), json!(true));
+    }
 
     item
 }

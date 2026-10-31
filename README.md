@@ -184,6 +184,35 @@ which outlasts Chromium's two-second debounce, and every switch the helper turne
 is turned off again when it exits. `ax_activation` says what happened, and
 `ax_messages` counts only the last of those walks: the one whose list is returned.
 
+On Linux, `elements` reads the same way through AT-SPI, the desktop's accessibility
+bus, and the same walk lists what it finds (M86 L1, the reading half):
+
+* the application read is the one whose window reads ACTIVE on the accessibility
+  bus, and the view decides which of its controls are listed;
+* `native_role` is AT-SPI's own role, as the name of its `AtspiRole` constant
+  (`push button`, `check box`, `password text`, …), and `role` reads `unknown` until
+  the role table has an AT-SPI column; a control is listed for its role or for one
+  of its own actions named `click`, `press`, `activate`, `jump`, `check`, `open`,
+  `clickAncestor`, `toggle`, `increase` or `decrease`, in any case;
+* every property is read with its own `Get`, the optional interfaces only when the
+  node lists them, and action names one index at a time (`NActions`, then
+  `GetName(i)`). The helper never sends `Action.GetActions` — ATK bridge 2.38
+  (Ubuntu 22.04) aborts the application it is sent to — and never
+  `Properties.GetAll`, which kills a Qt 6.4 application. A control some of whose
+  actions would not name says `"actions_partial": true`;
+* a node's reads go out together, and up to eight siblings are read at once;
+* bounds are the X11 screen extents of a node that says it is SHOWING; a password
+  field (`password text`) is listed and its text is never asked for;
+* GTK 4 has no screen positions, on X11 too (it answers every node's screen extents
+  at 0, 0), so a GTK 4 application's controls are not listed yet;
+* `ax_messages` counts the D-Bus calls of the walk.
+
+The Linux build reads controls and does not act on them yet: a control lists no
+verbs, `hello` offers none of them, nor `wait_for` or `inspect`, and an element
+reference is used only to read again. Nothing on Linux switches accessibility on for the person: an application
+that publishes no tree (a Qt one without `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`, a
+GTK4 one started before the accessibility bus) lists nothing.
+
 Two actions address a control rather than a point:
 
 * **`press/3`** performs the control's own press. The pointer does not move and it
@@ -292,9 +321,10 @@ binary is installed separately, this is what keeps them from silently drifting.
 
 The handshake's `actions` and `capabilities.input_methods` list only what that
 build can do. The macOS build lists every verb and both input methods
-(`foreground_hid`, `ax`); the Linux build lists neither `ax` nor the verbs that need
-the accessibility API or a bound window — `inspect`, `elements`, `press`,
-`set_value`, `select_target` and `release_target` — so a caller that offers what
+(`foreground_hid`, `ax`). The Linux build lists `elements`, which it reads through
+AT-SPI, and neither `ax` nor the actions that act through the accessibility API,
+wait on it or need a bound window — `inspect`, the verbs on a reference,
+`wait_for`, `select_target` and `release_target` — so a caller that offers what
 `hello` lists never offers a verb whose every use is a refusal.
 
 ## Installation
@@ -316,13 +346,13 @@ embedder that manages its own signed install passes an explicit `:binary_path` t
 macOS-first. **Apple-Silicon macOS** is the primary, fully-featured target
 (capture, input, accessibility `inspect` + `elements`, non-prompting permission
 probe, idle detection). **Linux/X11** supports capture + input + `wait_for_change`
-+ `paste` (the accessibility actions — `inspect` and `elements` — are macOS-only and
-return a typed error on Linux; the paste chord is Ctrl+V). The permission
-`probe` works on both (on Linux it reports X11-vs-Wayland capability).
-**Wayland**, **Linux accessibility**, and **Windows** are not supported yet. The
-accessibility actions `press` and `set_value` are macOS-only for the same reason
-`elements` is, and answer a typed error elsewhere rather than an empty success. The
-Linux build's `hello` does not list them (see "The version handshake").
++ `paste` (the paste chord is Ctrl+V), and `elements` through AT-SPI (see "Controls
+have names"). `inspect`, the verbs on a reference and `wait_for` are macOS-only
+and answer `accessibility_unavailable` on Linux rather than an empty success; the
+Linux build's `hello` does not list them (see "The version handshake"). The permission `probe` works on both (on
+Linux it reports X11-vs-Wayland capability). **Wayland** and **Windows** are not
+supported yet: on Wayland `elements` still needs the X11 display it measures its
+view on.
 
 `idle_ms` / `wait_for_idle` (operational, not model actions) report how long the
 human has been idle — a coexistence signal so a policy layer can yield the seat to

@@ -147,9 +147,9 @@ impl Refusal {
 /// "nothing here" dropped a slow container's whole subtree from a listing that
 /// still said it was complete — and with a quarter-second timeout on every read
 /// (M2), a slow container is the ordinary case, not the odd one.
-// Only the macOS reader and the recording platform produce these. The Linux build
-// has no reader yet, holds nothing, and so only ever answers `Gone`.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// The macOS and Linux readers and the recording platform produce these; a build for
+// anywhere else has no reader, holds nothing, and so only ever answers `Gone`.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unread {
     /// The message went out and no answer came within its timeout
@@ -184,6 +184,10 @@ pub struct Facts {
     /// The action names the control advertises for ITSELF. Nothing is inferred
     /// from what its role suggests it ought to support.
     pub actions: Vec<String>,
+    /// Some of its actions could not be named, so `actions` is not all of them.
+    /// AT-SPI names each action by index, and an index that errors is left out
+    /// rather than guessed; macOS names them in one call and never sets this.
+    pub actions_partial: bool,
     /// Where it is now, in global logical points.
     pub frame: Option<Frame>,
 }
@@ -276,12 +280,12 @@ pub struct Retained {
 }
 
 impl Retained {
-    /// Take ownership of a reference the platform has already retained. Private
-    /// on purpose: only the platform may say a reference exists — which is exactly
-    /// the two places this is gated to: the macOS reader, and the recording
-    /// platform the tests drive on every target.
-    #[cfg(any(target_os = "macos", test))]
-    fn new(handle: Handle, ax: Rc<dyn Ax>) -> Retained {
+    /// Take ownership of a reference the platform has already retained. Only the
+    /// platform may say a reference exists — which is exactly the places this is
+    /// gated to: the macOS reader, the Linux reader (`linux::atspi`), and the
+    /// recording platform the tests drive on every target.
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    pub(crate) fn new(handle: Handle, ax: Rc<dyn Ax>) -> Retained {
         Retained { handle, ax }
     }
 
@@ -559,7 +563,7 @@ pub fn bounded_value(value: String) -> String {
 /// platform and every caller, so a listing, a re-read after an action and a window
 /// match name a control the same way, and application text is flattened before
 /// anything above the seam can see it.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub fn label(title: Option<String>, description: Option<String>) -> Option<String> {
     title
         .or(description)
@@ -973,6 +977,8 @@ mod mac {
                 role,
                 subrole,
                 actions,
+                // One call names every action, or none are named.
+                actions_partial: false,
             })
         }
     }
@@ -1919,12 +1925,17 @@ pub use mac::{
     Real, ENHANCED_UI, MANUAL_ACCESSIBILITY,
 };
 
+// --- Linux: the AT-SPI reader -------------------------------------------------
+
+#[cfg(target_os = "linux")]
+pub use crate::linux::atspi::Real;
+
 // --- everywhere else: typed unsupported ---------------------------------------
 
-/// Linux has no accessibility API this build speaks, so every call answers the
+/// A system with no accessibility API this build speaks, so every call answers the
 /// same typed refusal. Deliberately not an empty success: a caller that cannot
 /// tell "nothing there" from "not supported here" writes the wrong sentence.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod stub {
     use super::{
         Ax, Facts, Focus, Handle, Refusal, Retained, Route, Routes, States, Unread, Write,
@@ -2056,7 +2067,7 @@ mod stub {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub use stub::Real;
 
 // --- the recording platform (tests only) --------------------------------------
@@ -2078,6 +2089,8 @@ pub struct Scripted {
     pub enabled: bool,
     /// The action names it advertises for ITSELF.
     pub actions: Vec<String>,
+    /// Some of its actions could not be named.
+    pub actions_partial: bool,
     pub settable: bool,
     /// `None` is a node that will not say where it is.
     pub frame: Option<Frame>,
@@ -2115,6 +2128,7 @@ impl Scripted {
             enabled: self.enabled,
             secure: self.secure(),
             actions: self.actions.clone(),
+            actions_partial: self.actions_partial,
             frame: self.frame,
         }
     }
@@ -2128,6 +2142,7 @@ impl Scripted {
             value: None,
             enabled: true,
             actions: Vec::new(),
+            actions_partial: false,
             settable: false,
             frame: None,
             children: Vec::new(),

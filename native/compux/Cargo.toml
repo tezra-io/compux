@@ -59,6 +59,20 @@ objc2-core-media = "0.3"
 objc2-core-video = "0.3"
 objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = ["std", "SCStream", "SCShareableContent", "SCError", "block2", "dispatch2", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-media"] }
 
+# Linux accessibility (M86 L1): AT-SPI over D-Bus, pure Rust (no libdbus), driven
+# with `async_io::block_on` (the executor zbus itself runs on) from the one action
+# worker — no tokio, no runtime of our own. `futures-util` only for running a node's
+# reads concurrently and bounding how many nodes are in flight.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["async-io"] }
+async-io = "2"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
+# The reader's unit tests answer it from fake AT-SPI servers over a peer-to-peer
+# connection: no bus daemon, no desktop.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zbus = { version = "5", default-features = false, features = ["async-io", "p2p"] }
+
 [profile.release]
 strip = true
 opt-level = "z"

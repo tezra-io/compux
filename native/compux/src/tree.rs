@@ -67,10 +67,11 @@ const TRUNCATED_NODES: &str = "nodes";
 const TRUNCATED_DEPTH: &str = "depth";
 const TRUNCATED_TIME: &str = "time";
 
-/// Roles worth surfacing as targets. A password field is an `AXTextField`
-/// here and is told apart by its subrole, so it is listed like any other
-/// field — a control the caller cannot see at all is one it invents a reason
-/// for missing — and its value is withheld instead.
+/// Roles worth surfacing as targets, in each reader's own words: macOS's AX roles,
+/// then AT-SPI's (`linux::vocabulary`). A password field is listed like any other
+/// field — a control the caller cannot see at all is one it invents a reason for
+/// missing — and its value is withheld instead: on macOS it is an `AXTextField`
+/// told apart by its subrole, on Linux a `password text`.
 const INTERACTIVE: &[&str] = &[
     "AXButton",
     "AXMenuItem",
@@ -86,12 +87,38 @@ const INTERACTIVE: &[&str] = &[
     "AXSlider",
     "AXDisclosureTriangle",
     "AXCell",
+    "push button",
+    "toggle button",
+    "check box",
+    "radio button",
+    "menu item",
+    "check menu item",
+    "radio menu item",
+    "combo box",
+    "text",
+    "entry",
+    "password text",
+    "spin button",
+    "slider",
+    "link",
+    "page tab",
+    "list item",
+    "table cell",
+    "tree item",
+    "push button menu",
+    "switch",
 ];
 
 /// The actions that make a node a control whatever its role (M4): it does
 /// something when operated. Not `AXShowMenu`, `AXScrollToVisible`, `AXRaise` or
 /// a focus-only action — every container answers those, and listing on them would
 /// list the whole tree.
+///
+/// Then AT-SPI's, as `GetName(i)` names them: the press names (click, press,
+/// activate, jump, check, open, clickAncestor) and Qt's toggle and stepping names
+/// (L3-19). Not `doDefault`, which Chromium advertises on plain text where it does
+/// nothing (L18-16), nor `showContextMenu`, `ShowMenu` or `SetFocus`. The toolkits disagree on case, so these are compared
+/// without it.
 const PRIMARY_ACTIONS: &[&str] = &[
     "AXPress",
     "AXConfirm",
@@ -99,6 +126,16 @@ const PRIMARY_ACTIONS: &[&str] = &[
     "AXIncrement",
     "AXDecrement",
     "AXOpen",
+    "click",
+    "press",
+    "activate",
+    "jump",
+    "check",
+    "open",
+    "clickAncestor",
+    "toggle",
+    "increase",
+    "decrease",
 ];
 
 /// Whether a node gets a reference: its role is one a person operates, OR its own
@@ -112,9 +149,11 @@ pub fn eligible(role: Option<&str>, actions: &[String]) -> bool {
         return false;
     };
     INTERACTIVE.contains(&role)
-        || actions
-            .iter()
-            .any(|action| PRIMARY_ACTIONS.contains(&action.as_str()))
+        || actions.iter().any(|action| {
+            PRIMARY_ACTIONS
+                .iter()
+                .any(|primary| primary.eq_ignore_ascii_case(action))
+        })
 }
 
 /// A find (protocol 12): the nodes whose normalised role is `role` and whose text
@@ -157,6 +196,8 @@ pub struct Node {
     /// Its OWN action names. Never inferred from the role: a control that looks
     /// pressable and is not would be a refusal the caller was invited to expect.
     pub actions: Vec<String>,
+    /// Some of its actions could not be named, so `actions` is not all it has.
+    pub actions_partial: bool,
     /// Which of its attributes may be written; `select` also when its container
     /// selects its children.
     pub routes: Routes,
@@ -634,6 +675,7 @@ impl<'a> Walker<'a> {
             value,
             routes,
             states,
+            actions_partial: facts.actions_partial,
             secure: facts.secure,
             enabled: facts.enabled,
             label: facts.label,
@@ -876,6 +918,94 @@ mod tests {
             !presses(&found.nodes[2]),
             "a role lists it, and its own list has no press"
         );
+    }
+
+    // The Linux reader answers AT-SPI's own words (M86 L1): its roles, and the
+    // action names `GetName(i)` gives, which the toolkits spell in their own case —
+    // GTK `click`, Qt `Press` and `Toggle`, Chromium `clickAncestor` (L3-19).
+    #[test]
+    fn an_at_spi_node_is_listed_for_its_role_or_a_primary_action_in_any_case() {
+        let none: Vec<String> = Vec::new();
+        for role in [
+            "push button",
+            "toggle button",
+            "check box",
+            "radio button",
+            "menu item",
+            "check menu item",
+            "radio menu item",
+            "combo box",
+            "text",
+            "entry",
+            "password text",
+            "spin button",
+            "slider",
+            "link",
+            "page tab",
+            "list item",
+            "table cell",
+            "tree item",
+            "push button menu",
+            "switch",
+        ] {
+            assert!(eligible(Some(role), &none), "{role} is a control");
+        }
+        for role in ["panel", "filler", "label", "frame", "scroll pane", "static"] {
+            assert!(
+                !eligible(Some(role), &none),
+                "{role} alone is not a control"
+            );
+        }
+
+        for primary in [
+            "click",
+            "Press",
+            "press",
+            "activate",
+            "jump",
+            "check",
+            "open",
+            "clickAncestor",
+            "Toggle",
+            "Increase",
+            "Decrease",
+        ] {
+            assert!(
+                eligible(Some("panel"), &[primary.to_string()]),
+                "{primary} makes a control"
+            );
+        }
+        for secondary in [
+            "showContextMenu",
+            "ShowMenu",
+            "SetFocus",
+            "doDefault",
+            "menu",
+        ] {
+            assert!(
+                !eligible(Some("panel"), &[secondary.to_string()]),
+                "{secondary} alone is not a primary action"
+            );
+        }
+    }
+
+    // An action that could not be named is not invented, and the control says its
+    // list is not all of them.
+    #[test]
+    fn a_control_whose_actions_were_partly_named_says_so() {
+        let (_recorder, ax) = platform(vec![
+            Scripted {
+                actions_partial: true,
+                ..acting("push button", "Save", &["click"])
+            },
+            acting("push button", "Open", &["click"]),
+        ]);
+
+        let found = whole(&ax);
+
+        assert_eq!(labels(&found), vec!["Save", "Open"]);
+        assert!(found.nodes[0].actions_partial);
+        assert!(!found.nodes[1].actions_partial);
     }
 
     // A subrole is never a role, and a password field is listed like any other
