@@ -25,7 +25,8 @@
 #
 # 8. verbs (M86 L1): every verb compux answers on Linux, on each fixture in noble,
 #    judged by what the fixture recorded (verbs.py); verbs-jammy: the same on GTK3 in
-#    jammy (ATK bridge 2.38).
+#    jammy (ATK bridge 2.38), under the same bus monitor as L0(b), so its writes are
+#    counted and no GetActions and no GetAll may be among anything sent.
 #
 # SPIKE_STAGES picks the stages (default "a b wayland chromium verbs verbs-jammy"). Docker is whatever
 # DOCKER (default `docker`) and DOCKER_HOST name. CHROMIUM_BASE is the Debian
@@ -163,7 +164,7 @@ fi
 
 if staged b; then
   echo "== L0(b) gtk3 under ATK bridge 2.38 (jammy)"
-  in_session compux-spike:jammy gtk3 bash /opt/compux-spike/atk_bridge_check.sh "$RUNS" \
+  in_session compux-spike:jammy gtk3 bash /opt/compux-spike/atk_bridge_check.sh walk "$RUNS" \
     || failed+=("b:gtk3")
 fi
 
@@ -191,9 +192,7 @@ fi
 
 if staged verbs-jammy; then
   echo "== L1 verbs gtk3 under ATK bridge 2.38 (jammy)"
-  in_session compux-spike:jammy gtk3 python3 /opt/compux-spike/verbs.py \
-    --binary /opt/compux/compux --toolkit gtk3 \
-    --state /tmp/compux-fixture-state/gtk3.json --out /tmp/spike-out/gtk3-jammy-verbs.json \
+  in_session compux-spike:jammy gtk3 bash /opt/compux-spike/atk_bridge_check.sh verbs \
     || failed+=("verbs:gtk3-jammy")
 fi
 
