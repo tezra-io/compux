@@ -377,10 +377,13 @@ fn main() {
     #[cfg(target_os = "macos")]
     disclaim::become_responsible();
 
-    // Linux: a helper started with no display takes the session's from the user
-    // manager, before compux starts a thread of its own.
+    // Linux: where this process's display is, decided once and carried as a value,
+    // never written into the environment: its own, or for a helper started with
+    // none, the session's from the user manager (controls only).
     #[cfg(target_os = "linux")]
-    linux::display::adopt_from_user_manager();
+    let endpoint = Endpoint::of_session();
+    #[cfg(not(target_os = "linux"))]
+    let endpoint = Endpoint {};
 
     // One serialized writer shared by the control reader, the action worker and
     // the capture observer thread (§8.4a): every response, acknowledgement, ack
@@ -407,7 +410,7 @@ fn main() {
 
     // The action worker runs on the MAIN thread: input stays where it runs today,
     // and AppKit will want this thread in a later slice.
-    run_worker(jobs, &gate, &emitter);
+    run_worker(jobs, &gate, &emitter, endpoint);
 
     // Every sender is gone, so stdin reached EOF: the owning Port closed. Tear down any live
     // capture observer, then switch OFF any accessibility attribute this process
@@ -423,6 +426,24 @@ fn main() {
 /// taken for one of ours. The pid alone would not do it — pids are reused.
 fn boot_generation() -> String {
     format!("boot-{}-{}", std::process::id(), capture::now_ms())
+}
+
+/// Where this process's display is. Linux decides it once, at start, and carries
+/// it as a value (`linux::display::Endpoint`); a macOS helper's is always the
+/// session's own, with nothing to carry.
+#[cfg(target_os = "linux")]
+use linux::display::Endpoint;
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Debug, Default)]
+struct Endpoint {}
+
+#[cfg(not(target_os = "linux"))]
+impl Endpoint {
+    /// Pixels always reach the session's own display.
+    fn pixels(&self) -> bool {
+        true
+    }
 }
 
 /// Everything the action worker owns that is neither on the wire nor in the gate:
@@ -466,14 +487,33 @@ struct Worker {
     /// When the request in hand must have answered, on the gate's clock, where it
     /// named a `deadline_ms`: a wait never outlives it.
     cutoff_ms: Option<u64>,
+    /// Where this process's display is: what the handshake, the probe and the
+    /// pixel actions read to know whether pixels reach it.
+    endpoint: Endpoint,
+}
+
+/// The accessibility reader of this process, on its display.
+#[cfg(target_os = "linux")]
+fn reader(endpoint: &Endpoint) -> ax::Real {
+    ax::Real::on(endpoint.clone())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reader(_endpoint: &Endpoint) -> ax::Real {
+    ax::Real::new()
 }
 
 /// The serial action worker. One request at a time, to completion, on this thread.
-fn run_worker(jobs: mpsc::Receiver<control::Job>, gate: &Gate, emitter: &capture::Emitter) {
+fn run_worker(
+    jobs: mpsc::Receiver<control::Job>,
+    gate: &Gate,
+    emitter: &capture::Emitter,
+    endpoint: Endpoint,
+) {
     let mut worker = Worker {
         observations: Observations::new(&gate.envelope().sidecar_generation, gate.clock()),
         measured: Measured::new(),
-        ax: Rc::new(ax::Real::new()),
+        ax: Rc::new(reader(&endpoint)),
         frames: Rc::new(Screen),
         windows: Arc::new(window_server::Real::new()),
         launcher: Arc::new(indicator::Bundled::new()),
@@ -484,6 +524,7 @@ fn run_worker(jobs: mpsc::Receiver<control::Job>, gate: &Gate, emitter: &capture
         accessibility: accessibility_supported(),
         until_held: None,
         cutoff_ms: None,
+        endpoint,
     };
 
     for job in jobs {
@@ -635,11 +676,11 @@ fn handle(
     let req = &request.body;
 
     match request.action.as_str() {
-        "hello" => hello(&worker.launcher),
-        "probe" => probe(),
+        "hello" => hello(&worker.launcher, &worker.endpoint),
+        "probe" => probe(&worker.endpoint),
         "idle_ms" => idle_ms(worker),
         "wait_for_idle" => wait_for_idle(req, gate),
-        "request_permissions" => request_permissions(req),
+        "request_permissions" => request_permissions(req, &worker.endpoint),
         // Capture control verbs (MILESTONE_32 §8.4a) — NOT model actions, excluded
         // from `hello`. They return a type-discriminated `ack` frame (even on
         // refusal), never the generic `{ok:false,error}` shape, so the consumer's
@@ -699,6 +740,15 @@ fn before_dispatch(
                 .to_string(),
         ));
     }
+    if needs_pixels(request) && !worker.endpoint.pixels() {
+        return Err(Failure::new(
+            "pixels_unavailable",
+            "this helper has no display of its own: it took the session's from the user \
+             manager, which its screen capture and input cannot reach, so it works by control \
+             only (`elements` and the verbs on a reference); nothing was sent"
+                .to_string(),
+        ));
+    }
     if POINT_ACTIONS.contains(&request.action.as_str()) && !points_readable() {
         return Err(Failure::new(
             "unknown_action",
@@ -717,6 +767,13 @@ fn before_dispatch(
         worker.until_held = Some(held_before(request, until, gate, worker)?);
     }
     Ok(())
+}
+
+/// Does this request capture the screen or post input to it? `type` does at the
+/// focus; by reference it acts through the accessibility API.
+fn needs_pixels(request: &wire::Request) -> bool {
+    let action = request.action.as_str();
+    PIXEL_ACTIONS.contains(&action) || (action == "type" && request.element_ref.is_none())
 }
 
 /// What a reply needs to reach the caller before its deadline: a wait gives this
@@ -1058,18 +1115,18 @@ fn observe_ack(action: &str, ok: bool, error: Option<String>) -> Value {
 /// is the model-facing verb set (probe/hello are operational, excluded), and it
 /// lists only what THIS build can do (F1): the engine builds the model's verbs
 /// from it, and a verb whose every use is a refusal is a turn wasted on it.
-fn hello(launcher: &Arc<dyn indicator::Launcher>) -> Result<Value, Failure> {
+fn hello(launcher: &Arc<dyn indicator::Launcher>, endpoint: &Endpoint) -> Result<Value, Failure> {
     Ok(json!({
         "ok": true,
         "protocol_version": PROTOCOL_VERSION,
         "compux_version": env!("CARGO_PKG_VERSION"),
-        "actions": advertised_actions(),
+        "actions": advertised_actions(endpoint),
         // Listed only because this build really has them: the input methods an
         // action can carry, the three controls the gate implements, and the
         // bounds of the observation table — a caller mirrors those numbers to know
         // which ids it may still address before it asks.
         "capabilities": {
-            "input_methods": input_methods(),
+            "input_methods": input_methods(endpoint),
             "controls": ["pause", "resume", "release"],
             "observations": {
                 "max": observation::MAX_OBSERVATIONS,
@@ -1081,7 +1138,7 @@ fn hello(launcher: &Arc<dyn indicator::Launcher>) -> Result<Value, Failure> {
             // it, and finding that out by selecting a window and being refused
             // would be finding it out too late.
             "targets": targets_supported(),
-            "capture_methods": capture_methods(),
+            "capture_methods": capture_methods(endpoint),
             "indicator": indicator_presence(launcher),
         },
     }))
@@ -1139,14 +1196,33 @@ const POINT_ACTIONS: [&str; 1] = ["inspect"];
 /// The verbs that bind a window.
 const TARGET_ACTIONS: [&str; 2] = ["select_target", "release_target"];
 
+/// The verbs that capture the screen or post input to it, through xcap and enigo.
+/// On Linux those reach only this process's own display: they read its
+/// environment, and are never handed a display as a value.
+const PIXEL_ACTIONS: [&str; 11] = [
+    "screenshot",
+    "left_click",
+    "right_click",
+    "double_click",
+    "mouse_move",
+    "left_click_drag",
+    "scroll",
+    "key",
+    "wait_for_change",
+    "paste",
+    "windows",
+];
+
 /// The verbs this build can really serve: the accessibility ones only where there
 /// is an accessibility API, `inspect` only where it can read a point, the window
-/// ones only where a window can be bound.
-fn advertised_actions() -> Vec<&'static str> {
+/// ones only where a window can be bound, and the pixel ones only where pixels
+/// reach this process's display.
+fn advertised_actions(endpoint: &Endpoint) -> Vec<&'static str> {
     ACTIONS
         .into_iter()
         .filter(|action| accessibility_served(action))
         .filter(|action| targets_supported() || !TARGET_ACTIONS.contains(action))
+        .filter(|action| endpoint.pixels() || !PIXEL_ACTIONS.contains(action))
         .collect()
 }
 
@@ -1159,14 +1235,18 @@ fn accessibility_served(action: &str) -> bool {
     accessibility_supported() && (points_readable() || !POINT_ACTIONS.contains(&action))
 }
 
-/// How an action can reach the machine in this build: `ax` only where there is an
-/// accessibility API to carry it.
-fn input_methods() -> Vec<&'static str> {
-    if accessibility_supported() {
-        vec!["foreground_hid", "ax"]
-    } else {
-        vec!["foreground_hid"]
+/// How an action can reach the machine in this build: `foreground_hid` only where
+/// pixels reach this process's display, `ax` only where there is an accessibility
+/// API to carry it.
+fn input_methods(endpoint: &Endpoint) -> Vec<&'static str> {
+    let mut methods = Vec::new();
+    if endpoint.pixels() {
+        methods.push("foreground_hid");
     }
+    if accessibility_supported() {
+        methods.push("ax");
+    }
+    methods
 }
 
 /// Does this build read and act on controls through an accessibility API? macOS,
@@ -1194,11 +1274,11 @@ fn targets_supported() -> bool {
 /// Which capture this build really has. `window` is a bound target's stream, and it
 /// is listed only where it exists: a caller that reads it and gets
 /// `capture_unavailable` on every selection has been lied to.
-fn capture_methods() -> Vec<&'static str> {
-    if targets_supported() {
-        vec!["display", "window"]
-    } else {
-        vec!["display"]
+fn capture_methods(endpoint: &Endpoint) -> Vec<&'static str> {
+    match (endpoint.pixels(), targets_supported()) {
+        (false, _) => Vec::new(),
+        (true, true) => vec!["display", "window"],
+        (true, false) => vec!["display"],
     }
 }
 
@@ -1223,23 +1303,27 @@ fn indicator_presence(launcher: &Arc<dyn indicator::Launcher>) -> &'static str {
 /// notes known without reading an application (`linux::probe`), read-only as
 /// well. Surfaced by the consumer's diagnostics (a doctor/setup surface); the
 /// model never calls this.
-fn probe() -> Result<Value, Failure> {
-    probe_with(accessibility_facts)
+fn probe(endpoint: &Endpoint) -> Result<Value, Failure> {
+    probe_with(endpoint, accessibility_facts)
 }
 
 /// `probe` with the accessibility facts `accessibility` reads: on Linux the
 /// accessibility bus, its packages and the toolkit notes; none on macOS, whose
 /// grants are the two booleans.
 fn probe_with(
+    endpoint: &Endpoint,
     accessibility: impl FnOnce() -> serde_json::Map<String, Value>,
 ) -> Result<Value, Failure> {
-    let mut reply = with_x11_endpoint(json!({
-        "ok": true,
-        "platform": std::env::consts::OS,
-        "display_server": display_server(),
-        "screen_capture": screen_capture_ok(),
-        "input_control": input_control_ok(),
-    }));
+    let mut reply = with_x11_endpoint(
+        json!({
+            "ok": true,
+            "platform": std::env::consts::OS,
+            "display_server": display_server(endpoint),
+            "screen_capture": screen_capture_ok(endpoint),
+            "input_control": input_control_ok(endpoint),
+        }),
+        endpoint,
+    );
     if let Some(object) = reply.as_object_mut() {
         object.extend(accessibility());
     }
@@ -1247,18 +1331,23 @@ fn probe_with(
 }
 
 /// Linux: whether an X endpoint answers, beside Wayland (XWayland) or as the
-/// session itself, since that is all an X client of this helper can reach.
+/// session itself, since that is all an X client of this helper can reach; and
+/// whether the display was taken from the user manager, which serves controls
+/// only.
 #[cfg(target_os = "linux")]
-fn with_x11_endpoint(mut reply: Value) -> Value {
+fn with_x11_endpoint(mut reply: Value, endpoint: &Endpoint) -> Value {
     if let Some(object) = reply.as_object_mut() {
-        let endpoint = linux::display::Server::here().x11_endpoint();
-        object.insert("x11_endpoint".to_string(), json!(endpoint));
+        object.insert(
+            "x11_endpoint".to_string(),
+            json!(endpoint.server().x11_endpoint()),
+        );
+        object.insert("display_adopted".to_string(), json!(endpoint.adopted));
     }
     reply
 }
 
 #[cfg(not(target_os = "linux"))]
-fn with_x11_endpoint(reply: Value) -> Value {
+fn with_x11_endpoint(reply: Value, _endpoint: &Endpoint) -> Value {
     reply
 }
 
@@ -1283,34 +1372,34 @@ fn accessibility_facts() -> serde_json::Map<String, Value> {
 /// variants RAISE the system dialog. The prompts are async, so the returned booleans
 /// are the pre-response snapshot (typically `false` on first call) — the consumer
 /// re-runs `probe` after the user approves. No-op on Linux (no TCC).
-fn request_permissions(_req: &Value) -> Result<Value, Failure> {
+fn request_permissions(_req: &Value, endpoint: &Endpoint) -> Result<Value, Failure> {
     Ok(json!({
         "ok": true,
         "platform": std::env::consts::OS,
-        "screen_capture": request_screen_capture_ok(),
-        "input_control": request_input_control_ok(),
+        "screen_capture": request_screen_capture_ok(endpoint),
+        "input_control": request_input_control_ok(endpoint),
     }))
 }
 
 #[cfg(target_os = "macos")]
-fn request_screen_capture_ok() -> bool {
+fn request_screen_capture_ok(_endpoint: &Endpoint) -> bool {
     permissions::request_screen_capture()
 }
 
 #[cfg(target_os = "macos")]
-fn request_input_control_ok() -> bool {
+fn request_input_control_ok(_endpoint: &Endpoint) -> bool {
     permissions::request_input_control()
 }
 
 // No TCC off macOS: report the same reality `probe` does (there is nothing to prompt).
 #[cfg(not(target_os = "macos"))]
-fn request_screen_capture_ok() -> bool {
-    screen_capture_ok()
+fn request_screen_capture_ok(endpoint: &Endpoint) -> bool {
+    screen_capture_ok(endpoint)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn request_input_control_ok() -> bool {
-    input_control_ok()
+fn request_input_control_ok(endpoint: &Endpoint) -> bool {
+    input_control_ok(endpoint)
 }
 
 #[cfg(target_os = "macos")]
@@ -1483,17 +1572,17 @@ mod pointer {
 }
 
 #[cfg(target_os = "macos")]
-fn display_server() -> &'static str {
+fn display_server(_endpoint: &Endpoint) -> &'static str {
     "quartz"
 }
 
 #[cfg(target_os = "macos")]
-fn screen_capture_ok() -> bool {
+fn screen_capture_ok(_endpoint: &Endpoint) -> bool {
     permissions::screen_capture()
 }
 
 #[cfg(target_os = "macos")]
-fn input_control_ok() -> bool {
+fn input_control_ok(_endpoint: &Endpoint) -> bool {
     permissions::input_control()
 }
 
@@ -1502,32 +1591,32 @@ fn input_control_ok() -> bool {
 // the display server, decided by which socket answers; a real capture/input still
 // fails loud per action.
 #[cfg(target_os = "linux")]
-fn display_server() -> &'static str {
-    linux::display::Server::here().name()
+fn display_server(endpoint: &Endpoint) -> &'static str {
+    endpoint.server().name()
 }
 
 #[cfg(target_os = "linux")]
-fn screen_capture_ok() -> bool {
-    linux::display::Server::here() == linux::display::Server::X11
+fn screen_capture_ok(endpoint: &Endpoint) -> bool {
+    endpoint.pixels() && endpoint.server() == linux::display::Server::X11
 }
 
 #[cfg(target_os = "linux")]
-fn input_control_ok() -> bool {
-    linux::display::Server::here() == linux::display::Server::X11
+fn input_control_ok(endpoint: &Endpoint) -> bool {
+    endpoint.pixels() && endpoint.server() == linux::display::Server::X11
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn display_server() -> &'static str {
+fn display_server(_endpoint: &Endpoint) -> &'static str {
     "unknown"
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn screen_capture_ok() -> bool {
+fn screen_capture_ok(_endpoint: &Endpoint) -> bool {
     false
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn input_control_ok() -> bool {
+fn input_control_ok(_endpoint: &Endpoint) -> bool {
     false
 }
 
@@ -5634,6 +5723,7 @@ mod tests {
             accessibility: true,
             until_held: None,
             cutoff_ms: None,
+            endpoint: Endpoint::default(),
         }
     }
 
@@ -6020,7 +6110,7 @@ mod tests {
     fn the_handshake_offers_targets_exactly_where_a_window_can_be_captured() {
         assert_eq!(
             targets_supported(),
-            capture_methods().contains(&"window"),
+            capture_methods(&Endpoint::default()).contains(&"window"),
             "`targets` and the window capture method are one fact"
         );
     }
@@ -6125,7 +6215,7 @@ mod tests {
 
     #[test]
     fn hello_reports_the_protocol_version_and_verbs() {
-        let v = hello(&test_launcher()).unwrap();
+        let v = hello(&test_launcher(), &Endpoint::default()).unwrap();
         assert_eq!(v["ok"], json!(true));
         assert_eq!(v["protocol_version"], json!(PROTOCOL_VERSION));
         assert!(v["compux_version"].is_string());
@@ -6159,7 +6249,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn on_linux_the_handshake_offers_the_controls_and_their_verbs_and_no_inspect() {
-        let v = hello(&test_launcher()).unwrap();
+        let v = hello(&test_launcher(), &Endpoint::default()).unwrap();
 
         assert_eq!(
             advertised(&v),
@@ -6201,7 +6291,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn on_linux_the_probe_says_which_display_answered() {
-        let v = probe_with(serde_json::Map::new).unwrap();
+        let v = probe_with(&Endpoint::default(), serde_json::Map::new).unwrap();
 
         let server = v["display_server"].as_str().expect("a display server");
         assert!(["x11", "wayland", "none"].contains(&server), "{v}");
@@ -6227,7 +6317,7 @@ mod tests {
             &linux::probe::Packages::default(),
         );
 
-        let v = probe_with(|| facts.clone()).unwrap();
+        let v = probe_with(&Endpoint::default(), || facts.clone()).unwrap();
 
         for key in [
             "accessibility_bus",
@@ -6239,11 +6329,57 @@ mod tests {
         assert!(v["display_server"].is_string(), "{v}");
     }
 
+    // A display taken from the user manager serves controls only: the capture and
+    // input libraries read this process's environment, which never holds it. The
+    // handshake offers no pixel verb and no foreground input, the probe says the
+    // display was adopted and captures and posts nothing, and a pixel request is
+    // refused by name before anything is sent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_a_display_taken_from_the_user_manager_serves_controls_only() {
+        let adopted = Endpoint {
+            adopted: true,
+            ..Endpoint::default()
+        };
+
+        let v = hello(&test_launcher(), &adopted).unwrap();
+        let probed = probe_with(&adopted, serde_json::Map::new).unwrap();
+
+        let actions = advertised(&v);
+        for pixel in PIXEL_ACTIONS {
+            assert!(!actions.contains(&pixel), "{pixel} offered: {v}");
+        }
+        for control in ["elements", "press", "set_value", "wait_for", "type", "wait"] {
+            assert!(actions.contains(&control), "{control} not offered: {v}");
+        }
+        assert_eq!(v["capabilities"]["input_methods"], json!(["ax"]), "{v}");
+        assert_eq!(v["capabilities"]["capture_methods"], json!([]), "{v}");
+        assert_eq!(probed["display_adopted"], json!(true), "{probed}");
+        assert_eq!(probed["screen_capture"], json!(false), "{probed}");
+        assert_eq!(probed["input_control"], json!(false), "{probed}");
+
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let mut worker = Worker {
+            endpoint: adopted.clone(),
+            ..idle_worker(&gate)
+        };
+        let mut typed = running("type", Some(2));
+        typed.body = json!({"action": "type", "text": "hi"});
+        for request in [
+            running("screenshot", None),
+            running("left_click", Some(1)),
+            typed,
+        ] {
+            let frame = served(&request, &gate, &mut worker);
+            assert_eq!(frame["error"], json!("pixels_unavailable"), "{frame}");
+        }
+    }
+
     // And the macOS build offers every verb it offered before, in the same order.
     #[cfg(target_os = "macos")]
     #[test]
     fn on_macos_the_handshake_offers_every_verb_and_both_input_methods() {
-        let v = hello(&test_launcher()).unwrap();
+        let v = hello(&test_launcher(), &Endpoint::default()).unwrap();
 
         assert_eq!(
             advertised(&v),
@@ -6388,7 +6524,7 @@ mod tests {
     // model verbs — same posture as `probe`. Lock that so they aren't offered to a model.
     #[test]
     fn idle_verbs_are_not_advertised_model_actions() {
-        let actions = hello(&test_launcher()).unwrap()["actions"]
+        let actions = hello(&test_launcher(), &Endpoint::default()).unwrap()["actions"]
             .as_array()
             .unwrap()
             .clone();
@@ -6400,7 +6536,7 @@ mod tests {
     // no model tool call must reach observe_start/observe_stop (MILESTONE_32 §8.4a).
     #[test]
     fn observe_verbs_are_not_advertised_model_actions() {
-        let actions = hello(&test_launcher()).unwrap()["actions"]
+        let actions = hello(&test_launcher(), &Endpoint::default()).unwrap()["actions"]
             .as_array()
             .unwrap()
             .clone();

@@ -32,6 +32,12 @@ they are as protocol 11 had them.
   - **Linux:** the list above without `inspect`, `select_target` and `release_target`. A request for `inspect` is
     `unknown_action`: a Linux session does not place every control (GTK 4, Wayland), so no control is read at a
     point.
+- A Linux helper started with no display of its own takes the session's `DISPLAY` and `WAYLAND_DISPLAY` from the
+  user manager, as values; it never writes them into its environment, which is the only place its screen capture
+  and input can read a display from. Such a helper works by control only: its `actions` leave out every pixel verb
+  (`screenshot`, the clicks, `mouse_move`, `left_click_drag`, `scroll`, `key`, `wait_for_change`, `paste`,
+  `windows`), `input_methods` is `["ax"]`, `capture_methods` is `[]`, its listings carry no positions, and a pixel
+  request (or `type` without `element_ref`) is refused `pixels_unavailable` before anything is sent.
 - `input_methods` is `["foreground_hid","ax"]` on both builds. `ax` is the wire's name for acting through the
   platform's accessibility API, whichever it is: macOS's AX API, or AT-SPI on Linux. A receipt's `input_method` is
   `"ax"` for every verb on a reference on both.
@@ -606,6 +612,7 @@ Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux bu
 | Code | When |
 |---|---|
 | `text_outside_layout` | Linux: `type` text the active keymap cannot produce; use `paste`. |
+| `pixels_unavailable` | Linux: a pixel action (or `type` without `element_ref`) on a helper whose display was taken from the user manager: its capture and input reach only a display of its own. Nothing sent; work by control. |
 | `consent_refused` | Linux: the person refused the portal's screen-capture or remote-desktop request. |
 | `consent_timeout` | Linux: the portal's request was not answered in time. |
 
@@ -620,7 +627,7 @@ read-only and raising no prompt:
 
 ```json
 {"type":"response","request_id":"p1","ok":true,"platform":"linux","display_server":"x11","x11_endpoint":true,
- "screen_capture":true,"input_control":true,
+ "display_adopted":false,"screen_capture":true,"input_control":true,
  "accessibility_bus":{"state":"answering","applications":7,
                       "status":{"is_enabled":false,"screen_reader_enabled":false}},
  "accessibility_packages":{"source":"dpkg","at_spi2_core":"2.44.0-3","atk_bridge":"2.38.0-3"},
@@ -630,7 +637,9 @@ read-only and raising no prompt:
 
 - `display_server` is decided by connecting, never by a variable: `wayland` when a Wayland socket answers, `x11`
   when only an X socket answers, `none` when neither does. `x11_endpoint` says whether an X endpoint answers: the
-  session's own on X11, XWayland beside Wayland. `screen_capture` and `input_control` are true on X11 alone.
+  session's own on X11, XWayland beside Wayland. `display_adopted` is true where the helper had no display of its
+  own and took the session's from the user manager (§1): it then works by control only. `screen_capture` and
+  `input_control` are true on X11 alone, and never on an adopted display.
 - `accessibility_bus.state`:
   - `answering`: the registry answers and lists `applications` applications, one or more;
   - `empty`: the registry answers and lists none (`applications` is 0);

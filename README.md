@@ -388,9 +388,12 @@ beside Wayland), whether the accessibility bus answers and how many applications
 its registry lists (or why it is unavailable), the at-spi2-core and ATK bridge
 versions dpkg records, and the toolkit notes known without reading any
 application, all read-only (PROTOCOL.md §8). A helper started with no display of its own (a daemon a systemd
-user unit started before login) reads `DISPLAY`, `WAYLAND_DISPLAY` and
-`XAUTHORITY`, and nothing else, from the user manager over the session bus and
-uses them for its own connections. **Wayland** pixels and **Windows** are not
+user unit started before login) reads `DISPLAY` and `WAYLAND_DISPLAY`, and
+nothing else, from the user manager over the session bus, and carries them as
+values: it never writes its own environment. Its screen capture and input
+(xcap, enigo) read a display only from that environment, so such a helper works
+by control only: its handshake offers no pixel verb, its listings carry no
+positions, and a pixel request is refused `pixels_unavailable`. **Wayland** pixels and **Windows** are not
 supported yet; on Wayland the controls are listed without positions and act by
 reference.
 

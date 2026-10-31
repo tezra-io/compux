@@ -10,18 +10,29 @@
 //!
 //! **A helper started before login.** A daemon that a systemd user unit
 //! started before anyone logged in hands its helper no display. When this process
-//! has neither `DISPLAY` nor `WAYLAND_DISPLAY`, it reads exactly three names —
-//! `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY` — from the systemd user manager's
-//! environment, where a GNOME login puts them, and uses them for its own
-//! connections. It logs only which of the three it took, never a value and never
-//! another name, and changes nothing anywhere.
+//! has neither `DISPLAY` nor `WAYLAND_DISPLAY`, it reads exactly those two names
+//! from the systemd user manager's environment, where a GNOME login puts them, and
+//! carries them as a value ([`Endpoint`]): this process's environment is never
+//! written. It logs only which of the two it took, never a value and never another
+//! name, and changes nothing anywhere.
+//!
+//! **Controls only, on a display taken that way.** The capture and input
+//! libraries cannot be handed a display: xcap connects with
+//! `xcb::Connection::connect(None)` and reads `WAYLAND_DISPLAY` itself, and
+//! enigo's `x11_display` names a display but leaves Xlib to read `XAUTHORITY` from
+//! the environment. So a display taken from the user manager serves the
+//! accessibility reader (which needs only whether its sockets answer), lists
+//! controls without positions, and refuses every pixel action
+//! (`pixels_unavailable`). `XAUTHORITY` is not read: nothing here could be handed
+//! it.
 
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// The three names read from the user manager, and the only ones.
-pub const NAMES: [&str; 3] = ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"];
+/// The names read from the user manager, and the only ones: the two that locate a
+/// display.
+pub const NAMES: [&str; 2] = ["DISPLAY", "WAYLAND_DISPLAY"];
 
 /// Where X servers put their sockets.
 const X11_SOCKETS: &str = "/tmp/.X11-unix";
@@ -49,10 +60,9 @@ pub enum Server {
 }
 
 impl Server {
-    /// The server of this process's own session, by connecting to its sockets.
-    pub fn here() -> Server {
-        let env = Env::of_process();
-        let wayland = wayland_socket(&env).is_some_and(|socket| answers_unix(&socket));
+    /// The server these variables locate, by connecting to its sockets.
+    pub fn of(env: &Env) -> Server {
+        let wayland = wayland_socket(env).is_some_and(|socket| answers_unix(&socket));
         let x11 = env
             .display
             .as_deref()
@@ -169,7 +179,7 @@ fn answers_tcp(host: &str, port: u16) -> bool {
         .any(|address| TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).is_ok())
 }
 
-/// Exactly the three names, out of the manager's `NAME=value` lines; every other
+/// Exactly the display names, out of the manager's `NAME=value` lines; every other
 /// line is left unread.
 pub fn picked(environment: &[String]) -> Vec<(String, String)> {
     environment
@@ -206,35 +216,102 @@ pub fn needs_display(display: Option<&str>, wayland_display: Option<&str>) -> bo
     display.is_none_or(str::is_empty) && wayland_display.is_none_or(str::is_empty)
 }
 
-/// When this process was started with no display, take the three names from
-/// the user manager for its own connections. Called once, first thing in `main`,
-/// before compux starts a thread of its own: the variables it sets are this
-/// process's own, and every connection it makes after reads them. A manager that does not answer
-/// is said on stderr, and the helper goes on with no display.
-pub fn adopt_from_user_manager() {
-    let own = |name: &str| std::env::var(name).ok();
-    if !needs_display(own("DISPLAY").as_deref(), own("WAYLAND_DISPLAY").as_deref()) {
-        return;
-    }
-    let read = async_io::block_on(async {
-        let session = zbus::connection::Builder::session()
-            .map_err(|error| format!("no session bus: {error}"))?
-            .method_timeout(CONNECT_TIMEOUT)
-            .build()
-            .await
-            .map_err(|error| format!("no session bus: {error}"))?;
-        user_manager(&session).await
-    });
-    match read {
-        Ok(environment) => {
-            let taken = picked(&environment);
-            let names: Vec<&str> = taken.iter().map(|(name, _)| name.as_str()).collect();
-            eprintln!("compux: no display of its own; took {names:?} from the user manager");
-            for (name, value) in taken {
-                std::env::set_var(name, value);
-            }
+/// Where this process's display is: the variables that locate it, and whether
+/// they are this process's own or were read from the user manager. Decided once,
+/// at start, and passed by value to everything that connects to it; never written
+/// into the environment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Endpoint {
+    pub env: Env,
+    /// Read from the user manager: this process was started with no display of
+    /// its own.
+    pub adopted: bool,
+}
+
+impl Endpoint {
+    /// This process's own variables.
+    pub fn own() -> Endpoint {
+        Endpoint {
+            env: Env::of_process(),
+            adopted: false,
         }
-        Err(why) => eprintln!("compux: no display of its own, and {why}"),
+    }
+
+    /// This process's display at start: its own, or where it has neither display
+    /// variable, the session's from the user manager.
+    pub fn of_session() -> Endpoint {
+        let own = Endpoint::own();
+        if !needs_display(
+            own.env.display.as_deref(),
+            own.env.wayland_display.as_deref(),
+        ) {
+            return own;
+        }
+        async_io::block_on(async {
+            let session = zbus::connection::Builder::session()
+                .map_err(|error| format!("no session bus: {error}"))?
+                .method_timeout(CONNECT_TIMEOUT)
+                .build()
+                .await
+                .map_err(|error| format!("no session bus: {error}"));
+            match session {
+                Ok(session) => Ok(adopt(own.env.clone(), &session).await),
+                Err(why) => Err(why),
+            }
+        })
+        .unwrap_or_else(|why: String| {
+            eprintln!("compux: no display of its own, and {why}");
+            own
+        })
+    }
+
+    /// The server its sockets answer as, connecting to them now.
+    pub fn server(&self) -> Server {
+        Server::of(&self.env)
+    }
+
+    /// Whether pixels reach this display. The capture and input libraries read
+    /// this process's environment, which never holds a display taken from the
+    /// user manager.
+    pub fn pixels(&self) -> bool {
+        !self.adopted
+    }
+
+    /// Whether a client's accessible extents are positions compux can draw.
+    pub fn places(&self) -> bool {
+        self.pixels() && self.server().places()
+    }
+}
+
+/// `own` with the display names the user manager holds, as values. A manager that
+/// names none, or does not answer, leaves `own` as it is.
+pub async fn adopt(own: Env, session: &zbus::Connection) -> Endpoint {
+    let environment = match user_manager(session).await {
+        Ok(environment) => environment,
+        Err(why) => {
+            eprintln!("compux: no display of its own, and {why}");
+            return Endpoint {
+                env: own,
+                adopted: false,
+            };
+        }
+    };
+    let taken = picked(&environment);
+    let names: Vec<&str> = taken.iter().map(|(name, _)| name.as_str()).collect();
+    eprintln!("compux: no display of its own; took {names:?} from the user manager, for controls");
+    let value = |wanted: &str| {
+        taken
+            .iter()
+            .find(|(name, _)| name == wanted)
+            .map(|(_, value)| value.clone())
+    };
+    Endpoint {
+        env: Env {
+            display: value("DISPLAY"),
+            wayland_display: value("WAYLAND_DISPLAY"),
+            runtime_dir: own.runtime_dir,
+        },
+        adopted: !taken.is_empty(),
     }
 }
 
@@ -319,9 +396,59 @@ mod tests {
         assert!(!answers_unix(&path));
     }
 
-    // Exactly the three names, and nothing else the manager holds.
+    // A display taken from the user manager is carried as a value: this process's
+    // environment is the same after as before. It serves controls only: the
+    // capture and input libraries read that environment, never a value, so they
+    // cannot reach it, and nothing is drawn where nothing can be captured.
     #[test]
-    fn only_the_three_names_are_taken_from_the_user_manager() {
+    fn a_display_taken_from_the_user_manager_leaves_the_environment_as_it_was() {
+        let desktop = Desktop {
+            manager_environment: vec![
+                "DISPLAY=:7".to_string(),
+                "XAUTHORITY=/run/user/1000/gdm/Xauthority".to_string(),
+                "HOME=/h".to_string(),
+            ],
+            ..Desktop::default()
+        };
+        let (_fake, session) = Fake::start(desktop, Duration::from_millis(200));
+        let before: Vec<_> = std::env::vars_os().collect();
+
+        let endpoint = async_io::block_on(adopt(Env::default(), &session));
+
+        let after: Vec<_> = std::env::vars_os().collect();
+        assert_eq!(before, after, "the environment is untouched");
+        assert_eq!(endpoint.env.display.as_deref(), Some(":7"));
+        assert!(endpoint.adopted);
+        assert!(!endpoint.pixels());
+        assert!(!endpoint.places());
+    }
+
+    // A manager that names no display adopts nothing, and a process with a
+    // display of its own keeps its pixels.
+    #[test]
+    fn a_display_of_its_own_serves_pixels_and_no_display_adopts_nothing() {
+        let desktop = Desktop {
+            manager_environment: vec!["HOME=/h".to_string()],
+            ..Desktop::default()
+        };
+        let (_fake, session) = Fake::start(desktop, Duration::from_millis(200));
+
+        let nothing = async_io::block_on(adopt(Env::default(), &session));
+        let own = Endpoint {
+            env: Env {
+                display: Some(":0".to_string()),
+                ..Env::default()
+            },
+            adopted: false,
+        };
+
+        assert_eq!(nothing, Endpoint::default());
+        assert!(own.pixels());
+    }
+
+    // Exactly the display names, and nothing else the manager holds.
+    #[test]
+    fn only_the_display_names_are_taken_from_the_user_manager() {
         let environment: Vec<String> = [
             "HOME=/home/someone",
             "DISPLAY=:1",
@@ -337,13 +464,7 @@ mod tests {
 
         assert_eq!(
             picked(&environment),
-            vec![
-                ("DISPLAY".to_string(), ":1".to_string()),
-                (
-                    "XAUTHORITY".to_string(),
-                    "/run/user/1000/gdm/Xauthority".to_string()
-                ),
-            ]
+            vec![("DISPLAY".to_string(), ":1".to_string())]
         );
     }
 

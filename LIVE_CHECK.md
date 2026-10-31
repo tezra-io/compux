@@ -2407,17 +2407,20 @@ Then `{"action":"inspect","x":1,"y":1,"observation_id":"x"}` answers
 `unknown_action`.
 
 Now the helper with no display of its own, as a daemon started before login has
-it (read only: it reads three names from the user manager, sets nothing):
+it (read only: it reads two names from the user manager, sets nothing):
 
 ```sh
 env -u DISPLAY -u WAYLAND_DISPLAY -u XAUTHORITY python3 /tmp/cx.py "$CX" '{"action":"probe"}' </dev/null
 ```
 
-Its stderr says `took ["DISPLAY", "XAUTHORITY"] from the user manager` (the names
-only, never a value), and the probe says `x11` again. `systemctl --user
-show-environment | grep -c DISPLAY` should be at least 1 for this to hold; if it
-is 0, GNOME did not import the display into the user manager, and the probe
-answers `none`: write that down.
+Its stderr says `took ["DISPLAY"] from the user manager, for controls` (the
+names only, never a value). The probe says `x11` again, `"display_adopted":
+true`, and capture and input `false`: such a helper works by control only. Its
+`hello` lists no pixel verb and `input_methods` is `["ax"]`; a `screenshot` is
+refused `pixels_unavailable`; `elements` lists the controls without positions.
+`systemctl --user show-environment | grep -c DISPLAY` should be at least 1 for
+this to hold; if it is 0, GNOME did not import the display into the user
+manager, and the probe answers `none`: write that down.
 
 ## 2. The GTK 3 fixture survives a listing (read only)
 

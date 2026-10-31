@@ -481,6 +481,9 @@ defmodule Compux do
 
     * `:x11_endpoint` — whether an X endpoint answers, as the session or beside
       Wayland (XWayland).
+    * `:display_adopted` — the helper had no display of its own and took the
+      session's from the user manager: it works by control only, and every pixel
+      action is refused `pixels_unavailable`.
     * `:accessibility_bus` — `%{state: "answering" | "empty" | "unavailable",
       applications:, cause:, detail:, status:}`: the registry's application count,
       or why no registry answered (`cause`: `"no_session_bus"`, `"not_installed"`,
@@ -653,6 +656,7 @@ defmodule Compux do
       screen_capture: Map.get(response, "screen_capture") == true,
       input_control: Map.get(response, "input_control") == true,
       x11_endpoint: probe_boolean(Map.get(response, "x11_endpoint")),
+      display_adopted: probe_boolean(Map.get(response, "display_adopted")),
       accessibility_bus: probe_bus(Map.get(response, "accessibility_bus")),
       accessibility_packages: probe_packages(Map.get(response, "accessibility_packages")),
       toolkit_notes: probe_notes(Map.get(response, "toolkit_notes"))

@@ -337,6 +337,7 @@ defmodule CompuxTest do
       # A build that reports no accessibility facts (macOS) has none of them.
       assert %{
                x11_endpoint: nil,
+               display_adopted: nil,
                accessibility_bus: nil,
                accessibility_packages: nil,
                toolkit_notes: nil
@@ -349,6 +350,7 @@ defmodule CompuxTest do
         "platform" => "linux",
         "display_server" => "x11",
         "x11_endpoint" => true,
+        "display_adopted" => false,
         "screen_capture" => true,
         "input_control" => true,
         "accessibility_bus" => %{
@@ -368,6 +370,7 @@ defmodule CompuxTest do
 
       assert {:ok, probe} = Compux.probe(cu)
       assert probe.x11_endpoint == true
+      assert probe.display_adopted == false
 
       assert probe.accessibility_bus == %{
                state: "answering",
@@ -392,6 +395,7 @@ defmodule CompuxTest do
         "platform" => "linux",
         "display_server" => "none",
         "x11_endpoint" => false,
+        "display_adopted" => true,
         "screen_capture" => false,
         "input_control" => false,
         "accessibility_bus" => %{
@@ -407,6 +411,7 @@ defmodule CompuxTest do
       cu = start!(responses: %{"probe" => {:ok, unavailable}})
 
       assert {:ok, probe} = Compux.probe(cu)
+      assert probe.display_adopted == true
 
       assert probe.accessibility_bus == %{
                state: "unavailable",

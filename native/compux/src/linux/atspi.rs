@@ -45,12 +45,13 @@ use serde::Serialize;
 use zbus::zvariant::{DynamicDeserialize, DynamicType, OwnedObjectPath, OwnedValue};
 use zbus::Connection;
 
+use super::display::Endpoint;
 use super::routes::{self, Toolkit, CHROMIUM_SWITCH, GTK4_SWITCH, QT_SWITCH};
 use super::vocabulary::{
     self, ACTIVE, COMBO_BOX, EDITABLE, ENTRY, EXPANDED, FOCUSED, MULTI_LINE, PASSWORD_TEXT,
     SCROLL_PANE, SHOWING, TEXT as TEXT_ROLE,
 };
-use super::{bus, display, session};
+use super::{bus, session};
 use crate::ax::{
     self, Ax, Facts, Focus, Frame, Handle, Identity, Refusal, Retained, Route, Routes, States,
     Unread, Write,
@@ -370,9 +371,12 @@ pub struct Real {
     /// looked up ([`Real::learn_toolkit`]).
     toolkits: RefCell<HashMap<String, Toolkit>>,
     /// Whether this session places nodes on the screen at all: an X11 session
-    /// does, a Wayland session gives no client a global position. Decided on the
-    /// first read that needs it, from the display server (`display`).
+    /// does, a Wayland session gives no client a global position, and a display
+    /// taken from the user manager draws nothing. Decided on the first read that
+    /// needs it, from `display`.
     places: Cell<Option<bool>>,
+    /// Where this process's display is.
+    display: Endpoint,
 }
 
 impl Default for Real {
@@ -396,7 +400,15 @@ impl Real {
     /// A reader of this session's accessibility bus, which it opens on the first
     /// question — never at start, so a handshake touches no bus.
     pub fn new() -> Real {
-        Real::with(None, open_session_bus, None)
+        Real::on(Endpoint::own())
+    }
+
+    /// A reader on this display, which opens its bus on the first question.
+    pub fn on(display: Endpoint) -> Real {
+        Real {
+            display,
+            ..Real::with(None, open_session_bus, None)
+        }
     }
 
     /// A reader of a bus already open, which never opens another, on a session
@@ -416,6 +428,13 @@ impl Real {
         self
     }
 
+    /// The same reader on this display, deciding afresh whether it places nodes.
+    #[cfg(test)]
+    pub fn on_display(self, display: Endpoint) -> Real {
+        self.places.set(None);
+        Real { display, ..self }
+    }
+
     fn with(
         bus: Option<Connection>,
         open: fn() -> Result<Connection, String>,
@@ -429,6 +448,7 @@ impl Real {
             messages: Cell::new(0),
             toolkits: RefCell::new(HashMap::new()),
             places: Cell::new(places),
+            display: Endpoint::default(),
         }
     }
 
@@ -455,7 +475,7 @@ impl Real {
         if let Some(places) = self.places.get() {
             return places;
         }
-        let places = display::Server::here().places();
+        let places = self.display.places();
         if !places {
             eprintln!(
                 "compux: this session gives no screen positions: controls are listed without them"
@@ -1480,6 +1500,7 @@ pub fn frontmost_application(ax: &Rc<dyn Ax>) -> Result<(i32, String), String> {
 mod tests {
     use super::*;
     use crate::gate::SystemClock;
+    use crate::linux::display::Env;
     use crate::linux::fake::{
         self, Call, Desktop, Fake, Life, Node, ACTIVE, EDITABLE, ENABLED, EXPANDABLE, EXPANDED,
         FOCUSABLE, MULTI_LINE, SELECTABLE, SELECTED, SENSITIVE, SHOWING, VISIBLE,
@@ -2050,6 +2071,49 @@ mod tests {
         assert_eq!(labels(&listed), vec!["Save"]);
         assert_eq!(listed.nodes[0].frame, None);
         assert!(fake.sent("GetExtents").is_empty());
+    }
+
+    /// An X11 display that answers: a listener on the TCP port its number names
+    /// (6000 + n), held for as long as the listener is.
+    fn answering_x11() -> (std::net::TcpListener, Env) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("its address").port();
+        let number = port
+            .checked_sub(6000)
+            .expect("an ephemeral port above 6000");
+        let env = Env {
+            display: Some(format!("127.0.0.1:{number}")),
+            ..Env::default()
+        };
+        (listener, env)
+    }
+
+    // A display taken from the user manager draws nothing, even an X11 one that
+    // answers: the capture library cannot reach it, so controls are listed
+    // without positions, as on Wayland. The same display as this process's own
+    // places them.
+    #[test]
+    fn a_reader_on_a_display_taken_from_the_user_manager_places_nothing() {
+        let (_x11, env) = answering_x11();
+        let window = || desktop(&["/w/save"], vec![("/w/save", button("Save", 10))]);
+        let listed_on = |adopted: bool| {
+            let (fake, bus) = Fake::start(window(), TIMEOUT);
+            let display = Endpoint {
+                env: env.clone(),
+                adopted,
+            };
+            let ax: Rc<dyn Ax> = Rc::new(Real::over(bus).on_display(display));
+            (walk(&ax), fake.sent("GetExtents").len())
+        };
+
+        let (own, own_extents) = listed_on(false);
+        let (adopted, adopted_extents) = listed_on(true);
+
+        assert!(own.nodes[0].frame.is_some(), "its own display places it");
+        assert_eq!(labels(&adopted), vec!["Save"]);
+        assert_eq!(adopted.nodes[0].frame, None);
+        assert!(own_extents > 0);
+        assert_eq!(adopted_extents, 0);
     }
 
     // A node that is not SHOWING is not listed on such a session either: it has no

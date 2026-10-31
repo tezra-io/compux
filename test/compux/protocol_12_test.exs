@@ -459,7 +459,8 @@ defmodule Compux.Protocol12Test do
                      ax_timed_out invalid_argument paused cancelled busy stale_generation
                      stale_mutation unknown_observation expired_observation stale_observation
                      point_outside_observation observation_required element_required
-                     addressing_conflict check_unsupported unknown_field target_unavailable) do
+                     addressing_conflict check_unsupported unknown_field target_unavailable
+                     pixels_unavailable) do
         assert code in refusals, code
       end
 
