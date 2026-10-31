@@ -84,7 +84,8 @@ class Helper:
 
 def listing(reply):
     return [{key: element.get(key) for key in
-             ("role", "label", "path", "enabled", "settable", "value", "actions_partial")}
+             ("role", "native_role", "label", "path", "enabled", "verbs", "value",
+              "actions_partial")}
             for element in reply.get("elements", [])]
 
 

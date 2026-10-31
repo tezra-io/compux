@@ -23,7 +23,11 @@
 # 7. chromium: Debian's Chromium (no snap) showing chromium_page.html in a private
 #    session (chromium.Dockerfile, chromium_session.sh): its tree and `elements` timed.
 #
-# SPIKE_STAGES picks the stages (default "a b wayland chromium"). Docker is whatever
+# 8. verbs (M86 L1): every verb compux answers on Linux, on each fixture in noble,
+#    judged by what the fixture recorded (verbs.py); verbs-jammy: the same on GTK3 in
+#    jammy (ATK bridge 2.38).
+#
+# SPIKE_STAGES picks the stages (default "a b wayland chromium verbs verbs-jammy"). Docker is whatever
 # DOCKER (default `docker`) and DOCKER_HOST name. CHROMIUM_BASE is the Debian
 # bookworm image the Chromium one starts from (default debian:bookworm; any bookworm
 # image with apt works). Every image is built from images already present when the
@@ -45,7 +49,7 @@ CACHE=${SPIKE_CACHE:-$HOME/.cache/compux-l0-spike}
 BUILD_LIMIT_S=${BUILD_LIMIT_S:-3600}
 RUN_LIMIT_S=${RUN_LIMIT_S:-600}
 CHROMIUM_BASE=${CHROMIUM_BASE:-debian:bookworm}
-STAGES=${SPIKE_STAGES:-a b wayland chromium}
+STAGES=${SPIKE_STAGES:-a b wayland chromium verbs verbs-jammy}
 mkdir -p "$OUT" "$CACHE"
 
 die() { echo "spike.sh: $*" >&2; exit 1; }
@@ -88,7 +92,7 @@ build_helper() {
 spike_images() {
   local context base
   context=$(mktemp -d)
-  cp "$CACHE/compux" "$HERE"/{elements_timing.py,a11y_tree.py,measure.sh,atk_bridge_check.sh} \
+  cp "$CACHE/compux" "$HERE"/{elements_timing.py,a11y_tree.py,measure.sh,atk_bridge_check.sh,verbs.py} \
     "$HERE"/{wayland_session.sh,chromium_session.sh,chromium_page.html} "$context/"
   for base in noble jammy; do
     build -q -t "compux-spike:$base" --build-arg "BASE=compux-fixtures:$base" \
@@ -173,6 +177,24 @@ if staged chromium; then
   echo "== L0(a) Chromium (Debian bookworm)"
   in_own_session compux-spike:chromium chromium /opt/compux-spike/chromium_session.sh "$RUNS" \
     || failed+=("chromium")
+fi
+
+if staged verbs; then
+  for toolkit in gtk3 gtk4 qt; do
+    echo "== L1 verbs $toolkit (noble)"
+    in_session compux-spike:noble "$toolkit" python3 /opt/compux-spike/verbs.py \
+      --binary /opt/compux/compux --toolkit "$toolkit" \
+      --state "/tmp/compux-fixture-state/$toolkit.json" --out "/tmp/spike-out/$toolkit-verbs.json" \
+      || failed+=("verbs:$toolkit")
+  done
+fi
+
+if staged verbs-jammy; then
+  echo "== L1 verbs gtk3 under ATK bridge 2.38 (jammy)"
+  in_session compux-spike:jammy gtk3 python3 /opt/compux-spike/verbs.py \
+    --binary /opt/compux/compux --toolkit gtk3 \
+    --state /tmp/compux-fixture-state/gtk3.json --out /tmp/spike-out/gtk3-jammy-verbs.json \
+    || failed+=("verbs:gtk3-jammy")
 fi
 
 [ "${#failed[@]}" -eq 0 ] || die "failed: ${failed[*]} (see $OUT)"

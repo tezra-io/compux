@@ -1,0 +1,59 @@
+name: linux-desktop
+
+# compux on a Linux desktop, in containers: a private Xvfb, a private session bus
+# and its own accessibility bus (at-spi2-core), with the GTK 3, GTK 4 and Qt fixture
+# apps (fixtures/linux). Nothing here has a desktop to reach: every session runs in
+# a container with no network, started by fixtures/linux/spike/spike.sh.
+#
+#   noble  Ubuntu 24.04: `elements` timed on each fixture, then every verb compux
+#          answers, judged by what the fixture recorded (verbs.py).
+#   jammy  Ubuntu 22.04, whose ATK bridge 2.38 aborts an application on
+#          Action.GetActions: the GTK 3 fixture read under a bus monitor that must
+#          show no GetActions and no GetAll, then the verbs on it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  noble:
+    name: fixtures on Ubuntu 24.04 (elements + verbs)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Elements and verbs on GTK 3, GTK 4 and Qt
+        env:
+          SPIKE_STAGES: a verbs
+          SPIKE_CACHE: ${{ runner.temp }}/spike-cache
+        run: fixtures/linux/spike/spike.sh "$RUNNER_TEMP/spike-out" 5
+      - name: Keep what the sessions wrote
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-desktop-noble
+          path: ${{ runner.temp }}/spike-out
+          if-no-files-found: warn
+
+  jammy:
+    name: GTK 3 under ATK bridge 2.38 (Ubuntu 22.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: No GetActions, no GetAll, and the verbs, on GTK 3 in 22.04
+        env:
+          SPIKE_STAGES: b verbs-jammy
+          SPIKE_CACHE: ${{ runner.temp }}/spike-cache
+        run: fixtures/linux/spike/spike.sh "$RUNNER_TEMP/spike-out" 5
+      - name: Keep what the session wrote
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-desktop-jammy
+          path: ${{ runner.temp }}/spike-out
+          if-no-files-found: warn

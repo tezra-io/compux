@@ -10,5 +10,5 @@ RUN apt-get update \
       libxdo3 libxkbcommon-x11-0 libxcb-shape0 libxcb-xfixes0 libxcb-render0 \
  && rm -rf /var/lib/apt/lists/*
 COPY compux /opt/compux/compux
-COPY elements_timing.py a11y_tree.py measure.sh atk_bridge_check.sh /opt/compux-spike/
+COPY elements_timing.py a11y_tree.py measure.sh atk_bridge_check.sh verbs.py /opt/compux-spike/
 USER tester
