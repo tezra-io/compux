@@ -18,8 +18,13 @@ does not offer the verb and a request for it is refused with nothing sent. Steps
 whose evidence is the reply itself (a refusal, a condition met, a surface on a
 receipt) say so in their expectation.
 
+Nothing is asked until the fixture is listed: the session hands over once the
+fixture has written its state file, which it does before its window, and a GTK 4
+fixture registers on the accessibility bus about half a second after that. The
+first step is then `probe`, read as a doctor reads it, with the fixture on the bus.
+
 Exit 0 when every step met its expectation, 1 otherwise; the JSON has each step's
-request, reply and verdict. The last step is `probe`, read as a doctor reads it.
+request, reply and verdict.
 """
 
 import argparse
@@ -367,17 +372,30 @@ def probe_check(helper):
             "why": f"failed {failed}: {why}" if failed else why, "probe": reply}
 
 
+def fixture_listed(helper, toolkit):
+    """Wait, bounded, until compux lists the fixture's first control: the fixture
+    is then on the accessibility bus. Every step runs after this, never before."""
+    label = LABELS[toolkit]
+    element, _, listing = find(helper, "button", f"{label} button")
+    if element is not None:
+        return {"flow": "fixture listed", "passed": True, "why": f"{label} button listed"}
+    return {"flow": "fixture listed", "passed": False,
+            "why": f"{label} button never listed in {READY_TRIES} tries",
+            "listing": json.dumps(listing)[:2000] if listing else None}
+
+
 def run(args):
     helper = Helper(args.binary, args.out + ".stderr")
     try:
         hello = helper.handshake()
-        results = [run_step(helper, args.toolkit, args.state, step)
-                   for step in steps_for(args.toolkit)]
-        results.append(menu_flow(helper, args.toolkit, args.state))
-        results.append(dialog_flow(helper, args.toolkit, args.state))
-        # Last: a GTK 4 application can register after the first listing, and a
-        # probe before it did reads the bus empty.
-        results.append(probe_check(helper))
+        ready = fixture_listed(helper, args.toolkit)
+        results = [ready]
+        if ready["passed"]:
+            results.append(probe_check(helper))
+            results += [run_step(helper, args.toolkit, args.state, step)
+                        for step in steps_for(args.toolkit)]
+            results.append(menu_flow(helper, args.toolkit, args.state))
+            results.append(dialog_flow(helper, args.toolkit, args.state))
     finally:
         helper.close()
     return {"toolkit": args.toolkit, "hello_actions": hello.get("actions"),
