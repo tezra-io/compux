@@ -19,7 +19,7 @@ whose evidence is the reply itself (a refusal, a condition met, a surface on a
 receipt) say so in their expectation.
 
 Exit 0 when every step met its expectation, 1 otherwise; the JSON has each step's
-request, reply and verdict.
+request, reply and verdict. The first step is `probe`, read as a doctor reads it.
 """
 
 import argparse
@@ -337,12 +337,41 @@ def dialog_flow(helper, toolkit, state_path):
     return result
 
 
+def probe_check(helper):
+    """`probe` in this session, as a doctor reads it: the display answered as X11,
+    the accessibility bus answers with the fixture on it, the session's status was
+    read, dpkg names both packages, and the Qt note is there exactly while the
+    status reads off."""
+    _, reply = helper.ask("probe")
+    bus = reply.get("accessibility_bus") or {}
+    packages = reply.get("accessibility_packages") or {}
+    notes = [note.get("toolkit") for note in reply.get("toolkit_notes") or []]
+    status = bus.get("status")
+    off = status is not None and not status.get("is_enabled") \
+        and not status.get("screen_reader_enabled")
+    checks = {
+        "display": reply.get("display_server") == "x11" and reply.get("x11_endpoint") is True,
+        "bus": bus.get("state") == "answering" and (bus.get("applications") or 0) >= 1,
+        "status": status is not None,
+        "packages": packages.get("source") == "dpkg" and bool(packages.get("at_spi2_core"))
+        and bool(packages.get("atk_bridge")),
+        "notes": notes == (["qt", "chromium"] if off else ["chromium"]),
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    why = (f"{bus.get('state')} with {bus.get('applications')} applications, status {status}, "
+           f"at-spi2-core {packages.get('at_spi2_core')}, ATK bridge "
+           f"{packages.get('atk_bridge')}, notes {notes}")
+    return {"flow": "probe", "passed": not failed,
+            "why": f"failed {failed}: {why}" if failed else why, "probe": reply}
+
+
 def run(args):
     helper = Helper(args.binary, args.out + ".stderr")
     try:
         hello = helper.handshake()
-        results = [run_step(helper, args.toolkit, args.state, step)
-                   for step in steps_for(args.toolkit)]
+        results = [probe_check(helper)]
+        results += [run_step(helper, args.toolkit, args.state, step)
+                    for step in steps_for(args.toolkit)]
         results.append(menu_flow(helper, args.toolkit, args.state))
         results.append(dialog_flow(helper, args.toolkit, args.state))
     finally:

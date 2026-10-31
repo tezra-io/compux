@@ -331,8 +331,93 @@ defmodule CompuxTest do
     test "normalizes the sidecar probe response" do
       cu = start!()
 
-      assert {:ok, %{platform: "test", screen_capture: true, input_control: false}} =
+      assert {:ok, %{platform: "test", screen_capture: true, input_control: false} = probe} =
                Compux.probe(cu)
+
+      # A build that reports no accessibility facts (macOS) has none of them.
+      assert %{
+               x11_endpoint: nil,
+               accessibility_bus: nil,
+               accessibility_packages: nil,
+               toolkit_notes: nil
+             } = probe
+    end
+
+    test "carries the Linux accessibility facts beside the display" do
+      linux = %{
+        "ok" => true,
+        "platform" => "linux",
+        "display_server" => "x11",
+        "x11_endpoint" => true,
+        "screen_capture" => true,
+        "input_control" => true,
+        "accessibility_bus" => %{
+          "state" => "answering",
+          "applications" => 3,
+          "status" => %{"is_enabled" => false, "screen_reader_enabled" => false}
+        },
+        "accessibility_packages" => %{
+          "source" => "dpkg",
+          "at_spi2_core" => "2.44.0-3",
+          "atk_bridge" => "2.38.0-3"
+        },
+        "toolkit_notes" => [%{"toolkit" => "qt", "note" => "start it with the switch"}]
+      }
+
+      cu = start!(responses: %{"probe" => {:ok, linux}})
+
+      assert {:ok, probe} = Compux.probe(cu)
+      assert probe.x11_endpoint == true
+
+      assert probe.accessibility_bus == %{
+               state: "answering",
+               applications: 3,
+               cause: nil,
+               detail: nil,
+               status: %{is_enabled: false, screen_reader_enabled: false}
+             }
+
+      assert probe.accessibility_packages == %{
+               source: "dpkg",
+               at_spi2_core: "2.44.0-3",
+               atk_bridge: "2.38.0-3"
+             }
+
+      assert probe.toolkit_notes == [%{toolkit: "qt", note: "start it with the switch"}]
+    end
+
+    test "names why the accessibility bus is unavailable" do
+      unavailable = %{
+        "ok" => true,
+        "platform" => "linux",
+        "display_server" => "none",
+        "x11_endpoint" => false,
+        "screen_capture" => false,
+        "input_control" => false,
+        "accessibility_bus" => %{
+          "state" => "unavailable",
+          "cause" => "not_installed",
+          "detail" => "no org.a11y.Bus",
+          "status" => nil
+        },
+        "accessibility_packages" => %{"source" => nil, "at_spi2_core" => nil, "atk_bridge" => nil},
+        "toolkit_notes" => []
+      }
+
+      cu = start!(responses: %{"probe" => {:ok, unavailable}})
+
+      assert {:ok, probe} = Compux.probe(cu)
+
+      assert probe.accessibility_bus == %{
+               state: "unavailable",
+               applications: nil,
+               cause: "not_installed",
+               detail: "no org.a11y.Bus",
+               status: nil
+             }
+
+      assert probe.accessibility_packages == %{source: nil, at_spi2_core: nil, atk_bridge: nil}
+      assert probe.toolkit_notes == []
     end
   end
 

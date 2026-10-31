@@ -56,15 +56,19 @@ defmodule Compux.StubDriver do
      }}
   end
 
-  defp reply(_state, "probe", _request) do
-    {:ok,
-     %{
-       "ok" => true,
-       "platform" => "test",
-       "display_server" => "test",
-       "screen_capture" => true,
-       "input_control" => false
-     }}
+  defp reply(state, "probe", _request) do
+    Map.get(
+      state.responses,
+      "probe",
+      {:ok,
+       %{
+         "ok" => true,
+         "platform" => "test",
+         "display_server" => "test",
+         "screen_capture" => true,
+         "input_control" => false
+       }}
+    )
   end
 
   defp reply(state, action, _request),

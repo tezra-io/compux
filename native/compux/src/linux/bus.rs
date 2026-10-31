@@ -23,6 +23,12 @@ const REGISTRY_PATH: &str = "/org/a11y/atspi/registry";
 const ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 
+/// The launcher's status: whether the session asked for accessibility.
+const STATUS: &str = "org.a11y.Status";
+
+/// What a session bus answers for a name nothing owns and nothing can start.
+const SERVICE_UNKNOWN: &str = "org.freedesktop.DBus.Error.ServiceUnknown";
+
 /// The event this process says it listens for. Chromium reports which of its
 /// windows is ACTIVE only once some client has registered for it (agent-desktop
 /// `system/bus/mod.rs`), and the frame that reads ACTIVE is how the application in
@@ -45,31 +51,42 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// does not.
 #[cfg(not(test))]
 pub fn connect(read_timeout: Duration) -> Result<Connection, String> {
-    use zbus::connection::Builder;
-
     async_io::block_on(async {
-        let session = Builder::session()
-            .map(|builder| builder.method_timeout(DISCOVERY_TIMEOUT))
-            .map_err(|error| format!("no session bus: {error}"))?
-            .build()
-            .await
-            .map_err(|error| format!("no session bus: {error}"))?;
+        let session = session().await?;
         let address = address(&session).await;
         // The session bus is needed for nothing else.
         drop(session);
 
-        let bus = Builder::address(address?.as_str())
-            .map_err(|error| format!("a bad accessibility bus address: {error}"))?
-            .method_timeout(read_timeout)
-            .build()
-            .await
-            .map_err(|error| format!("the accessibility bus would not connect: {error}"))?;
+        let bus = open(&address.map_err(|why| why.detail())?, read_timeout).await?;
         if let Err(why) = announce(&bus).await {
             eprintln!("compux: accessibility bus: {why}");
         }
         ready(&bus).await?;
         Ok(bus)
     })
+}
+
+/// This process's session bus, with the timeout a first `GetAddress` needs.
+#[cfg(not(test))]
+pub async fn session() -> Result<Connection, String> {
+    zbus::connection::Builder::session()
+        .map(|builder| builder.method_timeout(DISCOVERY_TIMEOUT))
+        .map_err(|error| format!("no session bus: {error}"))?
+        .build()
+        .await
+        .map_err(|error| format!("no session bus: {error}"))
+}
+
+/// A connection to the accessibility bus at `address`, `read_timeout` on every
+/// call.
+#[cfg(not(test))]
+pub async fn open(address: &str, read_timeout: Duration) -> Result<Connection, String> {
+    zbus::connection::Builder::address(address)
+        .map_err(|error| format!("a bad accessibility bus address: {error}"))?
+        .method_timeout(read_timeout)
+        .build()
+        .await
+        .map_err(|error| format!("the accessibility bus would not connect: {error}"))
 }
 
 /// Under test there is no session this process may read, whatever the machine
@@ -83,9 +100,27 @@ pub fn connect(_read_timeout: Duration) -> Result<Connection, String> {
     )
 }
 
+/// Why the session bus named no accessibility bus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unnamed {
+    /// Nothing on the session bus is `org.a11y.Bus`, or can be started as it:
+    /// at-spi2-core is not installed for this session.
+    NoLauncher(String),
+    /// The launcher gave no address that can be used, or no answer.
+    NoAddress(String),
+}
+
+impl Unnamed {
+    pub fn detail(&self) -> String {
+        match self {
+            Unnamed::NoLauncher(detail) | Unnamed::NoAddress(detail) => detail.clone(),
+        }
+    }
+}
+
 /// The accessibility bus's address, from the session bus: one auto-starting
 /// `GetAddress`, never a presence check first (L1-5).
-pub async fn address(session: &Connection) -> Result<String, String> {
+pub async fn address(session: &Connection) -> Result<String, Unnamed> {
     let reply = session
         .call_method(
             Some(LAUNCHER),
@@ -96,16 +131,59 @@ pub async fn address(session: &Connection) -> Result<String, String> {
         )
         .await
         .map_err(|error| {
-            format!("the session bus would not name the accessibility bus: {error}")
+            let detail = format!("the session bus would not name the accessibility bus: {error}");
+            match error {
+                zbus::Error::MethodError(name, _, _) if name.as_str() == SERVICE_UNKNOWN => {
+                    Unnamed::NoLauncher(detail)
+                }
+                _ => Unnamed::NoAddress(detail),
+            }
         })?;
-    let address: String = reply
-        .body()
-        .deserialize()
-        .map_err(|error| format!("an unreadable accessibility bus address: {error}"))?;
+    let address: String = reply.body().deserialize().map_err(|error| {
+        Unnamed::NoAddress(format!("an unreadable accessibility bus address: {error}"))
+    })?;
     if address.is_empty() {
-        return Err("the session bus named an empty accessibility bus address".to_string());
+        return Err(Unnamed::NoAddress(
+            "the session bus named an empty accessibility bus address".to_string(),
+        ));
     }
     Ok(address)
+}
+
+/// The session's accessibility status, as the launcher's `org.a11y.Status` reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Status {
+    /// Something asked for accessibility (`IsEnabled`).
+    pub is_enabled: bool,
+    /// A screen reader runs (`ScreenReaderEnabled`).
+    pub screen_reader_enabled: bool,
+}
+
+/// The session's accessibility status: two property `Get`s on the launcher,
+/// never `GetAll`, and never a `Set`. Turning it on is the person's to do.
+pub async fn status(session: &Connection) -> Result<Status, String> {
+    Ok(Status {
+        is_enabled: flag(session, "IsEnabled").await?,
+        screen_reader_enabled: flag(session, "ScreenReaderEnabled").await?,
+    })
+}
+
+async fn flag(session: &Connection, name: &str) -> Result<bool, String> {
+    let reply = session
+        .call_method(
+            Some(LAUNCHER),
+            LAUNCHER_PATH,
+            Some(PROPERTIES),
+            "Get",
+            &(STATUS, name),
+        )
+        .await
+        .map_err(|error| format!("the launcher did not say {name}: {error}"))?;
+    let value: zbus::zvariant::OwnedValue = reply
+        .body()
+        .deserialize()
+        .map_err(|error| format!("an unreadable {name}: {error}"))?;
+    bool::try_from(value).map_err(|error| format!("an unreadable {name}: {error}"))
 }
 
 /// Say what this client listens for ([`LISTENED_EVENT`]), as `(event, properties)`:

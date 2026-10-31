@@ -475,6 +475,21 @@ defmodule Compux do
   @doc """
   Non-prompting OS-permission probe: whether screen capture and input control are
   actually available, plus the platform and display server. Not a model action.
+
+  On Linux it also carries, read-only, what a doctor shows of accessibility (each
+  `nil` on a build that reports none, as macOS):
+
+    * `:x11_endpoint` — whether an X endpoint answers, as the session or beside
+      Wayland (XWayland).
+    * `:accessibility_bus` — `%{state: "answering" | "empty" | "unavailable",
+      applications:, cause:, detail:, status:}`: the registry's application count,
+      or why no registry answered (`cause`: `"no_session_bus"`, `"not_installed"`,
+      `"no_address"`, `"unreachable"`, `"not_answering"`), and the session's
+      `org.a11y.Status` as `%{is_enabled:, screen_reader_enabled:}` (`nil` unread).
+    * `:accessibility_packages` — `%{source:, at_spi2_core:, atk_bridge:}`, the
+      package database's versions (`source: "dpkg"`; all `nil` where none is read).
+    * `:toolkit_notes` — `[%{toolkit:, note:}]`, what is known without reading any
+      application (Qt while the status reads off; Chromium's switches).
   """
   @spec probe(t()) :: {:ok, map()} | {:error, term()}
   def probe(%__MODULE__{driver: driver, state: state}) do
@@ -636,7 +651,11 @@ defmodule Compux do
       platform: probe_string(response, "platform"),
       display_server: probe_string(response, "display_server"),
       screen_capture: Map.get(response, "screen_capture") == true,
-      input_control: Map.get(response, "input_control") == true
+      input_control: Map.get(response, "input_control") == true,
+      x11_endpoint: probe_boolean(Map.get(response, "x11_endpoint")),
+      accessibility_bus: probe_bus(Map.get(response, "accessibility_bus")),
+      accessibility_packages: probe_packages(Map.get(response, "accessibility_packages")),
+      toolkit_notes: probe_notes(Map.get(response, "toolkit_notes"))
     }
   end
 
@@ -646,4 +665,55 @@ defmodule Compux do
       _other -> "unknown"
     end
   end
+
+  # The Linux facts. A build that reports none (macOS) leaves each nil.
+  defp probe_boolean(value) when is_boolean(value), do: value
+  defp probe_boolean(_absent), do: nil
+
+  @bus_states ~w(answering empty unavailable)
+
+  defp probe_bus(%{} = bus) do
+    %{
+      state: if(bus["state"] in @bus_states, do: bus["state"], else: "unknown"),
+      applications: probe_count(bus["applications"]),
+      cause: probe_text(bus["cause"]),
+      detail: probe_text(bus["detail"]),
+      status: probe_status(bus["status"])
+    }
+  end
+
+  defp probe_bus(_absent), do: nil
+
+  defp probe_status(%{} = status) do
+    %{
+      is_enabled: probe_boolean(status["is_enabled"]),
+      screen_reader_enabled: probe_boolean(status["screen_reader_enabled"])
+    }
+  end
+
+  defp probe_status(_unread), do: nil
+
+  defp probe_packages(%{} = packages) do
+    %{
+      source: probe_text(packages["source"]),
+      at_spi2_core: probe_text(packages["at_spi2_core"]),
+      atk_bridge: probe_text(packages["atk_bridge"])
+    }
+  end
+
+  defp probe_packages(_absent), do: nil
+
+  defp probe_notes(notes) when is_list(notes) do
+    for %{"toolkit" => toolkit, "note" => note} <- notes,
+        is_binary(toolkit) and is_binary(note),
+        do: %{toolkit: toolkit, note: note}
+  end
+
+  defp probe_notes(_absent), do: nil
+
+  defp probe_count(count) when is_integer(count) and count >= 0, do: count
+  defp probe_count(_absent), do: nil
+
+  defp probe_text(text) when is_binary(text), do: text
+  defp probe_text(_absent), do: nil
 end

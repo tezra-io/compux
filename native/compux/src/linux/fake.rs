@@ -29,6 +29,8 @@ use zbus::{Connection, Message, MessageStream};
 /// Where the registry lives, and the path every application's root answers at.
 pub const REGISTRY: &str = "org.a11y.atspi.Registry";
 pub const ROOT: &str = "/org/a11y/atspi/accessible/root";
+/// The session bus's name for the accessibility bus launcher.
+pub const LAUNCHER: &str = "org.a11y.Bus";
 
 /// The error names the toolkits answer, as the ledger recorded them.
 pub const UNKNOWN_OBJECT: &str = "org.freedesktop.DBus.Error.UnknownObject";
@@ -254,6 +256,9 @@ pub struct Desktop {
     pub quit: Vec<String>,
     /// What `org.a11y.Bus.GetAddress` answers, for the session-bus half.
     pub address: String,
+    /// What the launcher's `org.a11y.Status` reads: `IsEnabled` and
+    /// `ScreenReaderEnabled`.
+    pub status: (bool, bool),
     /// The systemd user manager's `Environment`, for the session-bus half.
     pub manager_environment: Vec<String>,
     pub calls: Vec<Call>,
@@ -706,17 +711,33 @@ fn property_name(message: &Message) -> String {
 }
 
 fn answer(desktop: &Desktop, call: &Call, message: &Message) -> Reply {
+    if desktop.quit.contains(&call.bus) {
+        return Reply::Error(SERVICE_UNKNOWN);
+    }
     if call.bus == "org.freedesktop.systemd1" {
         return match call.argument.as_str() {
             "Environment" => Reply::Property(Value::from(desktop.manager_environment.clone())),
             _ => Reply::Error(UNKNOWN_METHOD),
         };
     }
+    if call.bus == LAUNCHER {
+        return launcher(desktop, call);
+    }
     match call.interface.as_str() {
-        "org.a11y.Bus" => Reply::Text(desktop.address.clone()),
         "org.a11y.atspi.Registry" => registration(call),
         "org.freedesktop.DBus" => process_id(desktop, &call.argument),
         _ => from_node(desktop, call, message),
+    }
+}
+
+/// The session bus's accessibility bus launcher: its address, and its status.
+/// One that quit is not there at all (at-spi2-core not installed).
+fn launcher(desktop: &Desktop, call: &Call) -> Reply {
+    match (call.member.as_str(), call.argument.as_str()) {
+        ("GetAddress", _) => Reply::Text(desktop.address.clone()),
+        ("Get", "IsEnabled") => Reply::Property(Value::from(desktop.status.0)),
+        ("Get", "ScreenReaderEnabled") => Reply::Property(Value::from(desktop.status.1)),
+        _ => Reply::Error(UNKNOWN_METHOD),
     }
 }
 

@@ -379,7 +379,10 @@ the Linux build's `hello` does not list it, and a request for it is
 `unknown_action` (see "The version handshake"). The permission `probe` works on
 both: on Linux it reports which display server answered its socket (`x11`,
 `wayland`, `none`) and whether an X endpoint answers (`x11_endpoint`, XWayland
-beside Wayland). A helper started with no display of its own (a daemon a systemd
+beside Wayland), whether the accessibility bus answers and how many applications
+its registry lists (or why it is unavailable), the at-spi2-core and ATK bridge
+versions dpkg records, and the toolkit notes known without reading any
+application, all read-only (PROTOCOL.md §8). A helper started with no display of its own (a daemon a systemd
 user unit started before login) reads `DISPLAY`, `WAYLAND_DISPLAY` and
 `XAUTHORITY`, and nothing else, from the user manager over the session bus and
 uses them for its own connections. **Wayland** pixels and **Windows** are not

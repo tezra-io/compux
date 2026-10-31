@@ -608,3 +608,44 @@ Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux bu
 
 Legacy argument errors that the library refuses before they reach the sidecar (a missing `text`, an unknown key in a
 chord, a bad drag point) still answer their sentence as the code from the sidecar.
+
+## 8. `probe`
+
+`probe` is operational, never a model verb, and unchanged on macOS: `platform`, `display_server` (`quartz`),
+`screen_capture` and `input_control`, the grants read without a prompt. On Linux it reports what a doctor shows,
+read-only and raising no prompt:
+
+```json
+{"type":"response","request_id":"p1","ok":true,"platform":"linux","display_server":"x11","x11_endpoint":true,
+ "screen_capture":true,"input_control":true,
+ "accessibility_bus":{"state":"answering","applications":7,
+                      "status":{"is_enabled":false,"screen_reader_enabled":false}},
+ "accessibility_packages":{"source":"dpkg","at_spi2_core":"2.44.0-3","atk_bridge":"2.38.0-3"},
+ "toolkit_notes":[{"toolkit":"qt","note":"the session's accessibility status reads off, so a Qt application publishes no tree: start it with QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 in its environment"},
+                  {"toolkit":"chromium","note":"a Chromium-based application publishes no page tree by itself: start it with --force-renderer-accessibility, and with ACCESSIBILITY_ENABLED=1 in its environment"}]}
+```
+
+- `display_server` is decided by connecting, never by a variable: `wayland` when a Wayland socket answers, `x11`
+  when only an X socket answers, `none` when neither does. `x11_endpoint` says whether an X endpoint answers: the
+  session's own on X11, XWayland beside Wayland. `screen_capture` and `input_control` are true on X11 alone.
+- `accessibility_bus.state`:
+  - `answering`: the registry answers and lists `applications` applications, one or more;
+  - `empty`: the registry answers and lists none (`applications` is 0);
+  - `unavailable`: no registry answered. `cause` names why and `detail` says what failed: `no_session_bus` (this
+    process has no session bus), `not_installed` (nothing on the session bus is or can start `org.a11y.Bus`:
+    at-spi2-core is not installed for this session), `no_address` (the launcher gave no usable address),
+    `unreachable` (the address would not connect), `not_answering` (the registry did not answer its child count).
+- `accessibility_bus.status` is the session's `org.a11y.Status`, `is_enabled` and `screen_reader_enabled`, or
+  `null` where it was not read. Qt publishes its tree only while one of them is true, or with its own switch.
+- `accessibility_packages` holds the versions the package database records for at-spi2-core and the ATK bridge
+  (`libatk-bridge2.0-0`, `libatk-bridge2.0-0t64` from Ubuntu 24.04), each `null` where it is not installed. `source`
+  is `dpkg`, or `null` with every version `null` where this build reads no package database (only dpkg's is read).
+  An ATK bridge older than 2.52 aborts a GTK 3 application asked `Action.GetActions`; compux never asks it.
+- `toolkit_notes` holds the notes known without reading any application, each `toolkit` and `note`: Qt while the
+  status reads off, and Chromium's switches. None where the bus is `unavailable`.
+
+What it sends: one `GetAddress` to the session bus's `org.a11y.Bus`, which may start the accessibility bus as any
+accessible application's start does (a check for the name first would report a healthy session where nothing has
+asked yet as one without accessibility); two property `Get`s of `org.a11y.Status`; and the registry's
+`ChildCount`. It registers for no event, reads no application, never sends `GetAll`, and sets nothing. It reads
+`/var/lib/dpkg/status` as a file.

@@ -1218,17 +1218,32 @@ fn indicator_presence(launcher: &Arc<dyn indicator::Launcher>) -> &'static str {
 /// the platform and display server. NON-PROMPTING: on macOS this queries TCC grant
 /// state (Accessibility + Screen Recording) WITHOUT raising a permission dialog or
 /// posting an event — the only reliable way to detect the silent-drop state where
-/// capture works but synthetic input is discarded. Surfaced by the consumer's
-/// diagnostics (a doctor/setup surface); the model never calls this.
+/// capture works but synthetic input is discarded. On Linux it also says whether
+/// the accessibility bus answers, which packages it rests on, and the toolkit
+/// notes known without reading an application (`linux::probe`), read-only as
+/// well. Surfaced by the consumer's diagnostics (a doctor/setup surface); the
+/// model never calls this.
 fn probe() -> Result<Value, Failure> {
-    let reply = json!({
+    probe_with(accessibility_facts)
+}
+
+/// `probe` with the accessibility facts `accessibility` reads: on Linux the
+/// accessibility bus, its packages and the toolkit notes; none on macOS, whose
+/// grants are the two booleans.
+fn probe_with(
+    accessibility: impl FnOnce() -> serde_json::Map<String, Value>,
+) -> Result<Value, Failure> {
+    let mut reply = with_x11_endpoint(json!({
         "ok": true,
         "platform": std::env::consts::OS,
         "display_server": display_server(),
         "screen_capture": screen_capture_ok(),
         "input_control": input_control_ok(),
-    });
-    Ok(with_x11_endpoint(reply))
+    }));
+    if let Some(object) = reply.as_object_mut() {
+        object.extend(accessibility());
+    }
+    Ok(reply)
 }
 
 /// Linux: whether an X endpoint answers, beside Wayland (XWayland) or as the
@@ -1245,6 +1260,17 @@ fn with_x11_endpoint(mut reply: Value) -> Value {
 #[cfg(not(target_os = "linux"))]
 fn with_x11_endpoint(reply: Value) -> Value {
     reply
+}
+
+/// What `probe` reports of the accessibility bus, its packages and the toolkits.
+#[cfg(target_os = "linux")]
+fn accessibility_facts() -> serde_json::Map<String, Value> {
+    linux::probe::report(Duration::from_millis(ax::READ_TIMEOUT_MS))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn accessibility_facts() -> serde_json::Map<String, Value> {
+    serde_json::Map::new()
 }
 
 // --- request_permissions (operational grant PROMPT, NOT a model action) -------
@@ -6175,7 +6201,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn on_linux_the_probe_says_which_display_answered() {
-        let v = probe().unwrap();
+        let v = probe_with(serde_json::Map::new).unwrap();
 
         let server = v["display_server"].as_str().expect("a display server");
         assert!(["x11", "wayland", "none"].contains(&server), "{v}");
@@ -6188,6 +6214,29 @@ mod tests {
         );
         assert_eq!(v["screen_capture"], json!(server == "x11"), "{v}");
         assert_eq!(v["input_control"], json!(server == "x11"), "{v}");
+    }
+
+    // Beside the display, the Linux probe says what the engine's doctor shows of
+    // accessibility: the bus, its packages and the toolkit notes, as read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_the_probe_adds_the_accessibility_bus_its_packages_and_the_notes() {
+        let facts = linux::probe::fields(
+            &linux::probe::Bus::Empty,
+            None,
+            &linux::probe::Packages::default(),
+        );
+
+        let v = probe_with(|| facts.clone()).unwrap();
+
+        for key in [
+            "accessibility_bus",
+            "accessibility_packages",
+            "toolkit_notes",
+        ] {
+            assert_eq!(v[key], facts[key], "{key}: {v}");
+        }
+        assert!(v["display_server"].is_string(), "{v}");
     }
 
     // And the macOS build offers every verb it offered before, in the same order.
