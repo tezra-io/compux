@@ -555,8 +555,23 @@ impl Real {
     where
         T: TryFrom<OwnedValue>,
     {
+        self.property_within(bus, at, (interface, name), read_timeout())
+            .await
+    }
+
+    /// One property, by itself, given up on as `Late` once `limit` has passed.
+    pub(super) async fn property_within<T>(
+        &self,
+        bus: &Connection,
+        at: &Address,
+        (interface, name): (&str, &str),
+        limit: Duration,
+    ) -> Result<T, Failed>
+    where
+        T: TryFrom<OwnedValue>,
+    {
         let value: OwnedValue = self
-            .call(bus, at, PROPERTIES, "Get", &(interface, name))
+            .call_within(bus, at, (PROPERTIES, "Get"), &(interface, name), limit)
             .await?;
         T::try_from(value).map_err(|_| Failed::Other)
     }

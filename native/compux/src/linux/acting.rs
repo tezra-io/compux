@@ -12,8 +12,8 @@ use zbus::zvariant::{OwnedObjectPath, Value};
 use zbus::Connection;
 
 use super::atspi::{
-    area, Address, Failed, Known, Real, ACCESSIBLE, ACTION, COMPONENT, EDITABLE_TEXT, PROPERTIES,
-    SELECTION, TEXT, VALUE,
+    area, read_timeout, Address, Failed, Known, Real, ACCESSIBLE, ACTION, COMPONENT, EDITABLE_TEXT,
+    PROPERTIES, SELECTION, TEXT, VALUE,
 };
 use super::routes::{self, Toolkit};
 use super::vocabulary::{self, SCROLL_BAR, SCROLL_PANE, VERTICAL};
@@ -99,6 +99,25 @@ fn no_bus() -> Refusal {
 /// What is left of a deadline, for the next call.
 fn left(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
+}
+
+/// A read before a write: a read's timeout, cut to what is left of the verb's
+/// time. The reads are charged to the verb, so they can never leave its write
+/// none.
+fn reading(deadline: Instant) -> Duration {
+    read_timeout().min(left(deadline))
+}
+
+/// Nothing is sent once the reads before a write used the verb's time up: a write
+/// sent then would only be given up on, and say it may have landed.
+fn in_time(deadline: Instant, what: &str) -> Result<(), Refusal> {
+    if !left(deadline).is_zero() {
+        return Ok(());
+    }
+    Err(Refusal::unsent(
+        "state_unreadable",
+        format!("{what} took all of this verb's time, so nothing was sent"),
+    ))
 }
 
 impl Real {
@@ -240,13 +259,26 @@ impl Real {
         limit: Duration,
     ) -> Result<(), Refusal> {
         let deadline = Instant::now() + limit;
-        let selections: i32 = async_io::block_on(self.call(bus, at, TEXT, "GetNSelections", &()))
-            .map_err(|why| unread(why, "reading the selection"))?;
+        let selections: i32 = async_io::block_on(self.call_within(
+            bus,
+            at,
+            (TEXT, "GetNSelections"),
+            &(),
+            reading(deadline),
+        ))
+        .map_err(|why| unread(why, "reading the selection"))?;
         let insert_at = if selections > 0 {
             self.delete_selection(bus, at, deadline)?
         } else {
-            async_io::block_on(self.property::<i32>(bus, at, TEXT, "CaretOffset"))
-                .map_err(|why| unread(why, "reading the caret"))?
+            let caret = async_io::block_on(self.property_within::<i32>(
+                bus,
+                at,
+                (TEXT, "CaretOffset"),
+                reading(deadline),
+            ))
+            .map_err(|why| unread(why, "reading the caret"))?;
+            in_time(deadline, "reading the caret")?;
+            caret
         };
         let length = i32::try_from(text.chars().count()).unwrap_or(i32::MAX);
         let done = async_io::block_on(self.call_within(
@@ -272,9 +304,15 @@ impl Real {
         at: &Address,
         deadline: Instant,
     ) -> Result<i32, Refusal> {
-        let (start, end): (i32, i32) =
-            async_io::block_on(self.call(bus, at, TEXT, "GetSelection", &(0i32,)))
-                .map_err(|why| unread(why, "reading the selection"))?;
+        let (start, end): (i32, i32) = async_io::block_on(self.call_within(
+            bus,
+            at,
+            (TEXT, "GetSelection"),
+            &(0i32,),
+            reading(deadline),
+        ))
+        .map_err(|why| unread(why, "reading the selection"))?;
+        in_time(deadline, "reading the selection")?;
         let done = async_io::block_on(self.call_within(
             bus,
             at,
@@ -316,35 +354,10 @@ impl Real {
     /// nothing, and nothing is sent.
     fn scroll_bar(&self, bus: &Connection, at: &Address, limit: Duration) -> Result<(), Refusal> {
         let deadline = Instant::now() + limit;
-        let pane = async_io::block_on(self.scroll_pane_of(bus, at))
-            .ok_or_else(|| Refusal::new(false, "no scroll pane holds this control now"))?;
-        let bar = async_io::block_on(self.vertical_bar(bus, &pane))
-            .ok_or_else(|| Refusal::new(false, "its scroll pane has no vertical scroll bar"))?;
-        let (node, view) = (
-            async_io::block_on(self.window_frame(bus, at)),
-            async_io::block_on(self.window_frame(bus, &pane)),
-        );
-        let (Some(node), Some(view)) = (node, view) else {
-            return Err(Refusal::new(
-                false,
-                "it or its scroll pane would not say where it is",
-            ));
-        };
-        let delta = outside(&node, &view);
-        if delta == 0.0 {
+        let Some((bar, target)) = async_io::block_on(self.scroll_target(bus, at, deadline))? else {
             return Ok(());
-        }
-        let (now, low, high) = async_io::block_on(self.range(bus, &bar))
-            .map_err(|why| unread(why, "reading the scroll bar"))?;
-        let target = moved(now, delta, (low, high)).ok_or_else(|| {
-            Refusal::unsent(
-                "state_unreadable",
-                format!(
-                    "its scroll bar reads {now} in {low} to {high}, which is no range to move \
-                     in, so how far to scroll could not be decided: nothing was sent"
-                ),
-            )
-        })?;
+        };
+        in_time(deadline, "reading where to scroll")?;
         let written: Result<(), Failed> = async_io::block_on(self.call_within(
             bus,
             &bar,
@@ -355,49 +368,155 @@ impl Real {
         written.map_err(|why| refused(why, "scroll_to"))
     }
 
+    /// The scroll bar to move and where to move it; `None` for a node already
+    /// inside its pane. Every read is charged to `deadline`.
+    async fn scroll_target(
+        &self,
+        bus: &Connection,
+        at: &Address,
+        deadline: Instant,
+    ) -> Result<Option<(Address, f64)>, Refusal> {
+        let pane = self
+            .scroll_pane_of(bus, at, deadline)
+            .await
+            .map_err(|why| unread(why, "finding its scroll pane"))?
+            .ok_or_else(|| Refusal::new(false, "no scroll pane holds this control now"))?;
+        let bar = self
+            .vertical_bar(bus, &pane, deadline)
+            .await
+            .map_err(|why| unread(why, "finding its scroll bar"))?
+            .ok_or_else(|| Refusal::new(false, "its scroll pane has no vertical scroll bar"))?;
+        let node = self.window_frame(bus, at, deadline).await;
+        let view = self.window_frame(bus, &pane, deadline).await;
+        let (Some(node), Some(view)) = (
+            node.map_err(|why| unread(why, "reading where it is"))?,
+            view.map_err(|why| unread(why, "reading where its scroll pane is"))?,
+        ) else {
+            return Err(Refusal::new(
+                false,
+                "it or its scroll pane would not say where it is",
+            ));
+        };
+        let delta = outside(&node, &view);
+        if delta == 0.0 {
+            return Ok(None);
+        }
+        let (now, low, high) = self
+            .range(bus, &bar, deadline)
+            .await
+            .map_err(|why| unread(why, "reading the scroll bar"))?;
+        let target = moved(now, delta, (low, high)).ok_or_else(|| {
+            Refusal::unsent(
+                "state_unreadable",
+                format!(
+                    "its scroll bar reads {now} in {low} to {high}, which is no range to move \
+                     in, so how far to scroll could not be decided: nothing was sent"
+                ),
+            )
+        })?;
+        Ok(Some((bar, target)))
+    }
+
     /// The nearest scroll pane above a node, [`MAX_SCROLL_HOPS`] parents up at most.
-    async fn scroll_pane_of(&self, bus: &Connection, at: &Address) -> Option<Address> {
+    async fn scroll_pane_of(
+        &self,
+        bus: &Connection,
+        at: &Address,
+        deadline: Instant,
+    ) -> Result<Option<Address>, Failed> {
         let mut node = at.clone();
         for _ in 0..MAX_SCROLL_HOPS {
-            let parent: (String, OwnedObjectPath) =
-                self.property(bus, &node, ACCESSIBLE, "Parent").await.ok()?;
-            node = Address::of_child(parent)?;
-            let role: u32 = self.accessible(bus, &node, "GetRole").await.ok()?;
-            if role == SCROLL_PANE {
-                return Some(node);
+            let parent: (String, OwnedObjectPath) = self
+                .property_within(bus, &node, (ACCESSIBLE, "Parent"), reading(deadline))
+                .await?;
+            let Some(parent) = Address::of_child(parent) else {
+                return Ok(None);
+            };
+            node = parent;
+            if self.role_within(bus, &node, deadline).await? == SCROLL_PANE {
+                return Ok(Some(node));
             }
         }
-        None
+        Ok(None)
     }
 
-    /// A scroll pane's vertical scroll bar.
-    async fn vertical_bar(&self, bus: &Connection, pane: &Address) -> Option<Address> {
-        for child in self.children_of(bus, pane, MAX_PANE_CHILDREN).await.ok()? {
-            let role: Result<u32, Failed> = self.accessible(bus, &child, "GetRole").await;
-            if role != Ok(SCROLL_BAR) {
+    /// A scroll pane's vertical scroll bar, among its first [`MAX_PANE_CHILDREN`]
+    /// children.
+    async fn vertical_bar(
+        &self,
+        bus: &Connection,
+        pane: &Address,
+        deadline: Instant,
+    ) -> Result<Option<Address>, Failed> {
+        let listed: Vec<(String, OwnedObjectPath)> = self
+            .call_within(
+                bus,
+                pane,
+                (ACCESSIBLE, "GetChildren"),
+                &(),
+                reading(deadline),
+            )
+            .await?;
+        let children = listed.into_iter().filter_map(Address::of_child);
+        for child in children.take(MAX_PANE_CHILDREN) {
+            if self.role_within(bus, &child, deadline).await? != SCROLL_BAR {
                 continue;
             }
-            let states: Vec<u32> = self.accessible(bus, &child, "GetState").await.ok()?;
+            let states: Vec<u32> = self
+                .call_within(
+                    bus,
+                    &child,
+                    (ACCESSIBLE, "GetState"),
+                    &(),
+                    reading(deadline),
+                )
+                .await?;
             if vocabulary::has(&states, VERTICAL) {
-                return Some(child);
+                return Ok(Some(child));
             }
         }
-        None
+        Ok(None)
     }
 
-    async fn window_frame(&self, bus: &Connection, at: &Address) -> Option<Frame> {
-        let extents: (i32, i32, i32, i32) = self
-            .call(bus, at, COMPONENT, "GetExtents", &(WINDOW,))
+    async fn role_within(
+        &self,
+        bus: &Connection,
+        at: &Address,
+        deadline: Instant,
+    ) -> Result<u32, Failed> {
+        self.call_within(bus, at, (ACCESSIBLE, "GetRole"), &(), reading(deadline))
             .await
-            .ok()?;
-        area(extents)
+    }
+
+    async fn window_frame(
+        &self,
+        bus: &Connection,
+        at: &Address,
+        deadline: Instant,
+    ) -> Result<Option<Frame>, Failed> {
+        let extents: (i32, i32, i32, i32) = self
+            .call_within(
+                bus,
+                at,
+                (COMPONENT, "GetExtents"),
+                &(WINDOW,),
+                reading(deadline),
+            )
+            .await?;
+        Ok(area(extents))
     }
 
     /// A Value's current, minimum and maximum.
-    async fn range(&self, bus: &Connection, at: &Address) -> Result<(f64, f64, f64), Failed> {
-        let now: f64 = self.property(bus, at, VALUE, "CurrentValue").await?;
-        let low: f64 = self.property(bus, at, VALUE, "MinimumValue").await?;
-        let high: f64 = self.property(bus, at, VALUE, "MaximumValue").await?;
+    async fn range(
+        &self,
+        bus: &Connection,
+        at: &Address,
+        deadline: Instant,
+    ) -> Result<(f64, f64, f64), Failed> {
+        let value = |name| self.property_within(bus, at, (VALUE, name), reading(deadline));
+        let now: f64 = value("CurrentValue").await?;
+        let low: f64 = value("MinimumValue").await?;
+        let high: f64 = value("MaximumValue").await?;
         Ok((now, low, high))
     }
 }
@@ -452,7 +571,7 @@ mod scrolling {
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::ax::{Ax, Handle, Write, PRESS, SCROLL_TO_VISIBLE};
     use crate::gate::SystemClock;
@@ -1018,6 +1137,57 @@ mod tests {
             assert!(!refused.sent(), "{case}");
             assert!(fake.sent("Set").is_empty(), "{case}");
         }
+    }
+
+    // The reads a verb makes before it writes are charged to the verb's own time,
+    // never a read's timeout each: a scroll pane chain or a field that does not
+    // answer ends the verb within its time, as unreadable, with nothing sent. A
+    // write sent after its time had gone would only be given up on, and say it may
+    // have landed.
+    #[test]
+    fn the_reads_before_a_write_end_within_the_verbs_time_and_send_nothing() {
+        const BUDGET_MS: u64 = 40;
+        // Well under a read's own timeout here (the connection's, `TIMEOUT`), so a
+        // read held to that fails this.
+        let within = Duration::from_millis(150);
+        let (fake, ax) = reader(scrolling(scroll_bar(0.0, (0.0, 3900.0))));
+        let found = walk(&ax);
+        fake.change(APP, "/w/view", |view| view.stalls = vec!["GetRole"]);
+        let (fake_too, ax_too) = reader(fake::one_window(
+            &["/w/code"],
+            vec![("/w/code", field("Code", "abef"))],
+        ));
+        let found_too = walk(&ax_too);
+        fake_too.change(APP, "/w/code", |code| code.stalls = vec!["GetNSelections"]);
+
+        let started = Instant::now();
+        let scrolled = ax
+            .perform(listed(&found, "Far"), SCROLL_TO_VISIBLE, BUDGET_MS)
+            .expect_err("its scroll pane did not answer");
+        let scrolling_took = started.elapsed();
+        let started = Instant::now();
+        let typed = ax_too
+            .write(
+                listed(&found_too, "Code"),
+                Write::SelectedText("cd"),
+                BUDGET_MS,
+            )
+            .expect_err("its selection did not answer");
+        let typing_took = started.elapsed();
+
+        assert!(scrolling_took < within, "scroll_to took {scrolling_took:?}");
+        assert!(typing_took < within, "type took {typing_took:?}");
+        for refused in [&scrolled, &typed] {
+            assert!(!refused.sent(), "{}", refused.detail());
+            assert_eq!(
+                refused.code(),
+                Some("state_unreadable"),
+                "{}",
+                refused.detail()
+            );
+        }
+        assert!(fake.sent("Set").is_empty());
+        assert!(fake_too.sent("InsertText").is_empty());
     }
 
     // A read a verb needs before it writes, a scroll bar's range or a field's
