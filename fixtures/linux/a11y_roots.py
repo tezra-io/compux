@@ -14,8 +14,8 @@ It makes raw D-Bus calls rather than going through libatspi, so the calls it mak
 are exactly the ones written here: `org.a11y.Bus.GetAddress` on the session bus,
 then on the accessibility bus only `Accessible.GetChildren`, `Accessible.GetRole`
 and single `Properties.Get` reads of `Name`. Never `Action.GetActions`, which ATK
-bridge 2.38 answers by aborting the application (M86 §3.3, R1), and never
-`Properties.GetAll`, which kills a Qt 6.4 application (R2).
+bridge 2.38 answers by aborting the application, and never `Properties.GetAll`,
+which kills a Qt 6.4 application.
 """
 
 import argparse

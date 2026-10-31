@@ -3,7 +3,8 @@
 # Run something inside a private Linux desktop session, INSIDE the fixture
 # container (Dockerfile beside this file). Nothing here can reach a person's
 # desktop: the session bus is dbus-run-session's own, the X server is a private
-# Xvfb, and the accessibility bus is the one that session's bus starts (M86 R10).
+# Xvfb, and the accessibility bus is the one that session's bus starts. Nothing
+# here ever runs on the owner's live desktop.
 #
 #   private-session.sh --self-test          every fixture's --self-test, in turn
 #   private-session.sh COMMAND [ARGS...]    start every fixture, run COMMAND, stop

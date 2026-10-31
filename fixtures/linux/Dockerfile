@@ -5,7 +5,8 @@
 # exists only inside the container (dbus-run-session), the accessibility bus
 # (at-spi2-core), and the three fixture applications with their toolkits. The
 # owner's desktop is never reached: no socket from the host is mounted, and
-# `private-session.sh` starts every bus and server it uses itself (M86 R10).
+# `private-session.sh` starts every bus and server it uses itself: nothing here ever
+# runs on the owner's live desktop.
 #
 #   docker build -t compux-fixtures:noble fixtures/linux
 #   docker build -t compux-fixtures:jammy --build-arg BASE=ubuntu:22.04 \

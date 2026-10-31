@@ -9,7 +9,7 @@
 # container's seccomp profile refuses, and this container has no network and shows
 # one local page. ACCESSIBILITY_ENABLED=1 and --force-renderer-accessibility make
 # the browser and the page publish their trees without waiting for an assistive
-# technology to be noticed (the same switch D6 has Fermix give apps it launches).
+# technology to be noticed (the same switch Fermix is to give the apps it launches).
 set -euo pipefail
 [ -f /.dockerenv ] || [ -f /run/.containerenv ] || { echo "runs only inside the spike container" >&2; exit 2; }
 if [ -z "${COMPUX_PRIVATE_BUS:-}" ]; then
