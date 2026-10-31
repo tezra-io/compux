@@ -211,6 +211,10 @@ pub struct Facts {
     /// platform that places its nodes is not on screen, and is not listed. Only the
     /// Linux reader sets this.
     pub placeless: bool,
+    /// The platform says it is not on screen: an AT-SPI node that does not read
+    /// SHOWING. A menu a toolkit keeps after it closed is still in the tree, and
+    /// this is how it is told from an open one. Only the Linux reader sets this.
+    pub hidden: bool,
 }
 
 /// Which attributes of one element may be written (protocol 12): the routes the
@@ -427,6 +431,13 @@ pub trait Ax {
     /// (M7). A reply reports the difference across its own reads, which is the
     /// number the macOS reader's batching is measured by.
     fn messages(&self) -> u64;
+
+    /// What makes the application with this pid publish its tree, where its
+    /// toolkit publishes none until it is asked: the words of the switch. A macOS
+    /// application is asked by the reader itself (`AXManualAccessibility`).
+    fn tree_switch(&self, _pid: i32) -> Option<&'static str> {
+        None
+    }
 
     /// Whether this session places controls on a screen at all. A Linux session on
     /// Wayland, or with no display in reach, places none: its controls are listed
@@ -1020,8 +1031,9 @@ mod mac {
                 actions,
                 // One call names every action, or none are named.
                 actions_partial: false,
-                // macOS places every node it can see.
+                // macOS places every node it can see, and lists none it cannot.
                 placeless: false,
+                hidden: false,
             })
         }
     }
@@ -2183,6 +2195,7 @@ impl Scripted {
             actions_partial: self.actions_partial,
             frame: self.frame,
             placeless: self.placeless,
+            hidden: false,
         }
     }
 

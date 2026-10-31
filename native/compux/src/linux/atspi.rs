@@ -45,7 +45,7 @@ use serde::Serialize;
 use zbus::zvariant::{DynamicDeserialize, DynamicType, OwnedObjectPath, OwnedValue};
 use zbus::Connection;
 
-use super::routes::{self, Toolkit};
+use super::routes::{self, Toolkit, CHROMIUM_SWITCH, GTK4_SWITCH, QT_SWITCH};
 use super::vocabulary::{
     self, ACTIVE, COMBO_BOX, EDITABLE, ENTRY, EXPANDED, FOCUSED, MULTI_LINE, PASSWORD_TEXT,
     SCROLL_PANE, SHOWING, TEXT as TEXT_ROLE,
@@ -1232,6 +1232,8 @@ fn facts(
         actions_partial,
         frame,
         placeless,
+        // A node whose states would not read did not say it is off screen.
+        hidden: !known.states.is_empty() && !vocabulary::has(&known.states, SHOWING),
     }
 }
 
@@ -1355,6 +1357,18 @@ impl Ax for Real {
         self.places_nodes()
     }
 
+    fn tree_switch(&self, pid: i32) -> Option<&'static str> {
+        let bus = self.bus()?;
+        let toolkit = async_io::block_on(async {
+            let app = self.application_of(&bus, pid).await?;
+            if !self.toolkits.borrow().contains_key(&app.bus) {
+                self.learn_toolkit(&bus, &app).await;
+            }
+            Some(self.toolkit(&app.bus))
+        })?;
+        toolkit.switch()
+    }
+
     /// The writes the node's last read gives it a route for: no message.
     fn routes(&self, handle: Handle) -> Routes {
         self.known(handle)
@@ -1447,9 +1461,13 @@ impl Ax for Real {
 /// The application in front and its name, for `elements` to read: the one whose
 /// window reads ACTIVE on the accessibility bus.
 pub fn frontmost_application(ax: &Rc<dyn Ax>) -> Result<(i32, String), String> {
-    let pid = ax
-        .frontmost_pid()
-        .ok_or("no application window reads active on the accessibility bus")?;
+    let pid = ax.frontmost_pid().ok_or_else(|| {
+        format!(
+            "no application window reads active on the accessibility bus; an application \
+             whose toolkit publishes no tree is not on it: for Qt, {QT_SWITCH}; for Chromium, \
+             {CHROMIUM_SWITCH}; and {GTK4_SWITCH}"
+        )
+    })?;
     let name = session::name(pid).unwrap_or_else(|| format!("pid {pid}"));
     Ok((pid, name))
 }
@@ -2352,6 +2370,84 @@ mod tests {
             unread(Failed::Suspect),
             Unread::Refused,
             "alone it proves nothing"
+        );
+    }
+
+    // --- surfaces --------------------------------------------------------------
+
+    // An open menu is the menu inside a window the application put up for it (GTK
+    // 3), or a popup menu of its own (Qt); a dialog and an alert are children of
+    // the application. A menu that is not showing is not open: GTK 3 keeps a menu's
+    // window once it has been opened, and Qt every menu it has made.
+    #[test]
+    fn an_open_menu_a_dialog_and_an_alert_are_surfaces_and_a_hidden_menu_is_not() {
+        const WINDOW: u32 = 69;
+        const MENU: u32 = 33;
+        const POPUP_MENU: u32 = 41;
+        const DIALOG: u32 = 16;
+        const ALERT: u32 = 2;
+        let hidden = |node: Node| Node {
+            states: vec![ENABLED, SENSITIVE],
+            ..node
+        };
+        let mut desktop = desktop(
+            &[],
+            vec![
+                (
+                    "/popup",
+                    Node::of(WINDOW)
+                        .at(10, 10, 100, 200)
+                        .holding(APP, &["/popup/menu"]),
+                ),
+                (
+                    "/popup/menu",
+                    Node::of(MENU).named("Edit").at(10, 10, 100, 200),
+                ),
+                (
+                    "/kept",
+                    hidden(Node::of(WINDOW).holding(APP, &["/kept/menu"])),
+                ),
+                ("/kept/menu", hidden(Node::of(MENU).named("File"))),
+                (
+                    "/qt",
+                    Node::of(POPUP_MENU).named("Context").at(40, 40, 90, 120),
+                ),
+                ("/qtkept", hidden(Node::of(POPUP_MENU).named("View"))),
+                (
+                    "/save",
+                    Node::of(DIALOG).named("Save As").at(50, 50, 400, 300),
+                ),
+                (
+                    "/full",
+                    Node::of(ALERT).named("Disk full").at(60, 60, 300, 100),
+                ),
+            ],
+        );
+        desktop.put(
+            APP,
+            fake::ROOT,
+            Node::of(75).named("fixture").holding(
+                APP,
+                &["/w", "/popup", "/kept", "/qt", "/qtkept", "/save", "/full"],
+            ),
+        );
+        let (_fake, ax) = reader(desktop);
+
+        let found: Vec<(&str, String, Option<String>)> = crate::semantic::surfaces(&ax, PID)
+            .into_iter()
+            .map(|surface| (surface.kind, surface.native_kind, surface.label))
+            .collect();
+
+        let named =
+            |kind, native: &str, label: &str| (kind, native.to_string(), Some(label.to_string()));
+        assert_eq!(
+            found,
+            vec![
+                named("menu", "menu", "Edit"),
+                named("menu", "popup menu", "Context"),
+                named("dialog", "dialog", "Save As"),
+                named("alert", "alert", "Disk full"),
+            ]
         );
     }
 }

@@ -25,6 +25,19 @@ const TOGGLE: &str = "toggle";
 /// its press, which is all a GTK 3 expander has (L4-6).
 const EXPANDING: [&str; 2] = ["expand or contract", "listitem.toggle-expand"];
 
+/// Qt joins the accessibility bus only where an assistive technology is running,
+/// or where it is told to.
+pub const QT_SWITCH: &str = "start it with QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 in its environment";
+
+/// Chromium builds no page tree without both: the flag alone is not enough on
+/// Debian's build.
+pub const CHROMIUM_SWITCH: &str =
+    "start it with --force-renderer-accessibility, and with ACCESSIBILITY_ENABLED=1 in its \
+     environment";
+
+/// GTK 4 joins the accessibility bus only where the bus was there when it started.
+pub const GTK4_SWITCH: &str = "start a GTK 4 application again once the accessibility bus is up";
+
 /// The toolkit an application was made with, as far as a route depends on it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Toolkit {
@@ -48,6 +61,16 @@ impl Toolkit {
             "qt" => Toolkit::Qt,
             "chromium" => Toolkit::Chromium,
             _ => Toolkit::Other,
+        }
+    }
+
+    /// What makes an application of this toolkit publish its tree, where it
+    /// publishes none until it is asked.
+    pub fn switch(self) -> Option<&'static str> {
+        match self {
+            Toolkit::Qt => Some(QT_SWITCH),
+            Toolkit::Chromium => Some(CHROMIUM_SWITCH),
+            Toolkit::Gtk3 | Toolkit::Gtk4 | Toolkit::Other => None,
         }
     }
 }
@@ -156,6 +179,23 @@ pub fn seam_actions(read: &Read<'_>) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::linux::vocabulary::{CHECKED, EXPANDED, SENSITIVE, SHOWING};
+
+    // A toolkit that publishes no tree until it is asked names its own switch; one
+    // that always publishes has none.
+    #[test]
+    fn a_toolkit_that_publishes_no_tree_until_asked_names_its_switch() {
+        let qt = Toolkit::Qt.switch().expect("Qt's");
+        assert!(qt.contains("QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1"), "{qt}");
+        let chromium = Toolkit::Chromium.switch().expect("Chromium's");
+        assert!(
+            chromium.contains("--force-renderer-accessibility")
+                && chromium.contains("ACCESSIBILITY_ENABLED=1"),
+            "{chromium}"
+        );
+        for publishing in [Toolkit::Gtk3, Toolkit::Gtk4, Toolkit::Other] {
+            assert_eq!(publishing.switch(), None, "{publishing:?}");
+        }
+    }
 
     const PUSH_BUTTON: u32 = 43;
     const CHECK_BOX: u32 = 7;

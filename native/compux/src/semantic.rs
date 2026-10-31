@@ -286,7 +286,8 @@ pub struct Surface {
 
 /// The surfaces open in one application: its windows and their children, and the
 /// menu of a menu-bar item that reads selected, reading at most
-/// [`MAX_SURFACE_NODES`] nodes.
+/// [`MAX_SURFACE_NODES`] nodes. A node the platform says is off screen is no
+/// surface, and nothing below it is looked at.
 ///
 /// A node that will not answer is passed over, and one that does not answer in time
 /// ends the scan: it is a bounded look, not a census, and what it reports is what
@@ -358,7 +359,7 @@ impl Scan<'_> {
     /// children may be. Held while its children are read through it.
     fn top(&mut self, node: Retained) {
         let handle = node.handle();
-        let Some(facts) = self.facts(handle) else {
+        let Some(facts) = self.facts(handle).filter(|facts| !facts.hidden) else {
             return;
         };
         if facts.role.as_deref() == Some(MENU_BAR) {
@@ -402,7 +403,7 @@ impl Scan<'_> {
     /// Read a node and keep it if it is a surface; one that is not, or does not
     /// answer, is given back.
     fn surface(&mut self, node: Retained) {
-        if let Some(facts) = self.facts(node.handle()) {
+        if let Some(facts) = self.facts(node.handle()).filter(|facts| !facts.hidden) {
             self.keep(&facts, node);
         }
     }

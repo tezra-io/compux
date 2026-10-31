@@ -5169,14 +5169,14 @@ fn interactive_in_view(
         Ok(target) => target,
         Err(note) => return Ok(Viewed::nothing(note)),
     };
-    Ok(read_application(
+    read_application(
         ax_platform,
         &target,
         geom,
         region,
         gate,
         activate_accessibility,
-    ))
+    )
 }
 
 /// The portable half of [`interactive_in_view`], which only has to say WHICH
@@ -5189,7 +5189,7 @@ fn read_application(
     region: &Region,
     gate: &Gate,
     activate: fn(i32) -> Result<String, String>,
-) -> Viewed {
+) -> Result<Viewed, Failure> {
     // The reference that outlives this reply is only usable while the process it
     // came from is still THAT process, so the start time is read once, here,
     // against the same pid the walk is about to use.
@@ -5198,33 +5198,60 @@ fn read_application(
 
     let first = in_view_nodes(ax_platform, target.pid, geom, region, gate);
     if !first.nodes.is_empty() {
-        return Viewed {
+        return Ok(Viewed {
             nodes: first.nodes,
             owner,
             truncated: first.truncated,
             note: Some(format!("read {}", target.app)),
             messages: first.messages,
-        };
+        });
     }
     if first.total > 0 {
         let note = format!(
             "{}: {} interactive element(s) in the app, none inside this view",
             target.app, first.total
         );
-        return Viewed {
+        return Ok(Viewed {
             messages: first.messages,
             ..Viewed::nothing(note)
-        };
+        });
     }
 
     let attempt = attempt_note(&activate(target.pid));
     match settle(ax_platform, target.pid, geom, region, gate, first) {
-        Ok((walked, waited)) => settled_view(target, owner, &attempt, walked, waited),
-        Err(last) => Viewed {
+        Ok((walked, waited)) => {
+            tree_published(ax_platform, target, &walked)?;
+            Ok(settled_view(target, owner, &attempt, walked, waited))
+        }
+        Err(last) => Ok(Viewed {
             messages: last.messages,
             ..Viewed::nothing(format!("{}: cancelled while the tree settled", target.app))
-        },
+        }),
     }
+}
+
+/// A tree that stayed empty in an application whose toolkit publishes none until
+/// it is asked (Qt, Chromium on Linux) is that, said by name with the switch
+/// that would make it publish one — not an application with nothing in it.
+fn tree_published(
+    ax_platform: &Rc<dyn ax::Ax>,
+    target: &TargetApp,
+    walked: &InView,
+) -> Result<(), Failure> {
+    if walked.total > 0 {
+        return Ok(());
+    }
+    let Some(switch) = ax_platform.tree_switch(target.pid) else {
+        return Ok(());
+    };
+    Err(Failure::new(
+        "toolkit_accessibility_off",
+        format!(
+            "{}: its toolkit publishes no accessibility tree until it is asked to: {switch}, \
+             then list again; or work in the image",
+            target.app
+        ),
+    ))
 }
 
 /// Walk an empty tree again on a short cadence until it has controls in it or
@@ -5349,17 +5376,12 @@ fn activate_accessibility(pid: i32) -> Result<String, String> {
 }
 
 /// Linux has no switch per application, and compux changes no accessibility setting
-/// for the person: a toolkit publishes its tree, or `doctor` says what is
-/// missing. The empty tree is still walked again while it settles — Chromium builds
-/// its tree after the first client reads it. A GTK 4 application's tree is there
-/// but lists nothing, having no screen positions, and the reason says so.
+/// for the person: a toolkit publishes its tree, or the refusal names what would
+/// make it. The empty tree is still walked again while it settles — Chromium
+/// builds its tree after the first client reads it.
 #[cfg(target_os = "linux")]
 fn activate_accessibility(_pid: i32) -> Result<String, String> {
-    Err(
-        "nothing to switch on: a Linux toolkit publishes its own tree or none, \
-         and GTK 4 controls are not listed yet (no screen positions)"
-            .to_string(),
-    )
+    Err("nothing to switch on: a Linux toolkit publishes its own tree or none".to_string())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -7847,6 +7869,112 @@ mod tests {
             .is_some_and(|note| note.starts_with("read ")));
     }
 
+    /// A desktop whose one application, made with this toolkit, has an ACTIVE
+    /// window (or one that is not, where `active` is false) with nothing in it.
+    #[cfg(target_os = "linux")]
+    fn linux_desktop_with_an_empty_window(
+        toolkit: &'static str,
+        version: &'static str,
+        active: bool,
+    ) -> linux::fake::Desktop {
+        use crate::linux::fake::{Desktop, Node, ACTIVE, ENABLED, SENSITIVE, SHOWING};
+
+        const APP: &str = ":1.10";
+        let mut desktop = Desktop::with_applications(vec![(
+            APP,
+            std::process::id(),
+            Node::of(75)
+                .named("app")
+                .holding(APP, &["/w"])
+                .made_with(toolkit, version),
+        )]);
+        let mut states = vec![ENABLED, SENSITIVE, SHOWING];
+        if active {
+            states.push(ACTIVE);
+        }
+        desktop.put(
+            APP,
+            "/w",
+            Node {
+                states,
+                ..Node::of(23).named("Window").at(0, 0, 800, 600)
+            },
+        );
+        desktop
+    }
+
+    /// `elements` with no parameters, through the worker.
+    #[cfg(target_os = "linux")]
+    fn list_elements(worker: &mut Worker, gate: &Gate) -> Value {
+        let mut list = running("elements", None);
+        list.body = json!({"action": "elements"});
+        served(&list, gate, worker)
+    }
+
+    // An application in front whose toolkit publishes no tree until it is asked
+    // (Qt, Chromium), and whose tree stays empty, is refused by name with the
+    // switch that would make it publish one. A GTK 3 window with nothing in it is
+    // only empty.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_an_application_whose_toolkit_publishes_no_tree_names_its_switch() {
+        use crate::linux::fake::Fake;
+
+        for (toolkit, version, switch) in [
+            ("Qt", "5.15.3", Some("QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1")),
+            ("Chromium", "120.0", Some("ACCESSIBILITY_ENABLED=1")),
+            ("GTK", "3.24.41", None),
+        ] {
+            let desktop = linux_desktop_with_an_empty_window(toolkit, version, true);
+            let (_fake, bus) = Fake::start(desktop, Duration::from_millis(200));
+            let platform: Rc<dyn ax::Ax> = Rc::new(linux::atspi::Real::over(bus));
+            let gate = Gate::new("boot-1".to_string(), StepClock::new());
+            let mut worker = worker_with(&gate, platform);
+
+            let listed = list_elements(&mut worker, &gate);
+
+            let Some(switch) = switch else {
+                assert_eq!(listed["elements"], json!([]), "{toolkit}: {listed}");
+                continue;
+            };
+            assert_eq!(
+                listed["error"],
+                json!("toolkit_accessibility_off"),
+                "{toolkit}: {listed}"
+            );
+            let detail = listed["detail"].as_str().unwrap_or_default();
+            assert!(detail.contains(switch), "{toolkit}: {detail}");
+        }
+    }
+
+    // When no window on the accessibility bus reads ACTIVE, the application in
+    // front may be one whose toolkit is not on it, and the note says which
+    // switches would put it there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_a_front_window_not_on_the_bus_is_explained_by_the_switches() {
+        use crate::linux::fake::Fake;
+
+        let desktop = linux_desktop_with_an_empty_window("GTK", "3.24.41", false);
+        let (_fake, bus) = Fake::start(desktop, Duration::from_millis(200));
+        let platform: Rc<dyn ax::Ax> = Rc::new(linux::atspi::Real::over(bus));
+        let gate = Gate::new("boot-1".to_string(), StepClock::new());
+        let mut worker = worker_with(&gate, platform);
+
+        let listed = list_elements(&mut worker, &gate);
+
+        assert_eq!(listed["ok"], json!(true), "{listed}");
+        let note = listed["ax_activation"].as_str().unwrap_or_default();
+        for switch in [
+            "QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1",
+            "--force-renderer-accessibility",
+            "ACCESSIBILITY_ENABLED=1",
+            "GTK 4",
+        ] {
+            assert!(note.contains(switch), "{switch}: {note}");
+        }
+    }
+
     /// A screen no test may take a frame of.
     #[cfg(target_os = "linux")]
     struct NoFrames;
@@ -8021,7 +8149,8 @@ mod tests {
             app: "Fixture".to_string(),
         };
 
-        let viewed = read_application(&platform, &target, &geom, &region, &gate, switched_on);
+        let viewed = read_application(&platform, &target, &geom, &region, &gate, switched_on)
+            .expect("a tree that appeared");
 
         assert_eq!(viewed.nodes.len(), 2);
         assert_eq!(
