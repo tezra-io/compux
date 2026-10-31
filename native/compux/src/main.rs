@@ -1007,12 +1007,13 @@ fn barred(refusal: gate::Refusal) -> Failure {
 /// receipt says `dispatch: sent, effect: unknown`. Anything else is the
 /// application refusing a message it did receive. Neither is `stale_element`,
 /// which promises nothing was sent and is only ever minted by the revalidation
-/// before the call.
+/// before the call. A reader that stopped before sending, for a reason the
+/// contract names, keeps that reason's code.
 fn ax_failure(refusal: ax::Refusal) -> Failure {
-    let code = if refusal.sent() {
-        "ax_timed_out"
-    } else {
-        "ax_action_failed"
+    let code = match (refusal.code(), refusal.sent()) {
+        (Some(code), _) => code,
+        (None, true) => "ax_timed_out",
+        (None, false) => "ax_action_failed",
     };
     Failure::new(code, refusal.detail())
 }
@@ -7586,6 +7587,26 @@ mod tests {
 
         assert_eq!(frame["error"], json!("ax_action_failed"));
         assert!(frame["detail"].as_str().unwrap().contains("-25200"));
+    }
+
+    // A reader that stopped before sending, for a reason the contract names (a
+    // range it cannot move in, a value no control takes), keeps that code, and
+    // the receipt says nothing went out.
+    #[test]
+    fn a_refusal_the_reader_names_keeps_its_code_and_nothing_was_sent() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.fail_next(ax::Refusal::unsent(
+            "state_unreadable",
+            "its scroll bar's range is no range",
+        ));
+
+        let frame = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+
+        assert_eq!(frame["error"], json!("state_unreadable"), "{frame}");
+        assert_eq!(frame["receipt"]["dispatch"], json!("not_sent"), "{frame}");
+        assert!(frame["detail"].as_str().unwrap().contains("no range"));
     }
 
     // Through the gate exactly like a click: a pause stops it, and the receipt

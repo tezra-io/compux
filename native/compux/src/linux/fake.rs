@@ -89,6 +89,9 @@ pub struct Node {
     pub life: Life,
     /// Members this live node answers `UnknownObject` for (L17-2).
     pub refuses: Vec<&'static str>,
+    /// Members, or properties read through `Get`, it never answers: the caller's
+    /// timeout ends the call.
+    pub stalls: Vec<&'static str>,
     /// An application root's `ToolkitName` and `Version`.
     pub toolkit: (&'static str, &'static str),
     /// `GetExtents` in window coordinates, where it differs from the screen's.
@@ -127,6 +130,7 @@ impl Node {
             value: 0.0,
             life: Life::Alive,
             refuses: Vec::new(),
+            stalls: Vec::new(),
             toolkit: ("", ""),
             window_extents: None,
             range: (0.0, 100.0),
@@ -536,7 +540,8 @@ fn written(desktop: &mut Desktop, call: &Call, message: &Message) -> Option<Repl
 }
 
 /// Why a call to this node gets no answer of its own, if it does not: its
-/// application quit, it is not there, it is destroyed or silent, or it refuses.
+/// application quit, it is not there, it is destroyed or silent, or it refuses or
+/// stalls this call.
 fn unanswerable(desktop: &Desktop, call: &Call) -> Option<Reply> {
     if desktop.quit.contains(&call.bus) {
         return Some(Reply::Error(SERVICE_UNKNOWN));
@@ -549,8 +554,12 @@ fn unanswerable(desktop: &Desktop, call: &Call) -> Option<Reply> {
         Life::Silent => return Some(Reply::Silence),
         Life::Alive => {}
     }
-    if node.refuses.contains(&call.member.as_str()) {
+    let named = [call.member.as_str(), call.argument.as_str()];
+    if named.iter().any(|name| node.refuses.contains(name)) {
         return Some(Reply::Error(UNKNOWN_OBJECT));
+    }
+    if named.iter().any(|name| node.stalls.contains(name)) {
+        return Some(Reply::Silence);
     }
     None
 }
@@ -730,22 +739,10 @@ fn process_id(desktop: &Desktop, bus: &str) -> Reply {
 
 /// A call to one accessible: what its life, its refusals and its script answer.
 fn from_node(desktop: &Desktop, call: &Call, message: &Message) -> Reply {
-    if desktop.quit.contains(&call.bus) {
-        return Reply::Error(SERVICE_UNKNOWN);
+    if let Some(reply) = unanswerable(desktop, call) {
+        return reply;
     }
-    let Some(node) = desktop.nodes.get(&(call.bus.clone(), call.path.clone())) else {
-        return Reply::Error(UNKNOWN_OBJECT);
-    };
-    match node.life {
-        Life::Destroyed => return Reply::Error(UNKNOWN_OBJECT),
-        Life::Silent => return Reply::Silence,
-        Life::Alive => {}
-    }
-    if node.refuses.contains(&call.member.as_str())
-        || node.refuses.contains(&call.argument.as_str())
-    {
-        return Reply::Error(UNKNOWN_OBJECT);
-    }
+    let node = &desktop.nodes[&(call.bus.clone(), call.path.clone())];
     match call.member.as_str() {
         "Get" => property(node, message),
         "GetAll" => Reply::Error(FAILED),

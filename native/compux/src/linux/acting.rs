@@ -66,6 +66,23 @@ fn answered(done: Result<bool, Failed>, what: &str) -> Result<(), Refusal> {
     }
 }
 
+/// A read a verb needs before its write, that did not answer: nothing that
+/// changes anything went out, however the read failed. The verb could not read
+/// what it acts from, which the contract calls `state_unreadable`.
+fn unread(why: Failed, what: &str) -> Refusal {
+    let because = match why {
+        Failed::Late => "no answer in time",
+        Failed::Lost => "the accessibility bus failed under it",
+        Failed::Quit => "the application is gone",
+        Failed::Suspect => "the application has no such object or call now",
+        Failed::Other => "the application refused it",
+    };
+    Refusal::unsent(
+        "state_unreadable",
+        format!("{what}: {because}, so nothing was sent"),
+    )
+}
+
 /// Nothing was sent: there is no route for this on the node.
 fn no_route(what: &str) -> Refusal {
     Refusal::new(false, format!("this control has no route for {what}"))
@@ -133,8 +150,9 @@ impl Real {
     }
 
     /// `set_value`: a field's text whole, through `EditableText`, or a number
-    /// through `Value`. Text that is no number is refused before a slider is sent
-    /// anything.
+    /// through `Value`. Text that is no finite number is a wrong value, refused
+    /// before a slider is sent anything: "NaN" and "inf" parse, and no control
+    /// takes either.
     pub(super) fn set(&self, handle: Handle, value: &str, limit: Duration) -> Result<(), Refusal> {
         let (known, at, bus) = self.target(handle)?;
         if !routes::settable(&known.read()) {
@@ -150,12 +168,20 @@ impl Real {
             ));
             return answered(done, "set_value");
         }
-        let number: f64 = value.trim().parse().map_err(|_| {
-            Refusal::new(
-                false,
-                format!("this control takes a number, and {value:?} is none"),
-            )
-        })?;
+        let number = value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|number| number.is_finite())
+            .ok_or_else(|| {
+                Refusal::unsent(
+                    "invalid_argument",
+                    format!(
+                        "this control takes a finite number, and {value:?} is none: nothing was \
+                         sent"
+                    ),
+                )
+            })?;
         let written: Result<(), Failed> = async_io::block_on(self.call_within(
             &bus,
             &at,
@@ -209,12 +235,12 @@ impl Real {
     ) -> Result<(), Refusal> {
         let deadline = Instant::now() + limit;
         let selections: i32 = async_io::block_on(self.call(bus, at, TEXT, "GetNSelections", &()))
-            .map_err(|why| refused(why, "reading the selection"))?;
+            .map_err(|why| unread(why, "reading the selection"))?;
         let insert_at = if selections > 0 {
             self.delete_selection(bus, at, deadline)?
         } else {
             async_io::block_on(self.property::<i32>(bus, at, TEXT, "CaretOffset"))
-                .map_err(|why| refused(why, "reading the caret"))?
+                .map_err(|why| unread(why, "reading the caret"))?
         };
         let length = i32::try_from(text.chars().count()).unwrap_or(i32::MAX);
         let done = async_io::block_on(self.call_within(
@@ -242,7 +268,7 @@ impl Real {
     ) -> Result<i32, Refusal> {
         let (start, end): (i32, i32) =
             async_io::block_on(self.call(bus, at, TEXT, "GetSelection", &(0i32,)))
-                .map_err(|why| refused(why, "reading the selection"))?;
+                .map_err(|why| unread(why, "reading the selection"))?;
         let done = async_io::block_on(self.call_within(
             bus,
             at,
@@ -264,7 +290,7 @@ impl Real {
     ) -> Result<(), Refusal> {
         let item = self.address(item).ok_or_else(gone)?;
         let index: i32 = async_io::block_on(self.accessible(bus, &item, "GetIndexInParent"))
-            .map_err(|why| refused(why, "reading where the item is"))?;
+            .map_err(|why| unread(why, "reading where the item is"))?;
         if index < 0 {
             return Err(Refusal::new(false, "the item is in no container now"));
         }
@@ -303,8 +329,16 @@ impl Real {
             return Ok(());
         }
         let (now, low, high) = async_io::block_on(self.range(bus, &bar))
-            .map_err(|why| refused(why, "reading the scroll bar"))?;
-        let target = (now + delta).clamp(low, high);
+            .map_err(|why| unread(why, "reading the scroll bar"))?;
+        let target = moved(now, delta, (low, high)).ok_or_else(|| {
+            Refusal::unsent(
+                "state_unreadable",
+                format!(
+                    "its scroll bar reads {now} in {low} to {high}, which is no range to move \
+                     in, so how far to scroll could not be decided: nothing was sent"
+                ),
+            )
+        })?;
         let written: Result<(), Failed> = async_io::block_on(self.call_within(
             bus,
             &bar,
@@ -360,6 +394,17 @@ impl Real {
         let high: f64 = self.property(bus, at, VALUE, "MaximumValue").await?;
         Ok((now, low, high))
     }
+}
+
+/// Where a scroll bar at `now` ends after moving by `delta`, held to its range.
+/// `None` for a range no application could mean, which it may still publish: a
+/// number that is not finite, or a minimum above the maximum (`f64::clamp`
+/// panics on either).
+fn moved(now: f64, delta: f64, (low, high): (f64, f64)) -> Option<f64> {
+    let finite = [now, delta, low, high]
+        .iter()
+        .all(|number| number.is_finite());
+    (finite && low <= high).then(|| (now + delta).clamp(low, high))
 }
 
 /// How far a node lies outside the view it scrolls in, downward positive: 0 when
@@ -444,6 +489,16 @@ mod tests {
         semantic::plan(ax, handle, PID, &facts, false, &verb).map_err(|failure| failure.code)
     }
 
+    fn slider() -> Node {
+        Node {
+            value: 50.0,
+            ..Node::of(51)
+                .named("Volume")
+                .at(10, 40, 200, 24)
+                .listing(&["Value"])
+        }
+    }
+
     fn field(name: &str, text: &str) -> Node {
         Node {
             text: text.to_string(),
@@ -484,16 +539,9 @@ mod tests {
     // anything is sent to a slider.
     #[test]
     fn set_value_writes_a_fields_text_and_a_sliders_number() {
-        let slider = Node {
-            value: 50.0,
-            ..Node::of(51)
-                .named("Volume")
-                .at(10, 40, 200, 24)
-                .listing(&["Value"])
-        };
         let (fake, ax) = reader(fake::one_window(
             &["/w/name", "/w/volume"],
-            vec![("/w/name", field("Name", "ada")), ("/w/volume", slider)],
+            vec![("/w/name", field("Name", "ada")), ("/w/volume", slider())],
         ));
         let found = walk(&ax);
         let (name, volume) = (listed(&found, "Name"), listed(&found, "Volume"));
@@ -510,6 +558,28 @@ mod tests {
         assert_eq!(ax.value(volume).as_deref(), Some("75"));
         assert!(!refused.sent());
         assert_eq!(fake.sent("Set").len(), 1, "the refused one sent nothing");
+    }
+
+    // "NaN", "inf" and "infinity" parse as numbers, but no control takes one. Like
+    // text that is no number, each is a wrong value, refused before anything is
+    // sent to the slider.
+    #[test]
+    fn set_value_sends_a_slider_only_a_finite_number() {
+        let (fake, ax) = reader(fake::one_window(
+            &["/w/volume"],
+            vec![("/w/volume", slider())],
+        ));
+        let found = walk(&ax);
+        let volume = listed(&found, "Volume");
+
+        for text in ["NaN", "inf", "-inf", "infinity", "loud"] {
+            let refused = ax.set_value(volume, text, WRITE_MS).expect_err(text);
+
+            assert_eq!(refused.code(), Some("invalid_argument"), "{text}");
+            assert!(!refused.sent(), "{text}");
+        }
+        assert!(fake.sent("Set").is_empty());
+        assert_eq!(fake.node(APP, "/w/volume").value, 50.0);
     }
 
     // `type` by reference: the selection is deleted, then the text inserted at the
@@ -746,10 +816,21 @@ mod tests {
         assert_eq!(fake.sent("ScrollTo"), vec!["/w/far 6"], "ANYWHERE");
     }
 
-    // scroll_to on GTK moves the vertical scroll bar of the scroll pane the node
-    // sits in, by how far the node lies outside the pane, in window coordinates.
-    #[test]
-    fn scroll_to_moves_the_gtk_scroll_bar_by_how_far_the_node_lies_outside() {
+    /// A vertical scroll bar at `value` in `range`.
+    fn scroll_bar(value: f64, range: (f64, f64)) -> Node {
+        Node {
+            value,
+            range,
+            ..Node::of(48)
+                .at(0, 0, 0, 0)
+                .reading(&[VERTICAL])
+                .listing(&["Value"])
+        }
+    }
+
+    /// A GTK 4 window whose scroll pane, from 100 to 200 in the window, holds a
+    /// row inside it and one far below, beside this scroll bar.
+    fn scrolling(bar: Node) -> Desktop {
         let mut desktop = fake::one_window(
             &["/w/pane"],
             vec![
@@ -777,17 +858,7 @@ mod tests {
                         ..Node::of(32).named("Far").at(0, 0, 0, 0)
                     },
                 ),
-                (
-                    "/w/bar",
-                    Node {
-                        value: 0.0,
-                        range: (0.0, 3900.0),
-                        ..Node::of(48)
-                            .at(0, 0, 0, 0)
-                            .reading(&[VERTICAL])
-                            .listing(&["Value"])
-                    },
-                ),
+                ("/w/bar", bar),
             ],
         );
         desktop.put(
@@ -798,7 +869,14 @@ mod tests {
                 .holding(APP, &["/w"])
                 .made_with("GTK", "4.14.2"),
         );
-        let (fake, ax) = reader(desktop);
+        desktop
+    }
+
+    // scroll_to on GTK moves the vertical scroll bar of the scroll pane the node
+    // sits in, by how far the node lies outside the pane, in window coordinates.
+    #[test]
+    fn scroll_to_moves_the_gtk_scroll_bar_by_how_far_the_node_lies_outside() {
+        let (fake, ax) = reader(scrolling(scroll_bar(0.0, (0.0, 3900.0))));
         let found = walk(&ax);
 
         ax.perform(listed(&found, "Far"), SCROLL_TO_VISIBLE, WRITE_MS)
@@ -809,6 +887,75 @@ mod tests {
         ax.perform(listed(&found, "Near"), SCROLL_TO_VISIBLE, WRITE_MS)
             .expect("already in view");
         assert_eq!(fake.sent("Set").len(), 1, "a row in view moves nothing");
+    }
+
+    // An application publishes whatever range it likes. A scroll bar whose
+    // minimum is above its maximum, or any of whose numbers is not finite, gives
+    // no distance to move: scroll_to could not read the state it needs, and
+    // sends nothing.
+    #[test]
+    fn scroll_to_sends_nothing_to_a_scroll_bar_whose_range_is_no_range() {
+        let bars = [
+            (0.0, (3900.0, 0.0)),
+            (0.0, (f64::NAN, 3900.0)),
+            (0.0, (0.0, f64::NAN)),
+            (f64::NAN, (0.0, 3900.0)),
+            (0.0, (0.0, f64::INFINITY)),
+            (f64::NEG_INFINITY, (0.0, 3900.0)),
+        ];
+        for (value, range) in bars {
+            let (fake, ax) = reader(scrolling(scroll_bar(value, range)));
+            let found = walk(&ax);
+
+            let refused = ax
+                .perform(listed(&found, "Far"), SCROLL_TO_VISIBLE, WRITE_MS)
+                .expect_err("no range to move in");
+
+            let case = format!("{value} in {range:?}");
+            assert_eq!(refused.code(), Some("state_unreadable"), "{case}");
+            assert!(!refused.sent(), "{case}");
+            assert!(fake.sent("Set").is_empty(), "{case}");
+        }
+    }
+
+    // A read a verb needs before it writes, a scroll bar's range or a field's
+    // selection, that gets no answer in time sent nothing that changes anything:
+    // the verb could not read what it acts from, and says nothing went out.
+    #[test]
+    fn a_read_before_the_write_that_gets_no_answer_sent_nothing() {
+        let (fake, ax) = reader(scrolling(scroll_bar(0.0, (0.0, 3900.0))));
+        let found = walk(&ax);
+        let far = listed(&found, "Far");
+        fake.change(APP, "/w/bar", |bar| bar.stalls = vec!["CurrentValue"]);
+
+        let scrolled = ax
+            .perform(far, SCROLL_TO_VISIBLE, 100)
+            .expect_err("no range");
+
+        let (fake_too, ax_too) = reader(fake::one_window(
+            &["/w/code"],
+            vec![("/w/code", field("Code", "abef"))],
+        ));
+        let found_too = walk(&ax_too);
+        let code = listed(&found_too, "Code");
+        fake_too.change(APP, "/w/code", |code| code.stalls = vec!["GetNSelections"]);
+
+        let typed = ax_too
+            .write(code, Write::SelectedText("cd"), 100)
+            .expect_err("no selection");
+
+        for refused in [&scrolled, &typed] {
+            assert!(!refused.sent(), "{}", refused.detail());
+            assert_eq!(
+                refused.code(),
+                Some("state_unreadable"),
+                "{}",
+                refused.detail()
+            );
+        }
+        assert!(fake.sent("Set").is_empty());
+        assert!(fake_too.sent("InsertText").is_empty());
+        assert_eq!(fake_too.node(APP, "/w/code").text, "abef");
     }
 
     // A write to an application that quit never went out; one that got no answer

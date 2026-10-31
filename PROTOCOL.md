@@ -288,8 +288,9 @@ Brings the control into view. macOS route: the control's own `AXScrollToVisible`
 control's frame: moved is `changed`, the same is `not_observed` (it was already in view), unreadable is `unknown`.
 It reports no `state_before`/`state_after`. Linux route: Chromium's `Component.ScrollTo(ANYWHERE)`; on GTK 3 and
 GTK 4, the vertical scroll bar of the nearest scroll pane above the node (at most eight parents up) is set through its
-`Value` by how far the node lies outside the pane, both read in window coordinates. Qt has no route, so `scroll_to`
-is not listed there.
+`Value` by how far the node lies outside the pane, both read in window coordinates, held to the bar's range. A bar
+whose range is no range (a minimum above its maximum, or a number that is not finite) is never set: `scroll_to` is
+refused `state_unreadable` with nothing sent. Qt has no route, so `scroll_to` is not listed there.
 
 ### 4.6 `set_value` and `press`
 
@@ -297,8 +298,8 @@ As protocol 9 to 11, advertised in `verbs` (`set_value` where protocol 11 said `
 `press`). `set_value`'s effect stays `verified` or `not_observed`. Linux routes: `press` is `Action.DoAction(i)`, `i`
 the index the first action named `click`, `press`, `activate`, `jump`, `check` or `open` (any case) was read at by
 `GetName(i)`, never `doDefault` and never by `GetActions`; `set_value` is `EditableText.SetTextContents` on a node
-that reads `EDITABLE`, else `Value.CurrentValue` on a slider, dial, spin button or scroll bar (text that is no number
-is refused before anything is sent).
+that reads `EDITABLE`, else `Value.CurrentValue` on a slider, dial, spin button or scroll bar (text that is no
+finite number, `NaN` and `inf` among it, is refused `invalid_argument` before anything is sent).
 
 ### 4.7 `type` with `element_ref`
 
@@ -544,7 +545,7 @@ Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux bu
 | `element_required` | A verb on a reference without `element_ref`. |
 | `addressing_conflict` | A point and `element_ref` on one request. |
 | `check_unsupported` | A check on an action that dispatches no input, a string `semantic` check on an action that named no control, or a malformed check object. |
-| `invalid_argument` | A wrong value: an unknown scope, an empty query, a refused combination, a bad `until`, `toggle` without a boolean `on`, `type` without `text`. |
+| `invalid_argument` | A wrong value: an unknown scope, an empty query, a refused combination, a bad `until`, `toggle` without a boolean `on`, `type` without `text`; on Linux, `set_value` on a control that takes a number with text that is no finite number (nothing sent). |
 
 **The gate**
 
@@ -587,7 +588,7 @@ Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux bu
 | `stale_element` | The reference names nothing now: its process quit or its pid was reused, it is gone, its role changed, it did not answer in time, or the reply listed no such reference. Nothing sent. |
 | `element_disabled` | The control reads disabled. Nothing sent. |
 | `ax_action_unsupported` | The control has no route for this verb. Nothing sent, nothing clicked instead. |
-| `state_unreadable` | A state-reading verb could not read the state, so it could not decide whether to act. Nothing sent. |
+| `state_unreadable` | A verb could not read the state it acts from, so it could not decide whether or how to act. Nothing sent. That state is a toggle's or an expander's; on Linux also a scroll bar's range (or one that reads as no range), a field's selection or caret before `type`, and an item's place in its container before `select`. |
 | `focus_refused` | `focus` on a control whose window is not the active one. Nothing sent. |
 | `ax_action_failed` | The application refused the message. Nothing went out. |
 | `ax_timed_out` | The message went out and no answer came; never repeated. |

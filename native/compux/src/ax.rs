@@ -116,9 +116,14 @@ impl Frame {
 /// `dispatch: sent, effect: unknown` — while everything else is a refusal of a
 /// message that was received and is safe to reason about. The text is the
 /// platform's own words, so a bug report carries the AXError number.
+///
+/// A reader that stops before sending, on something the contract names apart
+/// (a range it cannot move in, a value no control takes), names that refusal's
+/// code; every other refusal is the message failing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal {
     sent: bool,
+    code: Option<&'static str>,
     detail: String,
 }
 
@@ -127,12 +132,28 @@ impl Refusal {
     pub fn new(sent: bool, detail: impl Into<String>) -> Refusal {
         Refusal {
             sent,
+            code: None,
+            detail: detail.into(),
+        }
+    }
+
+    /// Nothing was sent, for the reason the contract's `code` names.
+    // The Linux reader makes these; the macOS one has no such stop.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn unsent(code: &'static str, detail: impl Into<String>) -> Refusal {
+        Refusal {
+            sent: false,
+            code: Some(code),
             detail: detail.into(),
         }
     }
 
     pub fn sent(&self) -> bool {
         self.sent
+    }
+
+    pub fn code(&self) -> Option<&'static str> {
+        self.code
     }
 
     pub fn detail(&self) -> String {
