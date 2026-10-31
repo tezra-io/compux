@@ -256,9 +256,11 @@ pub trait Ax {
     fn facts(&self, handle: Handle) -> Result<Facts, Unread>;
 
     /// The element's value, bounded; `None` when it has none that is text, or will
-    /// not say. NEVER asked of a secure field: the platform has already said which
-    /// fields are secure, in [`Facts::secure`], and every caller checks that first —
-    /// not asking is a stronger guarantee than asking and throwing the answer away.
+    /// not say. Withheld at the SOURCE for a secure field, which answers `None`
+    /// before its value is ever asked for. Callers still check [`Facts::secure`]
+    /// first — not asking is a stronger guarantee than asking and throwing the
+    /// answer away — and this is what holds when a field turned secure after the
+    /// read they checked.
     fn value(&self, handle: Handle) -> Option<String>;
 
     /// Whether the element's value may be written.
@@ -843,10 +845,23 @@ mod mac {
             unsafe { self.read_facts(&element) }
         }
 
+        /// Withheld at the SOURCE for a secure field, so nothing above this seam
+        /// can see a password field's contents even to decide not to publish
+        /// them. macOS answers bullets rather than the text, but this method is
+        /// on the trait and anything may call it; reading the role and subrole
+        /// first is a cheaper guarantee than remembering the rule at every future
+        /// call site.
         fn value(&self, handle: Handle) -> Option<String> {
             let element = self.element(handle)?;
             unsafe {
                 prepare(&element, READ_TIMEOUT_MS);
+                self.sent();
+                let role = copy_string_attr(&element, ROLE);
+                self.sent();
+                let subrole = copy_string_attr(&element, SUBROLE);
+                if super::secure(role.as_deref(), subrole.as_deref()) {
+                    return None;
+                }
                 self.sent();
                 copy_string_attr(&element, VALUE).map(super::bounded_value)
             }
@@ -2072,15 +2087,17 @@ impl Ax for Recorder {
         }
     }
 
-    /// Whatever the node holds — a secure field's value too, exactly as a platform
-    /// would hand it over if asked. Not asking is the caller's rule, and this is
-    /// how a test catches a caller that asks.
+    /// Whatever the node holds, except a secure field's: withheld at the source as
+    /// the platform reader withholds it, and never counted as read.
     fn value(&self, handle: Handle) -> Option<String> {
         let mut state = self.state();
         state.messages += 1;
         let Some(&Slot::Node(index)) = state.held.get(&handle.0) else {
             return None;
         };
+        if state.elements[index].secure() {
+            return None;
+        }
         state.values_read.push(index);
         Recorder::land(&mut state, index);
         state.elements[index].value.clone().map(bounded_value)
@@ -2267,6 +2284,23 @@ mod tests {
         assert!(secure(Some(SECURE_TEXT_FIELD), None));
         assert!(!secure(Some("AXTextField"), None));
         assert!(!secure(None, None));
+    }
+
+    // The value is withheld at the source: a caller that asks a secure field gets
+    // nothing, whatever it decided from an older read, and nothing is counted as
+    // read.
+    #[test]
+    fn a_secure_field_answers_no_value_through_the_seam() {
+        let (recorder, ax) = platform(vec![
+            Scripted::secure_field("Password", "hunter2", frame(0.0, 0.0)),
+            Scripted::field("Name", "ada", frame(0.0, 40.0)),
+        ]);
+        let root = ax.application(&ax, 4711).expect("the application");
+        let page = ax.children(&ax, root.handle(), 0, 2).expect("two fields");
+
+        assert_eq!(ax.value(page[0].handle()), None);
+        assert_eq!(ax.value(page[1].handle()), Some("ada".to_string()));
+        assert_eq!(recorder.values_read(), vec![1]);
     }
 
     // A read that answered nothing is one of three facts, told apart by its code:

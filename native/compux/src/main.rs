@@ -3343,7 +3343,9 @@ fn set_value(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resul
     let since = gate.now_ms();
     let facts = revalidate(&worker.ax, &observation, entry, Capability::SetValue)?;
 
-    let (handle, secure) = (entry.element.handle(), entry.secure);
+    // The revalidation is the fresher read: a field can turn secure after the walk
+    // that listed it.
+    let (handle, secure) = (entry.element.handle(), entry.secure || facts.secure);
     let aimed = aimed_point(request, &facts);
     let before = worker.ax.frontmost_pid();
     let timeout_ms = write_timeout(gate, since);
@@ -3819,7 +3821,10 @@ fn element_after(
     let handle = entry.element.handle();
     let after = match worker.ax.facts(handle) {
         Ok(facts) if facts.role.is_some() => {
-            described_after(&worker.ax, handle, entry.secure, facts)
+            // What it says now decides as well as what the listing said: a field
+            // can turn secure after the walk that listed it.
+            let secure = entry.secure || facts.secure;
+            described_after(&worker.ax, handle, secure, facts)
         }
         _not_there => json!({ "present": false }),
     };
@@ -6653,6 +6658,29 @@ mod tests {
         );
     }
 
+    // A field can turn secure after the walk that listed it as plain: the write's
+    // own revalidation is the fresher read, and it decides. Nothing is read back,
+    // and nothing it holds reaches the wire.
+    #[test]
+    fn a_field_that_turned_secure_since_the_listing_is_never_read_back() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.change(1, |element| {
+            element.subrole = Some(ax::SECURE_TEXT_FIELD.to_string());
+        });
+        // The listing read it while it was plain.
+        let listed = app.values_read();
+
+        let frame = served(&set_to(&observation, "e2", "hunter2"), &gate, &mut worker);
+
+        assert_eq!(frame["ok"], json!(true));
+        assert_eq!(frame["receipt"]["effect"], json!("not_observed"));
+        assert_eq!(frame["verified"], json!(false));
+        assert!(frame.get("value").is_none(), "{frame}");
+        assert_eq!(app.values_read(), listed, "the field was read back");
+    }
+
     #[test]
     fn a_control_whose_value_is_not_settable_is_refused() {
         let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
@@ -7778,6 +7806,43 @@ mod tests {
         }
 
         assert_eq!(screen.taken(), 0, "a semantic check captures nothing");
+    }
+
+    // The re-read decides from what the control says now: a field listed as plain
+    // that turned secure since carries no value after the action.
+    #[test]
+    fn a_semantic_check_never_reads_a_field_that_turned_secure_since_the_listing() {
+        let clock = StepClock::new();
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        let app = fixture_app();
+        let (mut worker, listing) = worker_listing(&gate, &app);
+        app.change(1, |element| {
+            element.subrole = Some(ax::SECURE_TEXT_FIELD.to_string());
+        });
+        // The listing read it while it was plain.
+        let listed = app.values_read();
+
+        let mut request = at_element("set_value", &listing, "e2");
+        request.check = wire::Check::Semantic;
+        gate.admit(&request).expect("a fresh sequence");
+        let entry = element_in(&listing, &request).expect("a listed control");
+        let payload = post(
+            &request,
+            None,
+            &gate,
+            &mut worker,
+            Acted {
+                named: Some(&listing),
+                executed: None,
+                element: Some(entry),
+            },
+        )
+        .expect("a semantic check");
+
+        let after = &payload["element_after"];
+        assert_eq!(after["present"], json!(true));
+        assert!(after.get("value").is_none(), "{after}");
+        assert_eq!(app.values_read(), listed, "the field was read again");
     }
 
     // A control that no longer answers at all is worth knowing about — a dialog
