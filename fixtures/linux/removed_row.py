@@ -117,7 +117,9 @@ def account(bus, name, path):
     index = read(lambda: call(bus, name, path, ACCESSIBLE, "GetIndexInParent", None, "(i)")[0])
     states = read(lambda: call(bus, name, path, ACCESSIBLE, "GetState", None, "(au)")[0])
     listed = "unknown"
-    if isinstance(parent, tuple) and isinstance(index, int) and index >= 0:
+    # Only the fixture's own objects are asked: a parent on another bus is not read.
+    on_fixture = isinstance(parent, tuple) and parent[0] == name
+    if on_fixture and isinstance(index, int) and index >= 0:
         there = read(lambda: call(bus, parent[0], parent[1], ACCESSIBLE, "GetChildAtIndex",
                                   GLib.Variant("(i)", (index,)), "((so))")[0])
         listed = "yes" if there == (name, path) else f"no (it lists {there})"

@@ -597,7 +597,7 @@ Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux bu
 
 | Code | When |
 |---|---|
-| `stale_element` | The reference names nothing now: its process quit or its pid was reused, it is gone, its role changed, it did not answer in time, or the reply listed no such reference. Nothing sent. |
+| `stale_element` | The reference names nothing now: its process quit or its pid was reused, it is gone, its role changed, it did not answer in time, or the reply listed no such reference; on Qt, the control at that place no longer has the label it was listed with. Nothing sent. |
 | `element_disabled` | The control reads disabled. Nothing sent. |
 | `ax_action_unsupported` | The control has no route for this verb. Nothing sent, nothing clicked instead. |
 | `state_unreadable` | A verb could not read the state it acts from, so it could not decide whether or how to act. Nothing sent. That state is a toggle's or an expander's; on Linux also a scroll bar's range (or one that reads as no range), a field's selection or caret before `type`, and an item's place in its container before `select`. On Linux the reads before a write are held to the verb's own time: reads that use it up end the verb here too. |
