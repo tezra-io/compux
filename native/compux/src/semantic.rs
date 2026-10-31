@@ -34,7 +34,10 @@ pub const MAX_UNTIL_MS: u64 = 25_000;
 /// How many nodes a scan for surfaces reads, at most.
 pub const MAX_SURFACE_NODES: usize = 64;
 
-const MENU_BAR: &str = "AXMenuBar";
+/// Where the menu bar sits: macOS puts it on the application; GTK 3 in a box
+/// inside the window and Qt directly inside it, so on Linux a window's children,
+/// and the children of a box among them, are looked at for one.
+const MENU_BAR_IN_WINDOW: bool = cfg!(target_os = "linux");
 
 fn invalid(detail: String) -> Failure {
     Failure::new("invalid_argument", detail)
@@ -362,30 +365,63 @@ impl Scan<'_> {
         let Some(facts) = self.facts(handle).filter(|facts| !facts.hidden) else {
             return;
         };
-        if facts.role.as_deref() == Some(MENU_BAR) {
+        if is_menu_bar(&facts) {
             return self.menu_bar(handle);
         }
         let Some(_held) = self.keep(&facts, node) else {
             return;
         };
         for child in self.kids(handle) {
-            self.surface(child);
+            self.in_window(child);
+        }
+    }
+
+    /// A window's child: a surface, or on Linux the menu bar, or a box that may
+    /// hold it.
+    fn in_window(&mut self, node: Retained) {
+        let handle = node.handle();
+        let Some(facts) = self.facts(handle).filter(|facts| !facts.hidden) else {
+            return;
+        };
+        if MENU_BAR_IN_WINDOW && is_menu_bar(&facts) {
+            return self.menu_bar(handle);
+        }
+        let Some(_held) = self.keep(&facts, node) else {
+            return;
+        };
+        if !MENU_BAR_IN_WINDOW || kind_of(&facts) != "group" {
+            return;
+        }
+        for child in self.kids(handle) {
+            self.menu_bar_in(child);
+        }
+    }
+
+    /// A box's child, read only to find the menu bar.
+    fn menu_bar_in(&mut self, node: Retained) {
+        let handle = node.handle();
+        if self
+            .facts(handle)
+            .is_some_and(|facts| !facts.hidden && is_menu_bar(&facts))
+        {
+            self.menu_bar(handle);
         }
     }
 
     fn menu_bar(&mut self, bar: Handle) {
         for item in self.kids(bar) {
-            self.menu_of(item.handle());
+            self.menu_of(item);
         }
     }
 
     /// A menu-bar item's menu is its child whether or not it is open, so only the
-    /// item that reads selected has one open.
-    fn menu_of(&mut self, item: Handle) {
+    /// item that reads selected has one open. A GTK 3 menu-bar item is the menu
+    /// itself, and is the surface.
+    fn menu_of(&mut self, item: Retained) {
         if !self.counted() {
             return;
         }
-        let selected = match self.ax.states(item, false) {
+        let selected = match self.ax.states(item.handle(), false) {
             Ok(states) => states.selected,
             Err(why) => {
                 self.unread(why);
@@ -395,17 +431,19 @@ impl Scan<'_> {
         if selected != Some(true) {
             return;
         }
-        for menu in self.kids(item) {
+        let Some(item) = self.surface(item) else {
+            return;
+        };
+        for menu in self.kids(item.handle()) {
             self.surface(menu);
         }
     }
 
-    /// Read a node and keep it if it is a surface; one that is not, or does not
-    /// answer, is given back.
-    fn surface(&mut self, node: Retained) {
-        if let Some(facts) = self.facts(node.handle()).filter(|facts| !facts.hidden) {
-            self.keep(&facts, node);
-        }
+    /// Read a node and keep it if it is a surface. One that is not is handed back,
+    /// and one that does not answer is given back.
+    fn surface(&mut self, node: Retained) -> Option<Retained> {
+        let facts = self.facts(node.handle()).filter(|facts| !facts.hidden)?;
+        self.keep(&facts, node)
     }
 
     /// Keep a node that is a surface; give back one that is not.
@@ -422,6 +460,17 @@ impl Scan<'_> {
         });
         None
     }
+}
+
+fn kind_of(facts: &Facts) -> &'static str {
+    roles::normalise(
+        facts.role.as_deref().unwrap_or(""),
+        facts.subrole.as_deref(),
+    )
+}
+
+fn is_menu_bar(facts: &Facts) -> bool {
+    kind_of(facts) == "menubar"
 }
 
 /// Up to `limit` of a node's children, by count or in one copy where it will not

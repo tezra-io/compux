@@ -106,6 +106,9 @@ pub struct Node {
     pub relations: Vec<(u32, Vec<(String, String)>)>,
     /// Members it answers `false` to: it took the call and did nothing.
     pub declines: Vec<&'static str>,
+    /// It answers each `GetChildAtIndex` with a new object for the same child, as
+    /// Qt's tables do. The new object answers as the child does.
+    pub mints: bool,
 }
 
 impl Node {
@@ -133,6 +136,7 @@ impl Node {
             selection: None,
             relations: Vec::new(),
             declines: Vec::new(),
+            mints: false,
         }
     }
 
@@ -249,6 +253,8 @@ pub struct Desktop {
     /// The systemd user manager's `Environment`, for the session-bus half.
     pub manager_environment: Vec<String>,
     pub calls: Vec<Call>,
+    /// The objects a minting node made, each to the child it stands for.
+    pub minted: HashMap<(String, String), String>,
 }
 
 impl Desktop {
@@ -380,9 +386,14 @@ async fn serve(mut calls: MessageStream, server: Connection, desktop: Arc<Mutex<
         }
         let reply = {
             let mut desktop = desktop.lock().unwrap_or_else(|e| e.into_inner());
-            let call = call_of(&header, &message);
+            let mut call = call_of(&header, &message);
+            // A minted object is the child it stands for, in what it answers and in
+            // what the calls record.
+            if let Some(child) = desktop.minted.get(&(call.bus.clone(), call.path.clone())) {
+                call.path = child.clone();
+            }
             desktop.calls.push(call.clone());
-            match written(&mut desktop, &call, &message) {
+            match minted(&mut desktop, &call).or_else(|| written(&mut desktop, &call, &message)) {
                 Some(reply) => reply,
                 None => answer(&desktop, &call, &message),
             }
@@ -465,6 +476,22 @@ enum Reply {
     Nothing,
     Error(&'static str),
     Silence,
+}
+
+/// A minting node's child, as a new object. `None` for every other call.
+fn minted(desktop: &mut Desktop, call: &Call) -> Option<Reply> {
+    if call.member != "GetChildAtIndex" {
+        return None;
+    }
+    let node = desktop.nodes.get(&(call.bus.clone(), call.path.clone()))?;
+    if !node.mints {
+        return None;
+    }
+    let index: usize = call.argument.parse().ok()?;
+    let (bus, child) = node.children.get(index)?.clone();
+    let made = format!("{child}_{}", desktop.calls.len());
+    desktop.minted.insert((bus.clone(), made.clone()), child);
+    Some(Reply::Child(bus, made))
 }
 
 /// A call that changes the desktop, or asks where a node sits: answered here, with

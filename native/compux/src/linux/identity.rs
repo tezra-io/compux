@@ -10,6 +10,11 @@
 //! - the object at the place, reached through each parent's child list;
 //! - the object itself, present only where its own parent still lists it.
 //!
+//! The object is at its place too when it says so: its parent is the node at its
+//! place's parent, and its index there is the one its place ends in. Qt answers
+//! every `GetChildAtIndex` of a table with a new object for the same cell, so the
+//! object at a place is never the one a walk read there.
+//!
 //! Each is a candidate when it answers the role the walk read. One candidate is the
 //! control. Two — it moved, and another of its role took its place — is
 //! `ambiguous_element`. None is `stale_element`. A candidate that does not answer
@@ -67,11 +72,17 @@ impl Real {
             Err(Failed::Late | Failed::Lost) => return Look::Unreadable,
             Err(Failed::Suspect | Failed::Other) => None,
         };
-        if placed.as_ref() == Some(at) {
-            return match self.role_of(bus, at).await {
-                Ok(now) if now == role => Look::One,
-                other => verdict(other.map(|_| false), Ok(false)),
-            };
+        let here = if placed.as_ref() == Some(at) {
+            Ok(true)
+        } else {
+            self.says_it_is_at(bus, at, path).await
+        };
+        match here {
+            Ok(true) => return self.answers(bus, at, role).await,
+            Err(Failed::Quit) => return Look::Quit,
+            Err(Failed::Late | Failed::Lost) => return Look::Unreadable,
+            // It does not say where it is, so its place does not prove it.
+            Ok(false) | Err(Failed::Suspect | Failed::Other) => {}
         }
         let there = match &placed {
             Some(other) => self.role_of(bus, other).await.map(|now| now == role),
@@ -97,6 +108,35 @@ impl Real {
             }
         }
         Ok(Some(node))
+    }
+
+    /// The one candidate, at its place: it is the control when it answers `role`.
+    async fn answers(&self, bus: &Connection, at: &Address, role: u32) -> Look {
+        match self.role_of(bus, at).await {
+            Ok(now) if now == role => Look::One,
+            other => verdict(other.map(|_| false), Ok(false)),
+        }
+    }
+
+    /// Whether the object says it is the child its place names: its parent is the
+    /// node at its place's parent, at the index its place ends in.
+    async fn says_it_is_at(
+        &self,
+        bus: &Connection,
+        at: &Address,
+        path: &[usize],
+    ) -> Result<bool, Failed> {
+        let Some((last, above)) = path.split_last() else {
+            return Ok(false);
+        };
+        let Some(parent_there) = self.at_path(bus, &at.root(), above).await? else {
+            return Ok(false);
+        };
+        let parent: (String, OwnedObjectPath) =
+            self.property(bus, at, ACCESSIBLE, "Parent").await?;
+        let index: i32 = self.accessible(bus, at, "GetIndexInParent").await?;
+        let under = Address::of_child(parent).as_ref() == Some(&parent_there);
+        Ok(under && usize::try_from(index).ok() == Some(*last))
     }
 
     async fn role_of(&self, bus: &Connection, at: &Address) -> Result<u32, Failed> {
@@ -294,6 +334,31 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(roles.len(), 3, "{roles:?}");
+    }
+
+    // Qt answers every `GetChildAtIndex` of a table with a new object for the same
+    // cell, so the object at a reference's place is never the object the walk
+    // read. The object's own account of where it sits — its parent, and its index
+    // there — is what finds it, and nothing else took its place.
+    #[test]
+    fn a_cell_of_a_table_that_makes_a_new_object_per_ask_is_found_by_where_it_says_it_is() {
+        let mut desktop = listing(&["/w/a", "/w/b"]);
+        desktop.put(
+            APP,
+            "/w/list",
+            Node {
+                mints: true,
+                ..Node::of(39).named("List").holding(APP, &["/w/a", "/w/b"])
+            },
+        );
+        let (fake, ax) = reader(desktop);
+        let found = walk(&ax);
+        let b = handle_of(&found, "/w/b");
+        fake.change(APP, "/w/b", |b| b.name = "renamed".to_string());
+
+        let facts = ax.identify(b).expect("found where it says it is");
+
+        assert_eq!(facts.label.as_deref(), Some("renamed"));
     }
 
     // ServiceUnknown means the application is gone.

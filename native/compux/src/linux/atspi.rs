@@ -1478,7 +1478,7 @@ mod tests {
     use crate::gate::SystemClock;
     use crate::linux::fake::{
         self, Call, Desktop, Fake, Life, Node, ACTIVE, EDITABLE, ENABLED, EXPANDABLE, EXPANDED,
-        FOCUSABLE, MULTI_LINE, SELECTABLE, SENSITIVE, SHOWING, VISIBLE,
+        FOCUSABLE, MULTI_LINE, SELECTABLE, SELECTED, SENSITIVE, SHOWING, VISIBLE,
     };
     use crate::tree::{self, Walk};
 
@@ -2449,5 +2449,46 @@ mod tests {
                 named("alert", "alert", "Disk full"),
             ]
         );
+    }
+
+    // GTK 3 puts the menu bar in a box inside the window, and a menu-bar menu is
+    // open when it reads SELECTED: the menu itself is the surface.
+    #[test]
+    fn a_menu_bar_menu_inside_the_window_is_open_while_it_reads_selected() {
+        const FILLER: u32 = 20;
+        const MENU_BAR: u32 = 34;
+        const MENU: u32 = 33;
+        const MENU_ITEM: u32 = 35;
+        let (fake, ax) = reader(desktop(
+            &["/w/box"],
+            vec![
+                (
+                    "/w/box",
+                    Node::of(FILLER).holding(APP, &["/w/bar", "/w/body"]),
+                ),
+                ("/w/bar", Node::of(MENU_BAR).holding(APP, &["/w/actions"])),
+                ("/w/body", Node::of(FILLER)),
+                (
+                    "/w/actions",
+                    Node::of(MENU)
+                        .named("Actions")
+                        .at(0, 0, 60, 20)
+                        .reading(&[SELECTABLE])
+                        .holding(APP, &["/w/export"]),
+                ),
+                ("/w/export", Node::of(MENU_ITEM).named("Export Report")),
+            ],
+        ));
+        let kinds = |ax: &Rc<dyn Ax>| -> Vec<(&'static str, Option<String>)> {
+            crate::semantic::surfaces(ax, PID)
+                .into_iter()
+                .map(|surface| (surface.kind, surface.label))
+                .collect()
+        };
+        assert!(kinds(&ax).is_empty(), "no menu reads selected");
+
+        fake.change(APP, "/w/actions", |menu| menu.states.push(SELECTED));
+
+        assert_eq!(kinds(&ax), vec![("menu", Some("Actions".to_string()))]);
     }
 }
