@@ -315,6 +315,22 @@ pub async fn adopt(own: Env, session: &zbus::Connection) -> Endpoint {
     }
 }
 
+/// An X11 display that answers, for a test: a listener on the TCP port its number
+/// names (6000 + n), held for as long as the listener is.
+#[cfg(test)]
+pub fn answering_x11() -> (std::net::TcpListener, Env) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = listener.local_addr().expect("its address").port();
+    let number = port
+        .checked_sub(6000)
+        .expect("an ephemeral port above 6000");
+    let env = Env {
+        display: Some(format!("127.0.0.1:{number}")),
+        ..Env::default()
+    };
+    (listener, env)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

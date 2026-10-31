@@ -1512,7 +1512,7 @@ pub fn frontmost_application(ax: &Rc<dyn Ax>) -> Result<(i32, String), String> {
 mod tests {
     use super::*;
     use crate::gate::SystemClock;
-    use crate::linux::display::Env;
+    use crate::linux::display;
     use crate::linux::fake::{
         self, Call, Desktop, Fake, Life, Node, ACTIVE, EDITABLE, ENABLED, EXPANDABLE, EXPANDED,
         FOCUSABLE, MULTI_LINE, SELECTABLE, SELECTED, SENSITIVE, SHOWING, VISIBLE,
@@ -2085,28 +2085,13 @@ mod tests {
         assert!(fake.sent("GetExtents").is_empty());
     }
 
-    /// An X11 display that answers: a listener on the TCP port its number names
-    /// (6000 + n), held for as long as the listener is.
-    fn answering_x11() -> (std::net::TcpListener, Env) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
-        let port = listener.local_addr().expect("its address").port();
-        let number = port
-            .checked_sub(6000)
-            .expect("an ephemeral port above 6000");
-        let env = Env {
-            display: Some(format!("127.0.0.1:{number}")),
-            ..Env::default()
-        };
-        (listener, env)
-    }
-
     // A display taken from the user manager draws nothing, even an X11 one that
     // answers: the capture library cannot reach it, so controls are listed
     // without positions, as on Wayland. The same display as this process's own
     // places them.
     #[test]
     fn a_reader_on_a_display_taken_from_the_user_manager_places_nothing() {
-        let (_x11, env) = answering_x11();
+        let (_x11, env) = display::answering_x11();
         let window = || desktop(&["/w/save"], vec![("/w/save", button("Save", 10))]);
         let listed_on = |adopted: bool| {
             let (fake, bus) = Fake::start(window(), TIMEOUT);

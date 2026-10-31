@@ -6293,19 +6293,30 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn on_linux_the_probe_says_which_display_answered() {
-        let v = probe_with(&Endpoint::default(), serde_json::Map::new).unwrap();
+        let (_x11, env) = linux::display::answering_x11();
+        let own = Endpoint {
+            env,
+            adopted: false,
+        };
+        let shown = |endpoint: &Endpoint| {
+            let v = probe_with(endpoint, serde_json::Map::new).unwrap();
+            let keys = [
+                "display_server",
+                "x11_endpoint",
+                "screen_capture",
+                "input_control",
+            ];
+            keys.map(|key| v[key].clone())
+        };
 
-        let server = v["display_server"].as_str().expect("a display server");
-        assert!(["x11", "wayland", "none"].contains(&server), "{v}");
-        let endpoint = v["x11_endpoint"]
-            .as_bool()
-            .expect("whether an X endpoint answers");
-        assert!(
-            endpoint || server != "x11",
-            "an X11 session is its own endpoint: {v}"
+        assert_eq!(
+            shown(&own),
+            [json!("x11"), json!(true), json!(true), json!(true)]
         );
-        assert_eq!(v["screen_capture"], json!(server == "x11"), "{v}");
-        assert_eq!(v["input_control"], json!(server == "x11"), "{v}");
+        assert_eq!(
+            shown(&Endpoint::default()),
+            [json!("none"), json!(false), json!(false), json!(false)]
+        );
     }
 
     // Beside the display, the Linux probe says what the engine's doctor shows of
