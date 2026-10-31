@@ -8,13 +8,27 @@ name: linux-desktop
 #   noble  Ubuntu 24.04: `elements` timed on each fixture, then every verb compux
 #          answers, judged by what the fixture recorded (verbs.py).
 #   jammy  Ubuntu 22.04, whose ATK bridge 2.38 aborts an application on
-#          Action.GetActions: the GTK 3 fixture read under a bus monitor that must
-#          show no GetActions and no GetAll, then the verbs on it.
+#          Action.GetActions: the GTK 3 fixture read, then every verb on it, each
+#          under a bus monitor that must show no GetActions and no GetAll.
 
+# Each job builds its images from scratch (the fixture images for both releases,
+# the helper's build image, the helper, the spike images) before its sessions run,
+# so it runs only when what it tests changed, or by hand.
 on:
   push:
     branches: [main]
+    paths:
+      - native/compux/**
+      - lib/**
+      - fixtures/linux/**
+      - .github/workflows/linux-desktop.yml
   pull_request:
+    paths:
+      - native/compux/**
+      - lib/**
+      - fixtures/linux/**
+      - .github/workflows/linux-desktop.yml
+  workflow_dispatch:
 
 permissions:
   contents: read
