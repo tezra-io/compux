@@ -58,7 +58,12 @@ getall=$(grep -c 'member=GetAll' "$log" || true)
 getname=$(grep -c 'interface=org.a11y.atspi.Action; member=GetName' "$log" || true)
 nactions=$(grep -A2 'member=Get$' "$log" | grep -c '"NActions"' || true)
 calls=$(grep -c '^method call' "$log" || true)
-writes=$(grep -cE 'member=(DoAction|SetTextContents|InsertText|DeleteText|SelectChild|GrabFocus|Set)$' "$log" || true)
+# The writes compux sends: the accessibility calls that change something, and a
+# Value set. A bare Properties.Set is not counted: the registry sets each
+# application's Id as it registers.
+acts=$(grep -cE 'member=(DoAction|SetTextContents|InsertText|DeleteText|SelectChild|GrabFocus)$' "$log" || true)
+value_sets=$(grep -A1 'member=Set$' "$log" | grep -c '"org.a11y.atspi.Value"' || true)
+writes=$((acts + value_sets))
 {
   echo "fixture pid before: $before"
   echo "fixture pid after:  $after"
