@@ -112,8 +112,13 @@ pub struct Node {
     /// Members it answers `false` to: it took the call and did nothing.
     pub declines: Vec<&'static str>,
     /// It answers each `GetChildAtIndex` with a new object for the same child, as
-    /// Qt's tables do. The new object answers as the child does.
+    /// Qt's tables do. The new object stands for that place, and answers as
+    /// whichever child is there now.
     pub mints: bool,
+    /// Where it says it sits, (parent, index), whatever lists it now: a destroyed
+    /// GTK 3 or Chromium object keeps answering its old `Parent` and index for
+    /// about 16 s (L17-6, L17-8).
+    pub claims: Option<((String, String), i32)>,
 }
 
 impl Node {
@@ -143,6 +148,7 @@ impl Node {
             relations: Vec::new(),
             declines: Vec::new(),
             mints: false,
+            claims: None,
         }
     }
 
@@ -262,8 +268,9 @@ pub struct Desktop {
     /// The systemd user manager's `Environment`, for the session-bus half.
     pub manager_environment: Vec<String>,
     pub calls: Vec<Call>,
-    /// The objects a minting node made, each to the child it stands for.
-    pub minted: HashMap<(String, String), String>,
+    /// The objects a minting node made, each to the place it stands for: the
+    /// minting node and the index there.
+    pub minted: HashMap<(String, String), ((String, String), usize)>,
 }
 
 impl Desktop {
@@ -396,10 +403,10 @@ async fn serve(mut calls: MessageStream, server: Connection, desktop: Arc<Mutex<
         let reply = {
             let mut desktop = desktop.lock().unwrap_or_else(|e| e.into_inner());
             let mut call = call_of(&header, &message);
-            // A minted object is the child it stands for, in what it answers and in
-            // what the calls record.
-            if let Some(child) = desktop.minted.get(&(call.bus.clone(), call.path.clone())) {
-                call.path = child.clone();
+            // A minted object is the child at the place it stands for, in what it
+            // answers and in what the calls record.
+            if let Some(child) = minted_child(&desktop, &call) {
+                call.path = child;
             }
             desktop.calls.push(call.clone());
             match minted(&mut desktop, &call).or_else(|| written(&mut desktop, &call, &message)) {
@@ -499,8 +506,17 @@ fn minted(desktop: &mut Desktop, call: &Call) -> Option<Reply> {
     let index: usize = call.argument.parse().ok()?;
     let (bus, child) = node.children.get(index)?.clone();
     let made = format!("{child}_{}", desktop.calls.len());
-    desktop.minted.insert((bus.clone(), made.clone()), child);
+    let place = ((call.bus.clone(), call.path.clone()), index);
+    desktop.minted.insert((bus.clone(), made.clone()), place);
     Some(Reply::Child(bus, made))
+}
+
+/// The child now at the place a minted object stands for; `None` for any other
+/// object, or a place that holds nothing now.
+fn minted_child(desktop: &Desktop, call: &Call) -> Option<String> {
+    let (minter, index) = desktop.minted.get(&(call.bus.clone(), call.path.clone()))?;
+    let (_, child) = desktop.nodes.get(minter)?.children.get(*index)?;
+    Some(child.clone())
 }
 
 /// A call that changes the desktop, or asks where a node sits: answered here, with
@@ -525,17 +541,21 @@ fn written(desktop: &mut Desktop, call: &Call, message: &Message) -> Option<Repl
         return Some(refusal);
     }
     let key = (call.bus.clone(), call.path.clone());
+    let claims = desktop.nodes[&key].claims.clone();
     if parent {
-        return Some(match parent_of(desktop, &key) {
+        let parent = claims.map(|(parent, _)| parent);
+        return Some(match parent.or_else(|| parent_of(desktop, &key)) {
             Some((bus, at)) => Reply::Property(Value::from((bus, path(&at)))),
             None => Reply::Error(FAILED),
         });
     }
     if call.member == "GetIndexInParent" {
-        return Some(match index_in_parent(desktop, &key) {
-            Some(index) => Reply::Count(index),
-            None => Reply::Count(-1),
-        });
+        let index = claims.map(|(_, index)| index);
+        return Some(Reply::Count(
+            index
+                .or_else(|| index_in_parent(desktop, &key))
+                .unwrap_or(-1),
+        ));
     }
     let declined = desktop.nodes[&key].declines.contains(&call.member.as_str());
     if declined {

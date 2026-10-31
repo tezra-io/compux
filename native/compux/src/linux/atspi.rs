@@ -236,6 +236,8 @@ pub(super) struct Known {
     pub frame: Option<Frame>,
     /// How many children it said it has.
     pub children: usize,
+    /// What it was called, as its facts say.
+    pub label: Option<String>,
 }
 
 impl Known {
@@ -671,13 +673,14 @@ impl Real {
             scrolled: place.scrolled,
             frame: frame.ok().flatten(),
             children: count.unwrap_or(0),
+            label: ax::label(named.0, named.1),
         };
         // A combo box that is not open holds what a click would open, at places it
         // is not (Qt), or the selected option again (Chromium).
         let closed = role == COMBO_BOX && !vocabulary::has(&known.states, EXPANDED);
         let placeless = !placed && vocabulary::has(&known.states, SHOWING);
         Read {
-            facts: frame.map(|frame| facts(&known, named, frame, placeless, actions.partial)),
+            facts: frame.map(|frame| facts(&known, frame, placeless, actions.partial)),
             count: if closed { Ok(0) } else { count },
             known: Some(known),
         }
@@ -1236,19 +1239,13 @@ fn inside(frame: &Frame, clip: Option<Frame>) -> bool {
 
 /// What one node answers, from what its read said: its role, its name and
 /// description, its states, where it is and what it does.
-fn facts(
-    known: &Known,
-    (name, description): (Option<String>, Option<String>),
-    frame: Option<Frame>,
-    placeless: bool,
-    actions_partial: bool,
-) -> Facts {
+fn facts(known: &Known, frame: Option<Frame>, placeless: bool, actions_partial: bool) -> Facts {
     let text = matches!(known.role, TEXT_ROLE | ENTRY);
     let multi_line = text && vocabulary::has(&known.states, MULTI_LINE);
     Facts {
         role: Some(vocabulary::role(known.role)),
         subrole: multi_line.then(|| roles::MULTI_LINE.to_string()),
-        label: ax::label(name, description),
+        label: known.label.clone(),
         // A node whose states would not read did not say it is disabled.
         enabled: known.states.is_empty() || vocabulary::enabled(&known.states),
         secure: known.role == PASSWORD_TEXT,

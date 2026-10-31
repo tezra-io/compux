@@ -10,10 +10,14 @@
 //! - the object at the place, reached through each parent's child list;
 //! - the object itself, present only where its own parent still lists it.
 //!
-//! The object is at its place too when it says so: its parent is the node at its
-//! place's parent, and its index there is the one its place ends in. Qt answers
+//! On Qt, the object is at its place too when it says so: its parent is the node at
+//! its place's parent, and its index there is the one its place ends in. Qt answers
 //! every `GetChildAtIndex` of a table with a new object for the same cell, so the
-//! object at a place is never the one a walk read there.
+//! object at a place is never the one a walk read there. Nowhere else: the object
+//! a GTK 3 or Chromium list dropped still answers its old parent and index. And a
+//! place proves only a place: an object found by its own account is the control
+//! only while it still says what was listed, since a sort puts another item of the
+//! same role there.
 //!
 //! Each is a candidate when it answers the role the walk read. One candidate is the
 //! control. Two — it moved, and another of its role took its place — is
@@ -23,7 +27,8 @@
 use zbus::zvariant::OwnedObjectPath;
 use zbus::Connection;
 
-use super::atspi::{Address, Failed, Real, ACCESSIBLE};
+use super::atspi::{Address, Failed, Known, Real, ACCESSIBLE};
+use super::routes::Toolkit;
 use crate::ax::{Facts, Handle, Identity, Unread};
 
 /// How many times a candidate that does not answer in time is read: once, and
@@ -34,6 +39,8 @@ const READS: usize = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Look {
     One,
+    /// One, found only by its own account of where it is (Qt).
+    Placed,
     Two,
     None,
     /// A candidate did not answer in time.
@@ -53,8 +60,9 @@ impl Real {
         };
         let bus = self.bus().ok_or(Identity::Unread(Unread::NoAnswer))?;
         for _ in 0..READS {
-            match async_io::block_on(self.look(&bus, &at, &path, known.role)) {
+            match async_io::block_on(self.look(&bus, &at, &path, &known)) {
                 Look::One => return self.reread(handle).map_err(Identity::Unread),
+                Look::Placed => return self.still_as_listed(handle, &known),
                 Look::Two => return Err(Identity::Ambiguous),
                 Look::None | Look::Quit => return Err(Identity::Unread(Unread::Gone)),
                 Look::Unreadable => {}
@@ -63,26 +71,36 @@ impl Real {
         Err(Identity::Unknown)
     }
 
+    /// A reference found only by where it says it is: the control while it still
+    /// says what was listed. Another item sorted into its place is not it.
+    fn still_as_listed(&self, handle: Handle, listed: &Known) -> Result<Facts, Identity> {
+        let facts = self.reread(handle).map_err(Identity::Unread)?;
+        if facts.label != listed.label {
+            return Err(Identity::Unread(Unread::Gone));
+        }
+        Ok(facts)
+    }
+
     /// One look: the object at the reference's place, and the object itself
-    /// wherever its parent lists it, each a candidate when it answers `role`.
-    async fn look(&self, bus: &Connection, at: &Address, path: &[usize], role: u32) -> Look {
+    /// wherever its parent lists it, each a candidate when it answers the role the
+    /// walk read; on Qt, the object where it says it is.
+    async fn look(&self, bus: &Connection, at: &Address, path: &[usize], known: &Known) -> Look {
+        let role = known.role;
         let placed = match self.at_path(bus, &at.root(), path).await {
             Ok(placed) => placed,
             Err(Failed::Quit) => return Look::Quit,
             Err(Failed::Late | Failed::Lost) => return Look::Unreadable,
             Err(Failed::Suspect | Failed::Other) => None,
         };
-        let here = if placed.as_ref() == Some(at) {
-            Ok(true)
-        } else {
-            self.says_it_is_at(bus, at, path).await
+        if placed.as_ref() == Some(at) {
+            return self.answers(bus, at, role).await;
+        }
+        let account = match known.toolkit {
+            Toolkit::Qt => self.by_its_account(bus, at, path, role).await,
+            _ => None,
         };
-        match here {
-            Ok(true) => return self.answers(bus, at, role).await,
-            Err(Failed::Quit) => return Look::Quit,
-            Err(Failed::Late | Failed::Lost) => return Look::Unreadable,
-            // It does not say where it is, so its place does not prove it.
-            Ok(false) | Err(Failed::Suspect | Failed::Other) => {}
+        if let Some(look) = account {
+            return look;
         }
         let there = match &placed {
             Some(other) => self.role_of(bus, other).await.map(|now| now == role),
@@ -116,6 +134,27 @@ impl Real {
             Ok(now) if now == role => Look::One,
             other => verdict(other.map(|_| false), Ok(false)),
         }
+    }
+
+    /// Qt's object, where it says it is: `None` where it does not say it is at its
+    /// place, since then its place does not prove it.
+    async fn by_its_account(
+        &self,
+        bus: &Connection,
+        at: &Address,
+        path: &[usize],
+        role: u32,
+    ) -> Option<Look> {
+        match self.says_it_is_at(bus, at, path).await {
+            Ok(true) => {}
+            Err(Failed::Quit) => return Some(Look::Quit),
+            Err(Failed::Late | Failed::Lost) => return Some(Look::Unreadable),
+            Ok(false) | Err(Failed::Suspect | Failed::Other) => return None,
+        }
+        Some(match self.answers(bus, at, role).await {
+            Look::One => Look::Placed,
+            other => other,
+        })
     }
 
     /// Whether the object says it is the child its place names: its parent is the
@@ -190,7 +229,7 @@ mod tests {
     use std::rc::Rc;
     use std::time::Duration;
 
-    use crate::ax::{Ax, Handle, Identity, Unread};
+    use crate::ax::{Ax, Facts, Handle, Identity, Unread};
     use crate::gate::SystemClock;
     use crate::linux::atspi::Real;
     use crate::linux::fake::{self, Desktop, Fake, Life, Node, APP, PID};
@@ -230,6 +269,28 @@ mod tests {
             .unwrap_or_else(|| panic!("{label} is listed"))
             .element
             .handle()
+    }
+
+    /// That listing, in an application made with this toolkit.
+    fn made_with(mut desktop: Desktop, name: &'static str, version: &'static str) -> Desktop {
+        let root = Node::of(75)
+            .named("fixture")
+            .holding(APP, &["/w"])
+            .made_with(name, version);
+        desktop.put(APP, fake::ROOT, root);
+        desktop
+    }
+
+    /// A Qt table holding these cells, by path: each ask for a cell makes a new
+    /// object for its place.
+    fn qt_table(paths: &[&str]) -> Desktop {
+        let mut desktop = made_with(listing(paths), "Qt", "6.4.2");
+        let table = Node {
+            mints: true,
+            ..Node::of(39).named("List").holding(APP, paths)
+        };
+        desktop.put(APP, "/w/list", table);
+        desktop
     }
 
     /// The list's children from now on.
@@ -342,23 +403,54 @@ mod tests {
     // there — is what finds it, and nothing else took its place.
     #[test]
     fn a_cell_of_a_table_that_makes_a_new_object_per_ask_is_found_by_where_it_says_it_is() {
-        let mut desktop = listing(&["/w/a", "/w/b"]);
-        desktop.put(
-            APP,
-            "/w/list",
-            Node {
-                mints: true,
-                ..Node::of(39).named("List").holding(APP, &["/w/a", "/w/b"])
-            },
-        );
-        let (fake, ax) = reader(desktop);
+        let (_fake, ax) = reader(qt_table(&["/w/a", "/w/b"]));
         let found = walk(&ax);
         let b = handle_of(&found, "/w/b");
-        fake.change(APP, "/w/b", |b| b.name = "renamed".to_string());
 
         let facts = ax.identify(b).expect("found where it says it is");
 
-        assert_eq!(facts.label.as_deref(), Some("renamed"));
+        assert_eq!(facts.label.as_deref(), Some("/w/b"));
+    }
+
+    // A place proves a Qt cell only while it still says what was listed there. A
+    // sort between the listing and the verb leaves another item of the same role
+    // at that place, and acting on it would act on what the caller was not shown.
+    #[test]
+    fn a_qt_cell_whose_table_was_sorted_since_the_listing_is_stale() {
+        let (fake, ax) = reader(qt_table(&["/w/a", "/w/b"]));
+        let found = walk(&ax);
+        let b = handle_of(&found, "/w/b");
+
+        relist(&fake, &["/w/b", "/w/a"]);
+
+        assert_eq!(ax.identify(b).err(), Some(Identity::Unread(Unread::Gone)));
+    }
+
+    // L17-6, L17-8: a destroyed GTK 3 or Chromium object keeps answering its old
+    // parent and index for about 16 s after its parent dropped it. Its own account
+    // of its place proves nothing there, and another object of its role sits at
+    // that place now: stale. Only Qt's account is taken, where every ask for a
+    // cell makes a new object.
+    #[test]
+    fn a_dropped_object_that_still_claims_its_place_is_stale_except_on_qt() {
+        let identified = |name: &'static str, version: &'static str| -> Result<Facts, Identity> {
+            let mut desktop = made_with(listing(&["/w/a", "/w/b"]), name, version);
+            desktop.put(APP, "/w/other", item("other"));
+            let (fake, ax) = reader(desktop);
+            let found = walk(&ax);
+            let a = handle_of(&found, "/w/a");
+            relist(&fake, &["/w/other", "/w/b"]);
+            let old_place = ((APP.to_string(), "/w/list".to_string()), 0);
+            fake.change(APP, "/w/a", |a| a.claims = Some(old_place));
+            ax.identify(a)
+        };
+
+        assert_eq!(
+            identified("GTK", "3.24.33").err(),
+            Some(Identity::Unread(Unread::Gone))
+        );
+        let on_qt = identified("Qt", "6.4.2").expect("found where it says it is");
+        assert_eq!(on_qt.label.as_deref(), Some("/w/a"));
     }
 
     // ServiceUnknown means the application is gone.
