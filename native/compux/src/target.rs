@@ -361,8 +361,11 @@ impl TargetFrames {
         let deadline = self.clock.now_ms() + FENCE_WAIT_MS;
 
         loop {
+            // A window being proved again has its frame a frame or two away.
             match self.stream.latest(fence) {
-                Err(FrameError::NotYet) if self.clock.now_ms() < deadline => {
+                Err(FrameError::NotYet | FrameError::Reproving(_))
+                    if self.clock.now_ms() < deadline =>
+                {
                     self.clock.sleep(SLOT_POLL_MS)
                 }
                 answer => return answer,
@@ -566,9 +569,11 @@ fn first_frame(frames: &Rc<TargetFrames>, gate: &Gate) -> Result<WindowFrame, Fa
         let answer = frames.stream.latest(None);
         gate.record(Phase::Capture, gate.now_ms().saturating_sub(started));
 
+        // A window resized or shown again just as it was bound is proved again
+        // within a frame or two: that frame is waited for as one not yet sent.
         match answer {
             Ok(frame) => return Ok(frame),
-            Err(FrameError::NotYet) if gate.now_ms() < deadline => {
+            Err(FrameError::NotYet | FrameError::Reproving(_)) if gate.now_ms() < deadline => {
                 gate.sleep(SLOT_POLL_MS).map_err(crate::barred)?;
             }
             Err(FrameError::NotYet) => {
@@ -1018,6 +1023,45 @@ mod tests {
             )),
             seq: 1,
         }
+    }
+
+    /// A stream whose window is being proved again for its first `looks`
+    /// looks, and that then has a frame.
+    struct ProvingFirst {
+        looks: std::cell::Cell<u32>,
+    }
+
+    impl WindowFrames for ProvingFirst {
+        fn start(&self, _window: StreamWindow) -> Result<(), FrameError> {
+            Ok(())
+        }
+
+        fn latest(&self, _after: Option<Fence>) -> Result<WindowFrame, FrameError> {
+            let left = self.looks.get();
+            if left == 0 {
+                return Ok(frame(800.0, 600.0, 1.0, 1));
+            }
+            self.looks.set(left - 1);
+            Err(FrameError::Reproving("being proved again".to_string()))
+        }
+
+        fn stop(&self) {}
+    }
+
+    // A window resized or shown again just as it is bound, or just after an
+    // action, is proved again within a frame or two: the look waits for that
+    // frame inside its own deadline, as for one that has not arrived yet.
+    #[test]
+    fn a_look_waits_out_a_window_being_proved_again() {
+        let clock = Arc::new(crate::gate::SystemClock::new());
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        let stream = Rc::new(ProvingFirst {
+            looks: std::cell::Cell::new(2),
+        });
+        let frames = Rc::new(TargetFrames::new(stream.clone(), clock));
+        assert!(first_frame(&frames, &gate).is_ok());
+        stream.looks.set(2);
+        assert!(frames.newest().is_ok());
     }
 
     fn stream_window() -> StreamWindow {
