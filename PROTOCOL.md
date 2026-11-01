@@ -108,7 +108,9 @@ they are as protocol 11 had them.
   around it (`_NET_FRAME_EXTENTS`). Its process is its `_NET_WM_PID`.
 - **The binding** is the window's X id, the X connection that watches it from the moment it is bound, and its
   process with that process's start time. A window that names no process (no `_NET_WM_PID`, as a Qt popup) is
-  refused `target_binding_unavailable`. A window destroyed after it was bound is `target_unavailable` for the rest
+  refused `target_binding_unavailable`, and so is one whose process or title, read again once the watch holds
+  it, is not what `windows` listed (its id was given to another window in between, or it was retitled since;
+  take `windows` again). A window destroyed after it was bound is `target_unavailable` for the rest
   of the binding, even when the X server has given its id to a new window of the same process: each request first
   has the watch read everything the server sent it, so a window closed before the request is never answered with
   its last picture.
@@ -117,19 +119,27 @@ they are as protocol 11 had them.
   still seen. A redirect fills the new pixmap with what the screen showed there, another window's pixels where
   one covered it, so no pixel is sent until it is proved the window's own, whoever redirected it. Every
   window the picture is drawn from (the window manager's frame and its decorations, the client and the
-  client's own windows) is cleared and sent an Expose (`ClearArea` with exposures), and the drawing that
-  follows must reach every pixel of the picture, frame included, within 1 s. That Expose is the one side
-  effect a selection has on the application: it repaints. A window that does not repaint in time (a hung
+  client's own windows) is cleared to its background and sent an Expose (`ClearArea` with exposures), and the
+  drawing that follows must reach every pixel of the picture, frame included, within 1 s. Clearing and that
+  Expose are the one side effect a selection has: the application repaints, and under a window manager that
+  composites nothing the window flashes its background once. A window that does not repaint in time (a hung
   application, or one that draws only once) is `capture_unavailable` and nothing is held. The proof does not
   depend on which windows are over it, so a window moving meanwhile changes nothing; one resized, hidden or
-  shown during it is refused at selection, and proved again later. A window mapped again or resized is
-  proved the same way before its next frame, and any part of a picture the proof did not reach (the frame
-  extents moved it) is sent black. The picture is the window's listed bounds, frame included, in root pixels
+  shown during it is refused at selection, and proved again later. A window mapped again, resized or given a
+  new border width is proved the same way before its next frame, and nothing of it is read until that holds;
+  a proof that falls short then is tried again at each of the next three intervals, and the binding ends
+  (`capture_unavailable`) if none holds. Any part of a picture the proof did not reach (the frame extents moved
+  it) is sent black. The picture is the window's listed bounds, frame included, in root pixels
   at a scale of 1. A damaged window is read again at most ten times a second; an undamaged one reports idle
   frames.
 - **Pixel actions** on a bound window need it topmost at the point, as on macOS (`target_obstructed`, naming the
-  window in front). In front means listed by the window manager: menus, tooltips and other override-redirect
-  windows are not, so they never refuse a click.
+  window in front). In front means a window the window manager lists in front of it, or any window the X server
+  stacks above it that takes input at that point: menus, tooltips, notifications and a desktop shell's own
+  windows are override-redirect and in no list, and are read from the root's children in the server's stacking
+  order, each with its SHAPE input region (none is the whole window and its border). One of those is named by
+  its class or title, or as "a menu or popup". Nothing moves the pointer or grabs anything to tell. A program
+  holding a pointer grab with no window at the point takes the click all the same, and cannot be seen this
+  way.
 - **Controls.** `ax_binding` is `bound` when exactly one of the application's AT-SPI windows has the X window's
   title and place (with or without the window manager's frame). GTK 4 places no window on X11 (its screen extents
   are 0, 0), so a GTK 4 window binds with `ax_binding: "unavailable"`, and `elements` in it is
@@ -137,14 +147,16 @@ they are as protocol 11 had them.
 - **The badge** is `compux-indicator-x11`, a second binary beside the helper, which starts it when a window is
   bound and ends it at release (its pipe closes) or with the helper. It speaks the macOS badge's line wire, and its
   Pause and Stop reach the same gate. It is an override-redirect window, so the window manager never manages or
-  focuses it: 28 pixels high and at most 448 wide, at the window's left above its top edge, or just inside that
+  focuses it: 28 pixels high and at most 440 wide, at the window's left above its top edge, or just inside that
   edge where there is no room above, kept on the window's monitor and out of its panels. Only its two buttons take
   clicks (a Shape input region); a click anywhere else on it reaches the window under it. A button event another
   program sends to it (`SendEvent`) is dropped and logged, so no program can pause, resume or stop the session
   that way; input made through XTEST is the server's own, as the person's is, and nothing on X11 tells the two
   apart, for the badge or any other window. It hides while the
-  window is minimized or gone, or while another window covers the area it would take, and it raises itself over a
-  window that comes above it at most ten times a second. Its text is Noto Sans Regular, built in, at 13 pixels,
+  window is minimized or gone, or while another window covers the area it would take. It raises itself, at most
+  ten times a second, over a window the window manager manages that moves, restacks or maps onto it (the bound
+  window raised over it among them), and never over an override-redirect one: the person's own menus and
+  tooltips stay over it. Its text is Noto Sans Regular, built in, at 13 pixels,
   in root pixels at a scale of 1 on any screen. It draws glyphs in the order the characters come, with kerning
   and no shaping: right-to-left text reads in the wrong order, and a character the font lacks (CJK, among
   others) is its missing-glyph box. It is a real window, so it shows in display screenshots, never in the bound
@@ -696,7 +708,7 @@ Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux bu
 | `target_obstructed` | A pixel action on the bound window where something covers that point. |
 | `control_surface_unavailable` | No ownership badge is running for a mutation on a bound window: on Linux, `compux-indicator-x11` is not beside the helper, or it exited (§1.2). |
 | `ax_binding_unavailable` | The bound window has no accessibility element to list from. |
-| `target_binding_unavailable` | Linux: `select_target` on a session that can bind no window (any but X11's), or on an X11 window that names no process (`_NET_WM_PID`). |
+| `target_binding_unavailable` | Linux: `select_target` on a session that can bind no window (any but X11's), on an X11 window that names no process (`_NET_WM_PID`), or on one whose process or title is no longer what `windows` listed. |
 
 **Controls**
 

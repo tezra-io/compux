@@ -2926,6 +2926,16 @@ above the fixture where the badge sits. Then:
   where.
 * Now move Text Editor over the badge's strip as well: the badge hides. Move
   Text Editor away: the badge comes back within about a quarter of a second.
+* **A menu over the fixture.** Put Text Editor beside the fixture and right-click
+  in it near the edge, so its menu hangs over the fixture. Leave the menu open, take
+  `{"action":"screenshot"}`, and send **`left_click`** at a point of the fixture
+  the menu covers: it must be refused **`target_obstructed`**, naming the menu
+  ("a menu or popup", or Text Editor's class). The menu stays open and
+  `/tmp/gtk3.json` records nothing. Close the menu (Escape) and click the same
+  point again: it lands. The badge must not have jumped over the open menu.
+* If a GNOME notification is on screen over the fixture, a click at a point
+  under it should be refused the same way, naming GNOME Shell. If it lands in
+  the fixture instead, write it down: the shell's own windows were not seen.
 
 ## C4. The badge takes nothing from you (your own input)
 
@@ -2953,6 +2963,34 @@ In the same session, Text Editor focused:
   **The same click** now lands: the fixture records the press.
 * **Press Stop.** `event` with `operator_stop`, and the next click is refused
   `paused`. **Press Resume** to go on.
+
+## C5b. Stop on the badge with the driver suspended (POSTS INPUT)
+
+The macOS check's step 7, on X11: the badge's Stop reaches the helper's gate with
+nothing else in the path. In the same session, press Resume first if C5 left it
+stopped. Read two points inside the fixture's empty area from a screenshot, then
+send one drag whose check waits up to 25 seconds for a dialog the fixture never
+opens, so the request is still running when you press Stop:
+
+```
+{"action":"left_click_drag","from":{"x":<x1>,"y":<y1>},"to":{"x":<x2>,"y":<y2>},"check":{"kind":"semantic","until":{"kind":"appears","role":"dialog","timeout_ms":25000}}}
+```
+
+In another terminal, at once:
+
+```sh
+kill -STOP $(pgrep -f owner_bound.py)
+```
+
+* **Press Stop on the badge.**
+* The left button is up: drag in Text Editor's text yourself. It selects text as
+  usual, and nothing on screen is still being dragged.
+* `kill -CONT $(pgrep -f owner_bound.py)`: the session prints `event` with
+  `operator_stop`, and the drag's reply is `cancelled`, with a receipt that says
+  the drag was sent.
+* The drag itself takes about a third of a second, so by hand the Stop lands in
+  the check's wait after it, not in the middle of the drag. Press **Resume** to
+  go on.
 
 ## C6. Minimize, close, relaunch
 
@@ -2986,6 +3024,8 @@ Each with the window still bound, in the session:
 * A program clicking the badge through `SendEvent` is dropped, and the containers
   prove it; a program clicking it through XTEST cannot be told from you, on X11,
   and nothing here tries.
+* A program holding a pointer grab with no window at the point takes a click
+  there, and compux cannot see it.
 * *Optional:* a window manager that keeps a client's own X border on its
   top-level windows (dwm, for one). Bind a window there with `--save`: the
   picture must start at the window's first pixel, with no strip of the border's
