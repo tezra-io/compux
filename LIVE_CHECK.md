@@ -2936,6 +2936,16 @@ above the fixture where the badge sits. Then:
   Open the menu once more so it hangs over the badge too: the badge stays under
   it while it is open, and is back over the fixture within about a second of
   Escape.
+* **GNOME's own panels over the badge.** Move the fixture so its top edge is
+  just under the top bar and its left edge a little left of the clock, so the
+  badge sits where the calendar drops down. Open the calendar (click the clock)
+  so it hangs over the badge. The badge stays under the calendar while it is
+  open, and is back over the fixture within about a second of closing it
+  (Escape). Do the same with the quick settings menu, with the fixture's left
+  edge under it (top right). GNOME Shell draws these in its own full-screen
+  window, which takes input over the badge while they are open and is never
+  unmapped, so the badge comes back only by looking again: if it stays under the
+  fixture after the calendar closes, write down how long.
 * If a GNOME notification is on screen over the fixture, a click at a point
   under it should be refused the same way, naming GNOME Shell. If it lands in
   the fixture instead, write it down: the shell's own windows were not seen.

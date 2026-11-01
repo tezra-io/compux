@@ -158,12 +158,13 @@ they are as protocol 11 had them.
   that moves, restacks or maps onto it (the bound window raised over it among them), never higher, and never over
   an override-redirect one: the person's own menus and tooltips stay over it. While one of those is open over it
   (above it, and taking input where the badge is), it does not raise itself at all, for a new state either, and
-  goes back on top when that window is unmapped. Its text is Noto Sans Regular, built in, at 13 pixels, in root
-  pixels at a scale of 1 on any screen. It draws glyphs in the order the characters come, with kerning and no
-  shaping: right-to-left text reads in the wrong order, and a character the font lacks (CJK, among others) is its
-  missing-glyph box. It is a real window, so it shows in display screenshots, never in the bound window's frames. A
-  badge that cannot show itself (no SHAPE 1.1, or a display other than 24-bit TrueColor with 32-bit pixels) exits,
-  and a mutation on the window is then `control_surface_unavailable`.
+  goes back on top when that window is unmapped, or once it no longer takes input there (it looks again every half
+  second while it waits). Its text is Noto Sans Regular, built in, at 13 pixels, in root pixels at a scale of 1 on
+  any screen. It draws glyphs in the order the characters come, with kerning and no shaping: right-to-left text
+  reads in the wrong order, and a character the font lacks (CJK, among others) is its missing-glyph box. It is a
+  real window, so it shows in display screenshots, never in the bound window's frames. A badge that cannot show
+  itself (no SHAPE 1.1, or a display other than 24-bit TrueColor with 32-bit pixels) exits, and a mutation on the
+  window is then `control_surface_unavailable`.
 
 ## 2. `elements`
 
