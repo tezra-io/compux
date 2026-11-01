@@ -21,6 +21,12 @@ repository = "https://github.com/tezra-io/compux"
 name = "compux"
 path = "src/main.rs"
 
+# The ownership badge on an X11 desktop, spawned by the helper beside it. Built on
+# every platform so one `cargo build` stays one command; it draws only on Linux.
+[[bin]]
+name = "compux-indicator-x11"
+path = "src/bin/compux-indicator-x11/main.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -76,6 +82,9 @@ x11rb = { version = "0.13", default-features = false, features = ["xtest", "rand
 # What character an X keysym types, for every keysym a layout can name (the
 # legacy Cyrillic, Greek and other tables as well as Unicode's).
 xkeysym = "0.2"
+# The X11 badge's text: glyphs outlined and rasterised in pure Rust from
+# the unmodified Noto Sans in fonts/, whose SIL Open Font License sits beside it.
+ab_glyph = "0.2"
 
 # The reader's unit tests answer it from fake AT-SPI servers over a peer-to-peer
 # connection: no bus daemon, no desktop.

@@ -114,6 +114,10 @@ mod target;
 /// worked in, and the Pause and Stop on it that reach the gate directly.
 mod indicator;
 
+/// The rectangle the badge may be drawn in, as numbers this helper and the X11
+/// badge both compile.
+mod badge_area;
+
 /// Wire-compatibility version. MUST match `Compux.Protocol.protocol_version/0`.
 /// Bumped ONLY on a wire-incompatible change; reported in the `hello` handshake so
 /// a consumer can refuse a mismatched sidecar (the two-pin drift guard).

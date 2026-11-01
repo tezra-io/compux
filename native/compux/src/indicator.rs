@@ -60,34 +60,30 @@ pub const WATCH_INTERVAL_MS: u64 = 250;
 /// badge must never hold a release open.
 pub const STOP_WAIT_MS: u64 = 1_000;
 
-/// **The badge's possible area — the contract between this process and the panel.**
-///
-/// The child may draw the badge in one of two places relative to the window's
-/// top-left corner: OUTSIDE, floating just above the window's frame, or INSIDE,
-/// below the traffic lights where a title bar has room. Which one it picks is the
-/// child's business (`native/indicator/Placement.swift`); what is NOT the child's
-/// business is where this process looks for something covering it, so the numbers
-/// live here, once, and the child is written against them.
-///
-/// The rectangle below covers BOTH placements. It starts [`BADGE_ABOVE`] points
-/// above the window's top edge and runs to [`BADGE_INSIDE_DROP`] plus
-/// [`BADGE_HEIGHT`] below it, [`BADGE_WIDTH`] wide from the window's left edge. A
-/// window in front of the target that touches any of it is a window the badge
-/// cannot be drawn over, and the child hides rather than drawing on somebody else's
-/// window.
-///
-/// The width is the child's own ceiling, not a guess: `Placement.inset` (8) plus
-/// `Placement.maxBadgeWidth` (440), which the child enforces on its panel and
-/// proves in its headless self-test; a badge that cannot fit inside this rectangle
-/// hides. The height is `Placement.badgeHeight`. Change one side and the other
-/// must move with it.
-pub const BADGE_WIDTH: f64 = 448.0;
-pub const BADGE_HEIGHT: f64 = 28.0;
-/// How far above the window's top edge the outside placement floats.
-pub const BADGE_ABOVE: f64 = 34.0;
-/// How far below the window's top edge the inside placement sits — clear of the
-/// traffic lights.
-pub const BADGE_INSIDE_DROP: f64 = 52.0;
+// **The badge's possible area — the contract between this process and the panel.**
+//
+// The child may draw the badge in one of two places relative to the window's
+// top-left corner: OUTSIDE, floating just above the window's frame, or INSIDE,
+// below the traffic lights (on X11, below the title bar). Which one it picks is
+// the child's business (`native/indicator/Placement.swift`, and the X11 badge's
+// `place.rs`); what is NOT the child's business is where this process looks for
+// something covering it, so the numbers live on this side, once, and the child is
+// written against them.
+//
+// The rectangle below covers BOTH placements. It starts [`BADGE_ABOVE`] points
+// above the window's top edge and runs to [`BADGE_INSIDE_DROP`] plus
+// [`BADGE_HEIGHT`] below it, [`BADGE_WIDTH`] wide from the window's left edge. A
+// window in front of the target that touches any of it is a window the badge
+// cannot be drawn over, and the child hides rather than drawing on somebody else's
+// window.
+//
+// The width is the child's own ceiling, not a guess: `Placement.inset` (8) plus
+// `Placement.maxBadgeWidth` (440), which the child enforces on its panel and
+// proves in its headless self-test; a badge that cannot fit inside this rectangle
+// hides. The height is `Placement.badgeHeight`. Change one side and the other
+// must move with it. The numbers themselves are in `badge_area.rs`, which the
+// X11 badge compiles too, so on Linux both sides read one copy.
+use crate::badge_area::{BADGE_ABOVE, BADGE_HEIGHT, BADGE_INSIDE_DROP, BADGE_WIDTH};
 
 /// Every point the badge might be drawn on, for a window at these bounds.
 ///
