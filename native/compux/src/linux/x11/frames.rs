@@ -157,7 +157,10 @@ pub enum Proved {
 /// read. `renewed` is whether any event read since the pixmap was named
 /// renewed the window, those reports included: a pixmap replaced then is not
 /// the one being proved, so the proof is void there and nothing is asked to
-/// repaint. `None` goes on to the repaint.
+/// repaint. `None` goes on to the repaint. A resize the server reported before
+/// the pixmap was named, and read only after, voids a proof whose pixmap is
+/// already the new one: that errs on the safe side, and the proof is tried
+/// again.
 pub fn at_cut_off(renewed: bool) -> Option<Proved> {
     renewed.then_some(Proved::Void)
 }
@@ -686,11 +689,14 @@ impl Watch {
     /// Every window the picture is drawn from is cleared to its background and
     /// sent an Expose for all of it: the server paints what has a background, and
     /// the application or the window manager draws the rest, as after any
-    /// exposure. The clears are not checked one by one: x11rb can then wait for
-    /// a reply nothing will send (a clear checked after an event that carries
-    /// its own sequence number sends no sync). A refusal comes back as an event
-    /// instead, matched to its clear by sequence number ([`Watch::took`]), before
-    /// the drawing that follows. A window gone meanwhile needs nothing.
+    /// exposure. The clears are not checked one by one. x11rb's `check()` sends
+    /// no sync once a packet carrying the checked request's own sequence number
+    /// has been read (any event the server sends after processing it does), and
+    /// then waits for a packet with a later number, which only a later request
+    /// brings: none follows the last clear, so the wait would never end. A
+    /// refusal comes back as an event instead, matched to its clear by sequence
+    /// number ([`Watch::took`]), before the drawing that follows. A window gone
+    /// meanwhile needs nothing.
     fn expose(&mut self) -> Result<(), FrameError> {
         let windows = self.drawn_from()?;
         let connection = &self.connection;
