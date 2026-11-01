@@ -6,11 +6,17 @@
 //!   Allow was seen to grant them all, and anyone's Deny would refuse compux.
 //!   A portal with no Registry (xdg-desktop-portal before 1.18) is never used; the
 //!   session's pixels are refused instead (`pixels`).
+//! - **Only the portal's answers.** Any process on the session bus can send a
+//!   signal on any path. A Request's `Response` and a session's `Closed` are
+//!   taken only from the unique name that owns the portal when the call is
+//!   made, so no other process can name a file for compux to read and remove,
+//!   or grant what the person refused.
 //! - **Screenshot**, `interactive: false`. Response 0 is the image, read from
-//!   the file the portal saved, which is then removed; 1 is a refusal (the
-//!   person's, now or stored: `consent_refused`); 2, or no answer within the
-//!   consent budget, is `consent_timeout`. compux never writes the
-//!   PermissionStore: a stored no is the person's to reset.
+//!   the regular file the portal saved (never through a link), which is
+//!   removed once it has decoded; 1 is a refusal (the person's, now or stored:
+//!   `consent_refused`); 2, or no answer within the consent budget, is
+//!   `consent_timeout`. compux never writes the PermissionStore: a stored no is
+//!   the person's to reset.
 //! - **Input**: one RemoteDesktop session with keyboard and pointer, and a
 //!   ScreenCast monitor source that says where the picked monitor is. Asked for
 //!   with `persist_mode` 2; the restore token is kept in compux's own state file,
@@ -24,10 +30,14 @@
 //!   its token: the next input asks again.
 
 use std::collections::HashMap;
+use std::fs::Metadata;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use zbus::names::OwnedUniqueName;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, Message, MessageStream};
 
@@ -68,6 +78,8 @@ pub const REMOTE_DESKTOP: &str = "org.freedesktop.portal.RemoteDesktop";
 pub const SCREEN_CAST: &str = "org.freedesktop.portal.ScreenCast";
 const REQUEST: &str = "org.freedesktop.portal.Request";
 const SESSION: &str = "org.freedesktop.portal.Session";
+const BUS: &str = "org.freedesktop.DBus";
+const BUS_PATH: &str = "/org/freedesktop/DBus";
 
 /// RemoteDesktop's device types: keyboard 1, pointer 2.
 const KEYBOARD_AND_POINTER: u32 = 3;
@@ -130,7 +142,8 @@ pub struct Stream {
 struct Session {
     handle: OwnedObjectPath,
     stream: Stream,
-    /// The portal's `Closed` signal for it, read before each use.
+    /// The portal's `Closed` signal for it, from the portal's owner alone, read
+    /// before each use.
     closed: MessageStream,
     keyed: bool,
 }
@@ -549,9 +562,11 @@ where
 }
 
 /// Call a method that answers with a Request, and wait for its Response within
-/// the `wait`'s budget. Every Response is listened for before the call is made,
-/// so one that comes back at once is not missed; the one whose path the call
-/// returned is kept.
+/// the `wait`'s budget. Every Response from the portal's owner is listened for
+/// before the call is made, so one that comes back at once is not missed; the
+/// one whose path the call returned is kept. A call some other process
+/// answered is refused: the portal changed hands, and its Response would be
+/// another process's.
 async fn ask<B>(
     connection: &Connection,
     interface: &str,
@@ -562,9 +577,11 @@ async fn ask<B>(
 where
     B: serde::Serialize + zbus::zvariant::DynamicType,
 {
+    let owner = owner(connection).await?;
     let rule = MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
-        .interface(REQUEST)
+        .sender(owner.as_str())
+        .and_then(|rule| rule.interface(REQUEST))
         .and_then(|rule| rule.member("Response"))
         .map(|rule| rule.build())
         .map_err(|error| Refusal::Failed(error.to_string()))?;
@@ -578,6 +595,42 @@ where
     let request: OwnedObjectPath = reply.body().deserialize().map_err(|error| {
         Refusal::Failed(format!("the portal's {method} named no request: {error}"))
     })?;
+    if reply.header().sender().map(|name| name.as_str()) != Some(owner.as_str()) {
+        close_request(connection, &request).await;
+        return Err(Refusal::Failed(format!(
+            "the portal's {method} was answered by another process than {owner}, which owned \
+             the portal when it was asked; nothing was sent"
+        )));
+    }
+    let Some(message) = response(&mut responses, &request, wait.budget()).await else {
+        close_request(connection, &request).await;
+        return Err(wait.ran_out(method));
+    };
+    responded(method, &message)
+}
+
+/// The unique name that owns the portal now, the only sender a Response or a
+/// `Closed` is taken from. zbus checks a match rule's unique sender on every
+/// message it hands the stream, so a signal another process sends straight to
+/// compux, which the bus delivers whatever compux's rules say, is dropped too.
+async fn owner(connection: &Connection) -> Result<OwnedUniqueName, Refusal> {
+    let reply = connection
+        .call_method(Some(BUS), BUS_PATH, Some(BUS), "GetNameOwner", &(DESKTOP,))
+        .await
+        .map_err(|error| Refusal::Failed(format!("nothing owns the portal: {error}")))?;
+    reply
+        .body()
+        .deserialize()
+        .map_err(|error| Refusal::Failed(format!("the portal's owner: {error}")))
+}
+
+/// The first Response on the `request`'s path within the `budget`; `None` past
+/// it.
+async fn response(
+    responses: &mut MessageStream,
+    request: &OwnedObjectPath,
+    budget: Duration,
+) -> Option<Message> {
     let response = async {
         while let Some(message) = responses.next().await {
             let message = match message {
@@ -594,18 +647,13 @@ where
         None
     };
     let timer = async {
-        async_io::Timer::after(wait.budget()).await;
+        async_io::Timer::after(budget).await;
         None
     };
-    let Some(message) = futures_util::future::select(Box::pin(response), Box::pin(timer))
+    futures_util::future::select(Box::pin(response), Box::pin(timer))
         .await
         .factor_first()
         .0
-    else {
-        close_request(connection, &request).await;
-        return Err(wait.ran_out(method));
-    };
-    responded(method, &message)
 }
 
 /// A Response's code and results, as the refusal or the results.
@@ -627,14 +675,17 @@ fn responded(method: &str, message: &Message) -> Result<HashMap<String, OwnedVal
     }
 }
 
-/// The session's `Closed` signal, listened for from its start.
+/// The session's `Closed` signal from the portal's owner, listened for from its
+/// start.
 async fn closed_signal(
     connection: &Connection,
     handle: &OwnedObjectPath,
 ) -> Result<MessageStream, Refusal> {
+    let owner = owner(connection).await?;
     let rule = MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
-        .interface(SESSION)
+        .sender(owner.as_str())
+        .and_then(|rule| rule.interface(SESSION))
         .and_then(|rule| rule.member("Closed"))
         .and_then(|rule| rule.path(handle.as_str()))
         .map(|rule| rule.build())
@@ -693,39 +744,90 @@ fn first_stream(results: &HashMap<String, OwnedValue>) -> Option<Stream> {
 }
 
 /// The file a `file://` URI names, decoded, then removed: the portal saves every
-/// screenshot as a file and leaves it, and this one was taken for compux. Only
-/// the file the answer named goes; one that will not go is said.
+/// screenshot as a file and leaves it, and this one was taken for compux. Only a
+/// regular file is read, never through a link, and it is removed only once it
+/// has decoded and only while its path still names it. Which directory it may be
+/// in is not checked yet: that waits on where GNOME saves it, which
+/// LIVE_CHECK.md's M86 L2 steps B1 and B3 write down.
 fn read_screenshot(uri: &str) -> Result<image::RgbaImage, Refusal> {
     let path = uri
         .strip_prefix("file://")
         .map(percent_decoded)
         .ok_or_else(|| Refusal::Failed(format!("the portal's screenshot is not a file: {uri}")))?;
-    let picture = decode_screenshot(&path);
-    if let Err(error) = std::fs::remove_file(&path) {
+    let named = regular_file(&path)?;
+    let picture = decode_screenshot(&path, &named)?;
+    remove_screenshot(&path, &named);
+    Ok(picture)
+}
+
+/// What the path names, refused unless it is a regular file. A link is not
+/// followed, and is said.
+fn regular_file(path: &Path) -> Result<Metadata, Refusal> {
+    let named = std::fs::symlink_metadata(path)
+        .map_err(|error| Refusal::Failed(format!("the portal's screenshot: {error}")))?;
+    if named.file_type().is_symlink() {
         eprintln!(
-            "compux: the portal's screenshot {} stays: {error}",
+            "compux: the portal's screenshot {} is a link; it is neither followed nor removed",
             path.display()
         );
     }
-    picture
+    if !named.file_type().is_file() {
+        return Err(Refusal::Failed(format!(
+            "the portal's screenshot {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(named)
 }
 
-fn decode_screenshot(path: &Path) -> Result<image::RgbaImage, Refusal> {
-    let size = std::fs::metadata(path)
-        .map_err(|error| Refusal::Failed(format!("the portal's screenshot: {error}")))?
-        .len();
-    if size > MAX_SCREENSHOT_BYTES {
+/// The picture in the file `named` describes. The file opened must be that one,
+/// so a path swapped for a link once it was looked at is refused.
+fn decode_screenshot(path: &Path, named: &Metadata) -> Result<image::RgbaImage, Refusal> {
+    let unread =
+        |error: std::io::Error| Refusal::Failed(format!("the portal's screenshot: {error}"));
+    let file = std::fs::File::open(path).map_err(unread)?;
+    let opened = file.metadata().map_err(unread)?;
+    if !same_file(named, &opened) {
+        return Err(Refusal::Failed(
+            "the portal's screenshot was replaced as it was opened".to_string(),
+        ));
+    }
+    if opened.len() > MAX_SCREENSHOT_BYTES {
         return Err(Refusal::Failed(
             "the portal's screenshot is larger than any screen".to_string(),
         ));
     }
-    let bytes = std::fs::read(path)
-        .map_err(|error| Refusal::Failed(format!("the portal's screenshot: {error}")))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SCREENSHOT_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(unread)?;
     image::load_from_memory(&bytes)
         .map(|picture| picture.to_rgba8())
         .map_err(|error| {
             Refusal::Failed(format!("the portal's screenshot would not decode: {error}"))
         })
+}
+
+fn same_file(one: &Metadata, other: &Metadata) -> bool {
+    one.dev() == other.dev() && one.ino() == other.ino()
+}
+
+/// Remove the screenshot that was read, unless its path names something else by
+/// now. One that stays is said.
+fn remove_screenshot(path: &Path, named: &Metadata) {
+    let still = std::fs::symlink_metadata(path)
+        .map(|now| now.file_type().is_file() && same_file(named, &now));
+    let removed = match still {
+        Ok(true) => std::fs::remove_file(path),
+        Ok(false) => Err(std::io::Error::other("its path names another file by now")),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = removed {
+        eprintln!(
+            "compux: the portal's screenshot {} stays: {error}",
+            path.display()
+        );
+    }
 }
 
 /// A URI path with its `%XX` escapes undone.
@@ -898,6 +1000,116 @@ mod tests {
 
         assert!(!dir.join("a picture.png").exists(), "the screenshot stays");
         assert!(beside.exists(), "a file beside it went too");
+    }
+
+    // The portal names the file it saved. A link there is not followed: neither
+    // it nor what it points at is read or removed.
+    #[test]
+    fn a_screenshot_named_through_a_link_is_refused_and_nothing_is_removed() {
+        let dir = scratch("link");
+        let target = dir.join("target.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]))
+            .save(&target)
+            .expect("a target");
+        let link = dir.join("link.png");
+        std::os::unix::fs::symlink(&target, &link).expect("a link");
+        let (_fake, client) = FakePortal::start(Script {
+            screenshot_uri: format!("file://{}", link.display()),
+            ..Script::default()
+        });
+        let mut portal = over(&client, None, SHORT);
+
+        let refusal = portal.screenshot().expect_err("a link is not read");
+
+        assert_eq!(refusal.code(), "capture_unavailable", "{refusal:?}");
+        assert!(link.symlink_metadata().is_ok(), "the link was removed");
+        assert!(target.exists(), "what it points at was removed");
+    }
+
+    // Only a screenshot compux could read is removed: one that will not decode
+    // stays where the portal saved it.
+    #[test]
+    fn a_screenshot_that_will_not_decode_is_refused_and_left_where_it_was_saved() {
+        let dir = scratch("undecoded");
+        let saved = dir.join("saved.png");
+        std::fs::write(&saved, b"not a picture").expect("a file");
+        let (_fake, client) = FakePortal::start(Script {
+            screenshot_uri: format!("file://{}", saved.display()),
+            ..Script::default()
+        });
+        let mut portal = over(&client, None, SHORT);
+
+        let refusal = portal.screenshot().expect_err("not a picture");
+
+        assert_eq!(refusal.code(), "capture_unavailable", "{refusal:?}");
+        assert!(saved.exists(), "a file compux could not read was removed");
+    }
+
+    // Any process on the session bus can send a Response on compux's Request
+    // path. One sent before the portal's, naming another file, is not taken:
+    // the picture is the portal's, and the other file is neither read nor
+    // removed.
+    #[test]
+    fn a_response_another_process_sends_first_is_ignored_and_its_file_left() {
+        let dir = scratch("forged");
+        let victim = dir.join("victim.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]))
+            .save(&victim)
+            .expect("a victim");
+        let script = Script {
+            screenshot_uri: saved_picture(&dir, 8, 6),
+            forged: Some("Screenshot"),
+            forged_uri: format!("file://{}", victim.display()),
+            ..Script::default()
+        };
+        let (_fake, client) = FakePortal::start(script);
+        let mut portal = over(&client, None, SHORT);
+
+        let picture = portal.screenshot().expect("the portal's picture");
+
+        assert_eq!((picture.width(), picture.height()), (8, 6));
+        assert!(victim.exists(), "the forged answer's file was removed");
+        assert!(!dir.join("a picture.png").exists(), "the screenshot stays");
+    }
+
+    // A Response 0 another process sends for Start would open a session the
+    // person refused, and post input through it.
+    #[test]
+    fn a_start_another_process_grants_stays_the_persons_refusal_and_posts_nothing() {
+        let (fake, client) = FakePortal::start(Script {
+            start: Answer::Respond(1),
+            forged: Some("Start"),
+            ..Script::default()
+        });
+        let mut portal = over(&client, None, SHORT);
+
+        let refused = portal
+            .keysym(0x61, true)
+            .expect_err("refused by the person");
+
+        assert!(refused.contains("the person refused it"), "{refused}");
+        let keys = by(&fake.calls(), "NotifyKeyboardKeysym");
+        assert!(keys.is_empty(), "{keys:?}");
+    }
+
+    // The bus said who owns the portal, and another process answered the call:
+    // the portal changed hands, and its answers are not taken from either.
+    #[test]
+    fn a_request_answered_by_another_process_than_the_portals_owner_is_refused() {
+        let dir = scratch("other-owner");
+        let script = Script {
+            screenshot_uri: saved_picture(&dir, 8, 6),
+            owner: ":1.7",
+            ..Script::default()
+        };
+        let (_fake, client) = FakePortal::start(script);
+        let mut portal = over(&client, None, SHORT);
+
+        let refusal = portal.screenshot().expect_err("not the owner's answer");
+
+        assert_eq!(refusal.code(), "capture_unavailable", "{refusal:?}");
+        assert!(refusal.detail().contains("Screenshot"), "{refusal:?}");
+        assert!(dir.join("a picture.png").exists(), "an unread file went");
     }
 
     // Response 1 is a refusal, now or stored, and only the person can reset a
@@ -1107,6 +1319,25 @@ mod tests {
             "{selected:?}"
         );
         assert_eq!(stored(&state).as_deref(), Some("token-2"));
+    }
+
+    // A Closed another process sends does not end the session or forget its
+    // token: only the portal's does. Each input is a round trip on the one
+    // connection, so after the first the forged Closed has landed.
+    #[test]
+    fn a_close_another_process_sends_leaves_the_session_and_its_token() {
+        let state = scratch("forged-close").join("portal.json");
+        let (fake, client) = FakePortal::start(Script::default());
+        let mut portal = over(&client, Some(state.clone()), SHORT);
+        portal.session().expect("the session");
+
+        fake.forge_close();
+        portal.motion(1.0, 2.0).expect("moved");
+        portal.motion(3.0, 4.0).expect("moved again");
+
+        let calls = fake.calls();
+        assert_eq!(by(&calls, "CreateSession").len(), 1, "{calls:?}");
+        assert_eq!(stored(&state).as_deref(), Some("token-1"));
     }
 
     // The first key a remote-desktop session posted was seen dropped. A Shift

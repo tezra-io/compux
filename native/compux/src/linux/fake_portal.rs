@@ -3,11 +3,11 @@
 //! One peer-to-peer D-Bus connection, no bus daemon and no desktop, as the fake
 //! AT-SPI desktop (`fake`) is. It answers the calls compux makes of the portal
 //! frontend (the Registry, Screenshot, RemoteDesktop, ScreenCast, Request and
-//! Session closes), of the session bus (`NameHasOwner`, the portal's
-//! `Introspect`) and of the PermissionStore (`Lookup`), from a script, and it
-//! RECORDS every call in order, so a test asserts on what was asked: that the
-//! app id was registered before anything else, which restore token was offered,
-//! which keysym went out first, which call may start a service.
+//! Session closes), of the session bus (`NameHasOwner`, `GetNameOwner`, the
+//! portal's `Introspect`) and of the PermissionStore (`Lookup`), from a script,
+//! and it RECORDS every call in order, so a test asserts on what was asked: that
+//! the app id was registered before anything else, which restore token was
+//! offered, which keysym went out first, which call may start a service.
 //!
 //! A portal or store the script says is not running answers a call that carries
 //! `NO_AUTO_START` as dbus-daemon does, `NameHasNoOwner` ("Name … does not
@@ -16,6 +16,11 @@
 //! A Request answers as the portal's do: the call returns its object path at
 //! once, and the `Response` signal on that path follows, with the scripted code,
 //! or never.
+//!
+//! On a bus, dbus-daemon stamps every message with its sender's unique name; a
+//! peer-to-peer connection stamps nothing, so the fake does. The portal's own
+//! replies and signals come from [`PORTAL`], and a script can have another
+//! process on the same bus, [`FORGER`], answer first.
 
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
@@ -41,6 +46,16 @@ const FORBIDDEN: [&str; 5] = [
 
 /// How long compux's end waits on any one call before failing it.
 const METHOD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The portal's unique name on the fake bus.
+pub const PORTAL: &str = ":1.42";
+
+/// Another process on the same session bus, which can send any signal on any
+/// path.
+pub const FORGER: &str = ":1.66";
+
+const REQUEST: &str = "org.freedesktop.portal.Request";
+const SESSION: &str = "org.freedesktop.portal.Session";
 
 /// How a Request is answered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +93,13 @@ pub struct Script {
     /// A session set-up step (`CreateSession`, `SelectDevices`, `SelectSources`)
     /// whose Request is never answered.
     pub silent_step: Option<&'static str>,
+    /// The unique name the bus says owns the portal (`GetNameOwner`).
+    pub owner: &'static str,
+    /// A method (`Screenshot` or `Start`) whose Request first gets a Response 0
+    /// from [`FORGER`], before the portal's own.
+    pub forged: Option<&'static str>,
+    /// The file a forged Screenshot Response names.
+    pub forged_uri: String,
 }
 
 impl Default for Script {
@@ -100,6 +122,9 @@ impl Default for Script {
             portal_running: true,
             store_running: true,
             silent_step: None,
+            owner: PORTAL,
+            forged: None,
+            forged_uri: String::new(),
         }
     }
 }
@@ -180,20 +205,23 @@ impl FakePortal {
 
     /// The person stops the last session from the shell: its `Closed` signal.
     pub fn close_session(&self) {
+        self.closed_by(PORTAL);
+    }
+
+    /// Another process sends the last session's `Closed` signal.
+    pub fn forge_close(&self) {
+        self.closed_by(FORGER);
+    }
+
+    fn closed_by(&self, sender: &'static str) {
         let session = lock(&self.state)
             .sessions
             .last()
             .cloned()
             .expect("a session");
-        let empty: HashMap<&str, Value<'_>> = HashMap::new();
-        async_io::block_on(self.server.emit_signal(
-            None::<&str>,
-            session.as_str(),
-            "org.freedesktop.portal.Session",
-            "Closed",
-            &(empty,),
-        ))
-        .expect("the Closed signal");
+        let options: (HashMap<&str, Value<'_>>,) = (HashMap::new(),);
+        let closed = signal_from(&self.server, sender, &session, SESSION, "Closed", &options);
+        async_io::block_on(closed).expect("the Closed signal");
     }
 }
 
@@ -267,7 +295,7 @@ async fn answer(
     };
     let body = message.body();
     match member.as_str() {
-        "NameHasOwner" | "Introspect" | "Lookup" => {
+        "NameHasOwner" | "GetNameOwner" | "Introspect" | "Lookup" => {
             let stopped = not_started(&call, &lock(state).script);
             record(state, call);
             if stopped {
@@ -311,6 +339,7 @@ async fn answer_bus(
             let owned = script.owned.iter().any(|owner| *owner == name);
             server.reply(header, &owned).await
         }
+        Some("GetNameOwner") => server.reply(header, &script.owner).await,
         Some("Introspect") => {
             let xml: String = script
                 .interfaces
@@ -363,14 +392,16 @@ async fn screenshot(
     let (_parent, options): (String, HashMap<String, OwnedValue>) = body.deserialize()?;
     call.detail = format!("interactive={:?}", options.get("interactive").map(|v| &**v));
     record(state, call);
-    let (answer, uri) = {
+    let (answer, uri, forged) = {
         let state = lock(state);
-        (state.script.screenshot, state.script.screenshot_uri.clone())
+        let script = &state.script;
+        let forged = (script.forged == Some("Screenshot")).then(|| script.forged_uri.clone());
+        (script.screenshot, script.screenshot_uri.clone(), forged)
     };
-    let mut results: HashMap<&str, Value<'_>> = HashMap::new();
-    results.insert("uri", Value::from(uri));
+    let results = HashMap::from([("uri", Value::from(uri))]);
+    let forged = forged.map(|uri| HashMap::from([("uri", Value::from(uri))]));
     let token = option_text(&options, "handle_token");
-    request(server, header, &token, answer, results).await
+    request(server, header, &token, answer, results, forged).await
 }
 
 /// CreateSession and the two selections: granted, the session's handle named
@@ -406,7 +437,7 @@ async fn set_up(
         Answer::Respond(0)
     };
     let token = option_text(&options, "handle_token");
-    request(server, header, &token, answer, results).await
+    request(server, header, &token, answer, results, None).await
 }
 
 /// Start: the scripted answer, one monitor stream, and the next restore token.
@@ -420,21 +451,34 @@ async fn start(
     let (_session, _parent, options): (OwnedObjectPath, String, HashMap<String, OwnedValue>) =
         body.deserialize()?;
     record(state, call);
-    let (answer, (node, position, size), token) = {
+    let (answer, stream, token, forged) = {
         let mut state = lock(state);
         state.tokens += 1;
         let token = format!("{}-{}", state.script.token_prefix, state.tokens);
-        (state.script.start, state.script.stream, token)
+        let forged = state.script.forged == Some("Start");
+        (state.script.start, state.script.stream, token, forged)
     };
-    let mut properties: HashMap<&str, Value<'_>> = HashMap::new();
-    properties.insert("position", Value::from(position));
-    properties.insert("size", Value::from(size));
-    let mut results: HashMap<&str, Value<'_>> = HashMap::new();
-    results.insert("devices", Value::from(3u32));
-    results.insert("streams", Value::from(vec![(node, properties)]));
-    results.insert("restore_token", Value::from(token));
+    let results = started(stream, token);
+    let forged = forged.then(|| started(stream, "forged".to_string()));
     let token = option_text(&options, "handle_token");
-    request(server, header, &token, answer, results).await
+    request(server, header, &token, answer, results, forged).await
+}
+
+/// What a granted Start names: keyboard and pointer, the monitor stream, and a
+/// restore token.
+fn started(
+    (node, position, size): (u32, (i32, i32), (i32, i32)),
+    token: String,
+) -> HashMap<&'static str, Value<'static>> {
+    let properties = HashMap::from([
+        ("position", Value::from(position)),
+        ("size", Value::from(size)),
+    ]);
+    HashMap::from([
+        ("devices", Value::from(3u32)),
+        ("streams", Value::from(vec![(node, properties)])),
+        ("restore_token", Value::from(token)),
+    ])
 }
 
 /// The input calls, each with what it sent as its detail, and any other call
@@ -483,27 +527,45 @@ fn record(state: &Mutex<State>, call: Call) {
     lock(state).calls.push(call);
 }
 
-/// Answer with the Request's path, then its Response as scripted.
+/// Answer with the Request's path, then its Response as scripted; a `forged`
+/// Response from [`FORGER`] goes first.
 async fn request(
     server: &Connection,
     header: &Header<'_>,
     token: &str,
     answer: Answer,
     results: HashMap<&str, Value<'_>>,
+    forged: Option<HashMap<&str, Value<'_>>>,
 ) -> zbus::Result<()> {
     let path = format!("/org/freedesktop/portal/desktop/request/fake/{token}");
     let handle = OwnedObjectPath::try_from(path.as_str()).expect("a request path");
-    server.reply(header, &handle).await?;
+    let reply = Message::method_return(header)?
+        .sender(PORTAL)?
+        .build(&handle)?;
+    server.send(&reply).await?;
+    if let Some(forged) = forged {
+        signal_from(server, FORGER, &path, REQUEST, "Response", &(0u32, forged)).await?;
+    }
     let Answer::Respond(code) = answer else {
         return Ok(());
     };
-    server
-        .emit_signal(
-            None::<&str>,
-            path.as_str(),
-            "org.freedesktop.portal.Request",
-            "Response",
-            &(code, results),
-        )
-        .await
+    signal_from(server, PORTAL, &path, REQUEST, "Response", &(code, results)).await
+}
+
+/// A signal stamped with `sender`, as the bus would deliver it.
+async fn signal_from<B>(
+    server: &Connection,
+    sender: &str,
+    path: &str,
+    interface: &str,
+    member: &str,
+    body: &B,
+) -> zbus::Result<()>
+where
+    B: serde::Serialize + zbus::zvariant::DynamicType,
+{
+    let signal = Message::signal(path, interface, member)?
+        .sender(sender)?
+        .build(body)?;
+    server.send(&signal).await
 }

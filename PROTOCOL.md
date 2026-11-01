@@ -76,20 +76,22 @@ they are as protocol 11 had them.
 - **GNOME Wayland.** Nothing is asked of the portal before the first pixel action. The first one starts the session
   (keyboard and pointer, `persist_mode` 2, one monitor), which shows the portal's dialog unless the restore token
   kept in `$XDG_STATE_HOME/compux/portal.json` still serves; each token is offered once and replaced by the one the
-  start hands back. The session lives as long as the helper: closed by `release`, at exit, or by the person from
-  the shell (the next pixel action then asks again, without a token). The display is the one monitor picked for the
+  start hands back. The session lives as long as the helper: closed by `release`, at exit, or by the person from the
+  shell (the next pixel action then asks again, without a token). The display is the one monitor picked for the
   session, in the compositor's logical points; the frame is the portal's non-interactive screenshot, accepted only
-  when the desktop is that one monitor (`capture_unavailable` otherwise). The portal saves each screenshot as a file
-  and leaves it; compux removes the file the answer named once it is read, and no other. Whether the desktop is one
-  monitor is judged by size alone, since the portal says nothing of the others: a desktop of four 1280×800 monitors
-  in a 2×2 grid at 100% gives the same 2560×1600 screenshot as one 1280×800 monitor at 200%, and is taken as that
-  one monitor. Keys go as keysyms, the session's first one after a Shift tap that types nothing; the pointer goes as
-  absolute motion in the monitor stream's coordinates. The session's set-up steps (`CreateSession`,
-  `SelectDevices`, `SelectSources`) show no dialog and are each waited on for 5 s, past which the portal is not
-  answering (`capture_unavailable`, naming the step); only `Start` and `Screenshot` wait on the person. A dialog
-  answered no is `consent_refused`; one ended by the portal, or not answered within 25 s, is `consent_timeout`.
-  Keys go only into a window that reads `ACTIVE` (`no_active_window`); the compositor drops a character its layout
-  cannot type without saying so, so `type` is not refused for one here.
+  when the desktop is that one monitor (`capture_unavailable` otherwise). A portal answer is taken only from the
+  process that owns the portal when the call is made; another process's is ignored. The portal saves each screenshot
+  as a file and leaves it; compux reads the file the answer named only if it is a regular file (a link is refused,
+  `capture_unavailable`, and neither it nor what it points at is touched), and removes that file once it has
+  decoded, and no other. Whether the desktop is one monitor is judged by size alone, since the portal says nothing
+  of the others: a desktop of four 1280×800 monitors in a 2×2 grid at 100% gives the same 2560×1600 screenshot as
+  one 1280×800 monitor at 200%, and is taken as that one monitor. Keys go as keysyms, the session's first one after
+  a Shift tap that types nothing; the pointer goes as absolute motion in the monitor stream's coordinates. The
+  session's set-up steps (`CreateSession`, `SelectDevices`, `SelectSources`) show no dialog and are each waited on
+  for 5 s, past which the portal is not answering (`capture_unavailable`, naming the step); only `Start` and
+  `Screenshot` wait on the person. A dialog answered no is `consent_refused`; one ended by the portal, or not
+  answered within 25 s, is `consent_timeout`. Keys go only into a window that reads `ACTIVE` (`no_active_window`);
+  the compositor drops a character its layout cannot type without saying so, so `type` is not refused for one here.
 
 ## 2. `elements`
 
@@ -665,7 +667,7 @@ Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux bu
 | `pixels_unavailable` | Linux: a pixel action (or `type` without `element_ref`, or an image check) where the session's pixel route is refused (§1.1: a compositor with no qualified route, a portal without its `Registry`, no display), or one the route does not serve (`paste` and `windows` on GNOME Wayland). The detail is the route's reason. Nothing sent; work by control. |
 | `consent_refused` | Linux (GNOME Wayland): the portal answered no, now or by a stored answer. A stored no stays until the person resets it; `fermix doctor` prints how. compux never writes the PermissionStore. Nothing sent. |
 | `consent_timeout` | Linux (GNOME Wayland): the portal ended its dialog unanswered, or nobody answered it within 25 s; the dialog is closed. Nothing sent. |
-| `capture_unavailable` | Also Linux (GNOME Wayland): the portal's call failed, a session set-up step (`CreateSession`, `SelectDevices`, `SelectSources`, which show no dialog) went unanswered for 5 s (the detail names the step), or its screenshot holds more than the session's one monitor. Nothing sent. |
+| `capture_unavailable` | Also Linux (GNOME Wayland): the portal's call failed or was answered by another process than the portal's owner, a session set-up step (`CreateSession`, `SelectDevices`, `SelectSources`, which show no dialog) went unanswered for 5 s (the detail names the step), its screenshot is not a regular file or would not decode (the file is left where it is), or it holds more than the session's one monitor. Nothing sent. |
 
 Legacy argument errors that the library refuses before they reach the sidecar (a missing `text`, an unknown key in a
 chord, a bad drag point) still answer their sentence as the code from the sidecar.

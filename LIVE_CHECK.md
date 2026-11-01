@@ -2754,7 +2754,7 @@ Open Text Editor, then in one `cx.py` session:
 * `cat ~/.local/state/compux/portal.json` holds a `restore_token`, and `ls -l`
   shows it `-rw-------`.
 * `ls` the directory B1 step 3 wrote down: none of compux's screenshots stays
-  there (compux removes each file once it is read).
+  there (compux removes each file once it has decoded).
 * `{"action":"wait_for_change","timeout_ms":3000}` with nothing changing on screen
   (read only): it looks once per poll, and each look is a portal screenshot. Write
   down whether GNOME flashes the screen, or plays the shutter sound, at each look.
