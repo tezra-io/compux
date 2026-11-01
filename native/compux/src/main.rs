@@ -6722,7 +6722,7 @@ mod tests {
         let portal = linux::portal::Portal::with(
             Box::new(|| panic!("hello asked the portal")),
             None,
-            Duration::from_millis(1),
+            linux::portal::Budgets::PORTAL,
         );
         let pixels = Pixels::on_portal(portal);
 

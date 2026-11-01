@@ -7,7 +7,11 @@
 //! `Introspect`) and of the PermissionStore (`Lookup`), from a script, and it
 //! RECORDS every call in order, so a test asserts on what was asked: that the
 //! app id was registered before anything else, which restore token was offered,
-//! which keysym went out first.
+//! which keysym went out first, which call may start a service.
+//!
+//! A portal or store the script says is not running answers a call that carries
+//! `NO_AUTO_START` as the bus would, `ServiceUnknown`; one without the flag starts
+//! it, as the bus would, and is answered.
 //!
 //! A Request answers as the portal's do: the call returns its object path at
 //! once, and the `Response` signal on that path follows, with the scripted code,
@@ -21,7 +25,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use zbus::connection::Builder;
-use zbus::message::{Body, Header, Type};
+use zbus::message::{Body, Flags, Header, Type};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, Message, MessageStream};
 
@@ -67,6 +71,13 @@ pub struct Script {
     /// The PermissionStore's `screenshot` table: app id to answer; `None` is no
     /// table at all.
     pub stored: Option<Vec<(&'static str, &'static str)>>,
+    /// Whether the portal frontend runs before anything starts it.
+    pub portal_running: bool,
+    /// Whether the PermissionStore runs before anything starts it.
+    pub store_running: bool,
+    /// A session set-up step (`CreateSession`, `SelectDevices`, `SelectSources`)
+    /// whose Request is never answered.
+    pub silent_step: Option<&'static str>,
 }
 
 impl Default for Script {
@@ -86,6 +97,9 @@ impl Default for Script {
                 "org.freedesktop.portal.ScreenCast",
             ],
             stored: None,
+            portal_running: true,
+            store_running: true,
+            silent_step: None,
         }
     }
 }
@@ -100,6 +114,8 @@ pub struct Call {
     /// `NotifyPointerMotionAbsolute`'s stream and point; what a selection asked
     /// for, the restore token among it.
     pub detail: String,
+    /// The call did not carry `NO_AUTO_START`: it may start the service.
+    pub auto_start: bool,
 }
 
 struct State {
@@ -247,11 +263,17 @@ async fn answer(
         member: member.clone(),
         path: text(header.path().map(|path| path.to_string())),
         detail: String::new(),
+        auto_start: !header.primary().flags().contains(Flags::NoAutoStart),
     };
     let body = message.body();
     match member.as_str() {
         "NameHasOwner" | "Introspect" | "Lookup" => {
+            let stopped = not_started(&call, &lock(state).script);
             record(state, call);
+            if stopped {
+                let unknown = "org.freedesktop.DBus.Error.ServiceUnknown";
+                return server.reply_error(header, unknown, &("not running",)).await;
+            }
             answer_bus(server, header, &body, state).await
         }
         "Register" => register(server, header, &body, state, call).await,
@@ -262,6 +284,16 @@ async fn answer(
         "Start" => start(server, header, &body, state, call).await,
         _ => input(server, header, &body, state, call).await,
     }
+}
+
+/// Whether a read goes to a service that is not running and may not start it.
+fn not_started(call: &Call, script: &Script) -> bool {
+    let running = match call.member.as_str() {
+        "Introspect" => script.portal_running,
+        "Lookup" => script.store_running,
+        _ => true,
+    };
+    !running && !call.auto_start
 }
 
 /// The session bus's and the PermissionStore's answers: who owns a name, what
@@ -341,8 +373,8 @@ async fn screenshot(
     request(server, header, &token, answer, results).await
 }
 
-/// CreateSession and the two selections: always granted, the session's handle
-/// named after its token.
+/// CreateSession and the two selections: granted, the session's handle named
+/// after its token, unless the script leaves one unanswered.
 async fn set_up(
     server: &Connection,
     header: &Header<'_>,
@@ -366,9 +398,15 @@ async fn set_up(
         call.detail = selected(&options);
         options
     };
+    let silent = lock(state).script.silent_step == Some(call.member.as_str());
     record(state, call);
+    let answer = if silent {
+        Answer::Never
+    } else {
+        Answer::Respond(0)
+    };
     let token = option_text(&options, "handle_token");
-    request(server, header, &token, Answer::Respond(0), results).await
+    request(server, header, &token, answer, results).await
 }
 
 /// Start: the scripted answer, one monitor stream, and the next restore token.

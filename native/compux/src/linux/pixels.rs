@@ -662,11 +662,12 @@ mod tests {
 
     fn over(client: &Connection) -> Portal {
         let client = client.clone();
-        Portal::with(
-            Box::new(move || Ok(client.clone())),
-            None,
-            Duration::from_millis(300),
-        )
+        let short = Duration::from_millis(300);
+        let budgets = portal::Budgets {
+            consent: short,
+            step: short,
+        };
+        Portal::with(Box::new(move || Ok(client.clone())), None, budgets)
     }
 
     fn stream(position: (i32, i32), size: (i32, i32)) -> portal::Stream {
