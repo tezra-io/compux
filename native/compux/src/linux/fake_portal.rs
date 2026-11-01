@@ -10,8 +10,8 @@
 //! which keysym went out first, which call may start a service.
 //!
 //! A portal or store the script says is not running answers a call that carries
-//! `NO_AUTO_START` as the bus would, `ServiceUnknown`; one without the flag starts
-//! it, as the bus would, and is answered.
+//! `NO_AUTO_START` as dbus-daemon does, `NameHasNoOwner` ("Name … does not
+//! exist"); one without the flag starts it, as the bus would, and is answered.
 //!
 //! A Request answers as the portal's do: the call returns its object path at
 //! once, and the `Response` signal on that path follows, with the scripted code,
@@ -271,8 +271,8 @@ async fn answer(
             let stopped = not_started(&call, &lock(state).script);
             record(state, call);
             if stopped {
-                let unknown = "org.freedesktop.DBus.Error.ServiceUnknown";
-                return server.reply_error(header, unknown, &("not running",)).await;
+                let nobody = "org.freedesktop.DBus.Error.NameHasNoOwner";
+                return server.reply_error(header, nobody, &("not running",)).await;
             }
             answer_bus(server, header, &body, state).await
         }

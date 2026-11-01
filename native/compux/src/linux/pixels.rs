@@ -347,7 +347,10 @@ pub fn portal_frame(portal: &RefCell<Portal>) -> Result<image::RgbaImage, Refusa
     Ok(image)
 }
 
-/// Pure: whether a desktop image of this size is the stream's monitor alone.
+/// Pure: whether a desktop image of this size is the stream's monitor alone. It
+/// is judged by size, the only thing the portal says: one 1280×800 monitor at
+/// 200% and four 1280×800 monitors in a 2×2 grid at 100% both give a 2560×1600
+/// screenshot, and the second passes as the first.
 pub fn one_monitor(stream: &portal::Stream, width: u32, height: u32) -> Result<(), Refusal> {
     let (w, h) = (
         f64::from(stream.size.0.max(1)),
@@ -603,8 +606,16 @@ async fn introspected(session: &Connection, activation: Activation) -> Option<St
     }
 }
 
+/// The errors a call with NO_AUTO_START gets from a name nobody owns: dbus-daemon
+/// answers `NameHasNoOwner` ("Name … does not exist"), and `ServiceUnknown` where
+/// a start was tried and nothing can start it.
+const NOT_RUNNING: [&str; 2] = [
+    "org.freedesktop.DBus.Error.NameHasNoOwner",
+    "org.freedesktop.DBus.Error.ServiceUnknown",
+];
+
 /// A method call that never starts the service it goes to: a name nobody owns
-/// answers `ServiceUnknown` instead of being started to answer it.
+/// answers with one of [`NOT_RUNNING`] instead of being started to answer it.
 async fn call_unstarted<B, R>(
     session: &Connection,
     (destination, path, interface): (&'static str, &'static str, &'static str),
@@ -647,7 +658,7 @@ pub async fn stored_screenshot(session: &Connection) -> Option<&'static str> {
         Err(zbus::Error::MethodError(name, _, _)) if name.as_str().ends_with(".NotFound") => {
             return Some("unset")
         }
-        Err(zbus::Error::MethodError(name, _, _)) if name.as_str().ends_with(".ServiceUnknown") => {
+        Err(zbus::Error::MethodError(name, _, _)) if NOT_RUNNING.contains(&name.as_str()) => {
             return Some("not_running")
         }
         Err(_) => return None,

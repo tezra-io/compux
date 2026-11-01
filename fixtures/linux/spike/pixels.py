@@ -170,11 +170,19 @@ def hello_check(hello):
     return {"flow": "hello", "passed": passed, "why": f"missing {missing}, input_methods {methods}"}
 
 
+# The image ships neither the portal nor its PermissionStore, so on the private
+# session bus both are names nobody owns or can start: probe, which reads them
+# with NO_AUTO_START, must report both as not running.
+PORTAL_NOT_RUNNING = {"running": False, "registry": None, "screenshot_permission": "not_running"}
+
+
 def probe_check(helper):
     _, reply = helper.ask("probe")
     pixels = reply.get("x11_pixels")
+    portal = reply.get("portal") or {}
+    portal_read = {key: portal.get(key) for key in PORTAL_NOT_RUNNING}
     passed = (pixels == {"xtest": True, "keymap": True} and reply.get("screen_capture") is True
-              and reply.get("input_control") is True)
+              and reply.get("input_control") is True and portal_read == PORTAL_NOT_RUNNING)
     return {"flow": "probe", "passed": passed,
             "why": f"x11_pixels {pixels}, screen_capture {reply.get('screen_capture')}, "
                    f"input_control {reply.get('input_control')}, portal {reply.get('portal')}"}
