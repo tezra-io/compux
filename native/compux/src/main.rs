@@ -657,7 +657,7 @@ fn reply(
     gate: &Gate,
     outcome: Result<Value, Failure>,
     done: gate::Dispatched,
-    surfaces: Option<Vec<wire::Surface>>,
+    surfaces: Option<wire::Surfaces>,
 ) -> Value {
     // The capture verbs answer in the computer-history `ack` family, byte for byte
     // as they did at protocol 6. Their client reads that shape and nothing else.
@@ -954,6 +954,7 @@ impl Capability {
 fn element_in<'a>(
     observation: &'a Observation,
     request: &wire::Request,
+    worker: &Worker,
 ) -> Result<&'a ax::Entry, Failure> {
     let reference = request
         .element_ref
@@ -969,7 +970,7 @@ fn element_in<'a>(
         ));
     };
 
-    elements.get(reference).ok_or_else(|| {
+    let entry = elements.get(reference).ok_or_else(|| {
         Failure::new(
             "stale_element",
             format!(
@@ -978,7 +979,28 @@ fn element_in<'a>(
                 elements.len()
             ),
         )
-    })
+    })?;
+    listed_here(request, elements, reference, worker)?;
+    Ok(entry)
+}
+
+/// A request bound to a window uses only references listed under that window's
+/// binding, from its process ([`semantic::listed_here`]). A request with no
+/// binding uses any listing.
+fn listed_here(
+    request: &wire::Request,
+    elements: &ax::Elements,
+    reference: &str,
+    worker: &Worker,
+) -> Result<(), Failure> {
+    if request.target_id.is_none() {
+        return Ok(());
+    }
+    let target = worker
+        .target
+        .as_ref()
+        .ok_or_else(|| Failure::from("target_unavailable"))?;
+    semantic::listed_here(elements, reference, target.window_id, target.pid)
 }
 
 /// Is this still the control the caller was shown, and will it act at all?
@@ -2183,6 +2205,7 @@ fn select_target(
             requested: Requested::Exactly(Region::full(&geometry)),
             jpeg_quality: None,
             overlays: Overlays::default(),
+            marks: MarksFrom::Application,
         },
         gate,
         worker,
@@ -2375,6 +2398,7 @@ fn screenshot(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resu
             requested: Requested::Region(request),
             jpeg_quality: parse_jpeg_quality(req)?,
             overlays: parse_overlays(req)?,
+            marks: marks_from(view.bound.is_some(), worker),
         },
         gate,
         worker,
@@ -2382,6 +2406,30 @@ fn screenshot(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resu
     note_target(&mut payload, worker, view.bound.is_some())?;
 
     Ok(payload)
+}
+
+/// Where a screenshot's marks are read from: the application in view, or for a
+/// request naming the target what the bound window sees. A window bound without
+/// an accessibility element has no subtree to read, so its marks are the
+/// application's, points only.
+fn marks_from(bound: bool, worker: &Worker) -> MarksFrom {
+    if !bound {
+        return MarksFrom::Application;
+    }
+    let Some(target) = worker.target.as_ref() else {
+        return MarksFrom::PointsOnly;
+    };
+    let Some(window) = target.ax_window.as_ref() else {
+        return MarksFrom::PointsOnly;
+    };
+    MarksFrom::BoundWindow(semantic::Scene {
+        pid: target.pid,
+        window: Some(semantic::Bound {
+            element: window.handle(),
+            id: target.window_id,
+            windows: worker.windows.clone(),
+        }),
+    })
 }
 
 /// Say which window a reply is about, and which of that application's other windows
@@ -2713,6 +2761,23 @@ struct Rendering<'a> {
     requested: Requested<'a>,
     jpeg_quality: Option<u8>,
     overlays: Overlays,
+    /// Where the picture's marks are read from, when it draws any; a picture that
+    /// draws none passes [`MarksFrom::Application`].
+    marks: MarksFrom,
+}
+
+/// Where a picture's marks are read from, and what their references are listed
+/// under.
+enum MarksFrom {
+    /// The application in view; its references are listed under no binding.
+    Application,
+    /// What the bound window sees ([`bound_in_view`]); its references are listed
+    /// under the binding.
+    BoundWindow(semantic::Scene),
+    /// The application in view, for a window bound without an accessibility
+    /// element: badges and points only. No reference of it could be used under
+    /// the binding, so none is handed out, and a mark is clicked by its point.
+    PointsOnly,
 }
 
 fn capture_payload_encoded(
@@ -2727,6 +2792,7 @@ fn capture_payload_encoded(
         requested,
         jpeg_quality,
         overlays,
+        marks,
     } = rendering;
     // The transform is the caller's, because it is built from the FRAME this image
     // came out of — a display's measured from the capture, a bound window's from the
@@ -2762,6 +2828,7 @@ fn capture_payload_encoded(
             &mut resized,
             gate,
             &worker.ax,
+            &marks,
         ))
     } else {
         None
@@ -2898,17 +2965,25 @@ struct MarksInfo {
 
 /// Badge the interactive elements in view and answer their table.
 ///
-/// The read itself is the macOS half (`interactive_in_view`); everything from the
-/// nodes onwards is the same code on every platform, which is what keeps a
-/// reference, a badge and an element-list entry spelling the same fact one way.
+/// The read is the application in view (`interactive_in_view`), or for a bound
+/// window what that window sees (`bound_in_view`); everything from the nodes
+/// onwards is the same code on every platform, which is what keeps a reference, a
+/// badge and an element-list entry spelling the same fact one way.
 fn collect_marks(
     geom: &Geometry,
     region: &Region,
     img: &mut image::RgbaImage,
     gate: &Gate,
     ax: &Rc<dyn ax::Ax>,
+    marks: &MarksFrom,
 ) -> MarksInfo {
-    let viewed = match interactive_in_view(ax, geom, region, gate) {
+    let read = match marks {
+        MarksFrom::BoundWindow(scene) => bound_in_view(ax, scene, geom, region, gate),
+        MarksFrom::Application | MarksFrom::PointsOnly => {
+            interactive_in_view(ax, geom, region, gate)
+        }
+    };
+    let viewed = match read {
         Ok(viewed) => viewed,
         Err(unsupported) => {
             return MarksInfo {
@@ -2928,7 +3003,12 @@ fn collect_marks(
         .filter_map(|(node, point)| point.map(|point| (node, point)))
         .collect();
     let truncated = placed.len().saturating_sub(MAX_MARKS);
-    let names = viewed.owner.is_some();
+    // Points only: no table is kept, so no mark is named by a reference.
+    let owner = match marks {
+        MarksFrom::PointsOnly => None,
+        MarksFrom::Application | MarksFrom::BoundWindow(_) => viewed.owner,
+    };
+    let names = owner.is_some();
     let mut entries = Vec::new();
     let mut listed = Vec::new();
 
@@ -2953,8 +3033,58 @@ fn collect_marks(
         ax_activation: viewed.note,
         truncated,
         truncated_walk: viewed.truncated,
-        elements: retained(viewed.owner, listed),
+        elements: retained(owner, listed_under(marks), listed),
     }
+}
+
+/// The window marks read from it are listed under.
+fn listed_under(marks: &MarksFrom) -> Option<u32> {
+    match marks {
+        MarksFrom::BoundWindow(scene) => scene.window.as_ref().map(|window| window.id),
+        MarksFrom::Application | MarksFrom::PointsOnly => None,
+    }
+}
+
+/// What a bound window's marks are read from: the window's own subtree and the
+/// surfaces in windows of its own that its scene sees ([`semantic::surfaces`]), in
+/// one walk, cut to this view. Nothing else of the application is read, so no
+/// control of another window is marked under the binding.
+fn bound_in_view(
+    ax: &Rc<dyn ax::Ax>,
+    scene: &semantic::Scene,
+    geom: &Geometry,
+    region: &Region,
+    gate: &Gate,
+) -> Result<Viewed, Failure> {
+    let element = scene
+        .window
+        .as_ref()
+        .map(|window| window.element)
+        .ok_or_else(|| Failure::from("target_unavailable"))?;
+    let before = ax.messages();
+    let apart = semantic::surfaces(ax, scene)?
+        .found
+        .into_iter()
+        .filter(|surface| surface.apart)
+        .map(|surface| surface.element);
+    let window = ax
+        .retain_again(ax, element)
+        .ok_or_else(|| Failure::from("target_unavailable"))?;
+    let roots: Vec<ax::Retained> = std::iter::once(window).chain(apart).collect();
+    let clock = gate.clock();
+    let deadline = gate.now_ms().saturating_add(tree::WALK_BUDGET_MS);
+    let found = tree::walk_roots(ax, roots, &tree::Shape::default(), clock.as_ref(), deadline);
+    let messages = ax.messages() - before;
+    let (placed, _outside) = in_view(found.nodes, geom, region);
+    Ok(Viewed {
+        nodes: placed,
+        owner: ax
+            .process_started_at(scene.pid)
+            .map(|started_at| (scene.pid, started_at)),
+        truncated: found.truncated,
+        note: None,
+        messages,
+    })
 }
 
 /// One badge's entry: its number, the control's role and click point, and the
@@ -2979,11 +3109,16 @@ fn mark_entry(id: usize, node: &tree::Node, point: (i64, i64), reference: Option
     entry
 }
 
-/// The references one reply hands out, or `None` when it listed none — an empty
-/// table would be a promise of controls that are not there.
-fn retained(owner: Option<(i32, u64)>, entries: Vec<ax::Entry>) -> Option<Rc<ax::Elements>> {
+/// The references one reply hands out, listed under the window `bound` names
+/// (`None`: no binding), or `None` when it listed none — an empty table would be
+/// a promise of controls that are not there.
+fn retained(
+    owner: Option<(i32, u64)>,
+    bound: Option<u32>,
+    entries: Vec<ax::Entry>,
+) -> Option<Rc<ax::Elements>> {
     let (pid, started_at) = owner?;
-    let elements = ax::Elements::new(pid, started_at, entries);
+    let elements = ax::Elements::new(pid, started_at, bound, entries);
 
     if elements.is_empty() {
         None
@@ -3147,10 +3282,11 @@ fn aim(
 fn addressed_element<'a>(
     request: &wire::Request,
     observation: &'a Observation,
+    worker: &Worker,
 ) -> Result<Option<&'a ax::Entry>, Failure> {
     match request.element_ref {
         None => Ok(None),
-        Some(_) => element_in(observation, request).map(Some),
+        Some(_) => element_in(observation, request, worker).map(Some),
     }
 }
 
@@ -3191,7 +3327,7 @@ fn reachable(view: &View, worker: &Worker, lx: i32, ly: i32) -> Result<(), Failu
 
 fn mouse_move(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let observation = observed(request, worker)?;
-    let element = addressed_element(request, &observation)?;
+    let element = addressed_element(request, &observation, worker)?;
     let (lx, ly) = aim(request, &observation, element, worker)?;
     let view = acting_view(request, &observation, gate, worker)?;
     reachable(&view, worker, lx, ly)?;
@@ -3217,7 +3353,7 @@ fn click(
 ) -> Result<Value, Failure> {
     let req = &request.body;
     let observation = observed(request, worker)?;
-    let element = addressed_element(request, &observation)?;
+    let element = addressed_element(request, &observation, worker)?;
     let (lx, ly) = aim(request, &observation, element, worker)?;
     let view = acting_view(request, &observation, gate, worker)?;
     reachable(&view, worker, lx, ly)?;
@@ -3364,7 +3500,7 @@ fn scroll(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<V
     let req = &request.body;
     let amount = wire::scroll_notches(req)?;
     let observation = observed(request, worker)?;
-    let element = addressed_element(request, &observation)?;
+    let element = addressed_element(request, &observation, worker)?;
     let (lx, ly) = aim(request, &observation, element, worker)?;
     let view = acting_view(request, &observation, gate, worker)?;
     reachable(&view, worker, lx, ly)?;
@@ -3556,6 +3692,7 @@ fn wait_for_change_on(
                     requested: Requested::Exactly(region),
                     jpeg_quality: None,
                     overlays,
+                    marks: MarksFrom::Application,
                 },
                 gate,
                 worker,
@@ -3839,7 +3976,7 @@ fn press(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Va
     // refused for that rather than for a reference that went with it — and so the
     // badge check runs before anything is dispatched.
     let view = view(request, gate, worker)?;
-    let entry = element_in(&observation, request)?;
+    let entry = element_in(&observation, request, worker)?;
     let since = gate.now_ms();
     let facts = revalidate(&worker.ax, &observation, entry, Capability::Press)?;
 
@@ -3893,7 +4030,7 @@ fn set_value(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resul
 
     let observation = observed(request, worker)?;
     let view = view(request, gate, worker)?;
-    let entry = element_in(&observation, request)?;
+    let entry = element_in(&observation, request, worker)?;
     let since = gate.now_ms();
     let facts = revalidate(&worker.ax, &observation, entry, Capability::SetValue)?;
 
@@ -3961,7 +4098,7 @@ fn verb_on(
 ) -> Result<Value, Failure> {
     let observation = observed(request, worker)?;
     let view = view(request, gate, worker)?;
-    let entry = element_in(&observation, request)?;
+    let entry = element_in(&observation, request, worker)?;
     let since = gate.now_ms();
     let facts = present(&worker.ax, &observation, entry)?;
     let listed_by = observation
@@ -4268,6 +4405,7 @@ fn check_image(
             requested: Requested::Exactly(region),
             jpeg_quality: check_quality(&region, &geom),
             overlays,
+            marks: MarksFrom::Application,
         },
         gate,
         worker,
@@ -4501,6 +4639,7 @@ fn waited_after(
             looks: 0,
             waited_ms: 0,
             deadline_cut: false,
+            truncated: None,
         },
         _ => {
             let (scene, named) = scene_for(request, worker)?;
@@ -4514,6 +4653,7 @@ fn waited_after(
                 looks: waited.looks,
                 waited_ms: waited.waited_ms,
                 deadline_cut: cut,
+                truncated: waited.truncated,
             }
         }
     };
@@ -4562,11 +4702,21 @@ fn waited_on(
     let clock = gate.clock();
     let at = semantic::Looking {
         ax: &worker.ax,
-        scene: *scene,
+        scene: scene.clone(),
         named,
         clock: clock.as_ref(),
     };
     semantic::wait_until(gate, &at, until, worker.cutoff_ms)
+}
+
+/// The bound window as a scene reads it: its accessibility element, and its id on
+/// the window server that says which windows are its own.
+fn bound_scene(target: &target::Target, worker: &Worker) -> Result<semantic::Bound, Failure> {
+    Ok(semantic::Bound {
+        element: target::ax_root(target)?,
+        id: target.window_id,
+        windows: worker.windows.clone(),
+    })
 }
 
 /// The application a condition reads, and the listing its references name: the
@@ -4592,7 +4742,7 @@ fn scene_for(
             .ok_or_else(|| Failure::from("target_unavailable"))?;
         let scene = semantic::Scene {
             pid: target.pid,
-            window: Some(target::ax_root(target)?),
+            window: Some(bound_scene(target, worker)?),
         };
         return Ok((scene, named));
     }
@@ -4631,6 +4781,9 @@ fn wait_for(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result
     if let (Some(object), true) = (payload.as_object_mut(), cut) {
         object.insert("deadline_cut".to_string(), json!(true));
     }
+    if let (Some(object), Some(truncated)) = (payload.as_object_mut(), waited.truncated) {
+        object.insert("truncated".to_string(), json!(truncated));
+    }
     let Some(found) = waited.found else {
         return Ok(payload);
     };
@@ -4647,7 +4800,14 @@ fn wait_for(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result
     let (placed, _hidden) = in_view(found.nodes, view.geom, view.region);
     let (items, entries) = listed_nodes(placed, owner.is_some(), 0, None, &view);
     merge_into(&mut payload, json!({ "elements": items }));
-    let observation = mint_semantic(worker, &display, geom, region, retained(owner, entries));
+    let bound = scene.window.as_ref().map(|window| window.id);
+    let observation = mint_semantic(
+        worker,
+        &display,
+        geom,
+        region,
+        retained(owner, bound, entries),
+    );
     name_observation(&mut payload, &observation);
     Ok(payload)
 }
@@ -4713,7 +4873,8 @@ fn scoped_listing(
     let names = owner.is_some();
     let (mut payload, entries) = published(found, messages, &listing.shape, names, 0, None, view);
     merge_into(&mut payload, json!({ "scope": scope.as_str() }));
-    Ok((payload, retained(owner, entries)))
+    let bound = scene.window.as_ref().map(|window| window.id);
+    Ok((payload, retained(owner, bound, entries)))
 }
 
 /// The application a scoped listing reads: the bound window's, else the one that
@@ -4731,7 +4892,7 @@ fn listing_scene(
             .ok_or_else(|| Failure::from("target_unavailable"))?;
         return Ok(semantic::Scene {
             pid: target.pid,
-            window: Some(target::ax_root(target)?),
+            window: Some(bound_scene(target, worker)?),
         });
     }
     match view_target(&worker.ax, geom, region)? {
@@ -4743,29 +4904,34 @@ fn listing_scene(
     }
 }
 
-/// The dialogs, alerts, menus and popups open once an action that sent input has
-/// run, for its receipt. `None` is "not looked": nothing was sent, the action earns
-/// no receipt, this build has no accessibility API, or there is no application to
-/// look in.
+/// The dialogs, alerts, menus and popups the request's scene sees once an action
+/// that sent input has run, for its receipt: under a binding, the bound window's
+/// own. `None` is "not looked": nothing was sent, the action earns no receipt,
+/// this build has no accessibility API, there is no application to look in, or
+/// the window server would not say which windows are the bound window's.
 fn surfaces_after(
     request: &wire::Request,
     done: &gate::Dispatched,
     worker: &Worker,
-) -> Option<Vec<wire::Surface>> {
+) -> Option<wire::Surfaces> {
     if !done.posted || !worker.accessibility || !wire::carries_mutation_seq(&request.action) {
         return None;
     }
     let (scene, _named) = scene_for(request, worker).ok()?;
-    let open = semantic::surfaces(&worker.ax, scene.pid);
-    Some(
-        open.into_iter()
-            .map(|surface| wire::Surface {
-                kind: surface.kind,
-                native_kind: surface.native_kind,
-                label: surface.label,
-            })
-            .collect(),
-    )
+    let seen = semantic::surfaces(&worker.ax, &scene).ok()?;
+    let open = seen
+        .found
+        .into_iter()
+        .map(|surface| wire::Surface {
+            kind: surface.kind,
+            native_kind: surface.native_kind,
+            label: surface.label,
+        })
+        .collect();
+    Some(wire::Surfaces {
+        open,
+        truncated: seen.stopped,
+    })
 }
 
 /// Where a listing that answers a request is drawn: the named listing's own view
@@ -4901,6 +5067,7 @@ fn drill(
         )
     })?;
     answering(&worker.ax, &observation, entry)?;
+    listed_here(request, &named, root, worker)?;
 
     let (display, geom, region) = listing_frame(request, gate, worker)?;
     let clock = gate.clock();
@@ -4925,7 +5092,7 @@ fn drill(
         .cloned()
         .collect();
     held.extend(entries.into_iter().map(Rc::new));
-    let elements = ax::Elements::shared(named.pid, named.started_at, held);
+    let elements = ax::Elements::shared(named.pid, named.started_at, named.bound, held);
     let minted = mint_semantic(worker, &display, geom, region, Some(Rc::new(elements)));
     name_observation(&mut payload, &minted);
     Ok(payload)
@@ -5200,7 +5367,7 @@ fn elements_for(
     gate: &Gate,
 ) -> Result<(Value, Option<Rc<ax::Elements>>), Failure> {
     let viewed = interactive_in_view(ax, geom, region, gate)?;
-    Ok(publish_elements(viewed, geom, region))
+    Ok(publish_elements(viewed, None, geom, region))
 }
 
 /// One read, as the wire publishes it. Shared by the application listing and the
@@ -5208,6 +5375,7 @@ fn elements_for(
 /// same thing however the walk was rooted.
 fn publish_elements(
     viewed: Viewed,
+    bound: Option<u32>,
     geom: &Geometry,
     region: &Region,
 ) -> (Value, Option<Rc<ax::Elements>>) {
@@ -5233,7 +5401,7 @@ fn publish_elements(
         }
     }
 
-    (payload, retained(viewed.owner, listed))
+    (payload, retained(viewed.owner, bound, listed))
 }
 
 /// The controls of ONE window, from the accessibility element a target is bound to.
@@ -5270,7 +5438,12 @@ fn elements_rooted(
         messages,
     };
 
-    Ok(publish_elements(viewed, geom, region))
+    Ok(publish_elements(
+        viewed,
+        Some(target.window_id),
+        geom,
+        region,
+    ))
 }
 
 /// What one accessibility read found: the controls inside the view with their
@@ -7852,6 +8025,7 @@ mod tests {
             elements: Some(Rc::new(ax::Elements::new(
                 FIXTURE_PID,
                 recorder.started_at(),
+                None,
                 entries,
             ))),
         });
@@ -8466,7 +8640,7 @@ mod tests {
         let (worker, observation) = worker_listing(&gate, &app);
 
         let request = at_element("left_click", &observation, "e1");
-        let element = addressed_element(&request, &observation).expect("a listed control");
+        let element = addressed_element(&request, &observation, &worker).expect("a listed control");
         let listed = aim(&request, &observation, element, &worker).expect("a control to aim at");
         assert_eq!(listed, (140, 212), "the centre of the listed frame");
 
@@ -8922,6 +9096,241 @@ mod tests {
     /// budget is checked before each node is read.
     const WALK_COST_MS: u64 = tree::WALK_BUDGET_MS;
 
+    // A request bound to a window acts only on references listed under that
+    // window's binding. One listed without a binding, or while another window was
+    // bound, may name a control in a window the request is not bound to, and is
+    // refused before anything is sent; a listing of the bound window, by any
+    // binding of that same window, is used as before, and so is any listing by a
+    // request with no binding.
+    #[test]
+    fn a_bound_request_acts_only_on_references_listed_under_its_window() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                ax::Scripted {
+                    label: Some("Window 20".to_string()),
+                    children: vec![1],
+                    ..ax::Scripted::of("AXWindow")
+                },
+                ax::Scripted::button("Save", frame_at(100.0, 200.0)),
+            ],
+        );
+        app.windows_are(&[0]);
+        let (mut worker, unbound) = worker_listing(&gate, &app);
+        worker.target = bound_worker(&gate).target.take();
+        let windows = ax::application_windows(&worker.ax, FIXTURE_PID);
+        let (geom, region) = one_to_one();
+        let (_payload, listed) = elements_rooted(
+            &worker.ax,
+            windows[0].handle(),
+            &geom,
+            &region,
+            &gate,
+            &worker,
+        )
+        .expect("a listing of the bound window");
+        let listed = listed.expect("references");
+        assert_eq!(listed.bound, Some(20), "listed under the bound window");
+
+        let mut request = at_element("press", &unbound, "e1");
+        assert!(
+            element_in(&unbound, &request, &worker).is_ok(),
+            "no binding"
+        );
+        request.target_id = Some("t1".to_string());
+        let named = |elements: Rc<ax::Elements>| Observation {
+            elements: Some(elements),
+            ..unbound.clone()
+        };
+        let elsewhere = {
+            let rebound = ax::Elements::shared(
+                listed.pid,
+                listed.started_at,
+                Some(21),
+                listed.entries().to_vec(),
+            );
+            named(Rc::new(rebound))
+        };
+        let foreign = {
+            let other_process = ax::Elements::shared(
+                FIXTURE_PID,
+                listed.started_at,
+                Some(20),
+                listed.entries().to_vec(),
+            );
+            named(Rc::new(other_process))
+        };
+        assert_ne!(
+            FIXTURE_PID, listed.pid,
+            "the bound window's process is another"
+        );
+        for (listing, how) in [
+            (&unbound, "without a window binding"),
+            (&elsewhere, "while another window was bound"),
+            (&foreign, "from another application than the bound window's"),
+        ] {
+            let refused = element_in(listing, &request, &worker).expect_err(how);
+            assert_eq!(refused.code, "stale_element", "{how}");
+            let detail = refused.detail.unwrap_or_default();
+            assert!(detail.contains(how), "{detail}");
+            assert!(detail.contains("nothing was sent"), "{detail}");
+        }
+        let here = named(listed);
+        assert!(element_in(&here, &request, &worker).is_ok(), "listed here");
+        assert!(app.performed().is_empty());
+    }
+
+    // A bound screenshot's marks are what the bound window sees: its own controls,
+    // and those of a dialog in a window the window server says is its own. A
+    // control of another window of the same application, inside the same
+    // rectangle, is not marked, so no reference to it is listed under the binding.
+    #[test]
+    fn a_bound_screenshots_marks_are_what_the_bound_window_sees() {
+        let gate = boot_gate();
+        let placed = |x: f64, y: f64, w: f64, h: f64, node: ax::Scripted| ax::Scripted {
+            frame: Some(ax::Frame { x, y, w, h }),
+            ..node
+        };
+        let window = |label: &str, children: &[usize]| ax::Scripted {
+            label: Some(label.to_string()),
+            children: children.to_vec(),
+            ..ax::Scripted::of("AXWindow")
+        };
+        let app = ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                placed(0.0, 0.0, 600.0, 400.0, window("First", &[3])),
+                placed(40.0, 40.0, 500.0, 300.0, window("Second", &[4])),
+                placed(
+                    100.0,
+                    100.0,
+                    200.0,
+                    120.0,
+                    ax::Scripted {
+                        subrole: Some("AXDialog".to_string()),
+                        ..window("Save first?", &[5])
+                    },
+                ),
+                ax::Scripted::button("Save", frame_at(20.0, 360.0)),
+                ax::Scripted::button("Delete", frame_at(60.0, 80.0)),
+                ax::Scripted::button("Keep", frame_at(150.0, 150.0)),
+            ],
+        );
+        app.windows_are(&[0, 1]);
+        let platform: Rc<dyn ax::Ax> = app.clone();
+        let at =
+            |id: u32, x: f64, y: f64, w: f64, h: f64, of: Option<u32>| window_server::WindowFacts {
+                transient_for: of,
+                ..window_server::window(id, FIXTURE_PID, window_server::Bounds { x, y, w, h })
+            };
+        let server = window_server::Recorder::new(vec![
+            at(10, 0.0, 0.0, 600.0, 400.0, None),
+            at(11, 40.0, 40.0, 500.0, 300.0, None),
+            at(12, 100.0, 100.0, 200.0, 120.0, Some(10)),
+        ]);
+        let windows = ax::application_windows(&platform, FIXTURE_PID);
+        let scene = semantic::Scene {
+            pid: FIXTURE_PID,
+            window: Some(semantic::Bound {
+                element: windows[0].handle(),
+                id: 10,
+                windows: server,
+            }),
+        };
+        let (geom, region) = one_to_one();
+        let (w, h) = crop_rect(&geom, &region).sent_dims();
+        let mut image = image::RgbaImage::new(w, h);
+
+        let info = collect_marks(
+            &geom,
+            &region,
+            &mut image,
+            &gate,
+            &platform,
+            &MarksFrom::BoundWindow(scene),
+        );
+
+        let marked: Vec<&str> = info
+            .entries
+            .iter()
+            .map(|entry| entry["label"].as_str().unwrap_or("-"))
+            .collect();
+        assert_eq!(marked, vec!["Save", "Keep"]);
+        let listed = info.elements.expect("references");
+        assert_eq!(listed.bound, Some(10));
+        assert_eq!(listed.len(), 2);
+    }
+
+    // A window bound without an accessibility element has no subtree of its own
+    // to read, so its screenshot's marks are the application's in view, as a
+    // display's are, with points and no references: none could be used under the
+    // binding, and listing the bound window to get one leads nowhere. A mark is
+    // clicked by its point. A display's marks keep their references.
+    #[test]
+    fn a_bound_window_with_no_accessibility_element_gets_marks_without_references() {
+        let gate = boot_gate();
+        let worker = bound_worker(&gate);
+        assert!(matches!(marks_from(true, &worker), MarksFrom::PointsOnly));
+        assert!(matches!(marks_from(false, &worker), MarksFrom::Application));
+        let app = ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                ax::Scripted {
+                    label: Some("Window 20".to_string()),
+                    frame: Some(ax::Frame {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 600.0,
+                        h: 400.0,
+                    }),
+                    children: vec![1],
+                    ..ax::Scripted::of("AXWindow")
+                },
+                ax::Scripted::button("Save", frame_at(20.0, 360.0)),
+            ],
+        );
+        app.windows_are(&[0]);
+        let platform: Rc<dyn ax::Ax> = app.clone();
+        let (geom, region) = one_to_one();
+        let (w, h) = crop_rect(&geom, &region).sent_dims();
+        let mut image = image::RgbaImage::new(w, h);
+        let mut marked =
+            |marks: &MarksFrom| collect_marks(&geom, &region, &mut image, &gate, &platform, marks);
+
+        let points = marked(&MarksFrom::PointsOnly);
+        assert_eq!(points.entries.len(), 1, "the button is badged");
+        let mark = &points.entries[0];
+        assert!(mark.get("x").is_some() && mark.get("y").is_some(), "{mark}");
+        assert_eq!(mark.get("element_ref"), None, "{mark}");
+        assert!(points.elements.is_none(), "no references are listed");
+
+        let display = marked(&MarksFrom::Application);
+        assert_eq!(display.entries[0]["element_ref"], json!("e1"));
+        assert_eq!(display.elements.map(|elements| elements.bound), Some(None));
+    }
+
+    // A drill by a request bound to a window reads inside a control only when it
+    // was listed under that window's binding: it would otherwise list, and hand
+    // out references to, controls of a window the request is not bound to.
+    #[test]
+    fn a_bound_drill_reads_only_inside_a_control_listed_under_its_window() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        let (mut worker, listing) = worker_listing(&gate, &app);
+        worker.target = bound_worker(&gate).target.take();
+        let mut request = running("elements", None);
+        request.observation_id = Some(listing.id.clone());
+        request.target_id = Some("t1".to_string());
+        let shape = tree::Shape::default();
+
+        let refused =
+            drill(&request, "e1", &shape, &gate, &mut worker).expect_err("listed elsewhere");
+        assert_eq!(refused.code, "stale_element");
+        request.target_id = None;
+        drill(&request, "e1", &shape, &gate, &mut worker).expect("no binding, as before");
+    }
+
     // M7: a listing says how many accessibility messages its read sent, beside the
     // fields it always had, so the batching the macOS reader exists for is a number
     // the owner can read on a real application.
@@ -8976,7 +9385,7 @@ mod tests {
             messages: 12,
         };
 
-        let (payload, listed) = publish_elements(viewed, &geom, &region);
+        let (payload, listed) = publish_elements(viewed, None, &geom, &region);
 
         assert_eq!(payload["ax_messages"], json!(12));
         assert!(listed.is_none());
@@ -9251,6 +9660,7 @@ mod tests {
                 requested: Requested::Exactly(region),
                 jpeg_quality: None,
                 overlays: Overlays::default(),
+                marks: MarksFrom::Application,
             },
             gate,
             worker,
@@ -9650,7 +10060,7 @@ mod tests {
             request.check = wire::Check::Semantic;
             gate.admit(&request).expect("a fresh sequence");
 
-            let entry = element_in(&listing, &request).expect("a listed control");
+            let entry = element_in(&listing, &request, &worker).expect("a listed control");
             let payload = post(
                 &request,
                 None,
@@ -9711,7 +10121,7 @@ mod tests {
         let mut request = at_element("set_value", &listing, "e2");
         request.check = wire::Check::Semantic;
         gate.admit(&request).expect("a fresh sequence");
-        let entry = element_in(&listing, &request).expect("a listed control");
+        let entry = element_in(&listing, &request, &worker).expect("a listed control");
         let payload = post(
             &request,
             None,
@@ -9742,7 +10152,7 @@ mod tests {
         let mut request = at_element("press", &listing, "e1");
         request.check = wire::Check::Semantic;
         gate.admit(&request).expect("a fresh sequence");
-        let entry = element_in(&listing, &request).expect("a listed control");
+        let entry = element_in(&listing, &request, &worker).expect("a listed control");
 
         app.vanish(0);
 
@@ -10840,7 +11250,10 @@ mod tests {
         worker.accessibility = true;
         assert_eq!(
             surfaces_after(&running("key", Some(1)), &done, &worker),
-            Some(Vec::new())
+            Some(wire::Surfaces {
+                open: Vec::new(),
+                truncated: None,
+            })
         );
         assert_eq!(
             surfaces_after(
@@ -10851,6 +11264,22 @@ mod tests {
             None,
             "nothing sent"
         );
+    }
+
+    // A receipt's surfaces scan that stopped before it finished never claims
+    // nothing is open: it lists what it found and says why it stopped.
+    #[test]
+    fn a_receipt_whose_surfaces_scan_stopped_short_says_so() {
+        let gate = boot_gate();
+        let mut nodes = vec![ax::Scripted::button("Save", frame_at(100.0, 200.0))];
+        nodes.extend((0..100).map(|index| ax::Scripted::group(&format!("W{index}"), &[])));
+        let app = ax::Recorder::new(FIXTURE_PID, nodes);
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let pressed = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+
+        assert_eq!(pressed["receipt"]["surfaces"], json!([]), "{pressed}");
+        assert_eq!(pressed["receipt"]["surfaces_truncated"], json!("nodes"));
     }
 
     // The controls as protocol 12 names them: a normalised role beside the native
@@ -11034,6 +11463,48 @@ mod tests {
             ran.get("deadline_cut").is_none(),
             "its own timeout ended it: {ran}"
         );
+    }
+
+    // A wait for an absence whose every look ran out of its budget before it
+    // reached the control ends not met, and says why the last look stopped: on
+    // wait_for's reply, and in the receipt's check beside `not_met`.
+    #[test]
+    fn a_wait_for_an_absence_no_look_could_prove_says_truncated() {
+        let clock = StepClock::new();
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        let rows = (0..40)
+            .map(|row| ax::Scripted::button(&format!("Row {row}"), frame_at(100.0, row as f64)))
+            .collect();
+        let app = ax::Recorder::new(FIXTURE_PID, rows);
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.costs_per_node(100, clock.clone());
+        let last_row = || {
+            Box::new(
+                semantic::parse_until(
+                    &json!({"kind": "disappears", "name": "Row 39", "timeout_ms": 300}),
+                    true,
+                )
+                .expect("a condition"),
+            )
+        };
+
+        let mut waiting = running("wait_for", None);
+        waiting.observation_id = Some(observation.id.clone());
+        waiting.until = Some(last_row());
+        let cut = served(&waiting, &gate, &mut worker);
+        assert_eq!(cut["met"], json!(false), "{cut}");
+        assert_eq!(cut["truncated"], json!("time"), "{cut}");
+
+        let mut pressing = at_element("press", &observation, "e1");
+        pressing.check = wire::Check::Semantic;
+        pressing.until = Some(last_row());
+        let pressed = served(&pressing, &gate, &mut worker);
+        assert_eq!(
+            pressed["receipt"]["check"]["until"],
+            json!("not_met"),
+            "{pressed}"
+        );
+        assert_eq!(pressed["receipt"]["check"]["truncated"], json!("time"));
     }
 
     // The look before the input is held to the request's deadline, as the wait

@@ -2265,6 +2265,44 @@ with a small `N`. Leave the sheet open, and send the same request again: the
 condition held before the input, so it says `"held_before"` (and the press is
 answered by a modal window: note what `dispatch` says). Press Cancel by hand.
 
+## 4a. A bound window's scopes (POSTS INPUT)
+
+The unit tests prove what a binding does to `focused`, `menu` and `dialog` on a
+recording platform; the macOS reader's half (an element's `AXWindow` against the
+bound window) has never run. Bind the fixture window (`windows`, then
+`select_target` with its id, `T` below), and send each with `"target_id":"T"`:
+
+* With the caret in the fixture's text field,
+  `{"action":"elements","scope":"focused","target_id":"T"}` lists the field.
+* Open the sheet by hand (**Clear All…**): `{"action":"elements","scope":"dialog","target_id":"T"}`
+  lists OK and Cancel; a press with `"target_id":"T"` on Clear All… names the sheet
+  in `receipt.surfaces`. With the sheet still open, send
+  `{"action":"elements","scope":"focused","target_id":"T"}`: a control in the sheet
+  is inside the bound window, so if the sheet holds the focus this lists it. Note
+  what it answers: a `scope_not_found` saying focus is in another window means the
+  sheet's controls name the sheet, not the window, as their `AXWindow`. Press
+  Cancel by hand. The scope then answers
+  `scope_not_found` saying no dialog **of the bound window** is open.
+* Right-click the context-menu area and send
+  `{"action":"elements","scope":"menu","target_id":"T"}` while it is open: it answers
+  `scope_not_found` (a macOS context menu is the application's, not the window's)
+  and says to release the target; the same request without `target_id` lists the
+  menu's items. Press Escape.
+* TextEdit with two documents open: bind the first, click into the second, and
+  send `{"action":"elements","scope":"focused","target_id":"T"}`: `scope_not_found`
+  saying focus is in another window of the application. Nothing of the second
+  document is listed.
+* `{"action":"screenshot","target_id":"T","marks":true}` badges the fixture
+  window's controls; press one by its mark's `element_ref` with `"target_id":"T"`
+  and it acts. With the context menu open over the window, the same screenshot
+  badges none of the menu's items (the menu is the application's). A window
+  bound without an accessibility element (`ax_binding` not `bound`) gets marks
+  with points and no `element_ref`.
+* With the fixture bound again, a reference from step 2's listing (taken without
+  `target_id`) pressed with `"target_id":"T"` is `stale_element`, saying it was
+  listed without a window binding, and **nothing is pressed** (watch the control);
+  the same control from a listing taken with `"target_id":"T"` presses.
+
 ## 5. Waiting on a slow control (POSTS INPUT)
 
 Open this page in Chrome. Its button turns enabled two seconds after it loads.

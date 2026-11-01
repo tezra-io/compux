@@ -13,6 +13,10 @@
 //!
 //! Every request for every window is sent before any reply is read, so a
 //! listing costs one round trip's wait, not one per property.
+//!
+//! A process's windows ([`family`]) add the root's own children to the clients:
+//! a popup menu is override-redirect, so no window manager lists it, and it says
+//! whose it is only by `WM_TRANSIENT_FOR` (GTK 3, Qt).
 
 use x11rb::connection::Connection;
 use x11rb::cookie::Cookie;
@@ -31,6 +35,11 @@ use crate::window_server::{Bounds, WindowFacts, Windows};
 /// this is refused rather than cut, since the windows cut would be the
 /// front-most ones of a stacking list, which runs bottom to top.
 pub const MAX_CLIENTS: u32 = 512;
+
+/// The most root children read for a process's windows. A root with more is
+/// refused rather than cut: a window cut could be the one holding a bound
+/// window's menu.
+pub const MAX_TOP_LEVELS: usize = 2048;
 
 /// The longest title or class read, in bytes.
 const MAX_NAME_BYTES: u32 = 1024;
@@ -92,6 +101,9 @@ pub struct Window {
     pub bounds: Rect,
     /// The same without the window manager's frame.
     pub content: Rect,
+    /// The window its `WM_TRANSIENT_FOR` names: the one a dialog or a popup
+    /// belongs to.
+    pub transient_for: Option<u32>,
 }
 
 /// The windows, front-most first, and whether that order is the window
@@ -116,8 +128,8 @@ struct Atoms {
     shadow: u32,
 }
 
-/// The client windows, front-most first, on a connection of its own.
-pub fn list(env: &Env) -> Result<Listed, String> {
+/// A connection of its own, and its screen's root window.
+fn rooted(env: &Env) -> Result<(RustConnection, XWindow), String> {
     let (connection, screen) =
         super::connect(env).map_err(|why| format!("enumerate windows: {why}"))?;
     let root = connection
@@ -126,6 +138,12 @@ pub fn list(env: &Env) -> Result<Listed, String> {
         .get(screen)
         .map(|screen| screen.root)
         .ok_or("enumerate windows: the X display has no such screen")?;
+    Ok((connection, root))
+}
+
+/// The client windows, front-most first, on a connection of its own.
+pub fn list(env: &Env) -> Result<Listed, String> {
+    let (connection, root) = rooted(env)?;
     let atoms = atoms(&connection)?;
     let stacking = cardinals(&connection, root, atoms.stacking, MAX_CLIENTS)?;
     let stacked = !stacking.is_empty();
@@ -148,6 +166,45 @@ pub fn list(env: &Env) -> Result<Listed, String> {
         }
     }
     Ok(Listed { windows, stacked })
+}
+
+/// One process's windows that can be seen: the window manager's clients, then
+/// the root's own children it does not list, each read as the listing reads a
+/// client.
+pub fn family(env: &Env, pid: i32) -> Result<Vec<Window>, String> {
+    let (connection, root) = rooted(env)?;
+    let atoms = atoms(&connection)?;
+    let clients = cardinals(&connection, root, atoms.clients, MAX_CLIENTS)?;
+    let children = connection
+        .query_tree(root)
+        .map_err(|error| format!("enumerate windows: {error}"))?
+        .reply()
+        .map_err(|error| format!("enumerate windows: {error}"))?
+        .children;
+    if children.len() > MAX_TOP_LEVELS {
+        return Err(format!(
+            "enumerate windows: the root holds more than {MAX_TOP_LEVELS} windows, the most \
+             compux reads"
+        ));
+    }
+    let asked = each_once(clients, children)
+        .into_iter()
+        .map(|id| Asked::send(&connection, root, &atoms, id))
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut windows = Vec::new();
+    for asked in asked {
+        let window = asked.answer(&atoms, None)?;
+        windows.extend(window.filter(|window| window.pid == Some(pid) && window.viewable));
+    }
+    Ok(windows)
+}
+
+/// The clients, then the root children that are not one of them.
+pub fn each_once(clients: Vec<u32>, children: Vec<u32>) -> Vec<u32> {
+    let mut seen: std::collections::HashSet<u32> = clients.iter().copied().collect();
+    let mut ids = clients;
+    ids.extend(children.into_iter().filter(|id| seen.insert(*id)));
+    ids
 }
 
 /// A reply about one window, or `None` where the window went away while it was
@@ -289,6 +346,7 @@ struct Asked<'c> {
     pid: Cookie<'c, RustConnection, GetPropertyReply>,
     frame: Cookie<'c, RustConnection, GetPropertyReply>,
     shadow: Cookie<'c, RustConnection, GetPropertyReply>,
+    transient: Cookie<'c, RustConnection, GetPropertyReply>,
 }
 
 impl<'c> Asked<'c> {
@@ -315,6 +373,7 @@ impl<'c> Asked<'c> {
                 pid: property(atoms.pid, AtomEnum::CARDINAL, 1)?,
                 frame: property(atoms.frame, AtomEnum::CARDINAL, 4)?,
                 shadow: property(atoms.shadow, AtomEnum::CARDINAL, 4)?,
+                transient: property(AtomEnum::WM_TRANSIENT_FOR.into(), AtomEnum::WINDOW, 1)?,
             })
         })();
         sent.map_err(|error| format!("enumerate windows: {error}"))
@@ -343,6 +402,10 @@ impl<'c> Asked<'c> {
             .filter(|&pid| pid > 0);
         let frame = extents(&values(present(self.frame.reply())?)).unwrap_or_default();
         let shadow = extents(&values(present(self.shadow.reply())?)).unwrap_or_default();
+        let transient_for = values(present(self.transient.reply())?)
+            .first()
+            .copied()
+            .filter(|&id| id != 0);
         let client = Rect {
             x: i32::from(at.dst_x),
             y: i32::from(at.dst_y),
@@ -363,6 +426,7 @@ impl<'c> Asked<'c> {
             viewable: attributes.map_state == MapState::VIEWABLE,
             bounds,
             content,
+            transient_for,
         }))
     }
 }
@@ -432,6 +496,10 @@ impl Windows for WindowServer {
         Ok(listed.windows.into_iter().map(facts).collect())
     }
 
+    fn family(&self, pid: i32) -> Result<Vec<WindowFacts>, String> {
+        Ok(family(&self.env, pid)?.into_iter().map(facts).collect())
+    }
+
     fn unlisted_cover(&self, target_id: u32, x: i32, y: i32) -> Result<Option<String>, String> {
         super::above::covering(&self.env, target_id, x, y)
     }
@@ -473,6 +541,7 @@ pub fn facts(window: Window) -> WindowFacts {
         // order like any other window.
         layer: 0,
         on_screen: window.viewable,
+        transient_for: window.transient_for,
     }
 }
 
@@ -626,6 +695,7 @@ mod tests {
             viewable: false,
             bounds: rect(0, 229, 982, 795),
             content: rect(1, 249, 980, 770),
+            transient_for: Some(0x40_0001),
         };
         let facts = facts(window);
         assert_eq!(facts.pid, 0);
@@ -638,5 +708,15 @@ mod tests {
         assert!(!facts.on_screen);
         assert_eq!(facts.bounds, rect(0, 229, 982, 795).bounds());
         assert_eq!(facts.content, Some(rect(1, 249, 980, 770).bounds()));
+        assert_eq!(facts.transient_for, Some(0x40_0001));
+    }
+
+    // A process's windows are the clients first, then the root's children no
+    // window manager lists (a popup), each once: a managed client's frame is a
+    // root child of its own and is read, and left out by its process.
+    #[test]
+    fn a_family_reads_the_clients_then_the_root_children_they_are_not() {
+        assert_eq!(each_once(vec![5, 3], vec![9, 3, 7, 9]), vec![5, 3, 9, 7]);
+        assert_eq!(each_once(Vec::new(), vec![4]), vec![4]);
     }
 }

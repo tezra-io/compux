@@ -12,6 +12,7 @@
 //! timeout passes.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
@@ -22,6 +23,7 @@ use crate::ax::{
 use crate::gate::{Clock, Gate, Phase};
 use crate::roles;
 use crate::tree::{Query, Shape, Walk};
+use crate::window_server::{owned_by, WindowFacts, Windows};
 use crate::wire::{Effect, Failure};
 
 /// How often a wait looks at the tree.
@@ -99,10 +101,20 @@ impl Scope {
 
 /// The application a listing or a condition reads, and the bound window when
 /// there is one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Scene {
     pub pid: i32,
-    pub window: Option<Handle>,
+    pub window: Option<Bound>,
+}
+
+/// A bound window, as a scene reads it: its accessibility element, which the
+/// target holds, its id on the window server, and the window server that says
+/// which windows are its own.
+#[derive(Clone)]
+pub struct Bound {
+    pub element: Handle,
+    pub id: u32,
+    pub windows: Arc<dyn Windows>,
 }
 
 /// What an `elements` request asks for beyond protocol 11.
@@ -224,44 +236,120 @@ pub enum Roots {
     Held(Vec<Retained>),
 }
 
+/// Why a scope has no root.
+#[derive(Debug)]
+pub enum NoRoot {
+    /// The request asks for a scope it may not read.
+    Refused(Failure),
+    /// Nothing is there to start from: `scope_not_found`, with the sentence it
+    /// carries. `unseen` is why the look that found nothing stopped before it
+    /// finished, where it did: then nothing is proven missing.
+    Missing {
+        detail: String,
+        unseen: Option<&'static str>,
+    },
+}
+
+impl From<NoRoot> for Failure {
+    fn from(no: NoRoot) -> Failure {
+        match no {
+            NoRoot::Refused(failure) => failure,
+            NoRoot::Missing { detail, .. } => Failure::new("scope_not_found", detail),
+        }
+    }
+}
+
 /// Where a scope starts, or why it cannot.
-pub fn roots(ax: &Rc<dyn Ax>, scene: &Scene, scope: Scope) -> Result<Roots, Failure> {
-    let missing =
-        |what: &str| Failure::new("scope_not_found", format!("{what} in the application"));
+pub fn roots(ax: &Rc<dyn Ax>, scene: &Scene, scope: Scope) -> Result<Roots, NoRoot> {
+    let missing = |what: &str| NoRoot::Missing {
+        detail: format!("{what} in the application"),
+        unseen: None,
+    };
     match scope {
-        Scope::App if scene.window.is_some() => Err(invalid(
+        Scope::App if scene.window.is_some() => Err(NoRoot::Refused(invalid(
             "the app scope lists the whole application, and this request is bound to one window: \
              release the target to list the application"
                 .to_string(),
-        )),
+        ))),
         Scope::App => Ok(Roots::App),
-        Scope::Window => match scene.window {
-            Some(window) => Ok(Roots::Window(window)),
+        Scope::Window => match &scene.window {
+            Some(bound) => Ok(Roots::Window(bound.element)),
             None => ax
                 .focused(ax, scene.pid, Focus::Window)
                 .map(|window| Roots::Held(vec![window]))
                 .ok_or_else(|| missing("there is no focused window")),
         },
-        Scope::Focused => ax
-            .focused(ax, scene.pid, Focus::Element)
-            .map(|element| Roots::Held(vec![element]))
-            .ok_or_else(|| missing("nothing is focused")),
-        Scope::Menu => open(ax, scene.pid, &["menu"]).ok_or_else(|| missing("no menu is open")),
-        Scope::Dialog => {
-            open(ax, scene.pid, &["dialog", "alert"]).ok_or_else(|| missing("no dialog is open"))
-        }
+        Scope::Focused => focused(ax, scene),
+        Scope::Menu => open(ax, scene, &["menu"], "menu"),
+        Scope::Dialog => open(ax, scene, &["dialog", "alert"], "dialog"),
     }
 }
 
-/// The surfaces of these kinds open in the application, as roots; none open is
-/// `None`.
-fn open(ax: &Rc<dyn Ax>, pid: i32, kinds: &[&str]) -> Option<Roots> {
-    let held: Vec<Retained> = surfaces(ax, pid)
+/// The focused element, as a root: under a binding, only one inside the bound
+/// window. Focus in another window of the application is no root, and the
+/// sentence says where it is.
+fn focused(ax: &Rc<dyn Ax>, scene: &Scene) -> Result<Roots, NoRoot> {
+    let found = match &scene.window {
+        None => ax.focused(ax, scene.pid, Focus::Element),
+        Some(bound) => ax.focused_in(ax, bound.element),
+    };
+    if let Some(element) = found {
+        return Ok(Roots::Held(vec![element]));
+    }
+    let detail = match &scene.window {
+        None => "nothing is focused in the application",
+        Some(_) if ax.focused(ax, scene.pid, Focus::Element).is_some() => {
+            "focus is in another window of the application, not the bound one: list the bound \
+             window (scope window) or a dialog or menu of it (scope dialog, scope menu), or \
+             release the target to read the application's focus"
+        }
+        Some(_) => "nothing is focused in the bound window",
+    };
+    Err(NoRoot::Missing {
+        detail: detail.to_string(),
+        unseen: None,
+    })
+}
+
+/// The surfaces of these kinds the scene sees, as roots. None open is
+/// `scope_not_found` naming `what`, proven only by a scan that saw everything.
+fn open(ax: &Rc<dyn Ax>, scene: &Scene, kinds: &[&str], what: &str) -> Result<Roots, NoRoot> {
+    let seen = surfaces(ax, scene).map_err(NoRoot::Refused)?;
+    let held: Vec<Retained> = seen
+        .found
         .into_iter()
         .filter(|surface| kinds.contains(&surface.kind))
         .map(|surface| surface.element)
         .collect();
-    (!held.is_empty()).then_some(Roots::Held(held))
+    if !held.is_empty() {
+        return Ok(Roots::Held(held));
+    }
+    let detail = match (seen.stopped, &scene.window) {
+        (None, None) => format!("no {what} is open in the application"),
+        (None, Some(_)) => format!(
+            "no {what} of the bound window is open, and one open in another window of the \
+             application is not this window's: release the target to list the application's \
+             {what}s"
+        ),
+        (Some(why), _) => format!(
+            "the look for an open {what} stopped before it finished ({}), so whether one is \
+             open is not known: look again, or list the window and find its controls there",
+            stopped_because(why)
+        ),
+    };
+    Err(NoRoot::Missing {
+        detail,
+        unseen: seen.stopped,
+    })
+}
+
+/// Why a scan stopped, in words, from its wire word.
+fn stopped_because(word: &str) -> &'static str {
+    if word == crate::tree::TRUNCATED_TIME {
+        "an element did not answer in time"
+    } else {
+        "it read as many elements as it may"
+    }
 }
 
 /// One walk of a scope, listing what `shape` asks for. The focused scope lists
@@ -273,7 +361,7 @@ pub fn walk_scope(
     shape: &Shape,
     clock: &dyn Clock,
     deadline_ms: u64,
-) -> Result<Walk, Failure> {
+) -> Result<Walk, NoRoot> {
     let shape = Shape {
         list_root: scope == Scope::Focused,
         ..shape.clone()
@@ -294,48 +382,128 @@ pub struct Surface {
     pub native_kind: String,
     pub label: Option<String>,
     pub element: Retained,
+    /// It sits in a window of its own that the window server ties to the bound
+    /// window, outside the bound window's subtree.
+    pub apart: bool,
 }
 
-/// The surfaces open in one application: its windows and their children, and the
-/// menu of a menu-bar item that reads selected, reading at most
-/// [`MAX_SURFACE_NODES`] nodes. A node the platform says is off screen is no
-/// surface, and nothing below it is looked at.
+/// What one scan for surfaces found, and whether it saw everything it looks at.
+#[derive(Debug)]
+pub struct Surfaces {
+    pub found: Vec<Surface>,
+    /// Why the scan stopped before it finished: `"time"` (a node did not answer
+    /// in time) or `"nodes"` (it read as many nodes as it may). `None` is a scan
+    /// that saw everything it looks at, the only one that proves a surface is not
+    /// open.
+    pub stopped: Option<&'static str>,
+}
+
+/// The surfaces a scene sees, the one answer the `menu` and `dialog` scopes, the
+/// menu conditions and a receipt all read. Unbound, those open in the application:
+/// its windows and their children, and the menu of a menu-bar item that reads
+/// selected. Bound, the bound window's own: the window and what is inside it, and
+/// what is in a window the window server says is its own, transient for it
+/// directly or through a chain ([`MAX_TRANSIENT_HOPS`]). Where the window server
+/// marks no window as another's (macOS), that is only what is inside it.
 ///
-/// A node that will not answer is passed over, and one that does not answer in time
-/// ends the scan: it is a bounded look, not a census, and what it reports is what
-/// it could name.
-pub fn surfaces(ax: &Rc<dyn Ax>, pid: i32) -> Vec<Surface> {
-    let Some(app) = ax.application(ax, pid) else {
-        return Vec::new();
-    };
+/// A scan reads at most [`MAX_SURFACE_NODES`] nodes. A node the platform says is
+/// off screen is no surface, and nothing below it is looked at. A node that will
+/// not answer is passed over, and one that does not answer in time ends the scan:
+/// it is a bounded look, not a census, and what it reports is what it could name,
+/// and whether it saw all it looks at.
+///
+/// [`MAX_TRANSIENT_HOPS`]: crate::window_server::MAX_TRANSIENT_HOPS
+pub fn surfaces(ax: &Rc<dyn Ax>, scene: &Scene) -> Result<Surfaces, Failure> {
     let mut scan = Scan {
         ax,
         read: 0,
-        stopped: false,
+        stopped: None,
         found: Vec::new(),
+        apart: false,
     };
-    for child in scan.kids(app.handle()) {
-        scan.top(child);
+    match &scene.window {
+        None => scan.application(scene.pid),
+        Some(bound) => scan.bound(scene.pid, bound)?,
     }
-    scan.found
+    Ok(Surfaces {
+        found: scan.found,
+        stopped: scan.stopped,
+    })
 }
 
 /// One scan for surfaces in progress.
 struct Scan<'a> {
     ax: &'a Rc<dyn Ax>,
     read: usize,
-    /// A node did not answer in time, or the bound was reached: nothing more is
-    /// asked. A receipt waits on this scan, and a slow application would hold it
-    /// for a timeout per node.
-    stopped: bool,
+    /// A node did not answer in time (`"time"`), or the bound left something
+    /// unread (`"nodes"`): nothing more is asked. A receipt waits on this scan,
+    /// and a slow application would hold it for a timeout per node.
+    stopped: Option<&'static str>,
     found: Vec<Surface>,
+    /// What is read now sits in a window of the bound window's own, outside its
+    /// subtree.
+    apart: bool,
 }
 
 impl Scan<'_> {
+    /// Every child of the application.
+    fn application(&mut self, pid: i32) {
+        let Some(app) = self.ax.application(self.ax, pid) else {
+            return;
+        };
+        for child in self.kids(app.handle()) {
+            self.top(child);
+        }
+    }
+
+    /// A bound window's own surfaces: the window read as a child of the
+    /// application is, then the children of the application that sit in one of
+    /// the windows the window server says are its own.
+    fn bound(&mut self, pid: i32, bound: &Bound) -> Result<(), Failure> {
+        let family = bound.windows.family(pid).map_err(|why| {
+            Failure::new(
+                "target_unavailable",
+                format!(
+                    "the window server would not say which windows are the bound window's \
+                     ({why}): release the target to read the application's"
+                ),
+            )
+        })?;
+        let window = self
+            .ax
+            .retain_again(self.ax, bound.element)
+            .ok_or_else(|| {
+                Failure::new(
+                    "target_unavailable",
+                    "the bound window is no longer held: select the target again".to_string(),
+                )
+            })?;
+        self.top(window);
+        let owned = owned_by(&family, bound.id);
+        if owned.is_empty() {
+            return Ok(());
+        }
+        let Some(app) = self.ax.application(self.ax, pid) else {
+            return Ok(());
+        };
+        self.apart = true;
+        for child in self.kids(app.handle()) {
+            self.owned_top(child, &family, &owned);
+        }
+        Ok(())
+    }
+
+    /// Stop asking anything, for the first reason met.
+    fn stop(&mut self, why: &'static str) {
+        self.stopped.get_or_insert(why);
+    }
+
     /// Count one node read against the bound; `false` once the scan has stopped.
     fn counted(&mut self) -> bool {
-        if self.stopped || self.read >= MAX_SURFACE_NODES {
-            self.stopped = true;
+        if self.read >= MAX_SURFACE_NODES {
+            self.stop(crate::tree::TRUNCATED_NODES);
+        }
+        if self.stopped.is_some() {
             return false;
         }
         self.read += 1;
@@ -345,7 +513,7 @@ impl Scan<'_> {
     /// Note why a read answered nothing: only a slow application stops the scan.
     fn unread(&mut self, why: Unread) {
         if why == Unread::NoAnswer {
-            self.stopped = true;
+            self.stop(crate::tree::TRUNCATED_TIME);
         }
     }
 
@@ -356,28 +524,58 @@ impl Scan<'_> {
         self.ax.facts(handle).map_err(|why| self.unread(why)).ok()
     }
 
-    /// As many of a node's children as the bound has room for.
+    /// As many of a node's children as the bound has room for. One with more than
+    /// that leaves the scan unfinished.
     fn kids(&mut self, handle: Handle) -> Vec<Retained> {
-        if self.stopped {
+        if self.stopped.is_some() {
             return Vec::new();
         }
         let room = MAX_SURFACE_NODES - self.read;
-        kids(self.ax, handle, room)
-            .map_err(|why| self.unread(why))
-            .unwrap_or_default()
+        match kids(self.ax, handle, room) {
+            Ok((kids, cut)) => {
+                if cut {
+                    self.stop(crate::tree::TRUNCATED_NODES);
+                }
+                kids
+            }
+            Err(why) => {
+                self.unread(why);
+                Vec::new()
+            }
+        }
     }
 
     /// A child of the application: the menu bar, a surface, or a window whose
     /// children may be. Held while its children are read through it.
     fn top(&mut self, node: Retained) {
-        let handle = node.handle();
-        let Some(facts) = self.facts(handle).filter(|facts| !facts.hidden) else {
+        let Some(facts) = self.facts(node.handle()).filter(|facts| !facts.hidden) else {
             return;
         };
-        if is_menu_bar(&facts) {
+        self.top_read(&facts, node);
+    }
+
+    /// A child of the application read as [`Scan::top`] reads it, when its frame
+    /// ties it to one of the bound window's own windows (`owned`, out of the
+    /// application's windows `family`).
+    fn owned_top(&mut self, node: Retained, family: &[WindowFacts], owned: &[u32]) {
+        let Some(facts) = self.facts(node.handle()).filter(|facts| !facts.hidden) else {
+            return;
+        };
+        if facts
+            .frame
+            .is_some_and(|frame| crate::target::tied(frame, family, owned))
+        {
+            self.top_read(&facts, node);
+        }
+    }
+
+    /// What [`Scan::top`] does with a child of the application once read.
+    fn top_read(&mut self, facts: &Facts, node: Retained) {
+        let handle = node.handle();
+        if is_menu_bar(facts) {
             return self.menu_bar(handle);
         }
-        let Some(_held) = self.keep(&facts, node) else {
+        let Some(_held) = self.keep(facts, node) else {
             return;
         };
         for child in self.kids(handle) {
@@ -484,6 +682,7 @@ impl Scan<'_> {
             native_kind,
             label: facts.label.clone(),
             element: node,
+            apart: self.apart,
         });
         None
     }
@@ -501,15 +700,20 @@ fn is_menu_bar(facts: &Facts) -> bool {
 }
 
 /// Up to `limit` of a node's children, by count or in one copy where it will not
-/// count them.
-fn kids(ax: &Rc<dyn Ax>, handle: Handle, limit: usize) -> Result<Vec<Retained>, Unread> {
+/// count them, and whether it may have more than that: a node with no room left
+/// is not asked, and a copy that filled its room may have been cut.
+fn kids(ax: &Rc<dyn Ax>, handle: Handle, limit: usize) -> Result<(Vec<Retained>, bool), Unread> {
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), true));
     }
     match ax.child_count(handle) {
-        Ok(0) => Ok(Vec::new()),
-        Ok(count) => ax.children(ax, handle, 0, count.min(limit)),
-        Err(Unread::Refused) => ax.children_uncounted(ax, handle, limit),
+        Ok(0) => Ok((Vec::new(), false)),
+        Ok(count) => Ok((ax.children(ax, handle, 0, count.min(limit))?, count > limit)),
+        Err(Unread::Refused) => {
+            let copy = ax.children_uncounted(ax, handle, limit)?;
+            let full = copy.len() >= limit;
+            Ok((copy, full))
+        }
         Err(why) => Err(why),
     }
 }
@@ -666,6 +870,10 @@ fn timeout_of(value: Option<&Value>) -> Result<u64, String> {
 pub enum Seen {
     Holds(Option<Walk>),
     Not,
+    /// Nothing it waits to be gone was seen, and the look stopped before it saw
+    /// everything, so the absence is not proven: the walk's word for why
+    /// (`"nodes"`, `"depth"`, `"time"`). It does not hold.
+    Unproven(&'static str),
 }
 
 /// What a look reads with.
@@ -693,12 +901,13 @@ pub fn look(at: &Looking<'_>, condition: &Condition, deadline_ms: u64) -> Result
     };
     match condition {
         Condition::Appears { query, scope } => Ok(match finding(query, scope)? {
-            Some(found) if !found.nodes.is_empty() => Seen::Holds(Some(found)),
+            Scoped::Open(found) if !found.nodes.is_empty() => Seen::Holds(Some(found)),
             _ => Seen::Not,
         }),
         Condition::Disappears { query, scope } => Ok(match finding(query, scope)? {
-            Some(found) if !found.nodes.is_empty() => Seen::Not,
-            _ => Seen::Holds(None),
+            Scoped::Open(found) if !found.nodes.is_empty() => Seen::Not,
+            Scoped::Open(found) => absent(found.truncated),
+            Scoped::Missing(unseen) => absent(unseen),
         }),
         Condition::DisappearsElement(reference) => {
             let (named, entry) = named_entry(at, reference)?;
@@ -714,15 +923,18 @@ pub fn look(at: &Looking<'_>, condition: &Condition, deadline_ms: u64) -> Result
         Condition::WindowTitle { contains, .. } => Ok(holds(titled(at, contains))),
         Condition::MenuOpen => Ok(
             match walk_in(at, Scope::Menu, &Shape::default(), deadline_ms)? {
-                Some(found) => Seen::Holds(Some(found)),
-                None => Seen::Not,
+                Scoped::Open(found) => Seen::Holds(Some(found)),
+                Scoped::Missing(_) => Seen::Not,
             },
         ),
         Condition::MenuClosed => {
-            let open = surfaces(at.ax, at.scene.pid)
-                .iter()
-                .any(|surface| surface.kind == "menu");
-            Ok(holds(!open))
+            let seen = surfaces(at.ax, &at.scene)?;
+            let open = seen.found.iter().any(|surface| surface.kind == "menu");
+            Ok(if open {
+                Seen::Not
+            } else {
+                absent(seen.stopped)
+            })
         }
     }
 }
@@ -735,19 +947,37 @@ fn holds(yes: bool) -> Seen {
     }
 }
 
-/// A walk of a scope for a condition. A scope that is not open is read as empty
-/// (`None`): waiting for a dialog's button before the dialog exists is the
-/// ordinary case, not a refusal.
+/// What a look that found nothing proves of an absence: that it holds when the
+/// look saw everything, and nothing when it stopped short.
+fn absent(truncated: Option<&'static str>) -> Seen {
+    match truncated {
+        None => Seen::Holds(None),
+        Some(word) => Seen::Unproven(word),
+    }
+}
+
+/// What a condition's walk of a scope found.
+enum Scoped {
+    /// The scope is open, and this is what its walk listed.
+    Open(Walk),
+    /// The scope has no root, and why the look that found none stopped short
+    /// where it did.
+    Missing(Option<&'static str>),
+}
+
+/// A walk of a scope for a condition. A scope that is not open is read as empty,
+/// never refused: waiting for a dialog's button before the dialog exists is the
+/// ordinary case. One a look stopped short of is not proven empty.
 fn walk_in(
     at: &Looking<'_>,
     scope: Scope,
     shape: &Shape,
     deadline_ms: u64,
-) -> Result<Option<Walk>, Failure> {
+) -> Result<Scoped, Failure> {
     match walk_scope(at.ax, &at.scene, scope, shape, at.clock, deadline_ms) {
-        Ok(found) => Ok(Some(found)),
-        Err(failure) if failure.code == "scope_not_found" => Ok(None),
-        Err(failure) => Err(failure),
+        Ok(found) => Ok(Scoped::Open(found)),
+        Err(NoRoot::Missing { unseen, .. }) => Ok(Scoped::Missing(unseen)),
+        Err(NoRoot::Refused(failure)) => Err(failure),
     }
 }
 
@@ -783,7 +1013,36 @@ fn named_entry<'a>(
             format!("the listing this request names has no {reference}: list the controls again"),
         )
     })?;
+    if let Some(bound) = &at.scene.window {
+        listed_here(named, reference, bound.id, at.scene.pid)?;
+    }
     Ok((named, entry))
+}
+
+/// Whether a request bound to `window`, of process `pid`, may use a reference of
+/// this listing: only one listed while that window was bound. One listed without a
+/// binding, while another window was bound, or from another process may name a
+/// control of another window.
+pub fn listed_here(
+    named: &Elements,
+    reference: &str,
+    window: u32,
+    pid: i32,
+) -> Result<(), Failure> {
+    let listed = match named.bound {
+        None => "without a window binding",
+        Some(bound) if bound != window => "while another window was bound",
+        Some(_) if named.pid != pid => "from another application than the bound window's",
+        Some(_) => return Ok(()),
+    };
+    Err(Failure::new(
+        "stale_element",
+        format!(
+            "{reference} was listed {listed}, and this request is bound to one window, so \
+             nothing was sent: list the bound window (`elements` with this target_id) and use \
+             a reference from the new list"
+        ),
+    ))
 }
 
 /// A value condition. Refused on a secure field, by the listing's word or by what
@@ -810,8 +1069,8 @@ fn value_holds(at: &Looking<'_>, reference: &str, wanted: &str) -> Result<Seen, 
 /// ignoring case. No window is no title.
 fn titled(at: &Looking<'_>, text: &str) -> bool {
     let focused;
-    let window = match at.scene.window {
-        Some(window) => window,
+    let window = match &at.scene.window {
+        Some(bound) => bound.element,
         None => {
             focused = at.ax.focused(at.ax, at.scene.pid, Focus::Window);
             let Some(window) = focused.as_ref() else {
@@ -831,6 +1090,9 @@ pub struct Waited {
     pub looks: u64,
     pub waited_ms: u64,
     pub found: Option<Walk>,
+    /// A wait for an absence that ended not met with its last look cut short:
+    /// why that look stopped. The absence may hold beyond what it saw.
+    pub truncated: Option<&'static str>,
 }
 
 /// Look until the condition holds or `timeout_ms` passes: a look every
@@ -852,20 +1114,26 @@ pub fn wait(
         looks += 1;
         let seen = look(at.saturating_add(crate::tree::WALK_BUDGET_MS))?;
         let waited_ms = gate.now_ms().saturating_sub(started);
-        if let Seen::Holds(found) = seen {
-            return Ok(Waited {
-                met: true,
-                looks,
-                waited_ms,
-                found,
-            });
-        }
+        let truncated = match seen {
+            Seen::Holds(found) => {
+                return Ok(Waited {
+                    met: true,
+                    looks,
+                    waited_ms,
+                    found,
+                    truncated: None,
+                })
+            }
+            Seen::Not => None,
+            Seen::Unproven(word) => Some(word),
+        };
         if looks >= most || waited_ms >= timeout_ms {
             return Ok(Waited {
                 met: false,
                 looks,
                 waited_ms,
                 found: None,
+                truncated,
             });
         }
         let spent = gate.now_ms().saturating_sub(at);
@@ -1321,8 +1589,9 @@ pub fn held(plan: &Plan) -> Judged {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ax::{Focus, Recorder, Routes, Scripted, States, PRESS};
+    use crate::ax::{Focus, Recorder, Routes, Scripted, States, Unread, PRESS};
     use crate::gate::SystemClock;
+    use crate::window_server::{Bounds, Recorder as WindowRecorder, WindowFacts};
     use crate::wire::ControlAction;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
@@ -1381,6 +1650,11 @@ mod tests {
         }
     }
 
+    /// The surfaces open in the application, as an unbound scene sees them.
+    fn every(ax: &Rc<dyn Ax>) -> Surfaces {
+        surfaces(ax, &app_scene()).expect("an unbound scan is never refused")
+    }
+
     /// A node of this role and label at a frame, with these children.
     fn holding(role: &str, label: &str, children: &[usize]) -> Scripted {
         Scripted {
@@ -1415,6 +1689,7 @@ mod tests {
             &SystemClock::new(),
             u64::MAX,
         )
+        .map_err(Failure::from)
     }
 
     // --- listings ------------------------------------------------------------------
@@ -1531,10 +1806,7 @@ mod tests {
         let (recorder, ax) = platform(desktop());
         recorder.windows_are(&[0]);
         let windows = crate::ax::application_windows(&ax, PID);
-        let bound = Scene {
-            pid: PID,
-            window: Some(windows[0].handle()),
-        };
+        let bound = bound_to(&windows[0], 10, &WindowRecorder::new(Vec::new()));
 
         let refused = whole(&ax, &bound, Scope::App).expect_err("app with a target");
         assert_eq!(refused.code, "invalid_argument");
@@ -1604,6 +1876,287 @@ mod tests {
         }
     }
 
+    // --- a bound window's scopes ---------------------------------------------------
+
+    /// A scene bound to `window`, whose window-server id is `id`.
+    fn bound_to(window: &Retained, id: u32, windows: &Arc<WindowRecorder>) -> Scene {
+        Scene {
+            pid: PID,
+            window: Some(Bound {
+                element: window.handle(),
+                id,
+                windows: windows.clone(),
+            }),
+        }
+    }
+
+    fn span(x: f64, w: f64) -> Frame {
+        Frame {
+            x,
+            y: 100.0,
+            w,
+            h: 300.0,
+        }
+    }
+
+    /// Two windows of one application: the first holds Save, the second a field
+    /// and a menu, and each has a dialog of its own in a window of its own.
+    fn two_windows() -> Vec<Scripted> {
+        let placed = |frame: Frame, node: Scripted| Scripted {
+            frame: Some(frame),
+            ..node
+        };
+        vec![
+            placed(span(0.0, 400.0), holding("AXWindow", "First", &[4])),
+            placed(span(500.0, 400.0), holding("AXWindow", "Second", &[5, 6])),
+            placed(
+                span(100.0, 200.0),
+                subroled("AXWindow", "AXDialog", "Save first?", &[8]),
+            ),
+            placed(
+                span(600.0, 200.0),
+                subroled("AXWindow", "AXDialog", "Save second?", &[9]),
+            ),
+            Scripted::button("Save", frame(0.0, 120.0)),
+            Scripted::field("Name", "ada", frame(500.0, 120.0)),
+            holding("AXMenu", "Context", &[7]),
+            Scripted {
+                label: Some("Copy".to_string()),
+                actions: vec![PRESS.to_string()],
+                frame: Some(frame(500.0, 160.0)),
+                ..Scripted::of("AXMenuItem")
+            },
+            Scripted::button("Keep first", frame(100.0, 200.0)),
+            Scripted::button("Keep second", frame(600.0, 200.0)),
+        ]
+    }
+
+    /// What the window server says of them: the windows are 10 and 11, and each
+    /// dialog's window is transient for its own.
+    fn two_windows_server() -> Arc<WindowRecorder> {
+        let window = |id: u32, frame: Frame, of: Option<u32>| WindowFacts {
+            transient_for: of,
+            ..crate::window_server::window(
+                id,
+                PID,
+                Bounds {
+                    x: frame.x,
+                    y: frame.y,
+                    w: frame.w,
+                    h: frame.h,
+                },
+            )
+        };
+        WindowRecorder::new(vec![
+            window(10, span(0.0, 400.0), None),
+            window(11, span(500.0, 400.0), None),
+            window(12, span(100.0, 200.0), Some(10)),
+            window(13, span(600.0, 200.0), Some(11)),
+        ])
+    }
+
+    // Two windows of one application, the first bound, focus in the second. The
+    // focused scope answers only a control inside the bound window, so focus
+    // elsewhere is no scope at all, with a sentence that says where it is, and no
+    // reference to the second window's control is minted.
+    #[test]
+    fn focus_in_another_window_of_the_application_is_not_the_bound_windows() {
+        let (recorder, ax) = platform(two_windows());
+        recorder.windows_are(&[0, 1]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let first = bound_to(&windows[0], 10, &two_windows_server());
+        recorder.focuses(Some(1), Some(5));
+
+        let refused = whole(&ax, &first, Scope::Focused).expect_err("focus elsewhere");
+        assert_eq!(refused.code, "scope_not_found");
+        let detail = refused.detail.unwrap_or_default();
+        assert!(detail.contains("another window"), "{detail}");
+        drop(windows);
+        assert_eq!(
+            recorder.counts().2,
+            0,
+            "nothing of the second window is held"
+        );
+
+        let windows = crate::ax::application_windows(&ax, PID);
+        let first = bound_to(&windows[0], 10, &two_windows_server());
+        recorder.focuses(Some(0), Some(4));
+        let found = whole(&ax, &first, Scope::Focused).expect("focus in the bound window");
+        assert_eq!(labels(&found), vec!["Save"]);
+
+        recorder.focuses(Some(1), Some(5));
+        let found = whole(&ax, &app_scene(), Scope::Focused).expect("unbound, as before");
+        assert_eq!(labels(&found), vec!["Name"]);
+    }
+
+    // A dialog in a window of its own is the bound window's only when the window
+    // server says its window is transient for the bound one; without a binding
+    // every dialog of the application is listed, as before.
+    #[test]
+    fn a_dialog_is_listed_only_under_the_window_it_is_transient_for() {
+        let (recorder, ax) = platform(two_windows());
+        recorder.windows_are(&[0, 1]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let server = two_windows_server();
+
+        let first = whole(&ax, &bound_to(&windows[0], 10, &server), Scope::Dialog)
+            .expect("the first window's dialog");
+        assert_eq!(labels(&first), vec!["Keep first"]);
+        let second = whole(&ax, &bound_to(&windows[1], 11, &server), Scope::Dialog)
+            .expect("the second window's dialog");
+        assert_eq!(labels(&second), vec!["Keep second"]);
+
+        let every = whole(&ax, &app_scene(), Scope::Dialog).expect("unbound");
+        assert_eq!(labels(&every), vec!["Keep first", "Keep second"]);
+    }
+
+    // A window transient for a window that is the bound one's belongs to it too,
+    // and a dialog no window marks as anybody's is no bound window's: then the
+    // dialog scope says none of the bound window's is open, and how to list the
+    // application's.
+    #[test]
+    fn a_dialog_belongs_through_its_transient_chain_and_never_without_one() {
+        let (recorder, ax) = platform(two_windows());
+        recorder.windows_are(&[0, 1]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let server = two_windows_server();
+        server.change(13, |dialog| dialog.transient_for = Some(12));
+
+        let first =
+            whole(&ax, &bound_to(&windows[0], 10, &server), Scope::Dialog).expect("both dialogs");
+        assert_eq!(labels(&first), vec!["Keep first", "Keep second"]);
+
+        server.change(12, |dialog| dialog.transient_for = None);
+        server.change(13, |dialog| dialog.transient_for = None);
+        let refused = whole(&ax, &bound_to(&windows[0], 10, &server), Scope::Dialog)
+            .expect_err("no dialog is the first window's");
+        assert_eq!(refused.code, "scope_not_found");
+        let detail = refused.detail.unwrap_or_default();
+        assert!(detail.contains("bound window"), "{detail}");
+        assert!(detail.contains("release the target"), "{detail}");
+    }
+
+    // A menu open in another window of the application neither satisfies
+    // menu_open nor keeps menu_closed from holding under a binding, and the menu
+    // scope does not list it; without a binding it is the application's menu, as
+    // before.
+    #[test]
+    fn a_menu_in_another_window_is_not_the_bound_windows() {
+        let (recorder, ax) = platform(two_windows());
+        recorder.windows_are(&[0, 1]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let server = two_windows_server();
+        let clock = SystemClock::new();
+        let seen = |scene: Scene, condition: Condition| {
+            let at = Looking {
+                ax: &ax,
+                scene,
+                named: None,
+                clock: &clock,
+            };
+            holds(look(&at, &condition, u64::MAX).expect("a look"))
+        };
+
+        let first = bound_to(&windows[0], 10, &server);
+        assert!(!seen(first.clone(), Condition::MenuOpen));
+        assert!(seen(first.clone(), Condition::MenuClosed));
+        let refused = whole(&ax, &first, Scope::Menu).expect_err("not the first's");
+        assert_eq!(refused.code, "scope_not_found");
+        let receipt = surfaces(&ax, &first).expect("a scan");
+        let open: Vec<(&str, Option<&str>)> = kinds(&receipt.found)
+            .into_iter()
+            .map(|(kind, _native, label)| (kind, label))
+            .collect();
+        assert_eq!(
+            open,
+            vec![("dialog", Some("Save first?"))],
+            "a receipt sees the first window's dialog and not the second's menu"
+        );
+
+        let second = bound_to(&windows[1], 11, &server);
+        assert!(seen(second.clone(), Condition::MenuOpen));
+        assert!(!seen(second.clone(), Condition::MenuClosed));
+        let menu = whole(&ax, &second, Scope::Menu).expect("the second's menu");
+        assert_eq!(labels(&menu), vec!["Copy"]);
+
+        assert!(seen(app_scene(), Condition::MenuOpen));
+        assert!(!seen(app_scene(), Condition::MenuClosed));
+    }
+
+    // A bound window that is itself a dialog is the dialog its scope lists, as
+    // without a binding: its own subtree starts at it.
+    #[test]
+    fn a_bound_dialog_window_is_its_own_dialog() {
+        let (recorder, ax) = platform(two_windows());
+        recorder.windows_are(&[0, 1, 2, 3]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let dialog = bound_to(&windows[2], 12, &two_windows_server());
+
+        let found = whole(&ax, &dialog, Scope::Dialog).expect("the bound dialog");
+        assert_eq!(labels(&found), vec!["Keep first"]);
+    }
+
+    // Where the window server marks no window as another's (macOS), a bound
+    // window's surfaces are the ones inside it: a sheet of its own, never a
+    // dialog in a window of its own.
+    #[test]
+    fn where_nothing_marks_ownership_a_bound_window_sees_only_what_is_inside_it() {
+        let (recorder, ax) = platform(desktop());
+        recorder.windows_are(&[0]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let unmarked = WindowRecorder::new(Vec::new());
+        let bound = bound_to(&windows[0], 10, &unmarked);
+
+        let sheet = whole(&ax, &bound, Scope::Dialog).expect("its own sheet");
+        assert_eq!(labels(&sheet), vec!["Clear"]);
+        assert!(
+            whole(&ax, &bound, Scope::Menu).is_err(),
+            "the context menu is the application's, not the window's"
+        );
+    }
+
+    // A condition bound to a window reads a reference only from a listing taken
+    // while that window was bound: one listed without a binding, or under another
+    // window, may name a control of another window. Without a binding any
+    // listing is read, as before.
+    #[test]
+    fn a_bound_condition_reads_only_a_reference_listed_under_its_window() {
+        let (recorder, ax) = platform(two_windows());
+        recorder.windows_are(&[0, 1]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let first = bound_to(&windows[0], 10, &two_windows_server());
+        let unbound = listing_of(&ax, &recorder);
+        let under = |window: Option<u32>| {
+            Elements::shared(
+                unbound.pid,
+                unbound.started_at,
+                window,
+                unbound.entries().to_vec(),
+            )
+        };
+        let clock = SystemClock::new();
+        let enabled = Condition::Enabled("e1".to_string());
+        let looked = |scene: Scene, named: &Elements| {
+            let at = Looking {
+                ax: &ax,
+                scene,
+                named: Some(named),
+                clock: &clock,
+            };
+            look(&at, &enabled, u64::MAX)
+        };
+
+        for named in [&unbound, &under(Some(11))] {
+            let refused = looked(first.clone(), named).expect_err("listed elsewhere");
+            assert_eq!(refused.code, "stale_element");
+        }
+        assert!(
+            looked(first.clone(), &under(Some(10))).is_ok(),
+            "listed here"
+        );
+        assert!(looked(app_scene(), &unbound).is_ok(), "no binding");
+    }
+
     // --- surfaces ----------------------------------------------------------------
 
     fn kinds(found: &[Surface]) -> Vec<(&str, &str, Option<&str>)> {
@@ -1632,7 +2185,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            kinds(&surfaces(&ax, PID)),
+            kinds(&every(&ax).found),
             vec![
                 ("dialog", "AXSheet", Some("Save changes?")),
                 ("popup", "AXPopover", Some("Font")),
@@ -1657,11 +2210,11 @@ mod tests {
             holding("AXMenuBarItem", "Edit", &[4]),
             holding("AXMenu", "Edit", &[]),
         ]);
-        assert!(surfaces(&ax, PID).is_empty(), "no item is selected");
+        assert!(every(&ax).found.is_empty(), "no item is selected");
 
         recorder.change(3, |item| item.states = selected);
         assert_eq!(
-            kinds(&surfaces(&ax, PID)),
+            kinds(&every(&ax).found),
             vec![("menu", "AXMenu", Some("Edit"))]
         );
     }
@@ -1676,14 +2229,121 @@ mod tests {
         let (_recorder, ax) = platform(many);
         let before = ax.messages();
 
-        let found = surfaces(&ax, PID);
+        let found = every(&ax);
 
-        assert!(found.is_empty(), "the sheet past the bound is not reached");
+        assert!(
+            found.found.is_empty(),
+            "the sheet past the bound is not reached"
+        );
+        assert_eq!(found.stopped, Some("nodes"), "and the scan says so");
         assert!(
             ax.messages() - before <= 2 * MAX_SURFACE_NODES as u64 + 2,
             "{} messages",
             ax.messages() - before
         );
+    }
+
+    // A scan says whether it saw everything it looks at: a node that does not
+    // answer in time stops it, and one that saw every window is complete.
+    #[test]
+    fn a_scan_for_surfaces_says_whether_it_finished() {
+        let (recorder, ax) = platform(vec![
+            holding("AXWindow", "Slow", &[]),
+            holding("AXMenu", "Context", &[]),
+        ]);
+        recorder.fails_facts_for(0, Unread::NoAnswer);
+        let slow = every(&ax);
+        assert!(slow.found.is_empty(), "nothing after the slow node is read");
+        assert_eq!(slow.stopped, Some("time"));
+
+        let (_recorder, ax) = platform(desktop());
+        let whole = every(&ax);
+        assert_eq!(whole.found.len(), 2);
+        assert_eq!(whole.stopped, None);
+    }
+
+    // A scan that stopped before it reached the menu proves nothing closed:
+    // menu_closed does not hold, and says why the scan stopped. One that saw
+    // everything and found no menu holds.
+    #[test]
+    fn menu_closed_holds_only_on_a_scan_that_saw_everything() {
+        let clock = SystemClock::new();
+        let closed = |ax: &Rc<dyn Ax>| {
+            let at = Looking {
+                ax,
+                scene: app_scene(),
+                named: None,
+                clock: &clock,
+            };
+            look(&at, &Condition::MenuClosed, u64::MAX).expect("a look")
+        };
+        let mut many: Vec<Scripted> = (0..100)
+            .map(|index| holding("AXWindow", &format!("W{index}"), &[]))
+            .collect();
+        many.push(holding("AXMenu", "Context", &[]));
+        let (_recorder, ax) = platform(many);
+        let seen = closed(&ax);
+        assert!(matches!(seen, Seen::Unproven("nodes")), "{seen:?}");
+
+        let (recorder, ax) = platform(vec![
+            holding("AXWindow", "Slow", &[]),
+            holding("AXMenu", "Context", &[]),
+        ]);
+        recorder.fails_facts_for(0, Unread::NoAnswer);
+        let seen = closed(&ax);
+        assert!(matches!(seen, Seen::Unproven("time")), "{seen:?}");
+
+        let (_recorder, ax) = platform(vec![holding("AXWindow", "Document", &[])]);
+        assert!(holds(closed(&ax)));
+    }
+
+    // A menu or dialog scope that a scan stopped short of is not proven closed:
+    // `elements` says the look stopped before it finished, still as
+    // scope_not_found, and a condition reads the scope as unproven, never as
+    // empty.
+    #[test]
+    fn a_scope_an_incomplete_scan_found_nothing_in_is_not_proven_closed() {
+        let mut many: Vec<Scripted> = (0..100)
+            .map(|index| holding("AXWindow", &format!("W{index}"), &[]))
+            .collect();
+        many.push(holding("AXSheet", "Clear all items?", &[101]));
+        many.push(Scripted::button("Clear", frame(0.0, 40.0)));
+        let (_recorder, ax) = platform(many);
+
+        let refused = whole(&ax, &app_scene(), Scope::Dialog).expect_err("not found");
+        assert_eq!(refused.code, "scope_not_found");
+        let detail = refused.detail.unwrap_or_default();
+        assert!(detail.contains("stopped before it finished"), "{detail}");
+
+        let clock = SystemClock::new();
+        let at = Looking {
+            ax: &ax,
+            scene: app_scene(),
+            named: None,
+            clock: &clock,
+        };
+        let clear = Query {
+            role: Some("button".to_string()),
+            name: Some("clear".to_string()),
+        };
+        let gone = Condition::Disappears {
+            query: clear.clone(),
+            scope: Some(Scope::Dialog),
+        };
+        let seen = look(&at, &gone, u64::MAX).expect("a look");
+        assert!(matches!(seen, Seen::Unproven("nodes")), "{seen:?}");
+        let shows = Condition::Appears {
+            query: clear,
+            scope: Some(Scope::Dialog),
+        };
+        assert!(matches!(
+            look(&at, &shows, u64::MAX).expect("a look"),
+            Seen::Not
+        ));
+        assert!(matches!(
+            look(&at, &Condition::MenuOpen, u64::MAX).expect("a look"),
+            Seen::Not
+        ));
     }
 
     #[test]
@@ -1692,8 +2352,8 @@ mod tests {
             holding("AXWindow", "Document", &[1]),
             holding("AXSheet", "Save changes?", &[]),
         ]);
-        let found = surfaces(&ax, PID);
-        assert_eq!(found.len(), 1);
+        let found = every(&ax);
+        assert_eq!(found.found.len(), 1);
         drop(found);
         assert_eq!(recorder.counts().2, 0, "nothing is still held");
     }
@@ -1824,7 +2484,7 @@ mod tests {
                 element: node.element,
             })
             .collect();
-        Elements::new(PID, recorder.started_at(), entries)
+        Elements::new(PID, recorder.started_at(), None, entries)
     }
 
     fn holds(seen: Seen) -> bool {
@@ -1888,6 +2548,81 @@ mod tests {
             query: find("menuitem", "copy"),
             scope: Some(Scope::Dialog)
         }));
+    }
+
+    // A look that stopped before it saw everything proves no absence: a Save
+    // button the walk never reached is not gone, and the look says why it stopped.
+    // Only a complete look that lists no match holds; a match is no disappearance,
+    // as before.
+    #[test]
+    fn a_disappearance_by_query_holds_only_on_a_complete_look() {
+        let (_recorder, ax) = platform(desktop());
+        let clock = SystemClock::new();
+        let at = Looking {
+            ax: &ax,
+            scene: app_scene(),
+            named: None,
+            clock: &clock,
+        };
+        let gone = |name: &str| Condition::Disappears {
+            query: Query {
+                role: Some("button".to_string()),
+                name: Some(name.to_string()),
+            },
+            scope: None,
+        };
+        let spent = 0;
+
+        for name in ["save", "delete"] {
+            let cut = look(&at, &gone(name), spent).expect("a look");
+            assert!(matches!(cut, Seen::Unproven("time")), "{name}: {cut:?}");
+        }
+        assert!(holds(look(&at, &gone("delete"), u64::MAX).expect("a look")));
+        assert!(matches!(
+            look(&at, &gone("save"), u64::MAX).expect("a look"),
+            Seen::Not
+        ));
+    }
+
+    // A wait for an absence whose looks are all cut ends not met, never met by
+    // default, and says why its last look stopped; so does the look before an
+    // action's input, which never reads an incomplete look as held.
+    #[test]
+    fn a_wait_for_an_absence_its_looks_cannot_prove_says_they_were_cut() {
+        let (_recorder, ax) = platform(desktop());
+        let clock = SystemClock::new();
+        let at = Looking {
+            ax: &ax,
+            scene: app_scene(),
+            named: None,
+            clock: &clock,
+        };
+        let gone = Until {
+            condition: Condition::Disappears {
+                query: Query {
+                    role: Some("button".to_string()),
+                    name: Some("delete".to_string()),
+                },
+                scope: None,
+            },
+            timeout_ms: 300,
+        };
+
+        let waited = wait(&test_gate(), gone.timeout_ms, |_deadline| {
+            look(&at, &gone.condition, 0)
+        })
+        .expect("a wait");
+
+        assert!(!waited.met);
+        assert_eq!(waited.truncated, Some("time"));
+        assert!(!held_before(&at, &gone, 0, Some(0)).expect("a look"));
+
+        let whole = wait(&test_gate(), gone.timeout_ms, |deadline| {
+            look(&at, &gone.condition, deadline)
+        })
+        .expect("a wait");
+        assert!(whole.met);
+        assert_eq!(whole.truncated, None);
     }
 
     // A scope that is not open yet reads as empty: waiting for a dialog's button

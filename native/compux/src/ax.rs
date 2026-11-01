@@ -515,6 +515,16 @@ pub trait Ax {
     /// The application's focused window or focused element, retained; `None` when
     /// it has none or will not say.
     fn focused(&self, owner: &Rc<dyn Ax>, pid: i32, what: Focus) -> Option<Retained>;
+
+    /// The focused element when it sits in this window, retained: what a bound
+    /// window's focus is. `None` when focus is in another window, nowhere, or
+    /// either will not say, which is never read as this window's.
+    fn focused_in(&self, owner: &Rc<dyn Ax>, window: Handle) -> Option<Retained>;
+
+    /// One more reference to an element this platform already holds, released on
+    /// its own: for a scan that keeps what it found, of an element its caller only
+    /// lends it. `None` when the handle names nothing held.
+    fn retain_again(&self, owner: &Rc<dyn Ax>, handle: Handle) -> Option<Retained>;
 }
 
 /// One application's windows, retained through the platform that made them — which
@@ -552,20 +562,31 @@ pub struct Elements {
     /// The application the tree was read from, and when that process started.
     pub pid: i32,
     pub started_at: u64,
+    /// The window the listing was bound to, by its window-server id; `None` for
+    /// one read without a binding. A request bound to a window acts only on
+    /// references listed under that window's binding.
+    pub bound: Option<u32>,
     /// Shared, so a drill's observation holds the references it keeps from the
     /// listing it named without that listing letting go of them.
     entries: Vec<Rc<Entry>>,
 }
 
 impl Elements {
-    pub fn new(pid: i32, started_at: u64, entries: Vec<Entry>) -> Elements {
-        Elements::shared(pid, started_at, entries.into_iter().map(Rc::new).collect())
+    pub fn new(pid: i32, started_at: u64, bound: Option<u32>, entries: Vec<Entry>) -> Elements {
+        let entries = entries.into_iter().map(Rc::new).collect();
+        Elements::shared(pid, started_at, bound, entries)
     }
 
-    pub fn shared(pid: i32, started_at: u64, entries: Vec<Rc<Entry>>) -> Elements {
+    pub fn shared(
+        pid: i32,
+        started_at: u64,
+        bound: Option<u32>,
+        entries: Vec<Rc<Entry>>,
+    ) -> Elements {
         Elements {
             pid,
             started_at,
+            bound,
             entries,
         }
     }
@@ -1458,6 +1479,34 @@ mod mac {
                 Some(Retained::new(self.hold(&focused), owner.clone()))
             }
         }
+
+        /// The window's application's focused element, when its `AXWindow` is this
+        /// window.
+        fn focused_in(&self, owner: &Rc<dyn Ax>, window: Handle) -> Option<Retained> {
+            let window = self.element(window)?;
+            unsafe {
+                let mut pid: i32 = 0;
+                if AXUIElementGetPid(window.as_CFTypeRef(), &mut pid) != 0 || pid <= 0 {
+                    return None;
+                }
+                let app = application_element(pid)?;
+                prepare(&app, LOOKUP_TIMEOUT_MS);
+                self.sent();
+                let focused = copy_element_attr(&app, FOCUSED_ELEMENT)?;
+                prepare(&focused, READ_TIMEOUT_MS);
+                self.sent();
+                let its_window = copy_element_attr(&focused, WINDOW)?;
+                if CFEqual(its_window.as_CFTypeRef(), window.as_CFTypeRef()) == 0 {
+                    return None;
+                }
+                Some(Retained::new(self.hold(&focused), owner.clone()))
+            }
+        }
+
+        fn retain_again(&self, owner: &Rc<dyn Ax>, handle: Handle) -> Option<Retained> {
+            let element = self.element(handle)?;
+            Some(Retained::new(self.hold(&element), owner.clone()))
+        }
     }
 
     impl Real {
@@ -2165,6 +2214,14 @@ mod stub {
         }
 
         fn focused(&self, _owner: &Rc<dyn Ax>, _pid: i32, _what: Focus) -> Option<Retained> {
+            None
+        }
+
+        fn focused_in(&self, _owner: &Rc<dyn Ax>, _window: Handle) -> Option<Retained> {
+            None
+        }
+
+        fn retain_again(&self, _owner: &Rc<dyn Ax>, _handle: Handle) -> Option<Retained> {
             None
         }
     }
@@ -3078,6 +3135,26 @@ impl Ax for Recorder {
         }?;
         Some(Recorder::retain(&mut state, Slot::Node(index), owner))
     }
+
+    /// The focused element, when the window is it or one of its ancestors.
+    fn focused_in(&self, owner: &Rc<dyn Ax>, window: Handle) -> Option<Retained> {
+        let mut state = self.state();
+        state.messages += 1;
+        let window = Recorder::node(&state, window)?;
+        let focused = state.focused_element?;
+        let mut at = Some(focused);
+        while let Some(index) = at.filter(|index| *index != window) {
+            at = Recorder::parent_of(&state, index);
+        }
+        at?;
+        Some(Recorder::retain(&mut state, Slot::Node(focused), owner))
+    }
+
+    fn retain_again(&self, owner: &Rc<dyn Ax>, handle: Handle) -> Option<Retained> {
+        let mut state = self.state();
+        let slot = *state.held.get(&handle.0)?;
+        Some(Recorder::retain(&mut state, slot, owner))
+    }
 }
 
 #[cfg(test)]
@@ -3350,7 +3427,7 @@ mod tests {
             .collect();
         drop(root);
 
-        let elements = Elements::new(4711, recorder.started_at(), entries);
+        let elements = Elements::new(4711, recorder.started_at(), None, entries);
         assert_eq!(elements.len(), 2);
         assert_eq!(
             elements.get("e2").map(|entry| entry.role.as_str()),

@@ -90,7 +90,9 @@ defmodule Compux do
       condition (`wait_for/3` describes it). The condition is read once BEFORE the
       input, so the receipt's `check.until` says `met`, `not_met`, or `held_before`
       when it already held and so shows nothing about the action. A wait the
-      request's own deadline cut short also says `deadline_cut: true`.
+      request's own deadline cut short also says `deadline_cut: true`, and a wait
+      for an absence whose last look stopped before it saw everything says
+      `truncated` with the walk's word (`"nodes"`, `"depth"`, `"time"`).
 
   Left out, the action brings nothing back. Whatever the check says, the receipt's
   `dispatch` is about the INPUT and is decided before the check runs: evidence that
@@ -306,7 +308,11 @@ defmodule Compux do
 
   A condition that never held is still `{:ok, %{"met" => false}}`: the wait ran.
   The wait never outlives the request's own deadline; when that deadline is what
-  ended it, the reply also says `"deadline_cut" => true`.
+  ended it, the reply also says `"deadline_cut" => true`. A `disappears` wait
+  by role or name, and a `menu_closed` wait, hold only on a look that saw
+  everything; one that ended with its last look cut short says `"truncated"`
+  with the look's word, and what it waited to be gone may be past where that
+  look stopped.
   """
   @spec wait_for(t(), map(), keyword()) :: response()
   def wait_for(%__MODULE__{} = cu, until, opts \\ []) when is_map(until) do
@@ -398,7 +404,9 @@ defmodule Compux do
 
   Options beside `:region`, `:display` and `:observation_id`:
     * `:scope` — where the walk starts: `:window`, `:app`, `:focused`, `:menu`,
-      `:dialog`.
+      `:dialog`. With a `:target_id`, `:focused`, `:menu` and `:dialog` are the
+      bound window's own: focus or a surface in another window of the
+      application is `scope_not_found`, saying so.
     * `:query` — `%{"role" => role, "name" => text}` (either or both): only the
       matching nodes, wherever they are in the scope.
     * `:skeleton` — `true` cuts the walk at depth 3; a cut container says how many

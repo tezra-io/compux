@@ -654,10 +654,13 @@ fn edit(node: &mut Node, call: &Call, message: &Message) -> Reply {
             Err(_) => Reply::Error(FAILED),
         },
         "InsertText" => match body.deserialize::<(i32, String, i32)>() {
-            Ok((at, text, _)) => {
-                node.text = spliced(&node.text, at, at, &text);
-                Reply::Flag(true)
-            }
+            Ok((at, text, length)) => match inserted(&text, length) {
+                Some(part) => {
+                    node.text = spliced(&node.text, at, at, part);
+                    Reply::Flag(true)
+                }
+                None => Reply::Error(FAILED),
+            },
             Err(_) => Reply::Error(FAILED),
         },
         "DeleteText" => match body.deserialize::<(i32, i32)>() {
@@ -708,6 +711,16 @@ fn flip(states: &mut Vec<u32>, bit: u32) {
     } else {
         states.push(bit);
     }
+}
+
+/// What an `InsertText` of `length` inserts of `text`, as ATK and GTK read it: its
+/// first `length` BYTES, while the offset it goes in at counts characters. A
+/// length past the text's end or inside a character is refused, where GTK would
+/// read past the string or split the character, and so is a negative one, which
+/// GTK reads as the whole string: compux always says how long its text is.
+fn inserted(text: &str, length: i32) -> Option<&str> {
+    let length = usize::try_from(length).ok()?;
+    text.get(..length)
 }
 
 /// `text` with the characters from `start` to `end` replaced by `with`.

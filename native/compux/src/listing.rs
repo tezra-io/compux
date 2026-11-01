@@ -332,7 +332,7 @@ mod tests {
                 element,
             })
             .collect();
-        (recorder, ax::Elements::new(PID, 1, entries))
+        (recorder, ax::Elements::new(PID, 1, None, entries))
     }
 
     // An entry is inside a root when its chain of `under`s reaches it, however
