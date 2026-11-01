@@ -60,19 +60,10 @@
 //! compiled on every macOS build and started only on a real machine.
 
 // The slot, the fence, the budget, the health codes and the frame type are the
-// portable half of this module: on macOS the ScreenCaptureKit adapter produces
-// every one of them and the unit tests exercise them on every target, but on a
-// build whose `WindowFrames` is the refusing stub nothing constructs a frame at
-// all, so the producer side is unreachable rather than unwanted. Scoped to
-// non-macOS so a genuinely unused helper still fails the macOS gate — the same
-// shape, and for the same reason, as `capture.rs`'s portable frame builders.
-//
-// It is one attribute rather than a gate per item because the unreachable set
-// includes struct FIELDS and enum VARIANTS (`WindowFrame`'s timing and status,
-// `Health`'s four, `FrameError`'s four), and a type whose shape changes with the
-// target is a worse thing to own than a scoped allow. M42.1's Linux capture makes
-// the whole of it reachable again and this line goes with it.
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// portable half of this module: the ScreenCaptureKit adapter produces them on
+// macOS and the Composite stream on Linux. The three items only ScreenCaptureKit
+// has (its queue depth, a stream the server stopped, a refused grant) are allowed
+// unused off macOS, each where it is declared.
 
 use std::sync::{Arc, Mutex};
 
@@ -92,6 +83,7 @@ pub const MAX_FRAMES_PER_SECOND: i32 = 10;
 /// The stream's own queue depth: three native buffers SCK may hold. Three is the
 /// lowest depth Apple's own guidance names; the latest-frame semantics this module
 /// answers from are OURS and are unaffected by it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const QUEUE_DEPTH: isize = 3;
 
 /// How many frames' worth of memory one bound window may cost: the three native
@@ -139,6 +131,7 @@ pub enum Health {
     Minimized,
     /// The stream ended — the window closed, the application quit, the server
     /// stopped it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Disconnected,
 }
 
@@ -302,6 +295,7 @@ pub enum FrameError {
     /// Screen Recording was refused (`SCStreamErrorUserDeclined`). Its own code,
     /// because it is an operator action in System Settings and nothing the caller
     /// can retry its way out of.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Denied(String),
     /// A frame of this shape is more memory than a bound window may have.
     BudgetExceeded(String),
