@@ -11,9 +11,12 @@
 //! - `capture`: the monitors and one display's frame;
 //! - `windows`: the EWMH window listing, and the window server a bound window
 //!   lives by;
+//! - `above`: what takes a click over a bound window among the windows no
+//!   window manager lists;
 //! - `frames`: a bound window's frames, through Composite;
 //! - `clipboard`: the selection owner's thread.
 
+mod above;
 mod capture;
 mod clipboard;
 #[cfg(test)]

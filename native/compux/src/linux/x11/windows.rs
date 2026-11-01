@@ -405,6 +405,10 @@ impl Windows for WindowServer {
         }
         Ok(listed.windows.into_iter().map(facts).collect())
     }
+
+    fn unlisted_cover(&self, target_id: u32, x: i32, y: i32) -> Result<Option<String>, String> {
+        super::above::covering(&self.env, target_id, x, y)
+    }
 }
 
 /// Whether a window read again (its `_NET_WM_PID`, and its title made one

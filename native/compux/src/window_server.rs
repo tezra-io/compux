@@ -101,6 +101,15 @@ pub trait Windows: Send + Sync {
     /// refuses the listing, which is a different fact from an empty desktop and
     /// must never be flattened into one.
     fn list(&self) -> Result<Vec<WindowFacts>, String>;
+
+    /// What takes a click at (`x`, `y`) in front of window `target_id` among the
+    /// windows [`Windows::list`] does not hold, named; `None` where nothing does.
+    /// An X11 window manager lists only the windows it manages, so menus,
+    /// tooltips and a desktop shell's own windows are read here. The macOS
+    /// listing holds every window, so nothing is left to read there.
+    fn unlisted_cover(&self, _target_id: u32, _x: i32, _y: i32) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 }
 
 /// The window a given id names, out of one listing.
@@ -448,6 +457,7 @@ impl Windows for Unlisted {
 #[cfg(test)]
 pub struct Recorder {
     listed: std::sync::Mutex<Result<Vec<WindowFacts>, String>>,
+    unlisted: std::sync::Mutex<Result<Option<String>, String>>,
     calls: std::sync::atomic::AtomicUsize,
 }
 
@@ -457,8 +467,15 @@ impl Recorder {
     pub fn new(listed: Vec<WindowFacts>) -> std::sync::Arc<Recorder> {
         std::sync::Arc::new(Recorder {
             listed: std::sync::Mutex::new(Ok(listed)),
+            unlisted: std::sync::Mutex::new(Ok(None)),
             calls: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// What a window the listing does not hold (a menu, a popup) answers from
+    /// now on: its name over every point, nothing, or a refusal.
+    pub fn unlisted(&self, answer: Result<Option<String>, String>) {
+        *self.unlisted.lock().unwrap_or_else(|e| e.into_inner()) = answer;
     }
 
     /// The OS refuses the listing from now on.
@@ -497,6 +514,13 @@ impl Windows for Recorder {
     fn list(&self) -> Result<Vec<WindowFacts>, String> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.state().clone()
+    }
+
+    fn unlisted_cover(&self, _target_id: u32, _x: i32, _y: i32) -> Result<Option<String>, String> {
+        self.unlisted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 

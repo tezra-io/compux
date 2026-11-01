@@ -849,15 +849,31 @@ pub fn unobstructed(
                 )
             })?;
 
-    match covering {
-        None => Ok(()),
-        Some(covering) => Err(Failure::new(
+    if let Some(covering) = covering {
+        return Err(Failure::new(
             "target_obstructed",
             format!(
                 "{} — {} is in front of the target window at that point, so a click there would \
                  reach it instead. Act on a control by name, aim somewhere the target is not \
                  covered, or ask the user to move it",
                 covering.app, covering.title
+            ),
+        ));
+    }
+    // A menu, a tooltip or a shell's own window is in no listing on X11, and
+    // takes a click all the same.
+    match windows
+        .unlisted_cover(live.window_id, lx, ly)
+        .map_err(unavailable)?
+    {
+        None => Ok(()),
+        Some(name) => Err(Failure::new(
+            "target_obstructed",
+            format!(
+                "{name} is in front of the target window at that point (a menu, a popup or \
+                 another window no window manager lists), so a click there would reach it \
+                 instead. Close it, aim somewhere the target is not covered, or act on a \
+                 control by name"
             ),
         )),
     }
@@ -1216,6 +1232,26 @@ mod tests {
             refusal.detail.unwrap().contains("Window 10"),
             "the refusal must name what is in front"
         );
+    }
+
+    // On X11 a menu, a tooltip or a shell's notification is in no window
+    // manager's list, and a click where it takes input reaches it all the same.
+    #[test]
+    fn a_window_the_listing_does_not_hold_refuses_the_click_too() {
+        let live = live_at(at(0.0, 0.0, 800.0, 600.0), 2.0);
+        let recorder = windows_at(at(0.0, 0.0, 800.0, 600.0));
+        recorder.unlisted(Ok(Some("Compux Popup".to_string())));
+        let windows: Arc<dyn Windows> = recorder.clone();
+        let refusal = unobstructed(&live, &windows, 400, 400).expect_err("a popup is over it");
+        assert_eq!(refusal.code, "target_obstructed");
+        assert!(
+            refusal.detail.unwrap().contains("Compux Popup"),
+            "the refusal must name the popup"
+        );
+
+        recorder.unlisted(Err("the X server went away".to_string()));
+        let refusal = unobstructed(&live, &windows, 400, 400).expect_err("nothing is known");
+        assert_eq!(refusal.code, "target_unavailable");
     }
 
     // A window server that will not answer is the target being unusable, never an
