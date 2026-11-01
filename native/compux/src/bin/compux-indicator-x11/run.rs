@@ -98,6 +98,28 @@ pub fn popup_over(badge: Rect, above: &[Stacked]) -> Option<u32> {
         .map(|window| window.id)
 }
 
+/// Where the badge goes when it goes back on top.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restack {
+    /// Just over this window, which came over it: still under anything over that.
+    Above(u32),
+    /// Over every window: nothing names one it should go just over.
+    Top,
+    /// Where it is: the window that moved is under it already.
+    Stay,
+}
+
+/// Where the badge goes back on top, `came_over` being the managed window that
+/// moved, restacked or mapped onto it (`None` when none did), among `above`, the
+/// windows stacked over the badge now.
+pub fn restack(came_over: Option<u32>, above: &[Stacked]) -> Restack {
+    match came_over {
+        Some(window) if above.iter().any(|stacked| stacked.id == window) => Restack::Above(window),
+        Some(_under) => Restack::Stay,
+        None => Restack::Top,
+    }
+}
+
 /// Everything the loop is handed.
 enum Message {
     Input(Line),
@@ -267,7 +289,7 @@ impl Badge {
         self.window.show(frame, &canvas, self.row.input_region())?;
         self.canvas = Some(canvas);
         self.frame = Some(frame);
-        if self.clear_above(frame)? {
+        if self.free_above(frame)?.is_some() {
             self.window.raise()?;
         }
         Ok(())
@@ -291,7 +313,7 @@ impl Badge {
             // Another window moved, resized, restacked or mapped where the badge is.
             Event::ConfigureNotify(e) if e.window != id => {
                 let at = outer(e.x, e.y, e.width, e.height, e.border_width);
-                self.over(at, e.override_redirect)?
+                self.over(e.window, at, e.override_redirect)?
             }
             Event::MapNotify(e) if e.window != id && !e.override_redirect => {
                 self.mapped(e.window)?
@@ -299,7 +321,7 @@ impl Badge {
             // The menu or popup the badge stayed under closed.
             Event::UnmapNotify(e) if Some(e.window) == self.held_by => {
                 self.held_by = None;
-                self.on_top()?
+                self.on_top(None)?
             }
             Event::RandrScreenChangeNotify(_) => self.render()?,
             Event::Error(e) => {
@@ -357,11 +379,11 @@ impl Badge {
         }
     }
 
-    /// Back on top of a window that now meets the badge, unless the window is
-    /// the person's menu or tooltip.
-    fn over(&mut self, window: Rect, override_redirect: bool) -> Result<(), String> {
+    /// Back on top of `window`, now at `at`, where it meets the badge, unless
+    /// the window is the person's menu or tooltip.
+    fn over(&mut self, window: u32, at: Rect, override_redirect: bool) -> Result<(), String> {
         match self.frame {
-            Some(frame) if comes_over(frame, window, override_redirect) => self.on_top(),
+            Some(frame) if comes_over(frame, at, override_redirect) => self.on_top(Some(window)),
             _elsewhere => Ok(()),
         }
     }
@@ -370,14 +392,15 @@ impl Badge {
     /// gone since needs nothing.
     fn mapped(&mut self, window: u32) -> Result<(), String> {
         match self.window.outer_of(window)? {
-            Some(at) => self.over(at, false),
+            Some(at) => self.over(window, at, false),
             None => Ok(()),
         }
     }
 
     /// Back on top while shown, within the budget, unless the person's menu or
-    /// popup is open over it.
-    fn on_top(&mut self) -> Result<(), String> {
+    /// popup is open over it: just over `came_over`, the window that came over
+    /// it, or over every window where none did.
+    fn on_top(&mut self, came_over: Option<u32>) -> Result<(), String> {
         let Some(frame) = self.frame else {
             return Ok(());
         };
@@ -385,17 +408,22 @@ impl Badge {
         if !self.raises.allow(now_ms) {
             return Ok(());
         }
-        if self.clear_above(frame)? {
-            self.window.raise()?;
+        let Some(above) = self.free_above(frame)? else {
+            return Ok(());
+        };
+        match restack(came_over, &above) {
+            Restack::Above(window) => self.window.raise_above(window),
+            Restack::Top => self.window.raise(),
+            Restack::Stay => Ok(()),
         }
-        Ok(())
     }
 
-    /// Whether nothing the person opened is over the badge at `frame`. A menu or
-    /// popup taking input there is waited for: its unmap brings the badge back on
-    /// top. Past [`MAX_ABOVE`] windows above the badge none is read, and the
+    /// The windows stacked above the badge at `frame`, where nothing the person
+    /// opened is over it. A menu or popup taking input there is waited for (its
+    /// unmap brings the badge back on top), and the answer is then `None`; so it
+    /// is past [`MAX_ABOVE`] windows above the badge, which are not read, and the
     /// badge stays where it is.
-    fn clear_above(&mut self, frame: Rect) -> Result<bool, String> {
+    fn free_above(&mut self, frame: Rect) -> Result<Option<Vec<Stacked>>, String> {
         let Some(above) = self.window.above(frame)? else {
             if !self.crowded {
                 eprintln!(
@@ -404,10 +432,10 @@ impl Badge {
                 );
                 self.crowded = true;
             }
-            return Ok(false);
+            return Ok(None);
         };
         self.held_by = popup_over(frame, &above);
-        Ok(self.held_by.is_none())
+        Ok(self.held_by.is_none().then_some(above))
     }
 }
 
@@ -581,6 +609,20 @@ mod tests {
         };
         assert_eq!(popup_over(badge, &[unread]), None);
         assert_eq!(popup_over(badge, &[]), None);
+    }
+
+    // A managed window that comes over the badge has the badge go just over it,
+    // never to the very top: a menu stacked over that window stays over the badge.
+    #[test]
+    fn the_badge_goes_just_over_the_window_that_came_over_it() {
+        let above = [stacked(7, true, false, &[]), stacked(9, true, true, &[])];
+        assert_eq!(restack(Some(7), &above), Restack::Above(7));
+        assert_eq!(
+            restack(Some(5), &above),
+            Restack::Stay,
+            "a window under the badge needs nothing"
+        );
+        assert_eq!(restack(None, &above), Restack::Top);
     }
 
     #[test]

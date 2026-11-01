@@ -327,6 +327,29 @@ impl Window {
         ))
     }
 
+    /// Just over `sibling`, a window stacked over the badge: over it, and still
+    /// under whatever is over that. On top of every window where the server will
+    /// not take `sibling` as the badge's sibling (`BadMatch`: it is no longer one
+    /// of the root's children); nothing where `sibling` is gone, since nothing is
+    /// then over the badge. Checked, so a refusal is answered here and never
+    /// reaches the event loop, which ends on any error.
+    pub fn raise_above(&self, sibling: u32) -> Result<(), String> {
+        let above = ConfigureWindowAux::new()
+            .sibling(sibling)
+            .stack_mode(StackMode::ABOVE);
+        match self
+            .conn
+            .configure_window(self.id, &above)
+            .map_err(lost)?
+            .check()
+        {
+            Ok(()) => Ok(()),
+            Err(ReplyError::X11Error(e)) if e.error_kind == ErrorKind::Match => self.raise(),
+            Err(ReplyError::X11Error(e)) if e.error_kind == ErrorKind::Window => Ok(()),
+            Err(e) => Err(lost(e)),
+        }
+    }
+
     /// Back on top of every other window, after one was raised over it.
     pub fn raise(&self) -> Result<(), String> {
         let top = ConfigureWindowAux::new().stack_mode(StackMode::ABOVE);
