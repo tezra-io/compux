@@ -37,12 +37,27 @@ const SHAPE_INPUT: (u32, u32) = (1, 1);
 const RANDR_MONITORS: (u32, u32) = (1, 5);
 /// How many `_NET_WORKAREA` values are read: four per desktop, for 64 desktops.
 const MAX_WORKAREA_VALUES: u32 = 256;
+/// The most windows read above the badge when it looks for a menu or popup open
+/// over it. Past this none is read, and the badge stays where it is.
+pub const MAX_ABOVE: usize = 1_024;
 
 /// What the X side hands the badge's one loop.
 pub enum Delivered {
     Event(Event),
     /// The connection failed; nothing more will arrive.
     Lost(String),
+}
+
+/// A window stacked above the badge, as one look found it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stacked {
+    pub id: u32,
+    pub viewable: bool,
+    pub override_redirect: bool,
+    /// Where it takes input, in root pixels; `None` where it was not read (a
+    /// window not viewable, one the window manager manages, or one nowhere near
+    /// the badge).
+    pub input: Option<Vec<Rect>>,
 }
 
 /// The atoms the badge reads or writes.
@@ -169,9 +184,9 @@ impl Window {
             .collect())
     }
 
-    /// Put the badge at `frame`, on top, taking clicks only on `buttons`, drawn.
-    /// The input region is set before the window is mapped, so there is no moment
-    /// when the whole badge swallows clicks.
+    /// Put the badge at `frame`, taking clicks only on `buttons`, drawn. Where it
+    /// stacks is [`Window::raise`]'s. The input region is set before the window
+    /// is mapped, so there is no moment when the whole badge swallows clicks.
     pub fn show(&mut self, frame: Rect, canvas: &Canvas, buttons: [Rect; 2]) -> Result<(), String> {
         let input = buttons.map(|button| xproto::Rectangle {
             x: button.x as i16,
@@ -194,8 +209,7 @@ impl Window {
             .x(frame.x)
             .y(frame.y)
             .width(frame.w as u32)
-            .height(frame.h as u32)
-            .stack_mode(StackMode::ABOVE);
+            .height(frame.h as u32);
         self.conn.configure_window(self.id, &place).map_err(lost)?;
         if !self.mapped {
             self.conn.map_window(self.id).map_err(lost)?;
@@ -216,15 +230,101 @@ impl Window {
     /// Another window's outer rectangle, border included, in root pixels; `None`
     /// where it is gone.
     pub fn outer_of(&self, window: u32) -> Result<Option<Rect>, String> {
-        match self.conn.get_geometry(window).map_err(lost)?.reply() {
-            Ok(g) => Ok(Some(outer(g.x, g.y, g.width, g.height, g.border_width))),
-            Err(ReplyError::X11Error(e))
-                if matches!(e.error_kind, ErrorKind::Window | ErrorKind::Drawable) =>
-            {
-                Ok(None)
-            }
-            Err(e) => Err(lost(e)),
+        let geometry = present(self.conn.get_geometry(window).map_err(lost)?.reply())?;
+        Ok(geometry.map(|g| outer(g.x, g.y, g.width, g.height, g.border_width)))
+    }
+
+    /// The root's children stacked above the badge, bottom to top, each read as
+    /// far as telling a menu or popup open over `badge` needs; `None` where more
+    /// than [`MAX_ABOVE`] are, and none is read. A window gone since is left out.
+    pub fn above(&self, badge: Rect) -> Result<Option<Vec<Stacked>>, String> {
+        let tree = self
+            .conn
+            .query_tree(self.root)
+            .map_err(lost)?
+            .reply()
+            .map_err(lost)?;
+        let at = tree
+            .children
+            .iter()
+            .position(|&window| window == self.id)
+            .ok_or_else(|| "the badge's window is not among the root's children".to_string())?;
+        let ids = &tree.children[at + 1..];
+        if ids.len() > MAX_ABOVE {
+            return Ok(None);
         }
+        self.stacked(ids, badge).map(Some)
+    }
+
+    /// Each of `ids`: whether it is viewable and override-redirect, and, for one
+    /// that is both and meets `badge`, where it takes input.
+    fn stacked(&self, ids: &[u32], badge: Rect) -> Result<Vec<Stacked>, String> {
+        let mut asked = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let attributes = self.conn.get_window_attributes(id).map_err(lost)?;
+            asked.push((id, attributes, self.conn.get_geometry(id).map_err(lost)?));
+        }
+        let mut found = Vec::with_capacity(asked.len());
+        for (id, attributes, geometry) in asked {
+            let (Some(attributes), Some(geometry)) =
+                (present(attributes.reply())?, present(geometry.reply())?)
+            else {
+                continue;
+            };
+            let viewable = attributes.map_state == xproto::MapState::VIEWABLE;
+            let override_redirect = attributes.override_redirect;
+            let g = &geometry;
+            let near = outer(g.x, g.y, g.width, g.height, g.border_width)
+                .intersection(badge)
+                .is_some();
+            let input = if viewable && override_redirect && near {
+                self.input_of(id, g)?
+            } else {
+                None
+            };
+            found.push(Stacked {
+                id,
+                viewable,
+                override_redirect,
+                input,
+            });
+        }
+        Ok(found)
+    }
+
+    /// Where `id` takes input, in root pixels: its SHAPE input region (the whole
+    /// window and its border where none was set), which counts from the corner
+    /// inside its border. `None` where it is gone.
+    fn input_of(
+        &self,
+        id: u32,
+        geometry: &xproto::GetGeometryReply,
+    ) -> Result<Option<Vec<Rect>>, String> {
+        let reply = self
+            .conn
+            .shape_get_rectangles(id, shape::SK::INPUT)
+            .map_err(lost)?
+            .reply();
+        let Some(reply) = present(reply)? else {
+            return Ok(None);
+        };
+        let border = i32::from(geometry.border_width);
+        let (x, y) = (
+            i32::from(geometry.x) + border,
+            i32::from(geometry.y) + border,
+        );
+        Ok(Some(
+            reply
+                .rectangles
+                .iter()
+                .map(|r| Rect {
+                    x: x + i32::from(r.x),
+                    y: y + i32::from(r.y),
+                    w: i32::from(r.width),
+                    h: i32::from(r.height),
+                })
+                .collect(),
+        ))
     }
 
     /// Back on top of every other window, after one was raised over it.
@@ -475,6 +575,19 @@ pub fn outer(x: i16, y: i16, width: u16, height: u16, border: u16) -> Rect {
         y: i32::from(y),
         w: i32::from(width) + 2 * border,
         h: i32::from(height) + 2 * border,
+    }
+}
+
+/// A reply, or `None` where the window it asks about is gone.
+fn present<T>(reply: Result<T, ReplyError>) -> Result<Option<T>, String> {
+    match reply {
+        Ok(reply) => Ok(Some(reply)),
+        Err(ReplyError::X11Error(e))
+            if matches!(e.error_kind, ErrorKind::Window | ErrorKind::Drawable) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(lost(e)),
     }
 }
 

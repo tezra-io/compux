@@ -21,7 +21,7 @@ use crate::label::target_label;
 use crate::layout::{layout, Button, Layout};
 use crate::place::{badge_frame, Rect, HEIGHT};
 use crate::wire::{self, Activity, Line, TargetState, WireError, LINE_LIMIT};
-use crate::x11::{outer, Delivered, Window};
+use crate::x11::{outer, Delivered, Stacked, Window, MAX_ABOVE};
 
 /// How many times a second the badge puts itself back on top. A window that keeps
 /// raising itself over the badge gets this many answers and no more, so two such
@@ -77,6 +77,27 @@ pub fn comes_over(badge: Rect, window: Rect, override_redirect: bool) -> bool {
     !override_redirect && badge.intersection(window).is_some()
 }
 
+/// The person's menu or popup open over the badge at `badge`, among `above`
+/// (the root's children stacked over the badge, bottom to top): the front-most
+/// that is viewable, override-redirect and takes input somewhere on the badge.
+/// A window taking input nowhere there is not one: a desktop shell's stage over
+/// the whole screen takes it only at its own panels.
+pub fn popup_over(badge: Rect, above: &[Stacked]) -> Option<u32> {
+    above
+        .iter()
+        .rev()
+        .find(|window| {
+            window.viewable
+                && window.override_redirect
+                && window
+                    .input
+                    .iter()
+                    .flatten()
+                    .any(|input| input.intersection(badge).is_some())
+        })
+        .map(|window| window.id)
+}
+
 /// Everything the loop is handed.
 enum Message {
     Input(Line),
@@ -122,6 +143,8 @@ fn serve() -> Result<(), String> {
         ignored: 0,
         forged: 0,
         raises: RaiseBudget::new(),
+        held_by: None,
+        crowded: false,
         started: Instant::now(),
     };
     badge.render()?;
@@ -150,6 +173,11 @@ struct Badge {
     /// Button events other programs sent, dropped.
     forged: u32,
     raises: RaiseBudget,
+    /// The person's menu or popup open over the badge: the badge stays under it,
+    /// and goes back on top when it is unmapped.
+    held_by: Option<u32>,
+    /// Whether more than [`MAX_ABOVE`] windows above the badge were said so.
+    crowded: bool,
     started: Instant,
 }
 
@@ -223,7 +251,8 @@ impl Badge {
         }
     }
 
-    /// Lay out, place and draw the state the helper last sent, or hide.
+    /// Lay out, place and draw the state the helper last sent, or hide. The
+    /// badge goes on top unless the person's menu or popup is open over it.
     fn render(&mut self) -> Result<(), String> {
         let label = target_label(&self.state.app, &self.state.title);
         let painter = &self.painter;
@@ -238,6 +267,9 @@ impl Badge {
         self.window.show(frame, &canvas, self.row.input_region())?;
         self.canvas = Some(canvas);
         self.frame = Some(frame);
+        if self.clear_above(frame)? {
+            self.window.raise()?;
+        }
         Ok(())
     }
 
@@ -263,6 +295,11 @@ impl Badge {
             }
             Event::MapNotify(e) if e.window != id && !e.override_redirect => {
                 self.mapped(e.window)?
+            }
+            // The menu or popup the badge stayed under closed.
+            Event::UnmapNotify(e) if Some(e.window) == self.held_by => {
+                self.held_by = None;
+                self.on_top()?
             }
             Event::RandrScreenChangeNotify(_) => self.render()?,
             Event::Error(e) => {
@@ -338,16 +375,39 @@ impl Badge {
         }
     }
 
-    /// Back on top while shown, within the budget.
+    /// Back on top while shown, within the budget, unless the person's menu or
+    /// popup is open over it.
     fn on_top(&mut self) -> Result<(), String> {
-        if self.canvas.is_none() {
+        let Some(frame) = self.frame else {
             return Ok(());
-        }
+        };
         let now_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if !self.raises.allow(now_ms) {
             return Ok(());
         }
-        self.window.raise()
+        if self.clear_above(frame)? {
+            self.window.raise()?;
+        }
+        Ok(())
+    }
+
+    /// Whether nothing the person opened is over the badge at `frame`. A menu or
+    /// popup taking input there is waited for: its unmap brings the badge back on
+    /// top. Past [`MAX_ABOVE`] windows above the badge none is read, and the
+    /// badge stays where it is.
+    fn clear_above(&mut self, frame: Rect) -> Result<bool, String> {
+        let Some(above) = self.window.above(frame)? else {
+            if !self.crowded {
+                eprintln!(
+                    "compux-indicator-x11: more than {MAX_ABOVE} windows are stacked above the \
+                     badge; it stays where it is rather than cover one"
+                );
+                self.crowded = true;
+            }
+            return Ok(false);
+        };
+        self.held_by = popup_over(frame, &above);
+        Ok(self.held_by.is_none())
     }
 }
 
@@ -462,6 +522,65 @@ mod tests {
             "a menu stays over the badge"
         );
         assert!(!comes_over(badge, below, false), "touching is not meeting");
+    }
+
+    fn stacked(id: u32, viewable: bool, override_redirect: bool, input: &[Rect]) -> Stacked {
+        Stacked {
+            id,
+            viewable,
+            override_redirect,
+            input: Some(input.to_vec()),
+        }
+    }
+
+    // A menu or popup open over the badge keeps it under: the badge goes back on
+    // top only once nothing the person opened is over it.
+    #[test]
+    fn a_popup_taking_input_over_the_badge_keeps_it_under() {
+        let badge = Rect {
+            x: 300,
+            y: 8,
+            w: 432,
+            h: 28,
+        };
+        let menu = Rect {
+            x: 280,
+            y: -12,
+            w: 520,
+            h: 320,
+        };
+        let panel = Rect {
+            x: 0,
+            y: 0,
+            w: 1280,
+            h: 4,
+        };
+        assert_eq!(
+            popup_over(badge, &[stacked(7, true, true, &[menu])]),
+            Some(7)
+        );
+        let both = [
+            stacked(7, true, true, &[menu]),
+            stacked(9, true, true, &[menu]),
+        ];
+        assert_eq!(popup_over(badge, &both), Some(9), "the front-most");
+        assert_eq!(popup_over(badge, &[stacked(7, false, true, &[menu])]), None);
+        assert_eq!(
+            popup_over(badge, &[stacked(7, true, false, &[menu])]),
+            None,
+            "a managed window is raised over, not waited for"
+        );
+        assert_eq!(
+            popup_over(badge, &[stacked(7, true, true, &[panel])]),
+            None,
+            "a shell's stage takes input only at its panel"
+        );
+        let unread = Stacked {
+            input: None,
+            ..stacked(7, true, true, &[])
+        };
+        assert_eq!(popup_over(badge, &[unread]), None);
+        assert_eq!(popup_over(badge, &[]), None);
     }
 
     #[test]
