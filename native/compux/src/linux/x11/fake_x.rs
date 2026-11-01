@@ -2,14 +2,18 @@
 //!
 //! It answers the connection setup with one screen, `QueryExtension` (XTEST is
 //! there, nothing else is) and `GetInputFocus` (the round trip a checked request
-//! waits on), and it refuses every XTEST `FakeInput` with the error it was given,
-//! as a server that will not take the input does. Any other request is answered
-//! `BadImplementation`, so a test never waits on a reply the fake does not have.
+//! waits on). It refuses every XTEST `FakeInput` with the error it was given, as
+//! a server that will not take the input does, or takes them all. Any other
+//! request is answered `BadImplementation`, so a test never waits on a reply the
+//! fake does not have. At each `GetInputFocus` it notes how many `FakeInput`s
+//! came since the last one, which is how much input was sent before compux
+//! waited on the server.
 //! It ends when compux's end of the socket closes, or when no request has come
 //! for [`IDLE`], which closes the socket and so fails a test that would wait.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -42,22 +46,43 @@ const IDLE: Duration = Duration::from_secs(10);
 /// The size of every reply's fixed part, and of every error.
 const PACKET: usize = 32;
 
-/// The fake's thread.
+/// The fake's thread, and the `FakeInput`s it had before each `GetInputFocus`.
 pub struct FakeX {
     serving: Option<JoinHandle<()>>,
+    syncs: Arc<Mutex<Vec<usize>>>,
 }
 
 impl FakeX {
     /// The fake, refusing every `FakeInput` with `error`, and compux's connection
     /// to it.
     pub fn start(error: u8) -> (FakeX, RustConnection) {
+        FakeX::serving(Some(error))
+    }
+
+    /// The fake, taking every `FakeInput`.
+    pub fn accepting() -> (FakeX, RustConnection) {
+        FakeX::serving(None)
+    }
+
+    /// How many `FakeInput`s came before each `GetInputFocus`, in order.
+    pub fn syncs(&self) -> Vec<usize> {
+        self.syncs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn serving(error: Option<u8>) -> (FakeX, RustConnection) {
         let (ours, theirs) = UnixStream::pair().expect("a socket pair");
         ours.set_read_timeout(Some(IDLE)).expect("an idle bound");
-        let serving = std::thread::spawn(move || serve(ours, error));
+        let syncs = Arc::new(Mutex::new(Vec::new()));
+        let noted = Arc::clone(&syncs);
+        let serving = std::thread::spawn(move || serve(ours, error, &noted));
         let (stream, _) = DefaultStream::from_unix_stream(theirs).expect("compux's end");
         let connection = RustConnection::connect_to_stream(stream, 0).expect("the fake's setup");
         let fake = FakeX {
             serving: Some(serving),
+            syncs,
         };
         (fake, connection)
     }
@@ -74,17 +99,29 @@ impl Drop for FakeX {
     }
 }
 
-fn serve(mut stream: UnixStream, error: u8) {
+fn serve(mut stream: UnixStream, error: Option<u8>, syncs: &Mutex<Vec<usize>>) {
     if let Err(why) = set_up(&mut stream) {
         eprintln!("fake X: the setup failed: {why}");
         return;
     }
     let mut sequence: u16 = 0;
+    let mut inputs = 0;
     for _ in 0..MAX_REQUESTS {
         let Some((major, minor, body)) = read_request(&mut stream) else {
             return;
         };
         sequence = sequence.wrapping_add(1);
+        if (major, minor) == (XTEST_MAJOR, FAKE_INPUT) {
+            inputs += 1;
+        }
+        if major == GET_INPUT_FOCUS_REQUEST {
+            // Noted before the reply goes, so a test that has the reply sees it.
+            syncs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(inputs);
+            inputs = 0;
+        }
         let answer = answer((major, minor), &body, sequence, error);
         if let Err(why) = stream.write_all(&answer) {
             eprintln!("fake X: an answer was not written: {why}");
@@ -152,10 +189,13 @@ fn read_request(stream: &mut UnixStream) -> Option<(u8, u8, Vec<u8>)> {
     Some((header[0], header[1], body))
 }
 
-fn answer((major, minor): (u8, u8), body: &[u8], sequence: u16, error: u8) -> Vec<u8> {
+/// The answer to one request; a `FakeInput` the fake takes has none.
+fn answer((major, minor): (u8, u8), body: &[u8], sequence: u16, error: Option<u8>) -> Vec<u8> {
     match major {
         QUERY_EXTENSION_REQUEST => {
-            let length = usize::from(u16::from_ne_bytes([body[0], body[1]]));
+            let length = body.get(0..2).map_or(0, |bytes| {
+                usize::from(u16::from_ne_bytes([bytes[0], bytes[1]]))
+            });
             let present = body.get(4..4 + length) == Some(b"XTEST".as_slice());
             let reply = QueryExtensionReply {
                 sequence,
@@ -174,7 +214,9 @@ fn answer((major, minor): (u8, u8), body: &[u8], sequence: u16, error: u8) -> Ve
             };
             packet(&reply.serialize())
         }
-        XTEST_MAJOR if minor == FAKE_INPUT => refusal(error, sequence, major, minor),
+        XTEST_MAJOR if minor == FAKE_INPUT => {
+            error.map_or_else(Vec::new, |code| refusal(code, sequence, major, minor))
+        }
         _ => refusal(BAD_IMPLEMENTATION, sequence, major, minor),
     }
 }

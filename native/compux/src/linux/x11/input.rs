@@ -7,6 +7,9 @@
 //!   press is posted and forgotten after their release (`journal`), so a helper
 //!   killed in between has them released by the next one. An action that would
 //!   hold one is refused before its first input where no journal can be written.
+//!   A tap, a click and a wheel notch hold nothing past themselves: each goes
+//!   whole in one write and is checked once after it, so a helper killed while
+//!   it waits has sent all of one or none.
 //! - **Text** is typed only once every character is known to be on the layout,
 //!   and only while the keyboard is neutral; the caller refuses otherwise before
 //!   anything is posted ([`Desktop::ready_to_type`]).
@@ -233,22 +236,8 @@ impl Input {
 
     /// The keymap, read again if the server said it changed since it was read.
     fn keymap(&mut self) -> Result<&Keymap, String> {
-        for _ in 0..MAX_DRAINED_EVENTS {
-            let event = self
-                .connection
-                .poll_for_event()
-                .map_err(|error| format!("the X display went away: {error}"))?;
-            match event {
-                None => break,
-                Some(Event::MappingNotify(notify)) if notify.request == Mapping::KEYBOARD => {
-                    self.keymap = None;
-                }
-                Some(Event::Error(error)) => {
-                    eprintln!("compux: input: {}", super::refused(&error));
-                }
-                Some(_) => {}
-            }
-        }
+        // No batch is waiting, so any error read here is only said.
+        self.drain(&[])?;
         if self.keymap.is_none() {
             self.keymap = Some(read_keymap(&self.connection)?);
         }
@@ -267,6 +256,70 @@ impl Input {
             held: u16::from(state.base_mods) | u16::from(state.latched_mods),
             locked: u16::from(state.locked_mods),
         })
+    }
+
+    /// What the server sent on the input connection since it was last read: a
+    /// keyboard `MappingNotify` drops the keymap so it is read again, and an error
+    /// for a request of `batch` (by the low 16 bits of its sequence number, all an
+    /// X error carries) is that batch's refusal. Any other error is said. More
+    /// than [`MAX_DRAINED_EVENTS`] waiting is an error, so no refusal is left
+    /// unread behind them.
+    fn drain(&mut self, batch: &[u16]) -> Result<Option<String>, String> {
+        let mut refused = None;
+        for _ in 0..MAX_DRAINED_EVENTS {
+            let event = self
+                .connection
+                .poll_for_event()
+                .map_err(|error| format!("the X display went away: {error}"))?;
+            match event {
+                None => return Ok(refused),
+                Some(Event::MappingNotify(notify)) if notify.request == Mapping::KEYBOARD => {
+                    self.keymap = None;
+                }
+                Some(Event::Error(error))
+                    if refused.is_none() && batch.contains(&error.sequence) =>
+                {
+                    refused = Some(super::refused(&error));
+                }
+                Some(Event::Error(error)) => {
+                    eprintln!("compux: input: {}", super::refused(&error));
+                }
+                Some(_) => {}
+            }
+        }
+        Err(format!(
+            "more than {MAX_DRAINED_EVENTS} events waited on the input connection"
+        ))
+    }
+
+    /// Input that holds nothing past itself (a tap, a click, a wheel notch), sent
+    /// whole in one write, then checked with one round trip. Nothing of it is
+    /// down while compux waits, so a helper killed then has sent all of it or
+    /// none, and it needs no journal. An error the server answered for any of it
+    /// is an error here; the rest of it still went, so what it pressed it also
+    /// released.
+    fn batch(&mut self, events: &[(u8, u8)]) -> Result<(), String> {
+        let mut sent = Vec::with_capacity(events.len());
+        for &(kind, detail) in events {
+            let cookie = self
+                .connection
+                .xtest_fake_input(kind, detail, CURRENT_TIME, self.root, 0, 0, 0)
+                .map_err(|error| error.to_string())?;
+            // An X error names only the low 16 bits of the sequence number.
+            sent.push(cookie.sequence_number() as u16);
+            // Unchecked: an error for it arrives as an event, read below.
+            drop(cookie);
+        }
+        self.flush()?;
+        self.connection
+            .get_input_focus()
+            .map_err(|error| error.to_string())?
+            .reply()
+            .map_err(|error| format!("the X display did not answer: {error}"))?;
+        match self.drain(&sent)? {
+            Some(refused) => Err(refused),
+            None => Ok(()),
+        }
     }
 
     /// One XTEST event, checked: a round trip says whether the server took it,
@@ -320,18 +373,18 @@ impl Input {
         Ok(())
     }
 
-    /// One character's key, with its level keys around it, in one write.
-    fn tap(&self, stroke: Stroke) -> Result<(), String> {
-        let levels = [stroke.shift, stroke.level3];
-        for code in levels.iter().flatten() {
-            self.fake(KEY_PRESS_EVENT, *code, 0, 0)?;
-        }
-        self.fake(KEY_PRESS_EVENT, stroke.keycode, 0, 0)?;
-        self.fake(KEY_RELEASE_EVENT, stroke.keycode, 0, 0)?;
-        for code in levels.iter().rev().flatten() {
-            self.fake(KEY_RELEASE_EVENT, *code, 0, 0)?;
-        }
-        self.flush()
+    /// One character's key, with its level keys around it, in one batch.
+    fn tap(&mut self, stroke: Stroke) -> Result<(), String> {
+        let levels: Vec<u8> = [stroke.shift, stroke.level3]
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut events: Vec<(u8, u8)> =
+            levels.iter().map(|code| (KEY_PRESS_EVENT, *code)).collect();
+        events.push((KEY_PRESS_EVENT, stroke.keycode));
+        events.push((KEY_RELEASE_EVENT, stroke.keycode));
+        events.extend(levels.iter().rev().map(|code| (KEY_RELEASE_EVENT, *code)));
+        self.batch(&events)
     }
 
     fn stroke(&mut self, key: Key) -> Result<Stroke, String> {
@@ -443,11 +496,9 @@ impl Platform for Desktop {
                 .press(Held::Button(number))
                 .map_err(|e| format!("press: {e}")),
             Direction::Release => input.release(Held::Button(number)),
-            Direction::Click => {
-                input.fake(BUTTON_PRESS_EVENT, number, 0, 0)?;
-                input.fake(BUTTON_RELEASE_EVENT, number, 0, 0)?;
-                input.flush().map_err(|e| format!("click: {e}"))
-            }
+            Direction::Click => input
+                .batch(&[(BUTTON_PRESS_EVENT, number), (BUTTON_RELEASE_EVENT, number)])
+                .map_err(|e| format!("click: {e}")),
         }
     }
 
@@ -500,10 +551,11 @@ impl Platform for Desktop {
         let input = self.input()?;
         let number = wheel(length, axis);
         for _ in 0..notches {
-            input.fake(BUTTON_PRESS_EVENT, number, 0, 0)?;
-            input.fake(BUTTON_RELEASE_EVENT, number, 0, 0)?;
+            input
+                .batch(&[(BUTTON_PRESS_EVENT, number), (BUTTON_RELEASE_EVENT, number)])
+                .map_err(|e| format!("scroll: {e}"))?;
         }
-        input.flush().map_err(|e| format!("scroll: {e}"))
+        Ok(())
     }
 
     /// Every character is resolved before the first is typed, so text the layout
@@ -591,6 +643,34 @@ mod tests {
         assert!(released.contains("refused"), "{released}");
         assert!(tapped.is_err(), "{tapped:?}");
         assert!(clicked.is_err(), "{clicked:?}");
+    }
+
+    // A tap, a click and a wheel notch hold nothing past themselves, so they keep
+    // no journal: each must reach the server whole before compux waits on it. A
+    // helper killed while it waits then has sent all of one or none of it, and
+    // never leaves a key, Shift or a button down that no journal names.
+    #[test]
+    fn a_tap_a_click_and_a_notch_each_go_whole_before_any_reply_is_awaited() {
+        let (server, connection) = FakeX::accepting();
+        let mut desktop = Desktop {
+            env: Env::default(),
+            input: Some(over(connection, None)),
+            clipboard: None,
+        };
+        let stroke = Stroke {
+            keycode: 38,
+            shift: Some(50),
+            level3: Some(92),
+        };
+
+        let input = desktop.input.as_mut().expect("the input connection");
+        input.tap(stroke).expect("tapped");
+        desktop
+            .button(Button::Left, Direction::Click)
+            .expect("clicked");
+        desktop.scroll(2, Axis::Vertical).expect("scrolled");
+
+        assert_eq!(server.syncs(), vec![6, 2, 2, 2]);
     }
 
     // The wire holds a scroll to its cap; the loop here holds itself to it too,
