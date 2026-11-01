@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use zbus::connection::Builder;
-use zbus::message::{Header, Type};
+use zbus::message::{Body, Header, Type};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, Message, MessageStream};
 
@@ -234,6 +234,7 @@ fn option_text(options: &HashMap<String, OwnedValue>, key: &str) -> String {
     }
 }
 
+/// One call: what it asked is recorded, then it is answered as scripted.
 async fn answer(
     server: &Connection,
     header: &Header<'_>,
@@ -241,7 +242,7 @@ async fn answer(
     state: &Mutex<State>,
 ) -> zbus::Result<()> {
     let member = text(header.member().map(|name| name.to_string()));
-    let mut call = Call {
+    let call = Call {
         interface: text(header.interface().map(|name| name.to_string())),
         member: member.clone(),
         path: text(header.path().map(|path| path.to_string())),
@@ -249,169 +250,180 @@ async fn answer(
     };
     let body = message.body();
     match member.as_str() {
-        "NameHasOwner" => {
-            let (name,): (String,) = body.deserialize()?;
-            let owned = lock(state).script.owned.iter().any(|owner| *owner == name);
+        "NameHasOwner" | "Introspect" | "Lookup" => {
             record(state, call);
+            answer_bus(server, header, &body, state).await
+        }
+        "Register" => register(server, header, &body, state, call).await,
+        "Screenshot" => screenshot(server, header, &body, state, call).await,
+        "CreateSession" | "SelectDevices" | "SelectSources" => {
+            set_up(server, header, &body, state, call).await
+        }
+        "Start" => start(server, header, &body, state, call).await,
+        _ => input(server, header, &body, state, call).await,
+    }
+}
+
+/// The session bus's and the PermissionStore's answers: who owns a name, what
+/// the portal introspects as, and the stored Screenshot table.
+async fn answer_bus(
+    server: &Connection,
+    header: &Header<'_>,
+    body: &Body,
+    state: &Mutex<State>,
+) -> zbus::Result<()> {
+    let script = lock(state).script.clone();
+    match header.member().map(|name| name.as_str()) {
+        Some("NameHasOwner") => {
+            let (name,): (String,) = body.deserialize()?;
+            let owned = script.owned.iter().any(|owner| *owner == name);
             server.reply(header, &owned).await
         }
-        "Introspect" => {
-            let interfaces = lock(state).script.interfaces.clone();
-            let xml: String = interfaces
+        Some("Introspect") => {
+            let xml: String = script
+                .interfaces
                 .iter()
                 .map(|name| format!("<interface name=\"{name}\"></interface>"))
                 .collect();
-            record(state, call);
             server.reply(header, &format!("<node>{xml}</node>")).await
         }
-        "Lookup" => {
-            let stored = lock(state).script.stored.clone();
-            record(state, call);
-            match stored {
-                None => {
-                    server
-                        .reply_error(
-                            header,
-                            "org.freedesktop.portal.Error.NotFound",
-                            &("no table",),
-                        )
-                        .await
-                }
-                Some(entries) => {
-                    let table: HashMap<String, Vec<String>> = entries
-                        .into_iter()
-                        .map(|(app, answer)| (app.to_string(), vec![answer.to_string()]))
-                        .collect();
-                    server.reply(header, &(table, Value::from(0u8))).await
-                }
-            }
-        }
-        "Register" => {
-            let (app_id, _options): (String, HashMap<String, OwnedValue>) = body.deserialize()?;
-            call.detail = app_id;
-            let registry = lock(state).script.registry;
-            record(state, call);
-            if registry {
-                server.reply(header, &()).await
-            } else {
-                server
-                    .reply_error(
-                        header,
-                        "org.freedesktop.DBus.Error.UnknownInterface",
-                        &("no such interface",),
-                    )
-                    .await
-            }
-        }
-        "Screenshot" => {
-            let (_parent, options): (String, HashMap<String, OwnedValue>) = body.deserialize()?;
-            call.detail = format!("interactive={:?}", options.get("interactive").map(|v| &**v));
-            record(state, call);
-            let (answer, uri) = {
-                let state = lock(state);
-                (state.script.screenshot, state.script.screenshot_uri.clone())
-            };
-            let mut results: HashMap<&str, Value<'_>> = HashMap::new();
-            results.insert("uri", Value::from(uri));
-            request(
-                server,
-                header,
-                &option_text(&options, "handle_token"),
-                answer,
-                results,
-            )
-            .await
-        }
-        "CreateSession" => {
-            let (options,): (HashMap<String, OwnedValue>,) = body.deserialize()?;
-            let session = format!(
-                "/org/freedesktop/portal/desktop/session/fake/{}",
-                option_text(&options, "session_handle_token")
-            );
-            lock(state).sessions.push(session.clone());
-            record(state, call);
-            let mut results: HashMap<&str, Value<'_>> = HashMap::new();
-            results.insert("session_handle", Value::from(session));
-            let token = option_text(&options, "handle_token");
-            request(server, header, &token, Answer::Respond(0), results).await
-        }
-        "SelectDevices" | "SelectSources" => {
-            let (_session, options): (OwnedObjectPath, HashMap<String, OwnedValue>) =
-                body.deserialize()?;
-            call.detail = selected(&options);
-            record(state, call);
-            let token = option_text(&options, "handle_token");
-            request(server, header, &token, Answer::Respond(0), HashMap::new()).await
-        }
-        "Start" => {
-            let (_session, _parent, options): (
-                OwnedObjectPath,
-                String,
-                HashMap<String, OwnedValue>,
-            ) = body.deserialize()?;
-            record(state, call);
-            let (answer, stream, token) = {
-                let mut state = lock(state);
-                state.tokens += 1;
-                let token = format!("{}-{}", state.script.token_prefix, state.tokens);
-                (state.script.start, state.script.stream, token)
-            };
-            let (node, position, size) = stream;
-            let mut properties: HashMap<&str, Value<'_>> = HashMap::new();
-            properties.insert("position", Value::from(position));
-            properties.insert("size", Value::from(size));
-            let mut results: HashMap<&str, Value<'_>> = HashMap::new();
-            results.insert("devices", Value::from(3u32));
-            results.insert("streams", Value::from(vec![(node, properties)]));
-            results.insert("restore_token", Value::from(token));
-            request(
-                server,
-                header,
-                &option_text(&options, "handle_token"),
-                answer,
-                results,
-            )
-            .await
-        }
-        "NotifyKeyboardKeysym" => {
-            let (_s, _o, keysym, pressed): (
-                OwnedObjectPath,
-                HashMap<String, OwnedValue>,
-                i32,
-                u32,
-            ) = body.deserialize()?;
-            call.detail = format!("{keysym:#x} {pressed}");
-            record(state, call);
-            server.reply(header, &()).await
-        }
-        "NotifyPointerMotionAbsolute" => {
-            let (_s, _o, node, x, y): (
-                OwnedObjectPath,
-                HashMap<String, OwnedValue>,
-                u32,
-                f64,
-                f64,
-            ) = body.deserialize()?;
-            call.detail = format!("{node} {x} {y}");
-            record(state, call);
-            server.reply(header, &()).await
-        }
-        "NotifyPointerButton" => {
-            let (_s, _o, button, pressed): (
-                OwnedObjectPath,
-                HashMap<String, OwnedValue>,
-                i32,
-                u32,
-            ) = body.deserialize()?;
-            call.detail = format!("{button:#x} {pressed}");
-            record(state, call);
-            server.reply(header, &()).await
-        }
         _ => {
-            record(state, call);
-            server.reply(header, &()).await
+            let Some(entries) = script.stored else {
+                let not_found = "org.freedesktop.portal.Error.NotFound";
+                return server.reply_error(header, not_found, &("no table",)).await;
+            };
+            let table: HashMap<String, Vec<String>> = entries
+                .into_iter()
+                .map(|(app, answer)| (app.to_string(), vec![answer.to_string()]))
+                .collect();
+            server.reply(header, &(table, Value::from(0u8))).await
         }
     }
+}
+
+async fn register(
+    server: &Connection,
+    header: &Header<'_>,
+    body: &Body,
+    state: &Mutex<State>,
+    mut call: Call,
+) -> zbus::Result<()> {
+    let (app_id, _options): (String, HashMap<String, OwnedValue>) = body.deserialize()?;
+    call.detail = app_id;
+    let registry = lock(state).script.registry;
+    record(state, call);
+    if registry {
+        return server.reply(header, &()).await;
+    }
+    let unknown = "org.freedesktop.DBus.Error.UnknownInterface";
+    server
+        .reply_error(header, unknown, &("no such interface",))
+        .await
+}
+
+async fn screenshot(
+    server: &Connection,
+    header: &Header<'_>,
+    body: &Body,
+    state: &Mutex<State>,
+    mut call: Call,
+) -> zbus::Result<()> {
+    let (_parent, options): (String, HashMap<String, OwnedValue>) = body.deserialize()?;
+    call.detail = format!("interactive={:?}", options.get("interactive").map(|v| &**v));
+    record(state, call);
+    let (answer, uri) = {
+        let state = lock(state);
+        (state.script.screenshot, state.script.screenshot_uri.clone())
+    };
+    let mut results: HashMap<&str, Value<'_>> = HashMap::new();
+    results.insert("uri", Value::from(uri));
+    let token = option_text(&options, "handle_token");
+    request(server, header, &token, answer, results).await
+}
+
+/// CreateSession and the two selections: always granted, the session's handle
+/// named after its token.
+async fn set_up(
+    server: &Connection,
+    header: &Header<'_>,
+    body: &Body,
+    state: &Mutex<State>,
+    mut call: Call,
+) -> zbus::Result<()> {
+    let mut results: HashMap<&str, Value<'_>> = HashMap::new();
+    let options: HashMap<String, OwnedValue> = if call.member == "CreateSession" {
+        let (options,): (HashMap<String, OwnedValue>,) = body.deserialize()?;
+        let session = format!(
+            "/org/freedesktop/portal/desktop/session/fake/{}",
+            option_text(&options, "session_handle_token")
+        );
+        lock(state).sessions.push(session.clone());
+        results.insert("session_handle", Value::from(session));
+        options
+    } else {
+        let (_session, options): (OwnedObjectPath, HashMap<String, OwnedValue>) =
+            body.deserialize()?;
+        call.detail = selected(&options);
+        options
+    };
+    record(state, call);
+    let token = option_text(&options, "handle_token");
+    request(server, header, &token, Answer::Respond(0), results).await
+}
+
+/// Start: the scripted answer, one monitor stream, and the next restore token.
+async fn start(
+    server: &Connection,
+    header: &Header<'_>,
+    body: &Body,
+    state: &Mutex<State>,
+    call: Call,
+) -> zbus::Result<()> {
+    let (_session, _parent, options): (OwnedObjectPath, String, HashMap<String, OwnedValue>) =
+        body.deserialize()?;
+    record(state, call);
+    let (answer, (node, position, size), token) = {
+        let mut state = lock(state);
+        state.tokens += 1;
+        let token = format!("{}-{}", state.script.token_prefix, state.tokens);
+        (state.script.start, state.script.stream, token)
+    };
+    let mut properties: HashMap<&str, Value<'_>> = HashMap::new();
+    properties.insert("position", Value::from(position));
+    properties.insert("size", Value::from(size));
+    let mut results: HashMap<&str, Value<'_>> = HashMap::new();
+    results.insert("devices", Value::from(3u32));
+    results.insert("streams", Value::from(vec![(node, properties)]));
+    results.insert("restore_token", Value::from(token));
+    let token = option_text(&options, "handle_token");
+    request(server, header, &token, answer, results).await
+}
+
+/// The input calls, each with what it sent as its detail, and any other call
+/// (the closes) as it is.
+async fn input(
+    server: &Connection,
+    header: &Header<'_>,
+    body: &Body,
+    state: &Mutex<State>,
+    mut call: Call,
+) -> zbus::Result<()> {
+    type Options = HashMap<String, OwnedValue>;
+    call.detail = match call.member.as_str() {
+        "NotifyKeyboardKeysym" | "NotifyPointerButton" => {
+            let (_s, _o, code, pressed): (OwnedObjectPath, Options, i32, u32) =
+                body.deserialize()?;
+            format!("{code:#x} {pressed}")
+        }
+        "NotifyPointerMotionAbsolute" => {
+            let (_s, _o, node, x, y): (OwnedObjectPath, Options, u32, f64, f64) =
+                body.deserialize()?;
+            format!("{node} {x} {y}")
+        }
+        _ => String::new(),
+    };
+    record(state, call);
+    server.reply(header, &()).await
 }
 
 /// What a selection asked for: its types, how long to keep the grant, and the

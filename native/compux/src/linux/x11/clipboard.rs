@@ -303,56 +303,9 @@ fn answer_request(
     };
     let owned = lock(shared).owned.clone();
     let owned = owned.filter(|_| request.selection == names.clipboard);
-    let atoms = names.atoms;
-    let answered = match selection::answer(request.target, owned.as_ref(), &atoms, names.chunk) {
-        Answer::Refuse => NONE,
-        Answer::Targets(targets) => {
-            connection
-                .change_property32(
-                    PropMode::REPLACE,
-                    request.requestor,
-                    property,
-                    atoms.atom,
-                    &targets,
-                )
-                .map_err(|e| e.to_string())?;
-            property
-        }
-        Answer::Text(text) => {
-            connection
-                .change_property8(
-                    PropMode::REPLACE,
-                    request.requestor,
-                    property,
-                    atoms.utf8_string,
-                    &text,
-                )
-                .map_err(|e| e.to_string())?;
-            property
-        }
-        Answer::Incr(text) => {
-            let total = u32::try_from(text.len()).unwrap_or(u32::MAX);
-            connection
-                .change_window_attributes(
-                    request.requestor,
-                    &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
-                )
-                .map_err(|e| e.to_string())?;
-            connection
-                .change_property32(
-                    PropMode::REPLACE,
-                    request.requestor,
-                    property,
-                    atoms.incr,
-                    &[total],
-                )
-                .map_err(|e| e.to_string())?;
-            lock(shared)
-                .transfers
-                .start(request.requestor, property, text);
-            property
-        }
-    };
+    let answer = selection::answer(request.target, owned.as_ref(), &names.atoms, names.chunk);
+    let place = (request.requestor, property);
+    let answered = write_answer(connection, names.atoms, shared, place, answer)?;
     let notify = SelectionNotifyEvent {
         response_type: SELECTION_NOTIFY_EVENT,
         sequence: 0,
@@ -366,6 +319,59 @@ fn answer_request(
         .send_event(false, request.requestor, EventMask::NO_EVENT, notify)
         .map_err(|e| e.to_string())?;
     connection.flush().map_err(|e| e.to_string())
+}
+
+/// Write an answer into the requestor's property: the property it is in, or
+/// `NONE` for a refusal.
+fn write_answer(
+    connection: &RustConnection,
+    atoms: Atoms,
+    shared: &Mutex<Shared>,
+    (requestor, property): (u32, u32),
+    answer: Answer,
+) -> Result<u32, String> {
+    match answer {
+        Answer::Refuse => return Ok(NONE),
+        Answer::Targets(targets) => connection
+            .change_property32(PropMode::REPLACE, requestor, property, atoms.atom, &targets)
+            .map(drop)
+            .map_err(|e| e.to_string())?,
+        Answer::Text(text) => connection
+            .change_property8(
+                PropMode::REPLACE,
+                requestor,
+                property,
+                atoms.utf8_string,
+                &text,
+            )
+            .map(drop)
+            .map_err(|e| e.to_string())?,
+        Answer::Incr(text) => start_incr(connection, atoms, shared, (requestor, property), text)?,
+    }
+    Ok(property)
+}
+
+/// Announce an INCR transfer of `text`, and watch the requestor's property for
+/// each chunk it takes.
+fn start_incr(
+    connection: &RustConnection,
+    atoms: Atoms,
+    shared: &Mutex<Shared>,
+    (requestor, property): (u32, u32),
+    text: Arc<[u8]>,
+) -> Result<(), String> {
+    let total = u32::try_from(text.len()).unwrap_or(u32::MAX);
+    connection
+        .change_window_attributes(
+            requestor,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        )
+        .map_err(|e| e.to_string())?;
+    connection
+        .change_property32(PropMode::REPLACE, requestor, property, atoms.incr, &[total])
+        .map_err(|e| e.to_string())?;
+    lock(shared).transfers.start(requestor, property, text);
+    Ok(())
 }
 
 /// A requestor took the last chunk of an INCR transfer: write the next one.

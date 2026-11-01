@@ -573,11 +573,10 @@ fn run_worker(
         // is read here, which is the first moment anything may act on it.
         if gate.take_release() {
             worker.observations.clear();
-            // And of the window it was working in. Dropping the target is what
-            // stops its stream and its badge, so letting go of the seat lets go of
-            // the screen the person can see it on.
+            // And of the window it was working in, and of the portal's session:
+            // dropping them stops their streams and their badges, so letting go of
+            // the seat lets go of the screen the person can see it on.
             worker.target = None;
-            // And of the portal's remote-desktop session, which the shell shows.
             worker.pixels.release();
         }
 
