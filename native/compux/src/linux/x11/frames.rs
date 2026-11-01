@@ -54,10 +54,11 @@ use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
 use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, EventMask, ImageFormat, ImageOrder,
-    MapState, Window as XWindow, WindowClass, CLEAR_AREA_REQUEST,
+    MapState, Window as XWindow, WindowClass,
 };
 use x11rb::protocol::{ErrorKind, Event};
 use x11rb::rust_connection::RustConnection;
+use x11rb::x11_utils::X11Error;
 
 use super::strips::{self, Format};
 use super::windows::{extents, placed, Rect};
@@ -195,6 +196,31 @@ pub fn reproved(proved: Proved, retries: u32) -> Reproved {
         Proved::Short(_) => Reproved::Retry {
             retries: retries + 1,
         },
+    }
+}
+
+/// What an X error says of the clears the last proof sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnClear {
+    /// It answers another request.
+    NotAClear,
+    /// The window was gone before it was cleared: it needs no repaint, and the
+    /// proof still waits for drawing over every pixel.
+    Gone,
+    /// The server would not clear a window of the picture: the proof ends.
+    Refused,
+}
+
+/// Whether the error the server sent for request `sequence` answers one of
+/// `clears` (the sequence numbers of the clears the last proof sent), and what
+/// it says of it.
+pub fn on_clear(clears: &[u64], sequence: u64, kind: ErrorKind) -> OnClear {
+    if !clears.contains(&sequence) {
+        return OnClear::NotAClear;
+    }
+    match kind {
+        ErrorKind::Window | ErrorKind::Drawable => OnClear::Gone,
+        _refused => OnClear::Refused,
     }
 }
 
@@ -533,6 +559,9 @@ struct Watch {
     hidden: bool,
     /// Proofs in a row that fell short since one last held.
     retries: u32,
+    /// The sequence numbers of the clears the last proof sent, whose errors come
+    /// back as events.
+    clears: Vec<u64>,
 }
 
 impl Watch {
@@ -578,6 +607,7 @@ impl Watch {
             renewed: false,
             hidden: false,
             retries: 0,
+            clears: Vec::new(),
         };
         if !watch.viewable()? {
             return Err(FrameError::Minimized(
@@ -655,13 +685,15 @@ impl Watch {
     /// Every window the picture is drawn from is cleared to its background and
     /// sent an Expose for all of it: the server paints what has a background, and
     /// the application or the window manager draws the rest, as after any
-    /// exposure. The clears are not waited on one by one, which would be a wait
-    /// on the server with no bound: a refusal comes back as an event, before the
-    /// drawing that follows, and the proof's own bounded wait reads it
-    /// ([`Watch::took`]). A window gone meanwhile needs nothing.
-    fn expose(&self) -> Result<(), FrameError> {
-        let connection = &self.connection;
+    /// exposure. The clears are not checked one by one: x11rb can then wait for
+    /// a reply nothing will send (a clear checked after an event that carries
+    /// its own sequence number sends no sync). A refusal comes back as an event
+    /// instead, matched to its clear by sequence number ([`Watch::took`]), before
+    /// the drawing that follows. A window gone meanwhile needs nothing.
+    fn expose(&mut self) -> Result<(), FrameError> {
         let windows = self.drawn_from()?;
+        let connection = &self.connection;
+        self.clears.clear();
         let mut asked = Vec::with_capacity(windows.len());
         for window in windows {
             asked.push((
@@ -678,11 +710,10 @@ impl Watch {
                 continue;
             }
             // Dropped unchecked: its error, if any, is delivered as an event.
-            drop(
-                connection
-                    .clear_area(true, window, 0, 0, 0, 0)
-                    .map_err(lost)?,
-            );
+            let cleared = connection
+                .clear_area(true, window, 0, 0, 0, 0)
+                .map_err(lost)?;
+            self.clears.push(cleared.sequence_number());
         }
         connection.flush().map_err(lost)
     }
@@ -786,10 +817,14 @@ impl Watch {
     /// The next damage report waiting, after any other events before it.
     fn next_damage(&mut self) -> Result<Option<Rect>, FrameError> {
         for _ in 0..MAX_EVENTS {
-            let Some(event) = self.connection.poll_for_event().map_err(lost)? else {
+            let Some((event, sequence)) = self
+                .connection
+                .poll_for_event_with_sequence()
+                .map_err(lost)?
+            else {
                 return Ok(None);
             };
-            if let Some(drawn) = self.took(event)? {
+            if let Some(drawn) = self.took(event, sequence)? {
                 return Ok(Some(drawn));
             }
         }
@@ -808,10 +843,10 @@ impl Watch {
         Ok(())
     }
 
-    /// One event: a damage report on this window is returned, in the window's
-    /// pixels, a change to the window is noted, and a window gone ends the
-    /// stream.
-    fn took(&mut self, event: Event) -> Result<Option<Rect>, FrameError> {
+    /// One event, the server's `sequence` number on it: a damage report on this
+    /// window is returned, in the window's pixels, a change to the window is
+    /// noted, and a window gone ends the stream.
+    fn took(&mut self, event: Event, sequence: u64) -> Result<Option<Rect>, FrameError> {
         let ours = |window: XWindow| window == self.top || window == self.client;
         match event {
             Event::DamageNotify(report) if report.damage == self.damage => {
@@ -835,23 +870,33 @@ impl Watch {
             // Mapped again, a window is given a new pixmap.
             Event::MapNotify(shown) if ours(shown.window) => self.renewed = true,
             Event::UnmapNotify(hidden) if ours(hidden.window) => self.renewed = true,
-            // A window the proof asked to repaint, gone before it was cleared,
-            // needs nothing; any other refusal to clear one ends the proof.
-            Event::Error(error) if error.major_opcode == CLEAR_AREA_REQUEST => {
-                return match error.error_kind {
-                    ErrorKind::Window | ErrorKind::Drawable => Ok(None),
-                    _refused => Err(unproven(format!(
-                        "the X server would not ask a window of it to repaint ({})",
-                        super::refused(&error)
-                    ))),
-                };
-            }
-            Event::Error(error) => {
-                eprintln!("compux: the window capture: {}", super::refused(&error))
-            }
+            Event::Error(error) => return self.refused(&error, sequence),
             _other => {}
         }
         Ok(None)
+    }
+
+    /// An error the server sent: one of the last proof's clears refused ends the
+    /// proof, unless its window was gone before it was cleared, which needs no
+    /// repaint. Each is logged.
+    fn refused(&self, error: &X11Error, sequence: u64) -> Result<Option<Rect>, FrameError> {
+        let refused = super::refused(error);
+        match on_clear(&self.clears, sequence, error.error_kind) {
+            OnClear::Refused => Err(unproven(format!(
+                "the X server would not ask a window of it to repaint ({refused})"
+            ))),
+            OnClear::Gone => {
+                eprintln!(
+                    "compux: the window capture: a window of the bound one was gone before it \
+                     could be asked to repaint ({refused})"
+                );
+                Ok(None)
+            }
+            OnClear::NotAClear => {
+                eprintln!("compux: the window capture: {refused}");
+                Ok(None)
+            }
+        }
     }
 
     /// One frame interval after another, catching up whenever a request asks,
@@ -1476,6 +1521,32 @@ mod tests {
         let closed = FrameError::Gone("the window was closed after it was bound".to_string());
         let refused = served(Caught::Reproving, Err(closed)).expect_err("gone");
         assert_eq!(refused.code(), "target_unavailable");
+    }
+
+    // A clear is sent unchecked, and its error, if any, comes back as an event: it
+    // is matched to the clear by the request's own sequence number.
+    #[test]
+    fn an_error_is_a_clears_only_by_its_sequence_number() {
+        let clears = [70_001, 70_002, 70_004];
+        assert_eq!(on_clear(&clears, 70_002, ErrorKind::Window), OnClear::Gone);
+        assert_eq!(
+            on_clear(&clears, 70_004, ErrorKind::Drawable),
+            OnClear::Gone
+        );
+        assert_eq!(
+            on_clear(&clears, 70_001, ErrorKind::Match),
+            OnClear::Refused
+        );
+        assert_eq!(
+            on_clear(&clears, 70_003, ErrorKind::Window),
+            OnClear::NotAClear
+        );
+        // The same low 16 bits, 65536 requests later, is another request.
+        assert_eq!(
+            on_clear(&clears, 70_002 + 65_536, ErrorKind::Value),
+            OnClear::NotAClear
+        );
+        assert_eq!(on_clear(&[], 70_002, ErrorKind::Window), OnClear::NotAClear);
     }
 
     #[test]
