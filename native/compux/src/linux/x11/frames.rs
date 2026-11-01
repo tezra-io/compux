@@ -17,13 +17,15 @@
 //! frame and GTK's shadow included, within [`REPAINT_WAIT_MS`], or the binding is
 //! refused. Nothing in the proof depends on which windows were over it, so a
 //! window moving meanwhile changes nothing. A window resized, hidden or shown
-//! during the proof voids it. A window mapped again or resized gets a new pixmap,
-//! and is proved again the same way before anything more is published, and any
-//! part of a picture the proof did not reach is sent black.
+//! during the proof voids it. A window mapped again, resized or given a new
+//! border width gets a new pixmap, and is proved again the same way before
+//! anything more is published, and any part of a picture the proof did not reach
+//! is sent black.
 //!
 //! **What a frame carries.** The window manager's frame and GTK's shadow are
 //! accounted for exactly as the window list accounts for them, so a picture is
-//! the window's listed bounds, pixel for pixel. Every [`FRAME_INTERVAL_MS`] the
+//! the window's listed bounds, pixel for pixel. The pixmap holds the window's X
+//! border too; the picture is read from inside it. Every [`FRAME_INTERVAL_MS`] the
 //! server is synced: a window it reported damage on is read again, and one it
 //! did not is an idle sample, stamped when the sync was sent, which is the
 //! window server saying nothing changed up to then.
@@ -220,6 +222,18 @@ pub fn inside(crop: Rect, width: u16, height: u16) -> bool {
     crop.x >= 0 && crop.y >= 0 && right <= i64::from(width) && bottom <= i64::from(height)
 }
 
+/// Where `crop`, in the window's own pixels, lies in the window's Composite
+/// pixmap. The pixmap holds the window's X border as well, so the window's own
+/// first pixel is `border` pixels in from the pixmap's corner. `None` past
+/// any coordinate a pixmap can have.
+pub fn in_pixmap(crop: Rect, border: u16) -> Option<Rect> {
+    Some(Rect {
+        x: crop.x.checked_add(i32::from(border))?,
+        y: crop.y.checked_add(i32::from(border))?,
+        ..crop
+    })
+}
+
 /// RGBA rows as the BGRA a window frame carries, in place.
 pub fn bgra(mut rgba: Vec<u8>) -> Vec<u8> {
     let (pixels, _) = rgba.as_chunks_mut::<BYTES_PER_PIXEL>();
@@ -414,10 +428,13 @@ struct Watch {
     format: Format,
     frame_atom: u32,
     shadow_atom: u32,
-    size: (u16, u16),
+    /// The redirected window's width, height and X border: the pixmap holds all
+    /// three, so a change to any gives the window a new one.
+    size: (u16, u16, u16),
     damaged: bool,
-    /// Resized, mapped or unmapped since the last proof began: the window has,
-    /// or will have, a new pixmap that proof says nothing of.
+    /// Resized, given a new border width, mapped or unmapped since the last proof
+    /// began: the window has, or will have, a new pixmap that proof says nothing
+    /// of.
     renewed: bool,
     hidden: bool,
 }
@@ -448,7 +465,7 @@ impl Watch {
             format,
             frame_atom,
             shadow_atom,
-            size: (geometry.width, geometry.height),
+            size: (geometry.width, geometry.height, geometry.border_width),
             damaged: true,
             renewed: false,
             hidden: false,
@@ -697,8 +714,9 @@ impl Watch {
             Event::DestroyNotify(gone) if gone.window == self.top => return Err(reframed()),
             Event::ReparentNotify(moved) if moved.window == self.client => return Err(reframed()),
             Event::ConfigureNotify(change) if change.window == self.top => {
-                self.renewed |= (change.width, change.height) != self.size;
-                self.size = (change.width, change.height);
+                let size = (change.width, change.height, change.border_width);
+                self.renewed |= size != self.size;
+                self.size = size;
             }
             // Mapped again, a window is given a new pixmap.
             Event::MapNotify(shown) if ours(shown.window) => self.renewed = true,
@@ -792,8 +810,8 @@ impl Watch {
             .damage_subtract(self.damage, 0u32, 0u32)
             .map_err(lost)?;
         self.damaged = false;
-        let crop = self.crop()?;
-        let mut pixels = self.grab(crop)?;
+        let (crop, border) = self.places()?;
+        let mut pixels = self.grab(in_pixmap(crop, border).ok_or_else(|| too_wide(crop))?)?;
         // The frame extents can move the picture within the window without a new
         // pixmap; whatever of it the proof did not reach is not sent.
         black_out(&mut pixels, crop, self.proven);
@@ -819,9 +837,9 @@ impl Watch {
     }
 
     /// Where the listed window (the client's place, less GTK's shadow, with the
-    /// window manager's frame) and the client are inside the redirected one, in
-    /// its pixels.
-    fn places(&self) -> Result<(Rect, Rect), FrameError> {
+    /// window manager's frame) is inside the redirected one, in its pixels, and
+    /// the redirected window's X border, from the same reading.
+    fn places(&self) -> Result<(Rect, u16), FrameError> {
         let connection = &self.connection;
         let outer = connection.get_geometry(self.top).map_err(lost)?;
         let client = connection.get_geometry(self.client).map_err(lost)?;
@@ -846,7 +864,7 @@ impl Watch {
             height: u32::from(client.height),
         };
         let crop = placed(inner, frame.reply_extents()?, shadow.reply_extents()?)
-            .map(|(seen, _)| (seen, inner))
+            .map(|(seen, _)| (seen, outer.border_width))
             .filter(|(seen, _)| inside(*seen, outer.width, outer.height));
         crop.ok_or_else(|| {
             FrameError::Unavailable(format!(
@@ -864,7 +882,8 @@ impl Watch {
             .map_err(lost)
     }
 
-    /// The pixmap's pixels under `crop`, in strips, as BGRA.
+    /// The pixmap's pixels under `crop`, in the pixmap's own pixels, in strips,
+    /// as BGRA.
     fn grab(&self, crop: Rect) -> Result<Vec<u8>, FrameError> {
         let width = u16::try_from(crop.width).map_err(|_| too_wide(crop))?;
         let height = u16::try_from(crop.height).map_err(|_| too_wide(crop))?;
@@ -1192,6 +1211,16 @@ mod tests {
         assert!(!inside(rect(0, 0, 983, 795), 982, 795));
         assert!(!inside(rect(-1, 0, 10, 10), 982, 795));
         assert!(!inside(rect(0, 790, 10, 10), 982, 795));
+    }
+
+    // Damage and the frame extents count from the window's own corner, inside its
+    // X border; its pixmap counts from the border's outer corner.
+    #[test]
+    fn a_picture_is_read_from_inside_the_windows_border() {
+        let crop = rect(6, 30, 800, 600);
+        assert_eq!(in_pixmap(crop, 0), Some(crop));
+        assert_eq!(in_pixmap(crop, 8), Some(rect(14, 38, 800, 600)));
+        assert_eq!(in_pixmap(rect(i32::MAX, 0, 1, 1), 1), None);
     }
 
     fn frame() -> WindowFrame {

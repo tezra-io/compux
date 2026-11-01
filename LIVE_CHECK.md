@@ -2978,3 +2978,8 @@ Each with the window still bound, in the session:
 * A program clicking the badge through `SendEvent` is dropped, and the containers
   prove it; a program clicking it through XTEST cannot be told from you, on X11,
   and nothing here tries.
+* *Optional:* a window manager that keeps a client's own X border on its
+  top-level windows (dwm, for one). Bind a window there with `--save`: the
+  picture must start at the window's first pixel, with no strip of the border's
+  colour along its top or left edge and none of the window cut off at its bottom
+  or right. The containers prove it on a display with no window manager.

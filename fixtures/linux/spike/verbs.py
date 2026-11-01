@@ -66,10 +66,10 @@ class Helper:
     a thread into a bounded queue, so a helper that writes nothing is waited for
     REPLY_TIMEOUT_S, never for ever."""
 
-    def __init__(self, binary, stderr_path):
+    def __init__(self, binary, stderr_path, env=None):
         self.stderr = open(stderr_path, "w")
         self.proc = subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=self.stderr, text=True, bufsize=1)
+                                     stderr=self.stderr, text=True, bufsize=1, env=env)
         self.lines = queue.Queue(maxsize=MAX_PENDING_LINES)
         threading.Thread(target=self._read, daemon=True).start()
         self.next_id = 0

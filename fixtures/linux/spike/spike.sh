@@ -37,8 +37,9 @@
 #    and title bar included, a covered window captured, a covered point refused,
 #    the badge's buttons reaching the gate as the person clicks them and not when
 #    another program sends the click, a click off them passing through, a reused
-#    window id refused, a window that never repaints refused, and twenty select
-#    and release cycles leaving no process behind. The badge (compux-indicator-x11) is built
+#    window id refused, a window that never repaints refused, twenty select and
+#    release cycles leaving no process behind, and, on a second X server with no
+#    window manager, a window with an X border read from inside it. The badge (compux-indicator-x11) is built
 #    beside the helper and installed beside it, as the release archive carries it.
 #
 # The helper is built with no C library but the C runtime (build.Dockerfile has no

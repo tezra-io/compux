@@ -35,6 +35,10 @@ under where the badge floats. Then:
   (xcb_victim.py) does not bring the binding back: `target_unavailable`;
 - a window that paints once and never repaints, bound with the cover over part of
   it, is refused `capture_unavailable`, and no frame of it is sent;
+- on a second X server with no window manager, a top-level window with an X
+  border of its own is read from inside the border: every pixel of its frames is
+  the window's colour, at the border it was bound with and after it is given
+  another;
 - twenty select and release cycles leave no badge process, no zombie and no badge
   window, and the helper's resident memory flat.
 
@@ -54,6 +58,7 @@ import sys
 import time
 
 import x11_oracle
+import xcb_victim
 from pixels import png_rows
 from verbs import CONTAINER_MARKERS, Helper, HelperFailed, events, fixture_listed, recorded
 from xcb_victim import Victim
@@ -63,6 +68,10 @@ FLOOR, FLOOR_COLOUR = "Compux Floor", 0x406080
 COVER, COVER_COLOUR = "Compux Cover", 0xFF00FF
 VICTIM, VICTIM_COLOUR = "Compux Victim", 0x30A030
 LAZY, LAZY_COLOUR, LAZY_AT = "Compux Lazy", 0x2050C0, (400, 450)
+BORDERED, BORDERED_COLOUR, BORDERED_AT = "Compux Bordered", 0x30A0A0, (200, 300)
+BORDER_COLOUR, BORDER_WIDTHS = 0xE0E020, (8, 3)
+# A second X server, with no window manager on it.
+BARE_DISPLAY = 77
 BADGE_CLASS = "^compux-indicator-x11$"
 # Where the windows go, in root pixels: the fixture with room above it for the
 # badge, the floor under that room, the cover over the fixture's right side from
@@ -102,8 +111,8 @@ class Session(Helper):
     """The helper on its pipe, keeping every `session_event` it writes between
     replies, so a badge press can be waited for."""
 
-    def __init__(self, binary, stderr_path):
-        super().__init__(binary, stderr_path)
+    def __init__(self, binary, stderr_path, env=None):
+        super().__init__(binary, stderr_path, env)
         self.session_events = []
 
     def _next_reply(self, action, deadline):
@@ -275,10 +284,11 @@ def covered_capture_check(helper, target, fixture, cover, out):
                    f"frame {frame['width']}x{frame['height']} {frame.get('target_id')}"}
 
 
-def cover_pixels(shot):
-    """How many of an image's pixels are the cover's colour, every pixel looked at."""
+def cover_pixels(shot, colour=COVER_COLOUR):
+    """How many of an image's pixels are `colour`, the cover's unless named, every
+    pixel looked at."""
     width, height, rows = png_rows(base64.b64decode(shot["data"]))
-    want = ((COVER_COLOUR >> 16) & 0xFF, (COVER_COLOUR >> 8) & 0xFF, COVER_COLOUR & 0xFF)
+    want = ((colour >> 16) & 0xFF, (colour >> 8) & 0xFF, colour & 0xFF)
     found = 0
     for y in range(height):
         row = rows[y]
@@ -721,6 +731,78 @@ def lazy_window_check(helper):
                    f"{stray} cover pixels in what it sent"}
 
 
+# --- a window with an X border ---------------------------------------------------------------
+
+
+def bare_display():
+    """A second private X server with no window manager on it: a top-level window
+    there keeps the X border its client gave it, which openbox takes off."""
+    socket = f"/tmp/.X11-unix/X{BARE_DISPLAY}"
+    server = subprocess.Popen(["Xvfb", f":{BARE_DISPLAY}", "-screen", "0", "1280x1024x24",
+                               "-nolisten", "tcp"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not wait_for(lambda: os.path.exists(socket)):
+        stop(server)
+        raise OSError(f"the bare X server never opened {socket}")
+    return server
+
+
+def stop(process):
+    process.terminate()
+    try:
+        process.wait(timeout=COMMAND_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def all_window(shot):
+    """Whether a frame is the bordered window's own picture: its size, and every
+    pixel its colour, none the border's."""
+    if not shot.get("data"):
+        return False, f"{shot.get('error')}: {shot.get('detail')}"
+    size = (shot["width"], shot["height"])
+    own, border = cover_pixels(shot, BORDERED_COLOUR), cover_pixels(shot, BORDER_COLOUR)
+    whole = size == xcb_victim.SIZE and own == size[0] * size[1] and border == 0
+    return whole, f"{size[0]}x{size[1]}, {own} pixels the window's, {border} the border's"
+
+
+def bordered_window_check(binary, out):
+    """A top-level window with an X border of its own, bound on a display with no
+    window manager: its frames hold the window's pixels and none of its border's,
+    at the border it was bound with, and after it is given another."""
+    flow = "a window with an X border is read from inside it"
+    server = bare_display()
+    helper = None
+    try:
+        display = f":{BARE_DISPLAY}"
+        victim = Victim(BORDERED, BORDERED_COLOUR, place=BORDERED_AT, display=display,
+                        border=(BORDER_WIDTHS[0], BORDER_COLOUR))
+        victim.create()
+        victim.listed_on_root()
+        helper = Session(binary, out + ".bare.stderr", env={**os.environ, "DISPLAY": display})
+        helper.handshake()
+        window = wait_listed(helper, BORDERED)
+        if window is None:
+            return {"flow": flow, "passed": False, "why": "the bordered window was never listed"}
+        _, bound = helper.ask("select_target", window_id=window["id"])
+        first, first_why = all_window(bound)
+        victim.set_border(BORDER_WIDTHS[1])
+        time.sleep(QUIET_S)
+        _, after = helper.ask("screenshot", target_id=bound.get("target_id"))
+        again, again_why = all_window(after)
+        helper.ask("release_target")
+        keep(os.path.dirname(out), "bordered-first.png", bound)
+        keep(os.path.dirname(out), "bordered-after.png", after)
+        return {"flow": flow, "passed": first and again,
+                "why": f"border {BORDER_WIDTHS[0]}: {first_why}; border {BORDER_WIDTHS[1]}: "
+                       f"{again_why}"}
+    finally:
+        if helper is not None:
+            helper.close()
+        stop(server)
+
+
 # --- twenty cycles ----------------------------------------------------------------------------
 
 
@@ -831,6 +913,7 @@ def run(args):
                 results.append(xid_reuse_check(helper))
                 results.append(lazy_window_check(helper))
                 results.append(cycles_check(helper, by_title(listed(helper), FIXTURE)))
+                results.append(bordered_window_check(args.binary, args.out))
     except (HelperFailed, subprocess.SubprocessError, OSError, KeyError, ValueError) as why:
         results.append({"flow": "the run", "passed": False, "why": f"{type(why).__name__}: {why}"})
     finally:

@@ -10,8 +10,10 @@ The window is an ordinary top-level the window manager frames, with `_NET_WM_PID
 set to this process, and it repaints itself in one colour on every expose from a
 thread of its own, as an application would. A LAZY one has no background and
 paints only on its first expose, as a hung application would: whatever is later
-copied into it stays until something else draws there. Runs only inside the
-private-session container; bound.py refuses to start anywhere else.
+copied into it stays until something else draws there. A BORDERED one, on a
+display with no window manager, keeps the X border its client gives it, in a
+colour of its own. Runs only inside the private-session container; bound.py
+refuses to start anywhere else.
 """
 
 import ctypes
@@ -23,13 +25,16 @@ import threading
 EXPOSE = 12
 INPUT_OUTPUT = 1
 CW_BACK_PIXEL = 1 << 1
+CW_BORDER_PIXEL = 1 << 3
 CW_EVENT_MASK = 1 << 11
+CONFIG_WINDOW_BORDER_WIDTH = 1 << 4
 EXPOSURE_MASK = 1 << 15
 GC_FOREGROUND = 1 << 2
 PROP_MODE_REPLACE = 0
 ATOM_STRING = 31
 ATOM_WM_NAME = 39
 ATOM_CARDINAL = 6
+ATOM_WINDOW = 33
 SIZE = (520, 320)
 PLACE = (640, 560)
 
@@ -70,6 +75,7 @@ def _library():
                                               u32, u32, ctypes.POINTER(u32)]),
         "xcb_destroy_window": (ctypes.c_uint, [void, u32]),
         "xcb_map_window": (ctypes.c_uint, [void, u32]),
+        "xcb_configure_window": (ctypes.c_uint, [void, u32, u16, void]),
         "xcb_change_property": (ctypes.c_uint, [void, u8, u32, u32, u32, u8, u32, void]),
         "xcb_intern_atom": (ctypes.c_uint, [void, u8, u16, ctypes.c_char_p]),
         "xcb_intern_atom_reply": (void, [void, ctypes.c_uint, void]),
@@ -94,12 +100,13 @@ class Victim:
     repaint thread is blocked on it, and it closes, with any window still standing,
     when this process exits."""
 
-    def __init__(self, title, colour, lazy=False, place=PLACE):
+    def __init__(self, title, colour, lazy=False, place=PLACE, display=None, border=(0, 0)):
         self.xcb = _library()
         self.title = title.encode()
         self.colour = colour
         self.lazy, self.place, self.painted = lazy, place, False
-        self.conn = self.xcb.xcb_connect(None, None)
+        self.border, self.border_colour = border
+        self.conn = self.xcb.xcb_connect(display.encode() if display else None, None)
         if not self.conn or self.xcb.xcb_connection_has_error(self.conn):
             raise RuntimeError("the private X server did not answer xcb")
         screen = _Screen.from_address(self.xcb.xcb_setup_roots_iterator(
@@ -110,7 +117,8 @@ class Victim:
         self.xcb.xcb_create_gc(self.conn, self.gc, self.root, GC_FOREGROUND,
                                (ctypes.c_uint32 * 1)(colour))
         self.atoms = {name: self._atom(name) for name in
-                      (b"_NET_WM_PID", b"_NET_WM_NAME", b"UTF8_STRING")}
+                      (b"_NET_WM_PID", b"_NET_WM_NAME", b"UTF8_STRING",
+                       b"_NET_CLIENT_LIST_STACKING", b"_NET_CLIENT_LIST")}
         threading.Thread(target=self._repaint, daemon=True).start()
 
     def _atom(self, name):
@@ -142,14 +150,15 @@ class Victim:
     def create(self):
         """The window, under this victim's one id, mapped and titled."""
         # A lazy window has no background: the server paints nothing for it.
+        # Values go in the order of their mask bits.
         if self.lazy:
             mask, values = CW_EVENT_MASK, (ctypes.c_uint32 * 1)(EXPOSURE_MASK)
         else:
-            mask = CW_BACK_PIXEL | CW_EVENT_MASK
-            values = (ctypes.c_uint32 * 2)(self.colour, EXPOSURE_MASK)
+            mask = CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_EVENT_MASK
+            values = (ctypes.c_uint32 * 3)(self.colour, self.border_colour, EXPOSURE_MASK)
         self.xcb.xcb_create_window(self.conn, self.depth, self.id, self.root, self.place[0],
-                                   self.place[1], SIZE[0], SIZE[1], 0, INPUT_OUTPUT, self.visual,
-                                   mask, values)
+                                   self.place[1], SIZE[0], SIZE[1], self.border, INPUT_OUTPUT,
+                                   self.visual, mask, values)
         self._property(ATOM_WM_NAME, ATOM_STRING, 8, self.title)
         self._property(self.atoms[b"_NET_WM_NAME"], self.atoms[b"UTF8_STRING"], 8, self.title)
         pid = (ctypes.c_uint32 * 1)(os.getpid())
@@ -157,11 +166,25 @@ class Victim:
         self.xcb.xcb_map_window(self.conn, self.id)
         self.xcb.xcb_flush(self.conn)
 
-    def _property(self, name, kind, bits, data):
+    def listed_on_root(self):
+        """On a display with no window manager, the root's client lists name this
+        window alone, as a window manager's would."""
+        ids = (ctypes.c_uint32 * 1)(self.id)
+        for name in (b"_NET_CLIENT_LIST_STACKING", b"_NET_CLIENT_LIST"):
+            self._property(self.atoms[name], ATOM_WINDOW, 32, ids, window=self.root)
+        self.xcb.xcb_flush(self.conn)
+
+    def set_border(self, width):
+        """A new X border width, the window's size unchanged."""
+        self.xcb.xcb_configure_window(self.conn, self.id, CONFIG_WINDOW_BORDER_WIDTH,
+                                      ctypes.cast((ctypes.c_uint32 * 1)(width), ctypes.c_void_p))
+        self.xcb.xcb_flush(self.conn)
+
+    def _property(self, name, kind, bits, data, window=None):
         count = len(data)
         buffer = data if isinstance(data, ctypes.Array) else ctypes.create_string_buffer(data, count)
-        self.xcb.xcb_change_property(self.conn, PROP_MODE_REPLACE, self.id, name, kind, bits,
-                                     count, ctypes.cast(buffer, ctypes.c_void_p))
+        self.xcb.xcb_change_property(self.conn, PROP_MODE_REPLACE, window or self.id, name, kind,
+                                     bits, count, ctypes.cast(buffer, ctypes.c_void_p))
 
     def destroy(self):
         self.xcb.xcb_destroy_window(self.conn, self.id)

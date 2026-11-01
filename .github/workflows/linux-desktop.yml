@@ -19,8 +19,9 @@ name: linux-desktop
 #          while covered, a covered point refused, the X11 badge's buttons clicked
 #          as a person would and judged by the gate and by what the window under a
 #          missed click recorded, a click another program sends dropped, a reused
-#          window id and a window that never repaints refused, and twenty select
-#          and release cycles.
+#          window id and a window that never repaints refused, twenty select
+#          and release cycles, and a window with an X border read from inside it
+#          on a second X server with no window manager.
 #   no-c-deps  the helper and its X11 badge built and tested in plain Ubuntu 24.04
 #          with no C library but the C runtime (no_c_deps.sh), their links
 #          checked, and clippy for aarch64-unknown-linux-gnu.
