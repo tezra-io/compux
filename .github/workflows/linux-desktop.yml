@@ -14,9 +14,14 @@ name: linux-desktop
 #          XTEST clicks and keys, a paste through the selection compux owns, the
 #          frame against a pattern on the root, a refused character off the
 #          layout, and a button a killed helper held released by the next one.
-#   no-c-deps  the helper built and tested in plain Ubuntu 24.04 with no C library
-#          but the C runtime (no_c_deps.sh), its links checked, and clippy for
-#          aarch64-unknown-linux-gnu.
+#   x11-bound  Ubuntu 24.04 under openbox: the GTK 3 fixture bound (bound.py),
+#          captured while another window covers it, a covered point refused,
+#          the X11 badge's buttons clicked as a person would and judged by the
+#          gate and by what the window under a missed click recorded, a reused
+#          window id refused, and twenty select and release cycles.
+#   no-c-deps  the helper and its X11 badge built and tested in plain Ubuntu 24.04
+#          with no C library but the C runtime (no_c_deps.sh), their links
+#          checked, and clippy for aarch64-unknown-linux-gnu.
 
 # Each job builds its images from scratch (the fixture images for both releases,
 # the helper's build image, the helper, the spike images) before its sessions run,
@@ -95,6 +100,25 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-desktop-x11-pixels
+          path: ${{ runner.temp }}/spike-out
+          if-no-files-found: warn
+
+  x11-bound:
+    name: a bound window and its badge on X11 (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Composite capture under a cover, the badge, a reused id, twenty cycles
+        env:
+          SPIKE_STAGES: bound
+          SPIKE_CACHE: ${{ runner.temp }}/spike-cache
+        run: fixtures/linux/spike/spike.sh "$RUNNER_TEMP/spike-out" 1
+      - name: Keep what the session wrote
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-desktop-x11-bound
           path: ${{ runner.temp }}/spike-out
           if-no-files-found: warn
 
