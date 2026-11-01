@@ -9,7 +9,8 @@
 # libc6-dev) and rustup's minimal stable toolchain, and no pkg-config:
 #   1. the X, XKB, xdo and D-Bus development packages are shown to be absent;
 #   2. `cargo build --release` and `cargo test` run;
-#   3. the release binary's dynamic dependencies are only the C runtime's;
+#   3. the release binaries' dynamic dependencies (the helper's and its X11
+#      badge's, M86 L3) are only the C runtime's;
 #   4. `cargo clippy --target aarch64-unknown-linux-gnu --all-targets -D warnings`
 #      passes: an aarch64 build stays one command away (none is made here).
 #
@@ -59,14 +60,16 @@ c=compux-no-c-deps-$$
       exit 1
     fi
     grep -E "^test result" /tmp/test.log
-    echo "== linked"
-    ldd /target/release/compux | tee /tmp/ldd.txt
-    beyond=$(grep -vE "linux-vdso|libc\.so|libm\.so|libgcc_s\.so|ld-linux|libpthread\.so|libdl\.so|librt\.so" /tmp/ldd.txt || true)
-    if [ -n "$beyond" ]; then
-      echo "the helper links past the C runtime: $beyond"
-      exit 1
-    fi
-    echo "only the C runtime"
+    for binary in compux compux-indicator-x11; do
+      echo "== linked: $binary"
+      ldd "/target/release/$binary" | tee /tmp/ldd.txt
+      beyond=$(grep -vE "linux-vdso|libc\.so|libm\.so|libgcc_s\.so|ld-linux|libpthread\.so|libdl\.so|librt\.so" /tmp/ldd.txt || true)
+      if [ -n "$beyond" ]; then
+        echo "$binary links past the C runtime: $beyond"
+        exit 1
+      fi
+      echo "only the C runtime"
+    done
     echo "== clippy aarch64-unknown-linux-gnu"
     cargo clippy -q --target aarch64-unknown-linux-gnu --all-targets -- -D warnings
     echo NO_C_DEPS_OK' >/dev/null

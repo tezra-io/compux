@@ -9,7 +9,7 @@
 #    noble and jammy variants its header names).
 # 2. Builds the compux helper in an Ubuntu 22.04 container (build.Dockerfile), so
 #    one binary runs in both images. The repository is copied in, and the cargo
-#    caches are named volumes (compux-spike-registry, compux-spike-target): nothing
+#    caches are named volumes ($SPIKE_VOLUMES-registry, -target below): nothing
 #    is mounted from the host.
 # 3. Builds the spike images (spike.Dockerfile): fixture image + helper + probes.
 # 4. L0(a): for each toolkit in noble, ONE fixture in a private session
@@ -32,16 +32,27 @@
 #    selection compux owns, the frame against a pattern tiled on the root, a refused
 #    character off the layout, and a button a killed helper held released by the
 #    next one, judged by the X server (x11_oracle.py).
+# 10. bound (M86 L3): one window bound on X11 and its badge, on the GTK3 fixture in
+#    noble (bound.py): a covered window captured, a covered point refused, the
+#    badge's buttons reaching the gate as the person clicks them, a click off them
+#    passing through, a reused window id refused, and twenty select and release
+#    cycles leaving no process behind. The badge (compux-indicator-x11) is built
+#    beside the helper and installed beside it, as the release archive carries it.
 #
 # The helper is built with no C library but the C runtime (build.Dockerfile has no
 # X, XKB, xdo or D-Bus development package); no_c_deps.sh proves that on its own.
 #
-# SPIKE_STAGES picks the stages (default "a b wayland chromium verbs verbs-jammy pixels"). Docker is whatever
+# SPIKE_STAGES picks the stages (default "a b wayland chromium verbs verbs-jammy pixels bound"). Docker is whatever
 # DOCKER (default `docker`) and DOCKER_HOST name. CHROMIUM_BASE is the Debian
 # bookworm image the Chromium one starts from (default debian:bookworm; any bookworm
 # image with apt works). Every image is built from images already present when the
 # daemon cannot reach a registry: run with DOCKER_BUILDKIT=0 then, since BuildKit
 # asks the registry about a base image even when it has it.
+#
+# SPIKE_IMAGE names the spike images (default compux-spike, tagged noble, jammy, ...)
+# and SPIKE_VOLUMES the cargo cache volumes (default compux-spike: -registry,
+# -target), so two checkouts can run the spike side by side without building into
+# each other's images or target directory.
 #
 # Every session container runs with --network none and mounts nothing from the
 # host: the results are copied out with `docker cp`. Every container is waited for
@@ -58,7 +69,9 @@ CACHE=${SPIKE_CACHE:-$HOME/.cache/compux-l0-spike}
 BUILD_LIMIT_S=${BUILD_LIMIT_S:-3600}
 RUN_LIMIT_S=${RUN_LIMIT_S:-600}
 CHROMIUM_BASE=${CHROMIUM_BASE:-debian:bookworm}
-STAGES=${SPIKE_STAGES:-a b wayland chromium verbs verbs-jammy pixels}
+STAGES=${SPIKE_STAGES:-a b wayland chromium verbs verbs-jammy pixels bound}
+IMAGE=${SPIKE_IMAGE:-compux-spike}
+VOLUMES=${SPIKE_VOLUMES:-compux-spike}
 mkdir -p "$OUT" "$CACHE"
 
 die() { echo "spike.sh: $*" >&2; exit 1; }
@@ -77,23 +90,25 @@ fixture_images() {
   fi
 }
 
-# The helper, built from a copy of the tracked files and the working tree.
+# The helper and its X11 badge, built from a copy of the tracked files and the
+# working tree.
 build_helper() {
   local context c
-  build -q -t compux-spike-build:jammy -f "$HERE/build.Dockerfile" "$HERE" >/dev/null
+  build -q -t "$IMAGE-build:jammy" -f "$HERE/build.Dockerfile" "$HERE" >/dev/null
   context=$(mktemp -d)
   (cd "$REPO" && git ls-files -coz --exclude-standard | rsync -rl --from0 --files-from=- ./ "$context/")
   c=compux-spike-build-$$
   "$DOCKER" rm -f "$c" >/dev/null 2>&1 || true
   "$DOCKER" create --name "$c" \
-    -v compux-spike-registry:/root/.cargo/registry -v compux-spike-target:/target \
-    -e CARGO_TARGET_DIR=/target -w /work/native/compux compux-spike-build:jammy \
+    -v "$VOLUMES-registry:/root/.cargo/registry" -v "$VOLUMES-target:/target" \
+    -e CARGO_TARGET_DIR=/target -w /work/native/compux "$IMAGE-build:jammy" \
     cargo build --release >/dev/null
   "$DOCKER" cp "$context/." "$c:/work"
   rm -rf "$context"
   local rc=0
   timeout -k 10 "$BUILD_LIMIT_S" "$DOCKER" start -a "$c" || rc=$?
   "$DOCKER" cp "$c:/target/release/compux" "$CACHE/compux" || rc=1
+  "$DOCKER" cp "$c:/target/release/compux-indicator-x11" "$CACHE/compux-indicator-x11" || rc=1
   "$DOCKER" rm -f "$c" >/dev/null
   [ "$rc" -eq 0 ] || die "the helper did not build"
 }
@@ -101,18 +116,19 @@ build_helper() {
 spike_images() {
   local context base
   context=$(mktemp -d)
-  cp "$CACHE/compux" "$HERE"/{elements_timing.py,a11y_tree.py,measure.sh,atk_bridge_check.sh,verbs.py} \
-    "$HERE"/{pixels.py,x11_oracle.py} \
+  cp "$CACHE/compux" "$CACHE/compux-indicator-x11" \
+    "$HERE"/{elements_timing.py,a11y_tree.py,measure.sh,atk_bridge_check.sh,verbs.py} \
+    "$HERE"/{pixels.py,x11_oracle.py,bound.py,panes.py,xcb_victim.py} \
     "$HERE"/{wayland_session.sh,chromium_session.sh,chromium_page.html} "$context/"
   for base in noble jammy; do
-    build -q -t "compux-spike:$base" --build-arg "BASE=compux-fixtures:$base" \
+    build -q -t "$IMAGE:$base" --build-arg "BASE=compux-fixtures:$base" \
       -f "$HERE/spike.Dockerfile" "$context" >/dev/null
   done
   if staged wayland; then
-    build -q -t compux-spike:wayland -f "$HERE/wayland.Dockerfile" "$context" >/dev/null
+    build -q -t "$IMAGE:wayland" -f "$HERE/wayland.Dockerfile" "$context" >/dev/null
   fi
   if staged chromium; then
-    build -q -t compux-spike:chromium --build-arg "BASE=$CHROMIUM_BASE" \
+    build -q -t "$IMAGE:chromium" --build-arg "BASE=$CHROMIUM_BASE" \
       -f "$HERE/chromium.Dockerfile" "$context" >/dev/null
   fi
   rm -rf "$context"
@@ -165,7 +181,7 @@ failed=()
 if staged a; then
   for toolkit in gtk3 gtk4 qt; do
     echo "== L0(a) $toolkit (noble)"
-    in_session compux-spike:noble "$toolkit" \
+    in_session "$IMAGE:noble" "$toolkit" \
       bash /opt/compux-spike/measure.sh "$toolkit" "$(window_of "$toolkit")" "$RUNS" \
       || failed+=("a:$toolkit")
   done
@@ -173,26 +189,26 @@ fi
 
 if staged b; then
   echo "== L0(b) gtk3 under ATK bridge 2.38 (jammy)"
-  in_session compux-spike:jammy gtk3 bash /opt/compux-spike/atk_bridge_check.sh walk "$RUNS" \
+  in_session "$IMAGE:jammy" gtk3 bash /opt/compux-spike/atk_bridge_check.sh walk "$RUNS" \
     || failed+=("b:gtk3")
 fi
 
 if staged wayland; then
   echo "== L0(a) gtk4 under headless GNOME Shell, Wayland (noble)"
-  in_own_session compux-spike:wayland wayland /opt/compux-spike/wayland_session.sh "$RUNS" \
+  in_own_session "$IMAGE:wayland" wayland /opt/compux-spike/wayland_session.sh "$RUNS" \
     || failed+=("wayland")
 fi
 
 if staged chromium; then
   echo "== L0(a) Chromium (Debian bookworm)"
-  in_own_session compux-spike:chromium chromium /opt/compux-spike/chromium_session.sh "$RUNS" \
+  in_own_session "$IMAGE:chromium" chromium /opt/compux-spike/chromium_session.sh "$RUNS" \
     || failed+=("chromium")
 fi
 
 if staged verbs; then
   for toolkit in gtk3 gtk4 qt; do
     echo "== L1 verbs $toolkit (noble)"
-    in_session compux-spike:noble "$toolkit" python3 /opt/compux-spike/verbs.py \
+    in_session "$IMAGE:noble" "$toolkit" python3 /opt/compux-spike/verbs.py \
       --binary /opt/compux/compux --toolkit "$toolkit" \
       --state "/tmp/compux-fixture-state/$toolkit.json" --out "/tmp/spike-out/$toolkit-verbs.json" \
       || failed+=("verbs:$toolkit")
@@ -201,16 +217,24 @@ fi
 
 if staged verbs-jammy; then
   echo "== L1 verbs gtk3 under ATK bridge 2.38 (jammy)"
-  in_session compux-spike:jammy gtk3 bash /opt/compux-spike/atk_bridge_check.sh verbs \
+  in_session "$IMAGE:jammy" gtk3 bash /opt/compux-spike/atk_bridge_check.sh verbs \
     || failed+=("verbs:gtk3-jammy")
 fi
 
 if staged pixels; then
   echo "== L2 X11 pixels gtk3 (noble)"
-  in_session compux-spike:noble gtk3 python3 /opt/compux-spike/pixels.py \
+  in_session "$IMAGE:noble" gtk3 python3 /opt/compux-spike/pixels.py \
     --binary /opt/compux/compux --state /tmp/compux-fixture-state/gtk3.json \
     --out /tmp/spike-out/gtk3-pixels.json \
     || failed+=("pixels:gtk3")
+fi
+
+if staged bound; then
+  echo "== L3 X11 bound window and badge gtk3 (noble)"
+  in_session "$IMAGE:noble" gtk3 python3 /opt/compux-spike/bound.py \
+    --binary /opt/compux/compux --state /tmp/compux-fixture-state/gtk3.json \
+    --out /tmp/spike-out/gtk3-bound.json \
+    || failed+=("bound:gtk3")
 fi
 
 [ "${#failed[@]}" -eq 0 ] || die "failed: ${failed[*]} (see $OUT)"

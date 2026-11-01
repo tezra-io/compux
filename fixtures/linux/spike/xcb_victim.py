@@ -1,0 +1,159 @@
+"""A window made and remade under one X id, through libxcb by ctypes (M86 L3).
+
+Xlib picks a new id for every window; xcb lets the client name it. So a window can
+be destroyed and a new one created under the SAME id, by the same process, with
+the same title: everything the window list says about it is what it said before.
+bound.py binds the first, closes it, makes the second, and asks the helper to act
+on the binding: a reused id must never bring the binding back.
+
+The window is an ordinary top-level the window manager frames, with `_NET_WM_PID`
+set to this process, and it repaints itself in one colour on every expose from a
+thread of its own, as an application would. Runs only inside the private-session
+container; bound.py refuses to start anywhere else.
+"""
+
+import ctypes
+import ctypes.util
+import os
+import threading
+
+# X protocol numbers (xproto.h).
+EXPOSE = 12
+INPUT_OUTPUT = 1
+CW_BACK_PIXEL = 1 << 1
+CW_EVENT_MASK = 1 << 11
+EXPOSURE_MASK = 1 << 15
+GC_FOREGROUND = 1 << 2
+PROP_MODE_REPLACE = 0
+ATOM_STRING = 31
+ATOM_WM_NAME = 39
+ATOM_CARDINAL = 6
+SIZE = (520, 320)
+PLACE = (640, 560)
+
+
+class _Iterator(ctypes.Structure):
+    _fields_ = [("data", ctypes.c_void_p), ("rem", ctypes.c_int), ("index", ctypes.c_int)]
+
+
+class _Screen(ctypes.Structure):
+    _fields_ = [("root", ctypes.c_uint32), ("default_colormap", ctypes.c_uint32),
+                ("white_pixel", ctypes.c_uint32), ("black_pixel", ctypes.c_uint32),
+                ("current_input_masks", ctypes.c_uint32),
+                ("width_in_pixels", ctypes.c_uint16), ("height_in_pixels", ctypes.c_uint16),
+                ("width_in_millimeters", ctypes.c_uint16),
+                ("height_in_millimeters", ctypes.c_uint16),
+                ("min_installed_maps", ctypes.c_uint16), ("max_installed_maps", ctypes.c_uint16),
+                ("root_visual", ctypes.c_uint32), ("backing_stores", ctypes.c_uint8),
+                ("save_unders", ctypes.c_uint8), ("root_depth", ctypes.c_uint8),
+                ("allowed_depths_len", ctypes.c_uint8)]
+
+
+class _Rectangle(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_int16), ("y", ctypes.c_int16),
+                ("width", ctypes.c_uint16), ("height", ctypes.c_uint16)]
+
+
+def _library():
+    xcb = ctypes.cdll.LoadLibrary(ctypes.util.find_library("xcb") or "libxcb.so.1")
+    void, u8, u16, u32, i16 = (ctypes.c_void_p, ctypes.c_uint8, ctypes.c_uint16,
+                               ctypes.c_uint32, ctypes.c_int16)
+    signatures = {
+        "xcb_connect": (void, [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]),
+        "xcb_connection_has_error": (ctypes.c_int, [void]),
+        "xcb_get_setup": (void, [void]),
+        "xcb_setup_roots_iterator": (_Iterator, [void]),
+        "xcb_generate_id": (u32, [void]),
+        "xcb_create_window": (ctypes.c_uint, [void, u8, u32, u32, i16, i16, u16, u16, u16, u16,
+                                              u32, u32, ctypes.POINTER(u32)]),
+        "xcb_destroy_window": (ctypes.c_uint, [void, u32]),
+        "xcb_map_window": (ctypes.c_uint, [void, u32]),
+        "xcb_change_property": (ctypes.c_uint, [void, u8, u32, u32, u32, u8, u32, void]),
+        "xcb_intern_atom": (ctypes.c_uint, [void, u8, u16, ctypes.c_char_p]),
+        "xcb_intern_atom_reply": (void, [void, ctypes.c_uint, void]),
+        "xcb_create_gc": (ctypes.c_uint, [void, u32, u32, u32, ctypes.POINTER(u32)]),
+        "xcb_poly_fill_rectangle": (ctypes.c_uint, [void, u32, u32, u32,
+                                                    ctypes.POINTER(_Rectangle)]),
+        "xcb_wait_for_event": (void, [void]),
+        "xcb_flush": (ctypes.c_int, [void]),
+    }
+    for name, (result, arguments) in signatures.items():
+        function = getattr(xcb, name)
+        function.restype, function.argtypes = result, arguments
+    return xcb
+
+
+_libc = ctypes.CDLL(None)
+_libc.free.argtypes = [ctypes.c_void_p]
+
+
+class Victim:
+    """One window id, made and remade. The connection is never closed by hand: the
+    repaint thread is blocked on it, and it closes, with any window still standing,
+    when this process exits."""
+
+    def __init__(self, title, colour):
+        self.xcb = _library()
+        self.title = title.encode()
+        self.colour = colour
+        self.conn = self.xcb.xcb_connect(None, None)
+        if not self.conn or self.xcb.xcb_connection_has_error(self.conn):
+            raise RuntimeError("the private X server did not answer xcb")
+        screen = _Screen.from_address(self.xcb.xcb_setup_roots_iterator(
+            self.xcb.xcb_get_setup(self.conn)).data)
+        self.root, self.visual, self.depth = screen.root, screen.root_visual, screen.root_depth
+        self.id = self.xcb.xcb_generate_id(self.conn)
+        self.gc = self.xcb.xcb_generate_id(self.conn)
+        self.xcb.xcb_create_gc(self.conn, self.gc, self.root, GC_FOREGROUND,
+                               (ctypes.c_uint32 * 1)(colour))
+        self.atoms = {name: self._atom(name) for name in
+                      (b"_NET_WM_PID", b"_NET_WM_NAME", b"UTF8_STRING")}
+        threading.Thread(target=self._repaint, daemon=True).start()
+
+    def _atom(self, name):
+        cookie = self.xcb.xcb_intern_atom(self.conn, 0, len(name), name)
+        reply = self.xcb.xcb_intern_atom_reply(self.conn, cookie, None)
+        if not reply:
+            raise RuntimeError(f"no atom for {name!r}")
+        atom = ctypes.c_uint32.from_address(reply + 8).value
+        _libc.free(reply)
+        return atom
+
+    def _repaint(self):
+        """Fill the window on every expose. Bounded by the connection: it ends when
+        `xcb_wait_for_event` returns nothing, which it does once disconnected."""
+        everything = _Rectangle(0, 0, SIZE[0], SIZE[1])
+        while True:
+            event = self.xcb.xcb_wait_for_event(self.conn)
+            if not event:
+                return
+            kind = ctypes.c_uint8.from_address(event).value & 0x7F
+            window = ctypes.c_uint32.from_address(event + 4).value
+            _libc.free(event)
+            if kind == EXPOSE and window == self.id:
+                self.xcb.xcb_poly_fill_rectangle(self.conn, self.id, self.gc, 1,
+                                                 ctypes.byref(everything))
+                self.xcb.xcb_flush(self.conn)
+
+    def create(self):
+        """The window, under this victim's one id, mapped and titled."""
+        values = (ctypes.c_uint32 * 2)(self.colour, EXPOSURE_MASK)
+        self.xcb.xcb_create_window(self.conn, self.depth, self.id, self.root, PLACE[0], PLACE[1],
+                                   SIZE[0], SIZE[1], 0, INPUT_OUTPUT, self.visual,
+                                   CW_BACK_PIXEL | CW_EVENT_MASK, values)
+        self._property(ATOM_WM_NAME, ATOM_STRING, 8, self.title)
+        self._property(self.atoms[b"_NET_WM_NAME"], self.atoms[b"UTF8_STRING"], 8, self.title)
+        pid = (ctypes.c_uint32 * 1)(os.getpid())
+        self._property(self.atoms[b"_NET_WM_PID"], ATOM_CARDINAL, 32, pid)
+        self.xcb.xcb_map_window(self.conn, self.id)
+        self.xcb.xcb_flush(self.conn)
+
+    def _property(self, name, kind, bits, data):
+        count = len(data)
+        buffer = data if isinstance(data, ctypes.Array) else ctypes.create_string_buffer(data, count)
+        self.xcb.xcb_change_property(self.conn, PROP_MODE_REPLACE, self.id, name, kind, bits,
+                                     count, ctypes.cast(buffer, ctypes.c_void_p))
+
+    def destroy(self):
+        self.xcb.xcb_destroy_window(self.conn, self.id)
+        self.xcb.xcb_flush(self.conn)

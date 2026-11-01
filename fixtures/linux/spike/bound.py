@@ -1,0 +1,726 @@
+#!/usr/bin/env python3
+"""One window bound on X11, and its badge, judged by what the fixture, the X server
+and the windows around it recorded (M86 L3).
+
+Runs INSIDE the private-session container only (`spike.sh` stage `bound` starts
+it), never on a desktop someone uses: it starts the compux helper, which binds a
+window, reads its frames through Composite and posts input through XTEST, and it
+clicks the badge as the person would. It refuses (exit 2) anywhere without a
+container's marker file, before it starts anything.
+
+  python3 bound.py --binary /opt/compux/compux \\
+      --state /tmp/compux-fixture-state/gtk3.json --out /tmp/spike-out/gtk3-bound.json
+
+Two plain windows (panes.py) go beside the GTK 3 fixture: a magenta COVER in front
+of its lower right, and a FLOOR behind it, under where the badge floats. Then:
+
+- `hello` offers `select_target` and `release_target`, `targets: true`, and window
+  capture;
+- the fixture is bound; its frame shows the fixture where the cover hides it, and
+  the display shows the cover there;
+- the badge is up: one override-redirect window of the helper's own child, inside
+  the rectangle the helper checks for anything covering it, taking clicks on two
+  rectangles only;
+- a click on the bound window's button lands (the fixture recorded it); one at a
+  point the cover hides is `target_obstructed`, and nothing recorded it;
+- the badge's Pause, clicked as the person clicks, reaches the gate (an
+  `operator_pause`, and the next click is refused `paused`); Resume undoes it; a
+  click on the badge outside its buttons reaches the floor under it; Stop reaches
+  the gate; none of these moved the keyboard focus;
+- a window bound, closed, and made again under the SAME id by the same process
+  (xcb_victim.py) does not bring the binding back: `target_unavailable`;
+- twenty select and release cycles leave no badge process, no zombie and no badge
+  window, and the helper's resident memory flat.
+
+Exit 0 when every step met its expectation, 1 otherwise; the JSON has each step's
+evidence and verdict.
+"""
+
+import argparse
+import base64
+import ctypes
+import ctypes.util
+import json
+import os
+import queue
+import subprocess
+import sys
+import time
+
+import x11_oracle
+from pixels import png_rows
+from verbs import CONTAINER_MARKERS, Helper, HelperFailed, events, fixture_listed, recorded
+from xcb_victim import Victim
+
+FIXTURE = "Compux Fixture GTK3"
+FLOOR, FLOOR_COLOUR = "Compux Floor", 0x406080
+COVER, COVER_COLOUR = "Compux Cover", 0xFF00FF
+VICTIM, VICTIM_COLOUR = "Compux Victim", 0x30A030
+BADGE_CLASS = "^compux-indicator-x11$"
+# Where the windows go, in root pixels: the fixture with room above it for the
+# badge, the floor under that room, the cover over the fixture's lower right and
+# clear of the badge's rectangle.
+FIXTURE_AT = (60, 160)
+FLOOR_GEOMETRY = (0, 0, 1280, 440)
+COVER_OFFSET = (520, 330)
+COVER_SIZE = (560, 480)
+# The helper's badge rectangle around a window at (x, y): its `badge_area`.
+BADGE_AREA = (34, 448, 114)
+CYCLES = 20
+RSS_WARM_CYCLE = 5
+RSS_GROWTH_LIMIT_KB = 4096
+COLOUR_TOLERANCE = 24
+INSET = 6
+# Bounded waits: tries x step.
+WAIT_TRIES = 100
+WAIT_STEP_S = 0.1
+EVENT_WAIT_S = 3.0
+QUIET_S = 1.0
+STATE_SETTLE_S = 0.8
+COMMAND_TIMEOUT_S = 10
+# Shape's kind for the input region (shape.h).
+SHAPE_INPUT = 2
+
+
+def refuse_outside_a_container():
+    if not any(os.path.exists(marker) for marker in CONTAINER_MARKERS):
+        print("bound.py: runs only inside the fixture container", file=sys.stderr)
+        sys.exit(2)
+
+
+# --- the helper, with the frames it writes unasked -------------------------------------
+
+
+class Session(Helper):
+    """The helper on its pipe, keeping every `session_event` it writes between
+    replies, so a badge press can be waited for."""
+
+    def __init__(self, binary, stderr_path):
+        super().__init__(binary, stderr_path)
+        self.session_events = []
+
+    def _next_reply(self, action, deadline):
+        while True:
+            frame = super()._next_reply(action, deadline)
+            if frame.get("type") != "session_event":
+                return frame
+            self.session_events.append(frame)
+
+    def wait_event(self, name, wait_s=EVENT_WAIT_S):
+        """The first unclaimed `session_event` named `name`, waiting `wait_s` at most."""
+        deadline = time.monotonic() + wait_s
+        while True:
+            for frame in self.session_events:
+                if frame.get("event") == name and not frame.get("claimed"):
+                    frame["claimed"] = True
+                    return frame
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            try:
+                line = self.lines.get(timeout=left)
+            except queue.Empty:
+                return None
+            if line is None:
+                raise HelperFailed(f"the helper exited waiting for {name}")
+            frame = json.loads(line)
+            if frame.get("type") == "session_event":
+                self.session_events.append(frame)
+
+    def take_authority(self, frame):
+        """A pause, a resume and a stop each mint a new authorization generation."""
+        self.generations["authorization_generation"] = frame["authorization_generation"]
+
+
+# --- the windows, through xdotool and the helper's own listing ---------------------------
+
+
+def xdotool(*arguments):
+    done = subprocess.run(["xdotool", *map(str, arguments)], capture_output=True, text=True,
+                          timeout=COMMAND_TIMEOUT_S, check=False)
+    return done.stdout.split()
+
+
+def window_id(title):
+    found = xdotool("search", "--name", f"^{title}$")
+    return found[0] if found else None
+
+
+def listed(helper):
+    _, reply = helper.ask("windows")
+    return reply.get("windows") or []
+
+
+def by_title(windows, title):
+    return next((window for window in windows if window.get("title") == title), None)
+
+
+def wait_listed(helper, title, present=True):
+    """The window once the helper lists it (or `None` once it does not)."""
+    for _ in range(WAIT_TRIES):
+        window = by_title(listed(helper), title)
+        if (window is not None) == present:
+            return window
+        time.sleep(WAIT_STEP_S)
+    return None if present else by_title(listed(helper), title)
+
+
+def region(window):
+    r = window["region"]
+    return (r["x"], r["y"], r["w"], r["h"])
+
+
+def overlap(a, b):
+    left, top = max(a[0], b[0]), max(a[1], b[1])
+    right, bottom = min(a[0] + a[2], b[0] + b[2]), min(a[1] + a[3], b[1] + b[3])
+    return (left, top, right - left, bottom - top) if right > left and bottom > top else None
+
+
+def inside(outer, inner):
+    return (inner[0] >= outer[0] and inner[1] >= outer[1]
+            and inner[0] + inner[2] <= outer[0] + outer[2]
+            and inner[1] + inner[3] <= outer[1] + outer[3])
+
+
+def arrange(helper):
+    """Floor at the back, the fixture over it, the cover in front; then where each
+    is and the front-to-back order the helper lists them in."""
+    fixture, floor, cover = window_id(FIXTURE), window_id(FLOOR), window_id(COVER)
+    xdotool("windowsize", floor, FLOOR_GEOMETRY[2], FLOOR_GEOMETRY[3])
+    xdotool("windowmove", "--sync", floor, FLOOR_GEOMETRY[0], FLOOR_GEOMETRY[1])
+    xdotool("windowmove", "--sync", fixture, *FIXTURE_AT)
+    xdotool("windowsize", cover, *COVER_SIZE)
+    xdotool("windowmove", "--sync", cover, FIXTURE_AT[0] + COVER_OFFSET[0],
+            FIXTURE_AT[1] + COVER_OFFSET[1])
+    restack()
+    time.sleep(QUIET_S)
+    windows = listed(helper)
+    order = [window.get("title") for window in windows]
+    found = {title: by_title(windows, title) for title in (FIXTURE, FLOOR, COVER)}
+    ranked = all(title in order for title in found)
+    passed = ranked and order.index(COVER) < order.index(FIXTURE) < order.index(FLOOR)
+    return found, {"flow": "arranged", "passed": passed,
+                   "why": f"front to back {order}; "
+                          f"{ {t: w and region(w) for t, w in found.items()} }"}
+
+
+def restack():
+    """The fixture over the floor and the cover over the fixture."""
+    xdotool("windowraise", window_id(FIXTURE))
+    xdotool("windowraise", window_id(COVER))
+    time.sleep(QUIET_S)
+
+
+# --- pictures -----------------------------------------------------------------------------
+
+
+def colour_share(shot, area, colour):
+    """The share of pixels in `area` (the sent image's own pixels) within tolerance
+    of `colour`."""
+    width, height, rows = png_rows(base64.b64decode(shot["data"]))
+    left, top, w, h = area
+    hits = total = 0
+    want = ((colour >> 16) & 0xFF, (colour >> 8) & 0xFF, colour & 0xFF)
+    for y in range(max(0, top), min(height, top + h)):
+        for x in range(max(0, left), min(width, left + w), 2):
+            got = rows[y][x * 4:x * 4 + 3]
+            total += 1
+            hits += max(abs(a - b) for a, b in zip(got, want, strict=True)) <= COLOUR_TOLERANCE
+    return hits / total if total else 0.0, total
+
+
+def scaled(area, origin, scale):
+    """A root rectangle in an image's pixels, `INSET` in from each side."""
+    x, y, w, h = area
+    return (round((x - origin[0] + INSET) * scale), round((y - origin[1] + INSET) * scale),
+            round((w - 2 * INSET) * scale), round((h - 2 * INSET) * scale))
+
+
+def keep(out, name, shot):
+    """The picture a step judged, beside the stage's report."""
+    if shot.get("data"):
+        with open(os.path.join(out, name), "wb") as handle:
+            handle.write(base64.b64decode(shot["data"]))
+
+
+def covered_capture_check(helper, target, fixture, cover, out):
+    """The bound window's frame shows the window where the cover hides it; the
+    display shows the cover there."""
+    hidden = overlap(region(fixture), region(cover))
+    if hidden is None:
+        return {"flow": "covered window captured", "passed": False, "why": "nothing is covered"}
+    order = [window.get("title") for window in listed(helper)]
+    _, frame = helper.ask("screenshot", target_id=target)
+    _, display = helper.ask("screenshot")
+    keep(out, "covered-frame.png", frame)
+    keep(out, "covered-display.png", display)
+    if not frame.get("ok") or not display.get("ok"):
+        return {"flow": "covered window captured", "passed": False,
+                "why": f"frame {frame.get('error')}, display {display.get('error')}"}
+    fx, fy, fw, _ = region(fixture)
+    in_frame, read = colour_share(frame, scaled(hidden, (fx, fy), frame["width"] / fw), COVER_COLOUR)
+    on_display, seen = colour_share(display, scaled(hidden, (0, 0),
+                                    display["width"] / display["physical"]["width"]), COVER_COLOUR)
+    passed = read > 1000 and in_frame == 0.0 and on_display > 0.95
+    return {"flow": "covered window captured", "passed": passed,
+            "why": f"cover over {hidden}: {in_frame:.3f} of {read} frame pixels are the cover's, "
+                   f"{on_display:.3f} of {seen} display pixels are; front to back {order}; "
+                   f"frame {frame['width']}x{frame['height']} {frame.get('target_id')}"}
+
+
+# --- the badge, as the X server and /proc see it ---------------------------------------------
+
+
+def badges(visible=True):
+    """The badge windows there are: mapped ones only, or every one."""
+    if visible:
+        return xdotool("search", "--onlyvisible", "--classname", BADGE_CLASS)
+    return xdotool("search", "--classname", BADGE_CLASS)
+
+
+def geometry(window):
+    fields = dict(line.split("=", 1) for line in
+                  subprocess.run(["xdotool", "getwindowgeometry", "--shell", str(window)],
+                                 capture_output=True, text=True, timeout=COMMAND_TIMEOUT_S,
+                                 check=False).stdout.split())
+    return tuple(int(fields[key]) for key in ("X", "Y", "WIDTH", "HEIGHT"))
+
+
+def children(pid):
+    found = []
+    for task in os.listdir(f"/proc/{pid}/task"):
+        with open(f"/proc/{pid}/task/{task}/children", encoding="ascii") as handle:
+            found.extend(int(child) for child in handle.read().split())
+    return found
+
+
+def badge_processes():
+    """Every process whose executable is the badge, with its state letter."""
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                program = handle.read().split(b"\0")[0]
+            with open(f"/proc/{entry}/stat", encoding="ascii") as handle:
+                state = handle.read().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            continue
+        if program.endswith(b"compux-indicator-x11"):
+            found.append((int(entry), state))
+    return found
+
+
+def resident_kb(pid):
+    with open(f"/proc/{pid}/status", encoding="ascii") as handle:
+        for line in handle:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1])
+    return -1
+
+
+def wait_for(predicate):
+    for _ in range(WAIT_TRIES):
+        if predicate():
+            return True
+        time.sleep(WAIT_STEP_S)
+    return predicate()
+
+
+def badge_check(display, helper, fixture):
+    """One visible badge, the helper's child, inside the helper's rectangle, taking
+    clicks on two rectangles of its own and nowhere else."""
+    if not wait_for(lambda: len(badges()) == 1):
+        return None, {"flow": "badge shown", "passed": False, "why": f"visible badges {badges()}"}
+    window = int(badges()[0])
+    place = geometry(window)
+    owner = xdotool("getwindowpid", window)
+    x, y, _, _ = region(fixture)
+    area = (x, y - BADGE_AREA[0], BADGE_AREA[1], BADGE_AREA[2])
+    rectangles = input_region(display, window)
+    own = (0, 0, place[2], place[3])
+    passed = (bool(owner) and int(owner[0]) in children(helper.proc.pid) and inside(area, place)
+              and len(rectangles) == 2 and all(inside(own, r) for r in rectangles)
+              and overlap(*rectangles) is None)
+    badge = {"window": window, "place": place, "buttons": rectangles}
+    return badge, {"flow": "badge shown", "passed": passed,
+                   "why": f"badge {window} at {place} inside {area}: {inside(area, place)}; "
+                          f"pid {owner} of children {children(helper.proc.pid)}; input {rectangles}"}
+
+
+def person_click(x, y):
+    """A click where the person would click: the core pointer, moved and pressed,
+    in that order on one connection. (`mousemove --sync` waits for a motion that
+    never comes when the pointer is already there.)"""
+    xdotool("mousemove", x, y, "click", "1")
+
+
+def button_centre(badge, index):
+    bx, by, _, _ = badge["place"]
+    x, y, w, h = badge["buttons"][index]
+    return bx + x + w // 2, by + y + h // 2
+
+
+def input_region(display, window):
+    """The window's input region (Shape), as rectangles in its own pixels."""
+    xext = ctypes.cdll.LoadLibrary(ctypes.util.find_library("Xext") or "libXext.so.6")
+
+    class Rectangle(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_short), ("y", ctypes.c_short),
+                    ("width", ctypes.c_ushort), ("height", ctypes.c_ushort)]
+
+    xext.XShapeGetRectangles.restype = ctypes.POINTER(Rectangle)
+    xext.XShapeGetRectangles.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                                         ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+    count, ordering = ctypes.c_int(), ctypes.c_int()
+    found = xext.XShapeGetRectangles(display.display, window, SHAPE_INPUT, ctypes.byref(count),
+                                     ctypes.byref(ordering))
+    rectangles = [(found[i].x, found[i].y, found[i].width, found[i].height)
+                  for i in range(count.value)]
+    if found:
+        display.x11.XFree(ctypes.cast(found, ctypes.c_void_p))
+    return rectangles
+
+
+# --- acting in the bound window ------------------------------------------------------------
+
+
+def presses(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle).get("presses", [])
+    except (OSError, ValueError):
+        return []
+
+
+def button_in(helper, target):
+    """The fixture's button in the bound window's own view, and that listing."""
+    listing = {}
+    for _ in range(WAIT_TRIES // 4):
+        _, listing = helper.ask("elements", target_id=target, deadline_ms=10000,
+                                query={"role": "button", "name": "GTK3 button"})
+        matches = [element for element in listing.get("elements", [])
+                   if element.get("label") == "GTK3 button"]
+        if listing.get("ok") and matches:
+            return matches[0], listing
+        time.sleep(WAIT_STEP_S * 4)
+    return None, listing
+
+
+def click_button(helper, target):
+    """A click on the fixture's button through the binding: the reply, or the
+    listing's refusal when the button could not be found."""
+    element, listing = button_in(helper, target)
+    if element is None:
+        return {"ok": False, "error": listing.get("error"), "detail": listing.get("detail")}
+    _, reply = helper.ask("left_click", mutation=True, observation_id=listing["observation_id"],
+                          x=element["x"], y=element["y"], target_id=target)
+    return reply
+
+
+def target_click_check(helper, target, state):
+    since = len(events(state))
+    reply = click_button(helper, target)
+    event = recorded(state, since, "gtk3", "button", "press", None)
+    return {"flow": "click in the bound window", "passed": bool(reply.get("ok")) and event is not None,
+            "why": f"reply {reply.get('error') or 'ok'} {reply.get('detail') or ''}, recorded {event}",
+            "input_method": reply.get("receipt", {}).get("input_method")}
+
+
+def obstructed_check(helper, target, state, fixture, cover, record):
+    """A click at a point of the bound window that the cover hides is refused, and
+    neither the fixture nor the cover was clicked."""
+    # The click on the fixture's button before this raised it over the cover.
+    restack()
+    hx, hy, hw, hh = overlap(region(fixture), region(cover))
+    fx, fy, fw, _ = region(fixture)
+    order = [window.get("title") for window in listed(helper)]
+    _, shot = helper.ask("screenshot", target_id=target)
+    scale = shot["width"] / fw
+    since, before = len(events(state)), len(presses(record))
+    _, reply = helper.ask("left_click", mutation=True, observation_id=shot.get("observation_id"),
+                          x=round((hx + hw / 2 - fx) * scale), y=round((hy + hh / 2 - fy) * scale),
+                          target_id=target)
+    time.sleep(QUIET_S)
+    arrived, clicked = events(state)[since:], presses(record)[before:]
+    passed = (order.index(COVER) < order.index(FIXTURE) and reply.get("error") == "target_obstructed"
+              and not arrived and not clicked)
+    return {"flow": "covered point refused", "passed": passed,
+            "why": f"front to back {order}; error {reply.get('error')}: {reply.get('detail')}; "
+                   f"fixture recorded {arrived}, cover recorded {clicked}",
+            "reply": {key: value for key, value in reply.items() if key != "data"},
+            "shot": {key: value for key, value in shot.items() if key != "data"}}
+
+
+# --- the badge's buttons, pressed as the person presses them ----------------------------------
+
+
+def focus():
+    return xdotool("getwindowfocus")
+
+
+def press_badge(helper, badge, index, expected):
+    """Click badge button `index` as the person would; the session event it should
+    raise, with its authority taken; and whether the keyboard focus stayed put."""
+    before = focus()
+    person_click(*button_centre(badge, index))
+    event = helper.wait_event(expected)
+    if event is not None:
+        helper.take_authority(event)
+    # The helper tells the badge the new state on its next look (four a second).
+    time.sleep(STATE_SETTLE_S)
+    return event, before == focus() and bool(before)
+
+
+def pause_check(helper, target, state, badge):
+    event, kept = press_badge(helper, badge, 0, "operator_pause")
+    since = len(events(state))
+    reply = click_button(helper, target)
+    time.sleep(QUIET_S)
+    arrived = events(state)[since:]
+    passed = event is not None and kept and reply.get("error") == "paused" and not arrived
+    return {"flow": "badge Pause reaches the gate", "passed": passed,
+            "why": f"event {event and event.get('event')}, focus kept {kept}, next click "
+                   f"{reply.get('error') or 'ok'}, recorded {arrived}"}
+
+
+def resume_check(helper, target, state, badge):
+    event, kept = press_badge(helper, badge, 0, "operator_resume")
+    since = len(events(state))
+    reply = click_button(helper, target)
+    arrived = recorded(state, since, "gtk3", "button", "press", None)
+    passed = event is not None and kept and bool(reply.get("ok")) and arrived is not None
+    return {"flow": "badge Resume reaches the gate", "passed": passed,
+            "why": f"event {event and event.get('event')}, focus kept {kept}, next click "
+                   f"{reply.get('error') or 'ok'}, recorded {arrived}"}
+
+
+def pass_through_check(helper, badge, record):
+    """A click on the badge away from its buttons reaches the floor under it and
+    raises nothing; the floor is then put back behind the fixture."""
+    bx, by, _, bh = badge["place"]
+    point = (bx + 30, by + bh // 2)
+    on_button = any(inside((bx + x, by + y, w, h), (point[0], point[1], 1, 1))
+                    for x, y, w, h in badge["buttons"])
+    before = len(presses(record))
+    person_click(*point)
+    arrived = wait_for(lambda: len(presses(record)) > before)
+    landed = presses(record)[before:]
+    raised = [helper.wait_event(name, QUIET_S / 3)
+              for name in ("operator_pause", "operator_resume", "operator_stop")]
+    restack()
+    back = wait_for(lambda: len(badges()) == 1)
+    exact = bool(landed) and (landed[0]["x"], landed[0]["y"]) == point
+    passed = not on_button and arrived and exact and not any(raised) and back
+    return {"flow": "a click off the badge's buttons passes through", "passed": passed,
+            "why": f"clicked {point} (on a button: {on_button}); floor recorded {landed}; "
+                   f"events {[e and e.get('event') for e in raised]}; badge back {back}"}
+
+
+def stop_check(helper, target, state, badge):
+    """Stop reaches the gate and holds the next click; Resume then reopens it, so
+    the stages after this one can act."""
+    event, kept = press_badge(helper, badge, 1, "operator_stop")
+    since = len(events(state))
+    reply = click_button(helper, target)
+    time.sleep(QUIET_S)
+    arrived = events(state)[since:]
+    resumed, _ = press_badge(helper, badge, 0, "operator_resume")
+    passed = (event is not None and kept and reply.get("error") == "paused" and not arrived
+              and resumed is not None)
+    return {"flow": "badge Stop reaches the gate", "passed": passed,
+            "why": f"event {event and event.get('event')}, focus kept {kept}, next click "
+                   f"{reply.get('error') or 'ok'}, recorded {arrived}; resumed after "
+                   f"{resumed and resumed.get('event')}"}
+
+
+def release_check(helper):
+    _, reply = helper.ask("release_target")
+    gone = wait_for(lambda: not badge_processes() and not badges(visible=False))
+    passed = bool(reply.get("ok")) and reply.get("released") is True and gone
+    return {"flow": "release takes the badge down", "passed": passed,
+            "why": f"reply {reply}, badge processes {badge_processes()}, "
+                   f"badge windows {badges(visible=False)}"}
+
+
+# --- a reused window id ---------------------------------------------------------------------
+
+
+def xid_reuse_check(helper):
+    """Bind a window, close it, make another under the same id: the binding stays
+    gone, for a capture and for a click alike."""
+    victim = Victim(VICTIM, VICTIM_COLOUR)
+    victim.create()
+    first = wait_listed(helper, VICTIM)
+    shown = wait_for(lambda: bool(xdotool("search", "--onlyvisible", "--name", f"^{VICTIM}$")))
+    if first is None or not shown:
+        return {"flow": "a reused window id never revives a binding", "passed": False,
+                "why": f"the victim window was listed {first is not None}, shown {shown}"}
+    _, bound = helper.ask("select_target", window_id=first["id"])
+    _, before = helper.ask("screenshot", target_id=bound.get("target_id"))
+    victim.destroy()
+    closed = wait_listed(helper, VICTIM, present=False) is None
+    victim.create()
+    again = wait_listed(helper, VICTIM)
+    wait_for(lambda: bool(xdotool("search", "--onlyvisible", "--name", f"^{VICTIM}$")))
+    same = again is not None and again["id"] == first["id"] == victim.id
+    owner = xdotool("getwindowpid", victim.id)
+    _, shot = helper.ask("screenshot", target_id=bound.get("target_id"))
+    # The newest picture of the binding is the one before the close.
+    _, click = helper.ask("left_click", mutation=True, observation_id=before.get("observation_id"),
+                          x=20, y=20, target_id=bound.get("target_id"))
+    helper.ask("release_target")
+    victim.destroy()
+    passed = (bool(bound.get("ok")) and bool(before.get("ok")) and closed and same
+              and owner == [str(os.getpid())]
+              and shot.get("error") == "target_unavailable"
+              and click.get("error") == "target_unavailable")
+    shot = {key: value for key, value in shot.items() if key != "data"}
+    return {"flow": "a reused window id never revives a binding", "passed": passed,
+            "why": f"bound {bound.get('ok')} {bound.get('error') or ''}; captured before the close "
+                   f"{before.get('ok')}; closed {closed}; same id "
+                   f"{same} ({victim.id:#x}, pid {owner}); capture {shot.get('error')}: "
+                   f"{shot.get('detail')}; click {click.get('error')}: {click.get('detail')}",
+            "capture_after": shot}
+
+
+# --- twenty cycles ----------------------------------------------------------------------------
+
+
+def cycles_check(helper, fixture):
+    """Select and release, CYCLES times: each badge comes up and goes, nothing is
+    left, and the helper's resident memory stays flat after the first few."""
+    series, failed = [], []
+    for cycle in range(1, CYCLES + 1):
+        _, bound = helper.ask("select_target", window_id=fixture["id"])
+        shown = bool(bound.get("ok")) and wait_for(lambda: len(badges()) == 1)
+        _, released = helper.ask("release_target")
+        gone = wait_for(lambda: not badge_processes() and not badges(visible=False))
+        series.append(resident_kb(helper.proc.pid))
+        if not (shown and released.get("ok") and gone):
+            failed.append({"cycle": cycle, "bound": bound.get("error") or "ok", "shown": shown,
+                           "gone": gone})
+    left = children(helper.proc.pid)
+    growth = series[-1] - series[RSS_WARM_CYCLE - 1]
+    passed = not failed and not left and not badge_processes() and growth <= RSS_GROWTH_LIMIT_KB
+    return {"flow": f"{CYCLES} select and release cycles", "passed": passed,
+            "why": f"failed {failed}; children left {left}; badge processes {badge_processes()}; "
+                   f"resident kB {series} (growth after cycle {RSS_WARM_CYCLE}: {growth})"}
+
+
+# --- the run ----------------------------------------------------------------------------------
+
+
+def hello_check(hello):
+    actions = hello.get("actions") or []
+    capabilities = hello.get("capabilities") or {}
+    passed = ("select_target" in actions and "release_target" in actions
+              and capabilities.get("targets") is True
+              and "window" in (capabilities.get("capture_methods") or []))
+    return {"flow": "hello offers bound windows", "passed": passed,
+            "why": f"targets {capabilities.get('targets')}, capture_methods "
+                   f"{capabilities.get('capture_methods')}, indicator {capabilities.get('indicator')}"}
+
+
+def unscaled_check(helper):
+    """Every rectangle here is read as root pixels: the display is sent unscaled."""
+    _, shot = helper.ask("screenshot")
+    passed = bool(shot.get("ok")) and shot.get("width") == shot.get("physical", {}).get("width")
+    return {"flow": "display sent unscaled", "passed": passed,
+            "why": f"sent {shot.get('width')}x{shot.get('height')} of {shot.get('physical')}"}
+
+
+def start_panes(records):
+    started = []
+    for title, colour in ((FLOOR, FLOOR_COLOUR), (COVER, COVER_COLOUR)):
+        record = records[title]
+        started.append(subprocess.Popen(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "panes.py"),
+             "--title", title, "--colour", f"{colour:06x}", "--record", record],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+    return started
+
+
+def bound_steps(helper, display, args, records):
+    """Every step on the fixture's binding, appended as decided."""
+    found, arranged = arrange(helper)
+    yield arranged
+    if not arranged["passed"]:
+        return
+    fixture, cover = found[FIXTURE], found[COVER]
+    _, bound = helper.ask("select_target", window_id=fixture["id"])
+    yield {"flow": "select the fixture", "passed": bool(bound.get("ok")),
+           "why": f"{bound.get('error') or 'ok'} {bound.get('detail') or ''}; ax_binding "
+                  f"{bound.get('ax_binding')}, methods {bound.get('methods')}"}
+    if not bound.get("ok"):
+        return
+    target = bound["target_id"]
+    yield covered_capture_check(helper, target, fixture, cover, os.path.dirname(args.out))
+    badge, shown = badge_check(display, helper, fixture)
+    yield shown
+    yield target_click_check(helper, target, args.state)
+    yield obstructed_check(helper, target, args.state, fixture, cover, records[COVER])
+    if badge is None:
+        return
+    yield pause_check(helper, target, args.state, badge)
+    yield resume_check(helper, target, args.state, badge)
+    yield pass_through_check(helper, badge, records[FLOOR])
+    yield stop_check(helper, target, args.state, badge)
+    yield release_check(helper)
+
+
+def run(args):
+    out = os.path.dirname(args.out)
+    records = {FLOOR: os.path.join(out, "floor-presses.json"),
+               COVER: os.path.join(out, "cover-presses.json")}
+    panes, results = start_panes(records), []
+    helper = Session(args.binary, args.out + ".stderr")
+    try:
+        with x11_oracle.Display() as display:
+            results.append(hello_check(helper.handshake()))
+            results.append(unscaled_check(helper))
+            results.append(fixture_listed(helper, "gtk3"))
+            for title in (FLOOR, COVER):
+                results.append({"flow": f"{title} listed", "passed": wait_listed(helper, title) is not None,
+                                "why": title})
+            if all(result.get("passed") for result in results):
+                results.extend(bound_steps(helper, display, args, records))
+                results.append(xid_reuse_check(helper))
+                results.append(cycles_check(helper, by_title(listed(helper), FIXTURE)))
+    except (HelperFailed, subprocess.SubprocessError, OSError, KeyError, ValueError) as why:
+        results.append({"flow": "the run", "passed": False, "why": f"{type(why).__name__}: {why}"})
+    finally:
+        helper.close()
+        for pane in panes:
+            pane.terminate()
+        for pane in panes:
+            try:
+                pane.wait(timeout=COMMAND_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                pane.kill()
+                pane.wait()
+    return {"steps": results, "events": events(args.state),
+            "session_events": helper.session_events,
+            "passed": bool(results) and all(result.get("passed") for result in results)}
+
+
+def main():
+    refuse_outside_a_container()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--binary", required=True)
+    parser.add_argument("--state", required=True)
+    parser.add_argument("--out", required=True)
+    args = parser.parse_args()
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    result = run(args)
+    with open(args.out, "w") as handle:
+        json.dump(result, handle, indent=1)
+    for step in result["steps"]:
+        print(f"{'PASS' if step.get('passed') else 'FAIL'} gtk3 {step['flow']}: {step.get('why')}")
+    print(f"BOUND gtk3: {'PASS' if result['passed'] else 'FAIL'}")
+    sys.exit(0 if result["passed"] else 1)
+
+
+if __name__ == "__main__":
+    main()
