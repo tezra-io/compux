@@ -382,6 +382,9 @@ pub struct Surface {
     pub native_kind: String,
     pub label: Option<String>,
     pub element: Retained,
+    /// It sits in a window of its own that the window server ties to the bound
+    /// window, outside the bound window's subtree.
+    pub apart: bool,
 }
 
 /// What one scan for surfaces found, and whether it saw everything it looks at.
@@ -416,6 +419,7 @@ pub fn surfaces(ax: &Rc<dyn Ax>, scene: &Scene) -> Result<Surfaces, Failure> {
         read: 0,
         stopped: None,
         found: Vec::new(),
+        apart: false,
     };
     match &scene.window {
         None => scan.application(scene.pid),
@@ -436,6 +440,9 @@ struct Scan<'a> {
     /// and a slow application would hold it for a timeout per node.
     stopped: Option<&'static str>,
     found: Vec<Surface>,
+    /// What is read now sits in a window of the bound window's own, outside its
+    /// subtree.
+    apart: bool,
 }
 
 impl Scan<'_> {
@@ -479,6 +486,7 @@ impl Scan<'_> {
         let Some(app) = self.ax.application(self.ax, pid) else {
             return Ok(());
         };
+        self.apart = true;
         for child in self.kids(app.handle()) {
             self.owned_top(child, &family, &owned);
         }
@@ -674,6 +682,7 @@ impl Scan<'_> {
             native_kind,
             label: facts.label.clone(),
             element: node,
+            apart: self.apart,
         });
         None
     }
@@ -1004,7 +1013,36 @@ fn named_entry<'a>(
             format!("the listing this request names has no {reference}: list the controls again"),
         )
     })?;
+    if let Some(bound) = &at.scene.window {
+        listed_here(named, reference, bound.id, at.scene.pid)?;
+    }
     Ok((named, entry))
+}
+
+/// Whether a request bound to `window`, of process `pid`, may use a reference of
+/// this listing: only one listed while that window was bound. One listed without a
+/// binding, while another window was bound, or from another process may name a
+/// control of another window.
+pub fn listed_here(
+    named: &Elements,
+    reference: &str,
+    window: u32,
+    pid: i32,
+) -> Result<(), Failure> {
+    let listed = match named.bound {
+        None => "without a window binding",
+        Some(bound) if bound != window => "while another window was bound",
+        Some(_) if named.pid != pid => "from another application than the bound window's",
+        Some(_) => return Ok(()),
+    };
+    Err(Failure::new(
+        "stale_element",
+        format!(
+            "{reference} was listed {listed}, and this request is bound to one window, so \
+             nothing was sent: list the bound window (`elements` with this target_id) and use \
+             a reference from the new list"
+        ),
+    ))
 }
 
 /// A value condition. Refused on a secure field, by the listing's word or by what
@@ -2075,6 +2113,48 @@ mod tests {
             whole(&ax, &bound, Scope::Menu).is_err(),
             "the context menu is the application's, not the window's"
         );
+    }
+
+    // A condition bound to a window reads a reference only from a listing taken
+    // while that window was bound: one listed without a binding, or under another
+    // window, may name a control of another window. Without a binding any
+    // listing is read, as before.
+    #[test]
+    fn a_bound_condition_reads_only_a_reference_listed_under_its_window() {
+        let (recorder, ax) = platform(two_windows());
+        recorder.windows_are(&[0, 1]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let first = bound_to(&windows[0], 10, &two_windows_server());
+        let unbound = listing_of(&ax, &recorder);
+        let under = |window: Option<u32>| {
+            Elements::shared(
+                unbound.pid,
+                unbound.started_at,
+                window,
+                unbound.entries().to_vec(),
+            )
+        };
+        let clock = SystemClock::new();
+        let enabled = Condition::Enabled("e1".to_string());
+        let looked = |scene: Scene, named: &Elements| {
+            let at = Looking {
+                ax: &ax,
+                scene,
+                named: Some(named),
+                clock: &clock,
+            };
+            look(&at, &enabled, u64::MAX)
+        };
+
+        for named in [&unbound, &under(Some(11))] {
+            let refused = looked(first.clone(), named).expect_err("listed elsewhere");
+            assert_eq!(refused.code, "stale_element");
+        }
+        assert!(
+            looked(first.clone(), &under(Some(10))).is_ok(),
+            "listed here"
+        );
+        assert!(looked(app_scene(), &unbound).is_ok(), "no binding");
     }
 
     // --- surfaces ----------------------------------------------------------------

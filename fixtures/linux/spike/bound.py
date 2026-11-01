@@ -30,6 +30,8 @@ under where the badge floats. Then:
   receipt see it, the dialog scope lists its Cancel, focus in it is not the bound
   window's own (`focused` says it is in another window), Cancel pressed from that
   listing closes it, and the scope then says no dialog of the bound window is open;
+- a bound screenshot's marks are the fixture's own controls, and its button pressed
+  by its mark's reference through the binding records a press;
 - an override-redirect popup, which no window manager lists, over the button
   refuses the click `target_obstructed`, naming it, and nothing is recorded; with
   its input region set clear of that point, the same click lands;
@@ -635,6 +637,26 @@ def bound_dialog_check(helper, target, state):
                    f"surfaces {surfaces}; focused {focused.get('error')}: {focused.get('detail')}; "
                    f"Cancel listed {cancel is not None}, pressed {cancelled.get('error') or 'ok'}, "
                    f"recorded {bool(event)}; then {closed.get('error')}: {closed.get('detail')}"}
+
+
+def marks_press_check(helper, target, state):
+    """A bound screenshot's marks are read from the bound window, listed under the
+    binding: its button, pressed by its mark's reference through the binding, acts."""
+    flow = "a bound screenshot's mark presses through the binding"
+    _, shot = helper.ask("screenshot", target_id=target, marks=True)
+    marks = shot.get("marks", [])
+    button = [mark for mark in marks
+              if mark.get("label") == "GTK3 button" and mark.get("element_ref")]
+    if not shot.get("observation_id") or not button:
+        return {"flow": flow, "passed": False,
+                "why": f"{shot.get('error') or 'ok'}: marks {[mark.get('label') for mark in marks]}"}
+    since = len(events(state))
+    _, pressed = helper.ask("press", mutation=True, observation_id=shot["observation_id"],
+                            element_ref=button[0]["element_ref"], target_id=target)
+    event = recorded(state, since, "gtk3", "button", "press", None)
+    return {"flow": flow, "passed": bool(pressed.get("ok")) and event is not None,
+            "why": f"{len(marks)} marks; press {pressed.get('error') or 'ok'} "
+                   f"{pressed.get('detail') or ''}, recorded {event}"}
 
 
 def popup_check(helper, target, state, display):
@@ -1294,6 +1316,7 @@ def bound_steps(helper, display, args, records):
     yield shown
     yield target_click_check(helper, target, args.state)
     yield bound_dialog_check(helper, target, args.state)
+    yield marks_press_check(helper, target, args.state)
     yield popup_check(helper, target, args.state, display)
     yield obstructed_check(helper, target, args.state, fixture, cover, records[COVER])
     if badge is None:

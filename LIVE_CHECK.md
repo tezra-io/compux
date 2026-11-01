@@ -2292,6 +2292,10 @@ bound window) has never run. Bind the fixture window (`windows`, then
   send `{"action":"elements","scope":"focused","target_id":"T"}`: `scope_not_found`
   saying focus is in another window of the application. Nothing of the second
   document is listed.
+* `{"action":"screenshot","target_id":"T","marks":true}` badges the fixture
+  window's controls; press one by its mark's `element_ref` with `"target_id":"T"`
+  and it acts. With the context menu open over the window, the same screenshot
+  badges none of the menu's items (the menu is the application's).
 * With the fixture bound again, a reference from step 2's listing (taken without
   `target_id`) pressed with `"target_id":"T"` is `stale_element`, saying it was
   listed without a window binding, and **nothing is pressed** (watch the control);

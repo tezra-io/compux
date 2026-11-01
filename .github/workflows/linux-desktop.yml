@@ -17,7 +17,8 @@ name: linux-desktop
 #   x11-bound  Ubuntu 24.04 under openbox: the GTK 3 fixture bound (bound.py)
 #          with none of a covering window's pixels in its first frame, captured
 #          while covered, its transient dialog listed and pressed through the
-#          binding and focus in it not the bound window's, a covered point and a
+#          binding and focus in it not the bound window's, a mark of a bound
+#          screenshot pressed through the binding, a covered point and a
 #          point under a popup refused, the
 #          X11 badge's buttons clicked as a person would and judged by the gate
 #          and by what the window under a missed click recorded, a click another

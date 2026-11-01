@@ -479,10 +479,17 @@ the same cell. Such an object is the control only while its label is the one lis
 there) is `stale_element`. On every other toolkit its own account proves nothing: a destroyed GTK 3 or Chromium object
 keeps answering its old parent and index for a while. A `ServiceUnknown` error means the application quit.
 
-A request naming a target uses only references listed while that window was bound (by any binding of it): one
-listed without a target, or while another window was bound, may name a control of another window, and is
-`stale_element` with nothing sent; the detail says to list the bound window and use a reference from that list. A
-request naming no target uses any listing, as before.
+A request naming a target uses only references listed while that window was bound (by any binding of it), from its
+application: one listed without a target, while another window was bound, or from another application may name a
+control of another window, and is `stale_element` with nothing sent; the detail says to list the bound window and
+use a reference from that list. The same holds for a condition naming an `element_ref` (§5.1) in a request naming a
+target. A request naming no target uses any listing, as before.
+
+A screenshot with `marks` of a bound window badges what that window sees: its own controls, and those of the
+surfaces in windows of its own that its `menu` and `dialog` scopes list (§2.1), and its references are listed under
+the binding. Nothing else of the application is marked, however it overlaps the window. A window bound without an
+accessibility element has nothing of its own to read, so its marks are the application's in view, as a display's
+are, listed under no binding.
 
 ## 5. Waiting on the tree
 
@@ -514,7 +521,8 @@ One object, used by `wait_for` (§5.3) and by an action's check (§5.2):
 - `timeout_ms` (optional): 1 to 25 000, default 5 000.
 - `element_ref` names a control of the listing the request's own `observation_id` names. A request with no
   `observation_id` (`key`, `type` at the focus, `paste`) cannot use the `element_ref` kinds: `invalid_argument`.
-  An `observation_id` that listed no controls (a screenshot's) names none of them: `stale_element`.
+  An `observation_id` that listed no controls (a screenshot's) names none of them: `stale_element`. A request
+  naming a target reads only a control listed while that window was bound (§4.8): another is `stale_element`.
 
 How it is read: a look every 100 ms, each look at most 1.5 s (the walk's own budget), until the condition holds or
 `timeout_ms` has passed; at most `timeout_ms / 100 + 1` looks. It never sends input. A pause ends it at once
