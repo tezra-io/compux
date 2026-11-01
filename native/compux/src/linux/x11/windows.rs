@@ -407,6 +407,42 @@ impl Windows for WindowServer {
     }
 }
 
+/// Whether a window read again (its `_NET_WM_PID`, and its title made one
+/// bounded line as the listing makes it) is still the one the listing named.
+/// An id reused between the two names another process's window, and a window
+/// retitled since may be another one too.
+pub fn still_named(listed_pid: i32, listed_title: &str, pid: Option<i32>, title: &str) -> bool {
+    pid == Some(listed_pid) && crate::ax::one_line(title, MAX_TITLE_CHARS) == listed_title
+}
+
+/// One window's `_NET_WM_PID` and title, read as the listing reads them.
+pub fn owner_and_title(
+    connection: &RustConnection,
+    window: XWindow,
+) -> Result<(Option<i32>, String), String> {
+    let atoms = atoms(connection)?;
+    let words = MAX_NAME_BYTES / 4;
+    let pid = connection
+        .get_property(false, window, atoms.pid, AtomEnum::CARDINAL, 0, 1)
+        .map_err(|error| error.to_string())?;
+    let net_name = connection
+        .get_property(false, window, atoms.name, atoms.utf8, 0, words)
+        .map_err(|error| error.to_string())?;
+    let wm_name = connection
+        .get_property(false, window, AtomEnum::WM_NAME, AtomEnum::STRING, 0, words)
+        .map_err(|error| error.to_string())?;
+    let read = |what| move |error| format!("read the window's {what}: {error}");
+    let pid = values(Some(pid.reply().map_err(read("process"))?))
+        .first()
+        .and_then(|&pid| i32::try_from(pid).ok())
+        .filter(|&pid| pid > 0);
+    let title = text(Some(net_name.reply().map_err(read("title"))?))
+        .filter(|title| !title.is_empty())
+        .or_else(|| text(wm_name.reply().ok()))
+        .unwrap_or_default();
+    Ok((pid, title))
+}
+
 /// One window as a bound target reads it. No pid is `0`, which names no
 /// process, so nothing can be bound to it.
 pub fn facts(window: Window) -> WindowFacts {
@@ -522,6 +558,19 @@ mod tests {
         assert_eq!(extents(&[1, 2, 3, 4, 5]), None);
         assert_eq!(extents(&[1, 2, MAX_EXTENT + 1, 4]), None);
         assert_eq!(extents(&[]), None);
+    }
+
+    #[test]
+    fn a_window_read_again_is_the_listed_one_only_with_its_process_and_title() {
+        let title = "Compux Fixture GTK3";
+        assert!(still_named(4242, title, Some(4242), title));
+        assert!(!still_named(4242, title, Some(4243), title));
+        assert!(!still_named(4242, title, None, title));
+        assert!(!still_named(4242, title, Some(4242), "Compux Victim"));
+        // The listing's title is one bounded line, and so is the one read again.
+        let raw = format!("line one\nline two {}", "x".repeat(200));
+        let listed = crate::ax::one_line(&raw, MAX_TITLE_CHARS);
+        assert!(still_named(4242, &listed, Some(4242), &raw));
     }
 
     // A bound window's facts: no pid names no process, the text is one bounded

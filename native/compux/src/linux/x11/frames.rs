@@ -341,7 +341,7 @@ impl WindowFrames for Composite {
     /// proved is a start that failed, and nothing is left running.
     fn start(&self, window: StreamWindow) -> Result<(), FrameError> {
         self.stop();
-        let mut watch = Watch::open(&self.env, window.id)?;
+        let mut watch = Watch::open(&self.env, &window)?;
         watch.read(&self.slot, self.clock.now_mach(), &*self.clock)?;
         let running = Running::spawn(watch, self.slot.clone(), self.clock.clone())?;
         *self.lock() = Some(running);
@@ -509,11 +509,25 @@ struct Watch {
 }
 
 impl Watch {
-    fn open(env: &Env, client: XWindow) -> Result<Watch, FrameError> {
+    /// The listed window, watched from here on: a window destroyed after this
+    /// is caught by the watch, and one replaced before it by its process and
+    /// title, read again on the watch's own connection.
+    fn open(env: &Env, listed: &StreamWindow) -> Result<Watch, FrameError> {
+        let client = listed.id;
         let (connection, _) = super::connect(env).map_err(unavailable)?;
         versions(&connection)?;
         let top = top_level(&connection, client)?;
         watch_structure(&connection, client, top)?;
+        let (pid, title) =
+            super::windows::owner_and_title(&connection, client).map_err(unavailable)?;
+        if !super::windows::still_named(listed.pid, &listed.title, pid, &title) {
+            return Err(FrameError::Replaced(
+                "the window with that id is no longer the one `windows` listed (its process or \
+                 its title changed since), so nothing was bound; take `windows` again and \
+                 select it"
+                    .to_string(),
+            ));
+        }
         let geometry = connection
             .get_geometry(top)
             .map_err(lost)?

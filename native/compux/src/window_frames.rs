@@ -309,6 +309,12 @@ pub enum FrameError {
     /// window server's listing says a window is gone before any frame is asked.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     Gone(String),
+    /// The window under the bound id is not the one the listing named: its
+    /// process or its title changed between the listing and the stream's own
+    /// look, as when the id was given to another window. Only the X11 stream
+    /// looks again this way; macOS binds the window server's own window.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    Replaced(String),
 }
 
 impl FrameError {
@@ -321,6 +327,7 @@ impl FrameError {
             FrameError::BudgetExceeded(_) => "capture_budget_exceeded",
             FrameError::NotYet => "capture_unavailable",
             FrameError::Gone(_) => "target_unavailable",
+            FrameError::Replaced(_) => "target_binding_unavailable",
         }
     }
 
@@ -330,7 +337,8 @@ impl FrameError {
             | FrameError::Minimized(detail)
             | FrameError::Denied(detail)
             | FrameError::BudgetExceeded(detail)
-            | FrameError::Gone(detail) => detail.clone(),
+            | FrameError::Gone(detail)
+            | FrameError::Replaced(detail) => detail.clone(),
             FrameError::NotYet => {
                 "no frame of that window arrived after the action was dispatched".to_string()
             }
@@ -368,6 +376,14 @@ pub struct StreamWindow {
     pub id: u32,
     pub width: u32,
     pub height: u32,
+    /// The process and title the listing gave the window. Where the window
+    /// server binds nothing by itself (X11), the stream reads both again once it
+    /// watches the window, so an id given to another window in between binds
+    /// nothing.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub pid: i32,
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub title: String,
 }
 
 /// One window's frames.
@@ -1297,6 +1313,8 @@ mod tests {
             id,
             width: 8,
             height: 4,
+            pid: 200,
+            title: "Window".to_string(),
         }
     }
 

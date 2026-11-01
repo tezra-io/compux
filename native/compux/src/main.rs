@@ -6330,6 +6330,8 @@ mod tests {
                 id: 20,
                 width: 1600,
                 height: 1200,
+                pid: 200,
+                title: "Window 20".to_string(),
             })
             .unwrap();
         stream.deliver_sized(1_000, window_frames::Health::Live, 1600, 1200, 1600 * 4);
