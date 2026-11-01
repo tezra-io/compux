@@ -88,6 +88,16 @@ RAISED, RAISED_COLOUR, RAISED_AT = "Compux Raised", 0x8040A0, (300, 4)
 HELD, HELD_COLOUR, HELD_AT, NUDGE = "Compux Held", 0x40A080, (300, 4), 16
 # How far a popup opened over the badge reaches past it on every side.
 POPUP_MARGIN = 20
+# Also at the top, the badge inside it; a managed window starts clear of the
+# badge, stacked over it, and is moved onto it.
+UNDER, UNDER_COLOUR = "Compux Under", 0x6080A0
+MOVER, MOVER_COLOUR, MOVER_FROM, MOVER_TO = "Compux Mover", 0xA06040, (300, 600), (250, 0)
+# A window resized again and again while it is captured, the way a drag at its
+# corner resizes it: sizes grow and shrink by these steps.
+RESIZED, RESIZED_COLOUR, RESIZED_AT = "Compux Resized", 0x50A050, (200, 200)
+RESIZE_STEPS, RESIZE_GROWTH = 40, (12, 10)
+# What a picture asked for mid-resize may be refused as without the binding ending.
+MID_RESIZE_REFUSALS = ("capture_unavailable", "capture_geometry_mismatch")
 # A second X server, with no window manager on it.
 BARE_DISPLAY = 77
 BADGE_CLASS = "^compux-indicator-x11$"
@@ -833,7 +843,9 @@ def bare_steps(binary, out):
         with x11_oracle.Display(display) as oracle:
             return [bordered_window_check(helper, display, out),
                     badge_restack_check(helper, display, oracle),
-                    badge_held_check(helper, display, oracle)]
+                    badge_held_check(helper, display, oracle),
+                    badge_sibling_check(helper, display, oracle),
+                    resize_while_captured_check(helper, display)]
     finally:
         if helper is not None:
             helper.close()
@@ -961,6 +973,90 @@ def badge_held_check(helper, display, oracle):
         if popup is not None and not closed:
             popup.destroy()
         held.destroy()
+
+
+def badge_sibling_check(helper, display, oracle):
+    """A bound window at the top of the screen, the badge inside its top edge; a
+    managed window clear of the badge, stacked over it; a popup clear of both,
+    stacked over everything. The managed window moved onto the badge has the badge
+    back over it and still under the popup: the badge goes just over the window
+    that came over it, never to the very top. The managed window is left out of
+    the window manager's list, as the popup is, so the badge never hides for it.
+    Judged by the server's stacking order."""
+    flow = "the badge goes back just over a window moved onto it, and stays under a popup elsewhere"
+    under = Victim(UNDER, UNDER_COLOUR, place=HELD_AT, display=display)
+    under.create()
+    under.listed_on_root()
+    mover = Victim(MOVER, MOVER_COLOUR, place=MOVER_FROM, display=display)
+    popup = Victim(POPUP, POPUP_COLOUR, place=POPUP_AWAY, display=display, override=True)
+    try:
+        window = wait_listed(helper, UNDER)
+        _, bound = helper.ask("select_target", window_id=window["id"]) if window else (None, {})
+        shown = wait_for(lambda: len(badges(display=display)) == 1)
+        if not bound.get("ok") or not shown:
+            return {"flow": flow, "passed": False,
+                    "why": f"select {bound.get('error') or 'ok'} {bound.get('detail')}; badge {shown}"}
+        badge = int(badges(display=display)[0])
+        mover.create()
+        popup.create()
+        time.sleep(QUIET_S)
+        before = oracle.stacking()
+        mover.move_to(*MOVER_TO)
+        time.sleep(QUIET_S)
+        after = oracle.stacking()
+        meets = overlap(geometry(badge, display), (*MOVER_TO, *xcb_victim.SIZE))
+        helper.ask("release_target")
+        stacked = before.index(badge) < before.index(mover.id) < before.index(popup.id)
+        over = after.index(badge) > after.index(mover.id)
+        under_popup = after.index(popup.id) > after.index(badge)
+        return {"flow": flow, "passed": stacked and meets is not None and over and under_popup,
+                "why": f"before the move, bottom to top {[hex(w) for w in before]} ({stacked}); the "
+                       f"window meets the badge at {meets}; after it, badge over the window {over}, "
+                       f"under the popup {under_popup} ({[hex(w) for w in after]})"}
+    finally:
+        popup.destroy()
+        mover.destroy()
+        under.destroy()
+
+
+def resize_while_captured_check(helper, display):
+    """A bound window resized again and again, growing and shrinking, while its
+    picture is asked for after each step: no answer ends the binding (a picture
+    asked for mid-resize may be refused, never the binding), and once the window
+    rests, its picture has its last size. Judged by the X server's geometry and
+    the replies."""
+    flow = "a window resized while it is captured keeps its binding, and its last picture has its last size"
+    resized = Victim(RESIZED, RESIZED_COLOUR, place=RESIZED_AT, display=display)
+    resized.create()
+    resized.listed_on_root()
+    try:
+        window = wait_listed(helper, RESIZED)
+        _, bound = helper.ask("select_target", window_id=window["id"]) if window else (None, {})
+        if not bound.get("ok"):
+            return {"flow": flow, "passed": False,
+                    "why": f"select {bound.get('error') or 'ok'} {bound.get('detail')}"}
+        answers = {}
+        for step in range(RESIZE_STEPS):
+            width = xcb_victim.SIZE[0] + (step % 8) * RESIZE_GROWTH[0]
+            height = xcb_victim.SIZE[1] + (step % 5) * RESIZE_GROWTH[1]
+            xdotool("windowsize", str(resized.id), str(width), str(height), display=display)
+            _, shot = helper.ask("screenshot", target_id=bound["target_id"])
+            answer = shot.get("error") or "ok"
+            answers.setdefault(answer, shot.get("detail"))
+        time.sleep(QUIET_S)
+        final = geometry(resized.id, display)[2:]
+        _, last = helper.ask("screenshot", target_id=bound["target_id"])
+        helper.ask("release_target")
+        refused = {code: detail for code, detail in answers.items()
+                   if code != "ok" and code not in MID_RESIZE_REFUSALS}
+        size = (last.get("width"), last.get("height"))
+        passed = bool(last.get("data")) and size == tuple(final) and not refused
+        return {"flow": flow, "passed": passed,
+                "why": f"answers mid-resize {sorted(answers)}, of which past a mid-resize refusal "
+                       f"{refused}; last picture {size} {last.get('error') or ''} "
+                       f"{last.get('detail') or ''}, window {tuple(final)}"}
+    finally:
+        resized.destroy()
 
 
 # --- twenty cycles ----------------------------------------------------------------------------
