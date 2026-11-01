@@ -226,10 +226,12 @@ defmodule Compux.BinaryTest do
 
   # A release artifact matching the host target: a real ad-hoc-signed Fermix.app
   # (zipped with ditto) on macOS so the ditto-extract + codesign-verify path is
-  # actually exercised; a bare-binary tarball on Linux.
+  # actually exercised; a tarball of the helper and its X11 badge on Linux.
   defp fake_artifact do
     case Binary.target() do
-      {:ok, "macos-" <> _} -> fake_app_zip()
+      {:ok, "macos-" <> _} ->
+        fake_app_zip()
+
       _ ->
         fake_tarball([
           {~c"compux", "compux-binary-bytes"},
