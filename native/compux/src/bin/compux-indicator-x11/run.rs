@@ -29,6 +29,9 @@ use crate::x11::{Delivered, Window};
 pub const MAX_RAISES_PER_SECOND: u32 = 10;
 /// How many ignored lines are described on stderr before they are only counted.
 pub const MAX_LOGGED_IGNORED: u32 = 5;
+/// How many sent button events are described on stderr before they are only
+/// counted.
+pub const MAX_LOGGED_FORGED: u32 = 5;
 
 /// Raises left in the current second.
 pub struct RaiseBudget {
@@ -54,6 +57,16 @@ impl RaiseBudget {
         self.used += 1;
         true
     }
+}
+
+/// Whether `event` is a button press or release another program sent
+/// (`SendEvent`), rather than one the server made from the pointer. Any X
+/// client can send the badge's window a click on Stop or Resume, so those are
+/// never a press. Input made through XTEST is the server's own, as the person's
+/// is: under the X11 model nothing tells the two apart, for this window or any
+/// other client's.
+pub fn forged(event: &Event) -> bool {
+    matches!(event, Event::ButtonPress(_) | Event::ButtonRelease(_)) && event.sent_event()
 }
 
 /// Everything the loop is handed.
@@ -98,6 +111,7 @@ fn serve() -> Result<(), String> {
         canvas: None,
         pressed: None,
         ignored: 0,
+        forged: 0,
         raises: RaiseBudget::new(),
         started: Instant::now(),
     };
@@ -122,6 +136,8 @@ struct Badge {
     /// The button a press went down on, waiting for its release.
     pressed: Option<Button>,
     ignored: u32,
+    /// Button events other programs sent, dropped.
+    forged: u32,
     raises: RaiseBudget,
     started: Instant,
 }
@@ -154,6 +170,12 @@ impl Badge {
             eprintln!(
                 "compux-indicator-x11: {} state line(s) ignored",
                 self.ignored
+            );
+        }
+        if self.forged > MAX_LOGGED_FORGED {
+            eprintln!(
+                "compux-indicator-x11: {} button event(s) another program sent were dropped",
+                self.forged
             );
         }
         self.window.hide()
@@ -207,6 +229,10 @@ impl Badge {
     }
 
     fn event(&mut self, event: Event) -> Result<Flow, String> {
+        if forged(&event) {
+            self.drop_forged(&event);
+            return Ok(Flow::Continue);
+        }
         let id = self.window.id();
         match event {
             Event::Expose(e) if e.window == id && e.count == 0 => self.repaint()?,
@@ -231,6 +257,25 @@ impl Badge {
             _unrelated => {}
         }
         Ok(Flow::Continue)
+    }
+
+    /// Counted, and described while few: a program pressing the badge's buttons
+    /// is worth the log, a flood of them is not.
+    fn drop_forged(&mut self, event: &Event) {
+        self.forged += 1;
+        if self.forged <= MAX_LOGGED_FORGED {
+            let kind = match event {
+                Event::ButtonPress(_) => "press",
+                _release => "release",
+            };
+            eprintln!(
+                "compux-indicator-x11: dropped a button {kind} another program sent; only the \
+                 pointer's own clicks press the badge"
+            );
+        }
+        if self.forged == MAX_LOGGED_FORGED {
+            eprintln!("compux-indicator-x11: further sent button events are counted, not logged");
+        }
     }
 
     fn repaint(&self) -> Result<(), String> {
@@ -306,6 +351,53 @@ fn read_input(sender: Sender<Message>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use x11rb::protocol::xproto::{
+        ButtonPressEvent, KeyButMask, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, EXPOSE_EVENT,
+    };
+
+    fn button(response_type: u8) -> ButtonPressEvent {
+        ButtonPressEvent {
+            response_type,
+            detail: 1,
+            sequence: 0,
+            time: 0,
+            root: 1,
+            event: 2,
+            child: 0,
+            root_x: 310,
+            root_y: 140,
+            event_x: 310,
+            event_y: 14,
+            state: KeyButMask::default(),
+            same_screen: true,
+        }
+    }
+
+    // Any X client can send any window a button event; the server marks the
+    // ones it did not make itself, and only those are refused.
+    #[test]
+    fn a_button_event_another_program_sent_is_not_a_press() {
+        const SENT: u8 = 0x80;
+        assert!(forged(&Event::ButtonPress(button(
+            BUTTON_PRESS_EVENT | SENT
+        ))));
+        assert!(forged(&Event::ButtonRelease(button(
+            BUTTON_RELEASE_EVENT | SENT
+        ))));
+        assert!(!forged(&Event::ButtonPress(button(BUTTON_PRESS_EVENT))));
+        assert!(!forged(&Event::ButtonRelease(button(BUTTON_RELEASE_EVENT))));
+        let expose = x11rb::protocol::xproto::ExposeEvent {
+            response_type: EXPOSE_EVENT | SENT,
+            sequence: 0,
+            window: 2,
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            count: 0,
+        };
+        assert!(!forged(&Event::Expose(expose)), "only buttons act");
+    }
 
     #[test]
     fn the_badge_raises_itself_at_most_ten_times_a_second() {
