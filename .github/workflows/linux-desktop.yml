@@ -14,11 +14,13 @@ name: linux-desktop
 #          XTEST clicks and keys, a paste through the selection compux owns, the
 #          frame against a pattern on the root, a refused character off the
 #          layout, and a button a killed helper held released by the next one.
-#   x11-bound  Ubuntu 24.04 under openbox: the GTK 3 fixture bound (bound.py),
-#          captured while another window covers it, a covered point refused,
-#          the X11 badge's buttons clicked as a person would and judged by the
-#          gate and by what the window under a missed click recorded, a reused
-#          window id refused, and twenty select and release cycles.
+#   x11-bound  Ubuntu 24.04 under openbox: the GTK 3 fixture bound (bound.py)
+#          with none of a covering window's pixels in its first frame, captured
+#          while covered, a covered point refused, the X11 badge's buttons clicked
+#          as a person would and judged by the gate and by what the window under a
+#          missed click recorded, a click another program sends dropped, a reused
+#          window id and a window that never repaints refused, and twenty select
+#          and release cycles.
 #   no-c-deps  the helper and its X11 badge built and tested in plain Ubuntu 24.04
 #          with no C library but the C runtime (no_c_deps.sh), their links
 #          checked, and clippy for aarch64-unknown-linux-gnu.

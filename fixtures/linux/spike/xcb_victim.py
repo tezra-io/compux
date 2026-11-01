@@ -8,8 +8,10 @@ on the binding: a reused id must never bring the binding back.
 
 The window is an ordinary top-level the window manager frames, with `_NET_WM_PID`
 set to this process, and it repaints itself in one colour on every expose from a
-thread of its own, as an application would. Runs only inside the private-session
-container; bound.py refuses to start anywhere else.
+thread of its own, as an application would. A LAZY one has no background and
+paints only on its first expose, as a hung application would: whatever is later
+copied into it stays until something else draws there. Runs only inside the
+private-session container; bound.py refuses to start anywhere else.
 """
 
 import ctypes
@@ -92,10 +94,11 @@ class Victim:
     repaint thread is blocked on it, and it closes, with any window still standing,
     when this process exits."""
 
-    def __init__(self, title, colour):
+    def __init__(self, title, colour, lazy=False, place=PLACE):
         self.xcb = _library()
         self.title = title.encode()
         self.colour = colour
+        self.lazy, self.place, self.painted = lazy, place, False
         self.conn = self.xcb.xcb_connect(None, None)
         if not self.conn or self.xcb.xcb_connection_has_error(self.conn):
             raise RuntimeError("the private X server did not answer xcb")
@@ -130,17 +133,23 @@ class Victim:
             kind = ctypes.c_uint8.from_address(event).value & 0x7F
             window = ctypes.c_uint32.from_address(event + 4).value
             _libc.free(event)
-            if kind == EXPOSE and window == self.id:
+            if kind == EXPOSE and window == self.id and not (self.lazy and self.painted):
                 self.xcb.xcb_poly_fill_rectangle(self.conn, self.id, self.gc, 1,
                                                  ctypes.byref(everything))
                 self.xcb.xcb_flush(self.conn)
+                self.painted = True
 
     def create(self):
         """The window, under this victim's one id, mapped and titled."""
-        values = (ctypes.c_uint32 * 2)(self.colour, EXPOSURE_MASK)
-        self.xcb.xcb_create_window(self.conn, self.depth, self.id, self.root, PLACE[0], PLACE[1],
-                                   SIZE[0], SIZE[1], 0, INPUT_OUTPUT, self.visual,
-                                   CW_BACK_PIXEL | CW_EVENT_MASK, values)
+        # A lazy window has no background: the server paints nothing for it.
+        if self.lazy:
+            mask, values = CW_EVENT_MASK, (ctypes.c_uint32 * 1)(EXPOSURE_MASK)
+        else:
+            mask = CW_BACK_PIXEL | CW_EVENT_MASK
+            values = (ctypes.c_uint32 * 2)(self.colour, EXPOSURE_MASK)
+        self.xcb.xcb_create_window(self.conn, self.depth, self.id, self.root, self.place[0],
+                                   self.place[1], SIZE[0], SIZE[1], 0, INPUT_OUTPUT, self.visual,
+                                   mask, values)
         self._property(ATOM_WM_NAME, ATOM_STRING, 8, self.title)
         self._property(self.atoms[b"_NET_WM_NAME"], self.atoms[b"UTF8_STRING"], 8, self.title)
         pid = (ctypes.c_uint32 * 1)(os.getpid())

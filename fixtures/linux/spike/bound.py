@@ -12,12 +12,14 @@ container's marker file, before it starts anything.
       --state /tmp/compux-fixture-state/gtk3.json --out /tmp/spike-out/gtk3-bound.json
 
 Two plain windows (panes.py) go beside the GTK 3 fixture: a magenta COVER in front
-of its lower right, and a FLOOR behind it, under where the badge floats. Then:
+of its right side, title bar and frame as well as client, and a FLOOR behind it,
+under where the badge floats. Then:
 
 - `hello` offers `select_target` and `release_target`, `targets: true`, and window
   capture;
-- the fixture is bound; its frame shows the fixture where the cover hides it, and
-  the display shows the cover there;
+- the fixture is bound under the cover; its first frame holds not one pixel of the
+  cover's colour, title bar and frame included, while the display shows the cover
+  over them; a later frame shows the fixture where the cover hides it;
 - the badge is up: one override-redirect window of the helper's own child, inside
   the rectangle the helper checks for anything covering it, taking clicks on two
   rectangles only;
@@ -25,10 +27,14 @@ of its lower right, and a FLOOR behind it, under where the badge floats. Then:
   point the cover hides is `target_obstructed`, and nothing recorded it;
 - the badge's Pause, clicked as the person clicks, reaches the gate (an
   `operator_pause`, and the next click is refused `paused`); Resume undoes it; a
-  click on the badge outside its buttons reaches the floor under it; Stop reaches
-  the gate; none of these moved the keyboard focus;
+  click on the badge outside its buttons reaches the floor under it; a press and
+  release on Stop that another program sends (SendEvent) is dropped, and the gate
+  goes on; Stop clicked as the person clicks reaches the gate; none of these moved
+  the keyboard focus;
 - a window bound, closed, and made again under the SAME id by the same process
   (xcb_victim.py) does not bring the binding back: `target_unavailable`;
+- a window that paints once and never repaints, bound with the cover over part of
+  it, is refused `capture_unavailable`, and no frame of it is sent;
 - twenty select and release cycles leave no badge process, no zombie and no badge
   window, and the helper's resident memory flat.
 
@@ -56,13 +62,14 @@ FIXTURE = "Compux Fixture GTK3"
 FLOOR, FLOOR_COLOUR = "Compux Floor", 0x406080
 COVER, COVER_COLOUR = "Compux Cover", 0xFF00FF
 VICTIM, VICTIM_COLOUR = "Compux Victim", 0x30A030
+LAZY, LAZY_COLOUR, LAZY_AT = "Compux Lazy", 0x2050C0, (400, 450)
 BADGE_CLASS = "^compux-indicator-x11$"
 # Where the windows go, in root pixels: the fixture with room above it for the
-# badge, the floor under that room, the cover over the fixture's lower right and
-# clear of the badge's rectangle.
+# badge, the floor under that room, the cover over the fixture's right side from
+# above its title bar down, and clear of the badge's rectangle.
 FIXTURE_AT = (60, 160)
 FLOOR_GEOMETRY = (0, 0, 1280, 440)
-COVER_OFFSET = (520, 330)
+COVER_OFFSET = (520, -40)
 COVER_SIZE = (560, 480)
 # The helper's badge rectangle around a window at (x, y): its `badge_area`.
 BADGE_AREA = (34, 448, 114)
@@ -266,6 +273,73 @@ def covered_capture_check(helper, target, fixture, cover, out):
             "why": f"cover over {hidden}: {in_frame:.3f} of {read} frame pixels are the cover's, "
                    f"{on_display:.3f} of {seen} display pixels are; front to back {order}; "
                    f"frame {frame['width']}x{frame['height']} {frame.get('target_id')}"}
+
+
+def cover_pixels(shot):
+    """How many of an image's pixels are the cover's colour, every pixel looked at."""
+    width, height, rows = png_rows(base64.b64decode(shot["data"]))
+    want = ((COVER_COLOUR >> 16) & 0xFF, (COVER_COLOUR >> 8) & 0xFF, COVER_COLOUR & 0xFF)
+    found = 0
+    for y in range(height):
+        row = rows[y]
+        for x in range(width):
+            got = row[x * 4:x * 4 + 3]
+            found += max(abs(a - b) for a, b in zip(got, want, strict=True)) <= COLOUR_TOLERANCE
+    return found
+
+
+def frame_border(display, client):
+    """The window manager's frame around `client` (the root's child holding it)
+    and that frame's border width."""
+    x11, pointer = display.x11, ctypes.POINTER
+    x11.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong, pointer(ctypes.c_ulong),
+                               pointer(ctypes.c_ulong), pointer(ctypes.c_void_p),
+                               pointer(ctypes.c_uint)]
+    x11.XGetGeometry.argtypes = [ctypes.c_void_p, ctypes.c_ulong, pointer(ctypes.c_ulong),
+                                 pointer(ctypes.c_int), pointer(ctypes.c_int),
+                                 pointer(ctypes.c_uint), pointer(ctypes.c_uint),
+                                 pointer(ctypes.c_uint), pointer(ctypes.c_uint)]
+    window, root, parent = client, ctypes.c_ulong(), ctypes.c_ulong()
+    for _ in range(WAIT_TRIES):
+        kids, count = ctypes.c_void_p(), ctypes.c_uint()
+        x11.XQueryTree(display.display, window, ctypes.byref(root), ctypes.byref(parent),
+                       ctypes.byref(kids), ctypes.byref(count))
+        if kids:
+            x11.XFree(kids)
+        if parent.value in (0, root.value):
+            break
+        window = parent.value
+    at, size = (ctypes.c_int(), ctypes.c_int()), (ctypes.c_uint(), ctypes.c_uint())
+    border, depth = ctypes.c_uint(), ctypes.c_uint()
+    x11.XGetGeometry(display.display, window, ctypes.byref(root), ctypes.byref(at[0]),
+                     ctypes.byref(at[1]), ctypes.byref(size[0]), ctypes.byref(size[1]),
+                     ctypes.byref(border), ctypes.byref(depth))
+    return window, border.value
+
+
+def first_frame_check(helper, display, bound, fixture, cover, out):
+    """The cover was over the fixture's title bar and frame, and its client, when
+    the fixture was bound: the frame `select_target` answered holds none of the
+    cover's colour, while the display shows the cover over the title bar."""
+    flow = "a window over the target at the bind is not in its first frame"
+    keep(out, "first-frame.png", bound)
+    client = geometry(window_id(FIXTURE))
+    fx, fy, fw, _ = region(fixture)
+    title = overlap(region(cover), (fx, fy, fw, client[1] - fy))
+    if title is None or not bound.get("data"):
+        return {"flow": flow, "passed": False,
+                "why": f"the cover {region(cover)} is not over the title bar above {client}"}
+    _, shot = helper.ask("screenshot")
+    keep(out, "first-frame-display.png", shot)
+    on_display, seen = colour_share(shot, scaled(title, (0, 0), shot["width"] / shot["physical"]["width"]),
+                                    COVER_COLOUR)
+    stray = cover_pixels(bound)
+    frame, border = frame_border(display, int(window_id(FIXTURE)))
+    passed = stray == 0 and seen > 0 and on_display > 0.95
+    return {"flow": flow, "passed": passed,
+            "why": f"{stray} of {bound['width']}x{bound['height']} first-frame pixels are the "
+                   f"cover's; it hides the title bar at {title}, where {on_display:.3f} of {seen} "
+                   f"display pixels are the cover's; frame {frame:#x} border {border}"}
 
 
 # --- the badge, as the X server and /proc see it ---------------------------------------------
@@ -518,6 +592,34 @@ def pass_through_check(helper, badge, record):
                    f"events {[e and e.get('event') for e in raised]}; badge back {back}"}
 
 
+def dropped(stderr_path):
+    """How many sent button events the badge has said it dropped."""
+    with open(stderr_path, encoding="utf-8", errors="replace") as handle:
+        return sum("another program sent" in line for line in handle)
+
+
+def forged_stop_check(helper, target, state, badge, stderr_path):
+    """A press and release on Stop sent by another program (`xdotool click
+    --window` sends them with SendEvent, the pointer resting on Stop) stop
+    nothing: no event, the next click lands, and the badge says it dropped both.
+    The person's click on Stop after this is the control that the same point
+    does reach the gate."""
+    xdotool("mousemove", *button_centre(badge, 1))
+    before = dropped(stderr_path)
+    xdotool("click", "--window", badge["window"], "1")
+    event = helper.wait_event("operator_stop", EVENT_WAIT_S)
+    if event is not None:
+        helper.take_authority(event)
+    since = len(events(state))
+    reply = click_button(helper, target)
+    arrived = recorded(state, since, "gtk3", "button", "press", None)
+    count = dropped(stderr_path) - before
+    passed = event is None and bool(reply.get("ok")) and arrived is not None and count == 2
+    return {"flow": "a click on Stop another program sends is dropped", "passed": passed,
+            "why": f"event {event and event.get('event')}; next click {reply.get('error') or 'ok'}, "
+                   f"recorded {arrived}; the badge dropped {count} sent event(s)"}
+
+
 def stop_check(helper, target, state, badge):
     """Stop reaches the gate and holds the next click; Resume then reopens it, so
     the stages after this one can act."""
@@ -583,6 +685,40 @@ def xid_reuse_check(helper):
                    f"{same} ({victim.id:#x}, pid {owner}); capture {shot.get('error')}: "
                    f"{shot.get('detail')}; click {click.get('error')}: {click.get('detail')}",
             "capture_after": shot}
+
+
+# --- a window that never repaints -------------------------------------------------------------
+
+
+def lazy_window_check(helper):
+    """A window that paints once and never again, bound while the cover hides part
+    of it: nothing after the bind ever draws its picture, so the binding is refused
+    `capture_unavailable` and no frame of it, the cover's pixels and all, is sent."""
+    flow = "a window that never repaints is refused, never sent"
+    lazy = Victim(LAZY, LAZY_COLOUR, lazy=True, place=LAZY_AT)
+    lazy.create()
+    shown = wait_for(lambda: bool(xdotool("search", "--onlyvisible", "--name", f"^{LAZY}$")))
+    # The window manager places a window that asks for no place where it likes.
+    if shown:
+        xdotool("windowmove", "--sync", window_id(LAZY), *LAZY_AT)
+    xdotool("windowraise", window_id(COVER))
+    time.sleep(QUIET_S)
+    listed_lazy = wait_listed(helper, LAZY)
+    under = overlap(region(listed_lazy), region(by_title(listed(helper), COVER))) if listed_lazy else None
+    if listed_lazy is None or not shown or under is None:
+        lazy.destroy()
+        return {"flow": flow, "passed": False,
+                "why": f"the lazy window was listed {listed_lazy is not None}, shown {shown}, "
+                       f"under the cover {under}"}
+    _, bound = helper.ask("select_target", window_id=listed_lazy["id"])
+    stray = cover_pixels(bound) if bound.get("data") else 0
+    helper.ask("release_target")
+    lazy.destroy()
+    passed = (bound.get("error") == "capture_unavailable" and "not drawn" in (bound.get("detail") or "")
+              and "data" not in bound)
+    return {"flow": flow, "passed": passed,
+            "why": f"cover over {under}; select {bound.get('error') or 'ok'}: {bound.get('detail')}; "
+                   f"{stray} cover pixels in what it sent"}
 
 
 # --- twenty cycles ----------------------------------------------------------------------------
@@ -656,6 +792,7 @@ def bound_steps(helper, display, args, records):
     if not bound.get("ok"):
         return
     target = bound["target_id"]
+    yield first_frame_check(helper, display, bound, fixture, cover, os.path.dirname(args.out))
     yield covered_capture_check(helper, target, fixture, cover, os.path.dirname(args.out))
     badge, shown = badge_check(display, helper, fixture)
     yield shown
@@ -666,6 +803,7 @@ def bound_steps(helper, display, args, records):
     yield pause_check(helper, target, args.state, badge)
     yield resume_check(helper, target, args.state, badge)
     yield pass_through_check(helper, badge, records[FLOOR])
+    yield forged_stop_check(helper, target, args.state, badge, args.out + ".stderr")
     yield stop_check(helper, target, args.state, badge)
     yield release_check(helper)
 
@@ -674,19 +812,24 @@ def run(args):
     out = os.path.dirname(args.out)
     records = {FLOOR: os.path.join(out, "floor-presses.json"),
                COVER: os.path.join(out, "cover-presses.json")}
-    panes, results = start_panes(records), []
+    panes, results = [], []
     helper = Session(args.binary, args.out + ".stderr")
     try:
         with x11_oracle.Display() as display:
             results.append(hello_check(helper.handshake()))
             results.append(unscaled_check(helper))
+            # Listed while it is the only window, and so the active one: a pane
+            # mapped before it is listed takes the focus, and the active
+            # application's tree is then the pane's.
             results.append(fixture_listed(helper, "gtk3"))
+            panes = start_panes(records)
             for title in (FLOOR, COVER):
                 results.append({"flow": f"{title} listed", "passed": wait_listed(helper, title) is not None,
                                 "why": title})
             if all(result.get("passed") for result in results):
                 results.extend(bound_steps(helper, display, args, records))
                 results.append(xid_reuse_check(helper))
+                results.append(lazy_window_check(helper))
                 results.append(cycles_check(helper, by_title(listed(helper), FIXTURE)))
     except (HelperFailed, subprocess.SubprocessError, OSError, KeyError, ValueError) as why:
         results.append({"flow": "the run", "passed": False, "why": f"{type(why).__name__}: {why}"})
