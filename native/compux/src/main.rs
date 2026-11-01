@@ -3302,12 +3302,12 @@ fn drag_through<P: held::Platform>(
 
 fn scroll(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Value, Failure> {
     let req = &request.body;
+    let amount = wire::scroll_notches(req)?;
     let observation = observed(request, worker)?;
     let element = addressed_element(request, &observation)?;
     let (lx, ly) = aim(request, &observation, element, worker)?;
     let view = acting_view(request, &observation, gate, worker)?;
     reachable(&view, worker, lx, ly)?;
-    let amount = req.get("amount").and_then(Value::as_i64).unwrap_or(3) as i32;
     let (axis, length) = match req.get("direction").and_then(Value::as_str) {
         Some("up") => (Axis::Vertical, -amount),
         Some("down") => (Axis::Vertical, amount),

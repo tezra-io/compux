@@ -988,6 +988,33 @@ fn request_id(value: &Value) -> Result<String, ParseFailure> {
     }
 }
 
+// --- verb arguments ------------------------------------------------------------
+
+/// The most wheel notches one `scroll` turns. A notch is a press and a release of
+/// a wheel button on X11, and one step on the portal and on macOS; more than this
+/// in one request is a mistake, not a page, so it is refused, never turned down.
+pub const MAX_SCROLL_NOTCHES: i32 = 50;
+
+/// `scroll`'s `amount`: 3 when it is absent, else a whole number from 1 to
+/// [`MAX_SCROLL_NOTCHES`]. Anything else is `invalid_argument`, before any input.
+pub fn scroll_notches(body: &Value) -> Result<i32, Failure> {
+    let Some(amount) = body.get("amount") else {
+        return Ok(3);
+    };
+    amount
+        .as_i64()
+        .filter(|notches| (1..=i64::from(MAX_SCROLL_NOTCHES)).contains(notches))
+        .and_then(|notches| i32::try_from(notches).ok())
+        .ok_or_else(|| {
+            Failure::new(
+                "invalid_argument",
+                format!(
+                    "a scroll turns 1 to {MAX_SCROLL_NOTCHES} notches, and {amount} is not one                      of them; nothing was sent"
+                ),
+            )
+        })
+}
+
 // --- failures ----------------------------------------------------------------
 
 /// What an action failed with: the wire's `error` code, and the sentence that goes
@@ -1434,6 +1461,31 @@ pub fn session_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // An amount is turned in full or refused: never wrapped into another number,
+    // never cut down to the cap without saying so.
+    #[test]
+    fn a_scroll_turns_one_to_fifty_notches_and_any_other_amount_is_refused_naming_the_cap() {
+        assert_eq!(scroll_notches(&json!({})), Ok(3));
+        assert_eq!(scroll_notches(&json!({"amount": 1})), Ok(1));
+        assert_eq!(scroll_notches(&json!({"amount": 50})), Ok(50));
+        let wrong = [
+            json!(51),
+            json!(0),
+            json!(-3),
+            json!(4_294_967_297_i64),
+            json!(2.5),
+            json!("3"),
+            Value::Null,
+        ];
+        for amount in wrong {
+            let refused = scroll_notches(&json!({ "amount": amount }))
+                .expect_err(&format!("{amount} is no amount"));
+            assert_eq!(refused.code, "invalid_argument", "{amount}");
+            let detail = refused.detail.unwrap_or_default();
+            assert!(detail.contains("50"), "{amount}: {detail}");
+        }
+    }
 
     fn envelope() -> Envelope {
         Envelope {

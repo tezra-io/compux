@@ -188,6 +188,8 @@ defmodule Compux.Protocol do
 
   @modifiers ~w(cmd ctrl alt shift)
   @scroll_directions ~w(up down left right)
+  # The sidecar turns at most this many notches in one scroll and refuses more.
+  @max_scroll_notches 50
   @max_type_bytes 10_000
   @max_wait_ms 10_000
   # `wait_for_change` must finish inside the caller's per-action deadline (30s in
@@ -686,7 +688,7 @@ defmodule Compux.Protocol do
   defp validate_action("scroll", params) do
     with {:ok, target} <- pointer_target(params),
          {:ok, direction} <- scroll_direction(params),
-         {:ok, amount} <- positive(params, "amount"),
+         {:ok, amount} <- scroll_notches(params),
          {:ok, display} <- opt_display(params) do
       request =
         Map.merge(%{"action" => "scroll", "direction" => direction, "amount" => amount}, target)
@@ -1001,10 +1003,13 @@ defmodule Compux.Protocol do
     end
   end
 
-  defp positive(params, key) do
-    case Map.get(params, key) do
-      value when is_integer(value) and value > 0 -> {:ok, value}
-      _other -> {:error, "#{key} must be a positive integer"}
+  defp scroll_notches(params) do
+    case Map.get(params, "amount") do
+      amount when is_integer(amount) and amount in 1..@max_scroll_notches ->
+        {:ok, amount}
+
+      _other ->
+        {:error, "amount must be a whole number of notches from 1 to #{@max_scroll_notches}"}
     end
   end
 

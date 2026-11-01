@@ -566,6 +566,17 @@ defmodule Compux.ProtocolTest do
       assert req["direction"] == "down" and req["amount"] == 3
     end
 
+    # The sidecar turns at most 50 notches in one scroll and refuses more; the
+    # library refuses them first, naming the cap, rather than cutting them down.
+    test "scroll turns at most 50 notches" do
+      at_cap = addressed_params("scroll") |> Map.put("amount", 50)
+      assert {:ok, %{"amount" => 50}} = Protocol.validate(at_cap)
+
+      over = Map.put(at_cap, "amount", 51)
+      assert {:error, reason} = Protocol.validate(over)
+      assert reason =~ "50"
+    end
+
     test "type needs a non-empty string" do
       assert {:error, _} = Protocol.validate(%{"action" => "type", "text" => ""})
       assert {:ok, %{"text" => "hi"}} = Protocol.validate(%{"action" => "type", "text" => "hi"})
