@@ -172,9 +172,9 @@ pub enum Proved {
 /// renewed the window, those reports included: a pixmap replaced then is not
 /// the one being proved, so the proof is void there and nothing is asked to
 /// repaint. `None` goes on to the repaint. A resize the server reported before
-/// the pixmap was named, and read only after, voids a proof whose pixmap is
-/// already the new one: that errs on the safe side, and the proof is tried
-/// again.
+/// the pixmap was named, and read only after, voids the proof only where its
+/// size is not the one read at the naming (an earlier step of a resize that
+/// went on): that errs on the safe side, and the proof is tried again.
 pub fn at_cut_off(renewed: bool) -> Option<Proved> {
     renewed.then_some(Proved::Void)
 }
@@ -661,7 +661,8 @@ struct Watch {
     frame_atom: u32,
     shadow_atom: u32,
     /// The redirected window's width, height and X border: the pixmap holds all
-    /// three, so a change to any gives the window a new one.
+    /// three, so a change to any gives the window a new one. Read when the
+    /// pixmap is named, and moved on by each resize the watch reads.
     size: (u16, u16, u16),
     damaged: bool,
     /// Resized, given a new border width, mapped or unmapped since its pixmap
@@ -898,10 +899,21 @@ impl Watch {
         )))
     }
 
-    /// The pixmap the window is drawn into now, under a name of this watch's.
-    /// Whatever renewed the window before this is what gave it that pixmap;
-    /// anything read from here on renews it again.
+    /// The pixmap the window is drawn into now, under a name of this watch's,
+    /// and the size the watch holds it at. Whatever renewed the window before
+    /// this is what gave it that pixmap; anything read from here on renews it
+    /// again. The size is read just before the naming, so a resize that slips
+    /// in between leaves the size older than the pixmap, which the next read
+    /// refuses and proves again, never a size newer than the pixmap. A size
+    /// read this way also catches the watch up with a resize it never heard of.
     fn name(&mut self) -> Result<(), FrameError> {
+        let geometry = self
+            .connection
+            .get_geometry(self.top)
+            .map_err(lost)?
+            .reply()
+            .map_err(|error| reply_error(error, "the window"))?;
+        self.size = (geometry.width, geometry.height, geometry.border_width);
         self.renewed = false;
         if self.pixmap != 0 {
             self.connection.free_pixmap(self.pixmap).map_err(lost)?;
