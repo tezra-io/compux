@@ -2205,7 +2205,7 @@ fn select_target(
             requested: Requested::Exactly(Region::full(&geometry)),
             jpeg_quality: None,
             overlays: Overlays::default(),
-            bound: None,
+            marks: MarksFrom::Application,
         },
         gate,
         worker,
@@ -2398,7 +2398,7 @@ fn screenshot(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resu
             requested: Requested::Region(request),
             jpeg_quality: parse_jpeg_quality(req)?,
             overlays: parse_overlays(req)?,
-            bound: marks_scene(&view, worker),
+            marks: marks_from(view.bound.is_some(), worker),
         },
         gate,
         worker,
@@ -2408,15 +2408,21 @@ fn screenshot(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resu
     Ok(payload)
 }
 
-/// The bound window a screenshot's marks are read from: its scene, when the
-/// request names the target and the target has an accessibility element. A
-/// window bound without one has no subtree to read, so its marks are read as a
-/// display's are, and listed under no binding.
-fn marks_scene(view: &View, worker: &Worker) -> Option<semantic::Scene> {
-    view.bound.as_ref()?;
-    let target = worker.target.as_ref()?;
-    let window = target.ax_window.as_ref()?;
-    Some(semantic::Scene {
+/// Where a screenshot's marks are read from: the application in view, or for a
+/// request naming the target what the bound window sees. A window bound without
+/// an accessibility element has no subtree to read, so its marks are the
+/// application's, points only.
+fn marks_from(bound: bool, worker: &Worker) -> MarksFrom {
+    if !bound {
+        return MarksFrom::Application;
+    }
+    let Some(target) = worker.target.as_ref() else {
+        return MarksFrom::PointsOnly;
+    };
+    let Some(window) = target.ax_window.as_ref() else {
+        return MarksFrom::PointsOnly;
+    };
+    MarksFrom::BoundWindow(semantic::Scene {
         pid: target.pid,
         window: Some(semantic::Bound {
             element: window.handle(),
@@ -2755,10 +2761,23 @@ struct Rendering<'a> {
     requested: Requested<'a>,
     jpeg_quality: Option<u8>,
     overlays: Overlays,
-    /// The bound window whose marks the picture draws, read from what that
-    /// window sees and listed under it; `None` for a picture whose marks, if it
-    /// asks for any, are the application's and listed under no binding.
-    bound: Option<semantic::Scene>,
+    /// Where the picture's marks are read from, when it draws any; a picture that
+    /// draws none passes [`MarksFrom::Application`].
+    marks: MarksFrom,
+}
+
+/// Where a picture's marks are read from, and what their references are listed
+/// under.
+enum MarksFrom {
+    /// The application in view; its references are listed under no binding.
+    Application,
+    /// What the bound window sees ([`bound_in_view`]); its references are listed
+    /// under the binding.
+    BoundWindow(semantic::Scene),
+    /// The application in view, for a window bound without an accessibility
+    /// element: badges and points only. No reference of it could be used under
+    /// the binding, so none is handed out, and a mark is clicked by its point.
+    PointsOnly,
 }
 
 fn capture_payload_encoded(
@@ -2773,7 +2792,7 @@ fn capture_payload_encoded(
         requested,
         jpeg_quality,
         overlays,
-        bound,
+        marks,
     } = rendering;
     // The transform is the caller's, because it is built from the FRAME this image
     // came out of — a display's measured from the capture, a bound window's from the
@@ -2809,7 +2828,7 @@ fn capture_payload_encoded(
             &mut resized,
             gate,
             &worker.ax,
-            bound.as_ref(),
+            &marks,
         ))
     } else {
         None
@@ -2956,11 +2975,13 @@ fn collect_marks(
     img: &mut image::RgbaImage,
     gate: &Gate,
     ax: &Rc<dyn ax::Ax>,
-    bound: Option<&semantic::Scene>,
+    marks: &MarksFrom,
 ) -> MarksInfo {
-    let read = match bound {
-        Some(scene) => bound_in_view(ax, scene, geom, region, gate),
-        None => interactive_in_view(ax, geom, region, gate),
+    let read = match marks {
+        MarksFrom::BoundWindow(scene) => bound_in_view(ax, scene, geom, region, gate),
+        MarksFrom::Application | MarksFrom::PointsOnly => {
+            interactive_in_view(ax, geom, region, gate)
+        }
     };
     let viewed = match read {
         Ok(viewed) => viewed,
@@ -2982,7 +3003,12 @@ fn collect_marks(
         .filter_map(|(node, point)| point.map(|point| (node, point)))
         .collect();
     let truncated = placed.len().saturating_sub(MAX_MARKS);
-    let names = viewed.owner.is_some();
+    // Points only: no table is kept, so no mark is named by a reference.
+    let owner = match marks {
+        MarksFrom::PointsOnly => None,
+        MarksFrom::Application | MarksFrom::BoundWindow(_) => viewed.owner,
+    };
+    let names = owner.is_some();
     let mut entries = Vec::new();
     let mut listed = Vec::new();
 
@@ -3007,13 +3033,16 @@ fn collect_marks(
         ax_activation: viewed.note,
         truncated,
         truncated_walk: viewed.truncated,
-        elements: retained(viewed.owner, bound.and_then(bound_id), listed),
+        elements: retained(owner, listed_under(marks), listed),
     }
 }
 
-/// The window a bound scene's listing is listed under.
-fn bound_id(scene: &semantic::Scene) -> Option<u32> {
-    scene.window.as_ref().map(|window| window.id)
+/// The window marks read from it are listed under.
+fn listed_under(marks: &MarksFrom) -> Option<u32> {
+    match marks {
+        MarksFrom::BoundWindow(scene) => scene.window.as_ref().map(|window| window.id),
+        MarksFrom::Application | MarksFrom::PointsOnly => None,
+    }
 }
 
 /// What a bound window's marks are read from: the window's own subtree and the
@@ -3663,7 +3692,7 @@ fn wait_for_change_on(
                     requested: Requested::Exactly(region),
                     jpeg_quality: None,
                     overlays,
-                    bound: None,
+                    marks: MarksFrom::Application,
                 },
                 gate,
                 worker,
@@ -4376,7 +4405,7 @@ fn check_image(
             requested: Requested::Exactly(region),
             jpeg_quality: check_quality(&region, &geom),
             overlays,
-            bound: None,
+            marks: MarksFrom::Application,
         },
         gate,
         worker,
@@ -9213,7 +9242,14 @@ mod tests {
         let (w, h) = crop_rect(&geom, &region).sent_dims();
         let mut image = image::RgbaImage::new(w, h);
 
-        let info = collect_marks(&geom, &region, &mut image, &gate, &platform, Some(&scene));
+        let info = collect_marks(
+            &geom,
+            &region,
+            &mut image,
+            &gate,
+            &platform,
+            &MarksFrom::BoundWindow(scene),
+        );
 
         let marked: Vec<&str> = info
             .entries
@@ -9224,6 +9260,54 @@ mod tests {
         let listed = info.elements.expect("references");
         assert_eq!(listed.bound, Some(10));
         assert_eq!(listed.len(), 2);
+    }
+
+    // A window bound without an accessibility element has no subtree of its own
+    // to read, so its screenshot's marks are the application's in view, as a
+    // display's are, with points and no references: none could be used under the
+    // binding, and listing the bound window to get one leads nowhere. A mark is
+    // clicked by its point. A display's marks keep their references.
+    #[test]
+    fn a_bound_window_with_no_accessibility_element_gets_marks_without_references() {
+        let gate = boot_gate();
+        let worker = bound_worker(&gate);
+        assert!(matches!(marks_from(true, &worker), MarksFrom::PointsOnly));
+        assert!(matches!(marks_from(false, &worker), MarksFrom::Application));
+        let app = ax::Recorder::new(
+            FIXTURE_PID,
+            vec![
+                ax::Scripted {
+                    label: Some("Window 20".to_string()),
+                    frame: Some(ax::Frame {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 600.0,
+                        h: 400.0,
+                    }),
+                    children: vec![1],
+                    ..ax::Scripted::of("AXWindow")
+                },
+                ax::Scripted::button("Save", frame_at(20.0, 360.0)),
+            ],
+        );
+        app.windows_are(&[0]);
+        let platform: Rc<dyn ax::Ax> = app.clone();
+        let (geom, region) = one_to_one();
+        let (w, h) = crop_rect(&geom, &region).sent_dims();
+        let mut image = image::RgbaImage::new(w, h);
+        let mut marked =
+            |marks: &MarksFrom| collect_marks(&geom, &region, &mut image, &gate, &platform, marks);
+
+        let points = marked(&MarksFrom::PointsOnly);
+        assert_eq!(points.entries.len(), 1, "the button is badged");
+        let mark = &points.entries[0];
+        assert!(mark.get("x").is_some() && mark.get("y").is_some(), "{mark}");
+        assert_eq!(mark.get("element_ref"), None, "{mark}");
+        assert!(points.elements.is_none(), "no references are listed");
+
+        let display = marked(&MarksFrom::Application);
+        assert_eq!(display.entries[0]["element_ref"], json!("e1"));
+        assert_eq!(display.elements.map(|elements| elements.bound), Some(None));
     }
 
     // A drill by a request bound to a window reads inside a control only when it
@@ -9576,7 +9660,7 @@ mod tests {
                 requested: Requested::Exactly(region),
                 jpeg_quality: None,
                 overlays: Overlays::default(),
-                bound: None,
+                marks: MarksFrom::Application,
             },
             gate,
             worker,

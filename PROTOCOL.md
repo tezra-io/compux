@@ -489,7 +489,8 @@ A screenshot with `marks` of a bound window badges what that window sees: its ow
 surfaces in windows of its own that its `menu` and `dialog` scopes list (§2.1), and its references are listed under
 the binding. Nothing else of the application is marked, however it overlaps the window. A window bound without an
 accessibility element has nothing of its own to read, so its marks are the application's in view, as a display's
-are, listed under no binding.
+are, with their points and no `element_ref`: no reference of them could be used under the binding. Such a mark is
+clicked by its point.
 
 ## 5. Waiting on the tree
 
