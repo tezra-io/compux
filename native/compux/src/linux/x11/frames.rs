@@ -17,10 +17,13 @@
 //! frame and GTK's shadow included, within [`REPAINT_WAIT_MS`], or the binding is
 //! refused. Nothing in the proof depends on which windows were over it, so a
 //! window moving meanwhile changes nothing. A window resized, hidden or shown
-//! during the proof voids it. A window mapped again, resized or given a new
-//! border width gets a new pixmap, and is proved again the same way before
-//! anything more is published, and any part of a picture the proof did not reach
-//! is sent black.
+//! during the proof voids it, and so does one read in the drain at the cut-off:
+//! the window is renewed from the moment its pixmap is named. A window mapped
+//! again, resized or given a new border width gets a new pixmap, and is proved
+//! again the same way before anything more is published; a proof that falls
+//! short then is retried at each of the next [`MAX_REPROOF_RETRIES`] intervals,
+//! and the binding ends if none holds. Any part of a picture the proof did not
+//! reach is sent black.
 //!
 //! **What a frame carries.** The window manager's frame and GTK's shadow are
 //! accounted for exactly as the window list accounts for them, so a picture is
@@ -50,7 +53,7 @@ use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
 use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, EventMask, ImageFormat, ImageOrder,
-    MapState, Window as XWindow, WindowClass,
+    MapState, Window as XWindow, WindowClass, CLEAR_AREA_REQUEST,
 };
 use x11rb::protocol::{ErrorKind, Event};
 use x11rb::rust_connection::RustConnection;
@@ -88,6 +91,10 @@ const MAX_PIECES: usize = 4_096;
 /// The pause between two looks while a proof waits.
 const PROOF_POLL_MS: u64 = 2;
 
+/// How many times in a row a window already bound is proved again at the next
+/// interval after a proof that fell short, before the binding ends.
+pub const MAX_REPROOF_RETRIES: u32 = 3;
+
 /// How long a request waits for the watch to catch up with the server. A watch
 /// mid-proof answers once the proof is done, so this covers the redirect's report
 /// and the window's repaint together.
@@ -109,7 +116,8 @@ const MAX_FRAME_DEPTH: usize = 8;
 pub enum Step {
     /// The window is not viewable: nothing to show.
     Hidden,
-    /// The window was mapped again or resized: it has a new pixmap to prove.
+    /// The window was mapped again or resized, or no proof holds for it: it has
+    /// a pixmap to prove.
     Prove,
     /// The server reported damage: read the window again.
     Read,
@@ -127,6 +135,65 @@ pub fn step(viewable: bool, was_hidden: bool, renewed: bool, damaged: bool) -> S
         Step::Read
     } else {
         Step::Idle
+    }
+}
+
+/// What a proof came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Proved {
+    /// Drawing after the cut-off reached every pixel of this picture.
+    Whole(Rect),
+    /// The window was resized, mapped or unmapped after its pixmap was named,
+    /// so it has, or will have, a pixmap the proof says nothing of.
+    Void,
+    /// This many pieces of the picture were not drawn in time.
+    Short(usize),
+}
+
+/// A proof at its cut-off, once every report the server sent before it is
+/// read. `renewed` is whether any event read since the pixmap was named
+/// renewed the window, those reports included: a pixmap replaced then is not
+/// the one being proved, so the proof is void there and nothing is asked to
+/// repaint. `None` goes on to the repaint.
+pub fn at_cut_off(renewed: bool) -> Option<Proved> {
+    renewed.then_some(Proved::Void)
+}
+
+/// A proof once its wait for drawing is over, with `left` pieces of `crop`
+/// undrawn.
+pub fn after_drawing(crop: Rect, renewed: bool, left: usize) -> Proved {
+    if renewed {
+        Proved::Void
+    } else if left == 0 {
+        Proved::Whole(crop)
+    } else {
+        Proved::Short(left)
+    }
+}
+
+/// What an interval does after proving a bound window again, `retries` being
+/// how many proofs in a row fell short before this one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reproved {
+    /// Proved: read it, and the count of retries starts again.
+    Read(Rect),
+    /// Not proved: nothing is read, and the next interval proves it again.
+    Retry { retries: u32 },
+    /// Short after every retry: the binding ends, `left` pieces undrawn.
+    End { left: usize },
+}
+
+/// A void proof is retried without counting: the window is still changing. A
+/// short one is retried at the next interval, [`MAX_REPROOF_RETRIES`] times in
+/// a row, and then the binding ends.
+pub fn reproved(proved: Proved, retries: u32) -> Reproved {
+    match proved {
+        Proved::Whole(crop) => Reproved::Read(crop),
+        Proved::Void => Reproved::Retry { retries },
+        Proved::Short(left) if retries >= MAX_REPROOF_RETRIES => Reproved::End { left },
+        Proved::Short(_) => Reproved::Retry {
+            retries: retries + 1,
+        },
     }
 }
 
@@ -432,11 +499,13 @@ struct Watch {
     /// three, so a change to any gives the window a new one.
     size: (u16, u16, u16),
     damaged: bool,
-    /// Resized, given a new border width, mapped or unmapped since the last proof
-    /// began: the window has, or will have, a new pixmap that proof says nothing
-    /// of.
+    /// Resized, given a new border width, mapped or unmapped since its pixmap
+    /// was named: the window has, or will have, a new pixmap that a proof of the
+    /// named one says nothing of.
     renewed: bool,
     hidden: bool,
+    /// Proofs in a row that fell short since one last held.
+    retries: u32,
 }
 
 impl Watch {
@@ -469,6 +538,7 @@ impl Watch {
             damaged: true,
             renewed: false,
             hidden: false,
+            retries: 0,
         };
         if !watch.viewable()? {
             return Err(FrameError::Minimized(
@@ -501,10 +571,15 @@ impl Watch {
             self.redirected()?;
         }
         self.name()?;
-        let proven = self.prove()?.ok_or_else(|| {
-            unproven("it was resized, hidden or shown while it was being proved".to_string())
-        })?;
-        self.proven = Some(proven);
+        self.proven = Some(match self.prove()? {
+            Proved::Whole(crop) => crop,
+            Proved::Void => {
+                return Err(unproven(
+                    "it was resized, hidden or shown while it was being proved".to_string(),
+                ))
+            }
+            Proved::Short(left) => return Err(unproven(short(left))),
+        });
         Ok(())
     }
 
@@ -524,32 +599,27 @@ impl Watch {
     /// reported so far is set aside, every window the picture is drawn from is
     /// cleared and asked to repaint, and the drawing after that must reach every
     /// pixel of the picture (the window manager's frame and GTK's shadow as much
-    /// as the client) within [`REPAINT_WAIT_MS`]. `None` when the window was
-    /// resized, hidden or shown meanwhile, which voids the proof; a picture not
-    /// wholly drawn by then is refused.
-    fn prove(&mut self) -> Result<Option<Rect>, FrameError> {
+    /// as the client) within [`REPAINT_WAIT_MS`]. Void when the window was
+    /// renewed after its pixmap was named, whether a report read at the cut-off
+    /// says so or one read during the repaint.
+    fn prove(&mut self) -> Result<Proved, FrameError> {
         self.repaired()?;
-        self.renewed = false;
+        if let Some(void) = at_cut_off(self.renewed) {
+            return Ok(void);
+        }
         let crop = self.crop()?;
         self.expose()?;
         let left = self.repaint_within(REPAINT_WAIT_MS, crop)?;
-        if self.renewed {
-            return Ok(None);
-        }
-        if left.is_empty() {
-            return Ok(Some(crop));
-        }
-        Err(unproven(format!(
-            "{} part(s) of its picture were not drawn within {REPAINT_WAIT_MS} ms of asking it \
-             to repaint",
-            left.len()
-        )))
+        Ok(after_drawing(crop, self.renewed, left.len()))
     }
 
     /// Every window the picture is drawn from is cleared to its background and
     /// sent an Expose for all of it: the server paints what has a background, and
     /// the application or the window manager draws the rest, as after any
-    /// exposure. A window gone meanwhile needs nothing.
+    /// exposure. The clears are not waited on one by one, which would be a wait
+    /// on the server with no bound: a refusal comes back as an event, before the
+    /// drawing that follows, and the proof's own bounded wait reads it
+    /// ([`Watch::took`]). A window gone meanwhile needs nothing.
     fn expose(&self) -> Result<(), FrameError> {
         let connection = &self.connection;
         let windows = self.drawn_from()?;
@@ -568,10 +638,12 @@ impl Watch {
             if attributes.class == WindowClass::INPUT_ONLY {
                 continue;
             }
-            connection
-                .clear_area(true, window, 0, 0, 0, 0)
-                .map_err(lost)?
-                .ignore_error();
+            // Dropped unchecked: its error, if any, is delivered as an event.
+            drop(
+                connection
+                    .clear_area(true, window, 0, 0, 0, 0)
+                    .map_err(lost)?,
+            );
         }
         connection.flush().map_err(lost)
     }
@@ -609,7 +681,10 @@ impl Watch {
     }
 
     /// The pixmap the window is drawn into now, under a name of this watch's.
+    /// Whatever renewed the window before this is what gave it that pixmap;
+    /// anything read from here on renews it again.
     fn name(&mut self) -> Result<(), FrameError> {
+        self.renewed = false;
         if self.pixmap != 0 {
             self.connection.free_pixmap(self.pixmap).map_err(lost)?;
         }
@@ -721,6 +796,17 @@ impl Watch {
             // Mapped again, a window is given a new pixmap.
             Event::MapNotify(shown) if ours(shown.window) => self.renewed = true,
             Event::UnmapNotify(hidden) if ours(hidden.window) => self.renewed = true,
+            // A window the proof asked to repaint, gone before it was cleared,
+            // needs nothing; any other refusal to clear one ends the proof.
+            Event::Error(error) if error.major_opcode == CLEAR_AREA_REQUEST => {
+                return match error.error_kind {
+                    ErrorKind::Window | ErrorKind::Drawable => Ok(None),
+                    _refused => Err(unproven(format!(
+                        "the X server would not ask a window of it to repaint ({})",
+                        super::refused(&error)
+                    ))),
+                };
+            }
             Event::Error(error) => {
                 eprintln!("compux: the window capture: {}", super::refused(&error))
             }
@@ -775,17 +861,15 @@ impl Watch {
         let stamp = clock.now_mach();
         let viewable = self.viewable()?;
         self.drain()?;
-        match step(viewable, self.hidden, self.renewed, self.damaged) {
+        // A window no proof holds for is proved before it is read.
+        let renewed = self.renewed || self.proven.is_none();
+        match step(viewable, self.hidden, renewed, self.damaged) {
             Step::Hidden => {
                 self.hidden = true;
                 slot.note(sample(slot, clock, stamp, Health::Minimized));
                 Ok(())
             }
-            // A proof the window voided by changing again is retried next interval.
-            Step::Prove => match self.prove_again()? {
-                true => self.read(slot, stamp, clock),
-                false => Ok(()),
-            },
+            Step::Prove => self.prove_again(slot, stamp, clock),
             Step::Read => self.read(slot, stamp, clock),
             Step::Idle => {
                 slot.note(sample(slot, clock, stamp, Health::Idle));
@@ -794,14 +878,39 @@ impl Watch {
         }
     }
 
-    /// A window mapped again or resized has a new pixmap: it is named, and proved
-    /// as the first one was. `false` when the window changed again meanwhile.
-    fn prove_again(&mut self) -> Result<bool, FrameError> {
+    /// A window mapped again or resized has a new pixmap, and one whose last
+    /// proof did not hold has none proved: it is named, proved as the first one
+    /// was, and read once that holds. Nothing is read while it does not. A proof
+    /// the window voided by changing again is retried at the next interval; one
+    /// that fell short is retried [`MAX_REPROOF_RETRIES`] times in a row, and
+    /// then the binding ends.
+    fn prove_again(
+        &mut self,
+        slot: &Slot,
+        stamp: u64,
+        clock: &dyn Clock,
+    ) -> Result<(), FrameError> {
         self.name()?;
-        self.proven = self.prove()?;
+        let proved = self.prove()?;
         self.hidden = false;
-        self.damaged = true;
-        Ok(self.proven.is_some())
+        match reproved(proved, self.retries) {
+            Reproved::Read(crop) => {
+                self.proven = Some(crop);
+                self.retries = 0;
+                self.damaged = true;
+                self.read(slot, stamp, clock)
+            }
+            Reproved::Retry { retries } => {
+                self.proven = None;
+                self.retries = retries;
+                Ok(())
+            }
+            Reproved::End { left } => Err(unproven(format!(
+                "{}, {} times in a row",
+                short(left),
+                MAX_REPROOF_RETRIES + 1
+            ))),
+        }
     }
 
     /// Read the window as it is now, and publish it stamped `stamp`.
@@ -1139,7 +1248,7 @@ fn still<T>(reply: Result<T, ReplyError>) -> Result<Option<T>, FrameError> {
         {
             Ok(None)
         }
-        Err(error) => Err(reply_error(error, "a window over it")),
+        Err(error) => Err(reply_error(error, "a window its picture is drawn from")),
     }
 }
 
@@ -1148,6 +1257,14 @@ fn unproven(why: String) -> FrameError {
         "the window's own picture could not be proved: {why}, so what compux holds of it could \
          still be what the screen showed there; select it again"
     ))
+}
+
+/// A proof that fell short, in words.
+fn short(left: usize) -> String {
+    format!(
+        "{left} part(s) of its picture were not drawn within {REPAINT_WAIT_MS} ms of asking it to \
+         repaint"
+    )
 }
 
 fn drowned() -> FrameError {
@@ -1211,6 +1328,43 @@ mod tests {
         assert!(!inside(rect(0, 0, 983, 795), 982, 795));
         assert!(!inside(rect(-1, 0, 10, 10), 982, 795));
         assert!(!inside(rect(0, 790, 10, 10), 982, 795));
+    }
+
+    // The drain at the cut-off reads every event the server sent before it, a
+    // resize, map or unmap among them: one read there replaced the pixmap that
+    // was named, and a proof that went on would prove the new one and leave the
+    // old one, the redirect's copy of the screen, to be read.
+    #[test]
+    fn a_window_renewed_in_the_cut_offs_drain_voids_the_proof() {
+        assert_eq!(at_cut_off(true), Some(Proved::Void));
+        assert_eq!(at_cut_off(false), None);
+    }
+
+    #[test]
+    fn a_proof_holds_only_for_a_pixmap_unrenewed_and_wholly_drawn() {
+        let crop = rect(0, 0, 982, 795);
+        assert_eq!(after_drawing(crop, false, 0), Proved::Whole(crop));
+        assert_eq!(after_drawing(crop, true, 0), Proved::Void);
+        assert_eq!(after_drawing(crop, false, 3), Proved::Short(3));
+        assert_eq!(after_drawing(crop, true, 3), Proved::Void);
+    }
+
+    #[test]
+    fn a_short_reproof_is_retried_three_times_then_ends_the_binding() {
+        let crop = rect(0, 0, 982, 795);
+        assert_eq!(
+            reproved(Proved::Short(2), 0),
+            Reproved::Retry { retries: 1 }
+        );
+        assert_eq!(
+            reproved(Proved::Short(2), 2),
+            Reproved::Retry { retries: 3 }
+        );
+        assert_eq!(reproved(Proved::Short(2), 3), Reproved::End { left: 2 });
+        // A window still changing is not counted against it, and a proof that
+        // holds starts the count again.
+        assert_eq!(reproved(Proved::Void, 3), Reproved::Retry { retries: 3 });
+        assert_eq!(reproved(Proved::Whole(crop), 3), Reproved::Read(crop));
     }
 
     // Damage and the frame extents count from the window's own corner, inside its
