@@ -2582,8 +2582,8 @@ Expected outcome in one line: on your X11 desktop compux's frame is GNOME's pict
 and its clicks, keys and paste land where they are aimed; on the Wayland VM one
 dialog grants the session, and a restarted helper is not asked again.
 
-> **Steps A3, A4, B3, B4, B5 and B6 POST REAL INPUT**: clicks, typed text and a paste,
-> into the GTK 3 fixture (A) or Text Editor (B). The other steps read only. Nothing
+> **Steps A3, A4, B1 (its `remote` runs), B3, B4, B5 and B6 POST REAL INPUT**: clicks,
+> typed text and a paste, into the GTK 3 fixture (A) or Text Editor (B). The other steps read only. Nothing
 > here may be run by an agent. Run it yourself, at the machine, with nothing
 > confidential on screen.
 
@@ -2604,21 +2604,22 @@ dialog grants the session, and a restarted helper is not asked again.
   --state-file /tmp/gtk3.json`. To read what it recorded: `python3 -m json.tool
   /tmp/gtk3.json | tail -20`.
 
-### A1. Is the frame honest? (Q2, read only, fails fastest)
+### A1. Is the frame honest? (read only, fails fastest)
 
-The L0 question, now on the code that ships. Put something GPU-drawn in view (a
-playing video in Firefox, or `glxgears`), then:
+Whether a grab of the root window shows what GNOME's GPU compositor draws, on the
+code that ships. Put something GPU-drawn in view (a playing video in Firefox, or
+`glxgears`), then:
 
 ```sh
-python3 fixtures/linux/spike/owner/owner_capture.py --binary "$CX" --out ~/l2-q2
-gnome-screenshot -f ~/l2-q2/gnome.png          # straight after, same scene
+python3 fixtures/linux/spike/owner/owner_capture.py --binary "$CX" --out ~/l2-frame
+gnome-screenshot -f ~/l2-frame/gnome.png       # straight after, same scene
 ```
 
-* `~/l2-q2/compux.png` and `~/l2-q2/gnome.png` show the same scene: the video or GL
-  window and the top bar drawn in both, not black or stale in compux's. If they are
-  not, stop here: the X11 frame needs Composite capture (L3), and nothing below
-  changes that.
-* `~/l2-q2/compux.json`'s `physical` size is your monitor's size in pixels, as
+* `~/l2-frame/compux.png` and `~/l2-frame/gnome.png` show the same scene: the video
+  or GL window and the top bar drawn in both, not black or stale in compux's. If
+  they are not, stop here: the X11 frame needs Composite capture, which is a later
+  stage's, and nothing below changes that.
+* `~/l2-frame/compux.json`'s `physical` size is your monitor's size in pixels, as
   `xrandr | grep '*'` prints it: compux now works in root pixels at a scale of 1,
   whatever GNOME's text scaling says.
 
@@ -2632,8 +2633,10 @@ python3 /tmp/cx.py "$CX" '{"action":"probe"}' </dev/null
   `key`, `wait_for_change`, `paste` and `windows`, and `input_methods` is
   `["foreground_hid","ax"]`.
 * The probe says `"x11_pixels": {"xtest": true, "keymap": true}` and `"portal":
-  {"version": "1.14.4-…", "registry": false, "screenshot_permission": …}`: 22.04's
-  portal has no Registry. Write down the stored answer it shows.
+  {"running": …, "version": "1.14.4-…", "registry": …, "screenshot_permission": …}`:
+  22.04's portal has no Registry. The probe starts neither the portal nor its store,
+  so either may read not running (`"running": false`, `"registry": null`,
+  `"screenshot_permission": "not_running"`). Write down what it shows.
 
 Then the helper with no display of its own (read only):
 
@@ -2691,22 +2694,33 @@ back afterwards. With **Compux Fixture GTK3** in front, one `cx.py` session
 
 ## B. The GNOME Wayland VM (Ubuntu 24.04, logged in for real)
 
-### B1. The portal itself (L0(d), fails fastest)
+### B1. The portal itself (fails fastest)
 
-Run L0(d)'s steps from the M86 L0 findings (§7) first, in this order: `apt policy
-xdg-desktop-portal` is 1.18 or later; the desktop file for the app id; the
-`owner_portal_probe.py` screenshot twice (a dialog the first time, none the
-second); `remote --type-after 5 --hold 15`, then `remote --token …` in a new process
-(no dialog means a restore token survives a restart). The desktop file, which
-compux needs too, is `~/.local/share/applications/io.tezra.fermix.ComputerUse.desktop`:
+The portal alone first, with the probe script, in this order:
 
-```
-[Desktop Entry]
-Type=Application
-Name=Fermix Computer Use
-Exec=/bin/false
-NoDisplay=true
-```
+1. `apt policy xdg-desktop-portal`: 1.18 or later (the `Registry` compux needs).
+2. The desktop file for the app id, which compux needs too:
+   `~/.local/share/applications/io.tezra.fermix.ComputerUse.desktop`:
+
+   ```
+   [Desktop Entry]
+   Type=Application
+   Name=Fermix Computer Use
+   Exec=/bin/false
+   NoDisplay=true
+   ```
+
+3. `python3 fixtures/linux/spike/owner/owner_portal_probe.py screenshot` twice: a
+   dialog naming **Fermix Computer Use** the first time (allow it), none the second.
+   Write down the directory its `image` line names: the portal saves each
+   screenshot there as a file and leaves it.
+4. **`python3 fixtures/linux/spike/owner/owner_portal_probe.py remote --type-after 5
+   --hold 15`**, with Text Editor focused when it says (it types `abc` and moves the
+   pointer): allow the dialog, write down whether the `a` arrived, and keep the
+   `restore_token` it prints.
+5. **`python3 fixtures/linux/spike/owner/owner_portal_probe.py remote --token
+   <that token>`** in a new process: no dialog means a restore token survives a
+   restart.
 
 If no dialog ever names the app, or the token does not survive, stop: compux's
 portal route rests on both.
@@ -2718,9 +2732,10 @@ Build and copy `cx.py` into the VM as in A0, then
 
 * `hello` lists `screenshot`, the clicks, `scroll`, `key` and `type`, and **no**
   `paste` and **no** `windows`; `input_methods` is `["foreground_hid","ax"]`.
-* The probe says `"display_server": "wayland"`, `"portal": {"version": "1.18.…",
-  "registry": true, "screenshot_permission": "unset"}` (or `"yes"` after B1), and
-  no dialog appears. `rm -f ~/.local/state/compux/portal.json` before B3, so B3
+* The probe says `"display_server": "wayland"`, `"portal": {"running": true,
+  "version": "1.18.…", "registry": true, "screenshot_permission": "unset"}` (or
+  `"yes"` after B1), and no dialog appears. A portal or store nobody has started
+  yet reads `"running": false` or `"not_running"`: the probe does not start them. `rm -f ~/.local/state/compux/portal.json` before B3, so B3
   starts with no restore token.
 
 ### B3. The first session (POSTS INPUT)
@@ -2736,7 +2751,13 @@ Open Text Editor, then in one `cx.py` session:
 * `{"action":"type","text":"é"}`: write down whether it arrives. The compositor
   drops a character its layout cannot type without saying so, so compux does not
   refuse it on Wayland.
-* `cat ~/.local/state/compux/portal.json` holds a `restore_token`.
+* `cat ~/.local/state/compux/portal.json` holds a `restore_token`, and `ls -l`
+  shows it `-rw-------`.
+* `ls` the directory B1 step 3 wrote down: none of compux's screenshots stays
+  there (compux removes each file once it is read).
+* `{"action":"wait_for_change","timeout_ms":3000}` with nothing changing on screen
+  (read only): it looks once per poll, and each look is a portal screenshot. Write
+  down whether GNOME flashes the screen, or plays the shutter sound, at each look.
 
 ### B4. A restarted helper is not asked again (POSTS INPUT)
 
@@ -2773,7 +2794,12 @@ the click lands where it was aimed.
 ### B7. What B cannot prove
 
 * KDE Plasma, COSMIC and wlroots compositors: pixels are refused there by design,
-  and the controls (L1) still work; nothing here runs one.
+  and the controls stage's verbs by reference still work; nothing here runs one.
 * A desktop of more than one monitor on Wayland: the portal's screenshot is the
   whole desktop and says nothing of where the others lie, so compux refuses it
   (`capture_unavailable`). Write down what a second monitor does.
+* Monitors that tile into the picked one's shape: the check is by size alone, so
+  four 1280×800 monitors in a 2×2 grid at 100% give the same 2560×1600 screenshot
+  as one 1280×800 monitor at 200%, and compux takes them as that one monitor (its
+  clicks would then land in the wrong place). If the VM can show four monitors,
+  write down what compux's screenshot and one click do there.

@@ -381,7 +381,8 @@ macOS-first. **Apple-Silicon macOS** is the primary, fully-featured target
 (capture, input, accessibility `inspect` + `elements`, non-prompting permission
 probe, idle detection). **Linux** answers `elements`, the verbs on a reference and
 `wait_for` through AT-SPI (see "Controls have names") on any session, and its
-pixels by one route per session, decided once at start (PROTOCOL.md §1.1):
+pixels by one route per session, decided once at start (PROTOCOL.md, "Linux pixel
+routes"):
 
 - **X11:** capture, input, `wait_for_change`, `windows` and `paste` (the paste
   chord is Ctrl+V), in pure Rust over x11rb: XTEST with the server's own keymap
@@ -391,7 +392,8 @@ pixels by one route per session, decided once at start (PROTOCOL.md §1.1):
   (`text_outside_layout`, use `paste`) or while a modifier, Caps Lock or a second
   layout group is on (`keyboard_not_neutral`). A key or button held across an
   action is journalled under `$XDG_RUNTIME_DIR`, and the next helper releases what
-  a killed one left held.
+  a killed one left held; without that directory a drag or a chord with modifiers
+  presses nothing and fails.
 - **GNOME Wayland:** capture and input through the XDG desktop portal
   (xdg-desktop-portal 1.18 or later, which registers compux as
   `io.tezra.fermix.ComputerUse`): the portal asks the person once, and a restore
@@ -401,22 +403,24 @@ pixels by one route per session, decided once at start (PROTOCOL.md §1.1):
   controls only; every pixel request is refused `pixels_unavailable` with the
   reason.
 
-On both, keys go only into a window that reads `ACTIVE` on the accessibility bus
-(`no_active_window`). `inspect` is macOS-only; the Linux build's `hello` does not
-list it, and a request for it is `unknown_action` (see "The version handshake").
+On both, keys go only into a window that reads `ACTIVE` on the accessibility bus,
+and only where exactly one application's does (`no_active_window` otherwise).
+`inspect` is macOS-only; the Linux build's `hello` does not list it, and a request
+for it is `unknown_action` (see "The version handshake").
 The permission `probe` works on both: on Linux it reports which display server
 answered its socket (`x11`, `wayland`, `none`) and whether an X endpoint answers
 (`x11_endpoint`, XWayland beside Wayland), whether the accessibility bus answers
 and how many applications its registry lists (or why it is unavailable), the
 at-spi2-core and ATK bridge versions dpkg records, the toolkit notes known
 without reading any application, whether XTEST and the keymap answer
-(`x11_pixels`), and the portal's version, its Registry and any stored Screenshot
-answer for compux (`portal`), all read-only and raising no dialog
-(PROTOCOL.md §8). A helper started with no display of its own (a daemon a
-systemd user unit started before login) reads `DISPLAY`, `WAYLAND_DISPLAY` and
-`XAUTHORITY`, and nothing else, from the user manager over the session bus, and
-carries them as values: it never writes its own environment, and reaches that
-display as its own. **Windows** is not supported.
+(`x11_pixels`), and whether the portal runs, its version, its Registry and any
+stored Screenshot answer for compux (`portal`), all read-only, raising no dialog
+and starting neither the portal nor its store (PROTOCOL.md, "`probe`"). A helper
+started with no display of its own (a daemon a systemd user unit started before
+login) reads `DISPLAY`, `WAYLAND_DISPLAY` and `XAUTHORITY`, and nothing else,
+from the user manager over the session bus, and carries them as values: it never
+writes its own environment, and reaches that display as its own. **Windows** is
+not supported.
 
 `idle_ms` / `wait_for_idle` (operational, not model actions) report how long the
 human has been idle — a coexistence signal so a policy layer can yield the seat to

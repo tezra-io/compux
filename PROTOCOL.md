@@ -55,6 +55,7 @@ they are as protocol 11 had them.
 | X11 (`display_server: "x11"`) | x11rb, pure Rust: XTEST for the pointer and the keys, the core `GetImage` on the root in strips for the frame, RandR for the monitors, EWMH for `windows`, the `CLIPBOARD` selection owned in-process for `paste` | all |
 | GNOME Wayland, XWayland beside it or not | the XDG desktop portal, under the app id `io.tezra.fermix.ComputerUse` registered through the host `Registry` (xdg-desktop-portal 1.18 or later): `Screenshot` for the frame, one RemoteDesktop session with a ScreenCast monitor source for the pointer and the keys | all but `paste` (no portal clipboard compux can own) and `windows` (no portal lists them) |
 | GNOME Wayland whose portal has no `Registry` (xdg-desktop-portal before 1.18) | refused, naming the portal's version: without its own app id compux would share the empty one with every host process | none |
+| GNOME Wayland whose portal is not running and does not start when asked | refused, saying so | none |
 | KDE Plasma, COSMIC, wlroots compositors on Wayland | refused, naming the compositor: no route is qualified there | none |
 | no display answers | refused | none |
 
@@ -65,20 +66,30 @@ they are as protocol 11 had them.
   held, Caps Lock on (`keyboard_not_neutral`). Keys go only into a window that reads `ACTIVE` on the accessibility
   bus (`no_active_window`). A key or button held across an action is written to a journal under
   `$XDG_RUNTIME_DIR/compux-held` before it is pressed and cleared after its release, so the next helper on that
-  display releases what a killed one left held. `paste` puts the text on the `CLIPBOARD`, which compux owns for the
+  display releases what a killed one left held. A drag and a chord with modifiers hold input, so on X11 they need
+  `$XDG_RUNTIME_DIR`: without it nothing is pressed, and the action fails at its first press with an error that
+  names the missing directory (a drag's pointer has already moved to its start). `scroll` turns at most 50 notches,
+  one press and release of a wheel button each. `paste` puts the text on the `CLIPBOARD`, which compux owns for the
   helper's life (answering `TARGETS` and `UTF8_STRING`, INCR for text past one property, 4 MiB at most) and
-  releases at exit.
+  releases at exit. The person's own text is read before a paste and put back after it; a text of theirs past
+  4 MiB is not read at all, never cut, so it is not put back.
 - **GNOME Wayland.** Nothing is asked of the portal before the first pixel action. The first one starts the session
   (keyboard and pointer, `persist_mode` 2, one monitor), which shows the portal's dialog unless the restore token
   kept in `$XDG_STATE_HOME/compux/portal.json` still serves; each token is offered once and replaced by the one the
   start hands back. The session lives as long as the helper: closed by `release`, at exit, or by the person from
   the shell (the next pixel action then asks again, without a token). The display is the one monitor picked for the
   session, in the compositor's logical points; the frame is the portal's non-interactive screenshot, accepted only
-  when the desktop is that one monitor (`capture_unavailable` otherwise). Keys go as keysyms, the session's first
-  one after a Shift tap that types nothing; the pointer goes as absolute motion in the monitor stream's
-  coordinates. A dialog answered no is `consent_refused`; one ended by the portal, or not answered within 25 s, is
-  `consent_timeout`. Keys go only into a window that reads `ACTIVE` (`no_active_window`); the compositor drops a
-  character its layout cannot type without saying so, so `type` is not refused for one here.
+  when the desktop is that one monitor (`capture_unavailable` otherwise). The portal saves each screenshot as a file
+  and leaves it; compux removes the file the answer named once it is read, and no other. Whether the desktop is one
+  monitor is judged by size alone, since the portal says nothing of the others: a desktop of four 1280×800 monitors
+  in a 2×2 grid at 100% gives the same 2560×1600 screenshot as one 1280×800 monitor at 200%, and is taken as that
+  one monitor. Keys go as keysyms, the session's first one after a Shift tap that types nothing; the pointer goes as
+  absolute motion in the monitor stream's coordinates. The session's set-up steps (`CreateSession`,
+  `SelectDevices`, `SelectSources`) show no dialog and are each waited on for 5 s, past which the portal is not
+  answering (`capture_unavailable`, naming the step); only `Start` and `Screenshot` wait on the person. A dialog
+  answered no is `consent_refused`; one ended by the portal, or not answered within 25 s, is `consent_timeout`.
+  Keys go only into a window that reads `ACTIVE` (`no_active_window`); the compositor drops a character its layout
+  cannot type without saying so, so `type` is not refused for one here.
 
 ## 2. `elements`
 
@@ -591,7 +602,7 @@ Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux bu
 | `element_required` | A verb on a reference without `element_ref`. |
 | `addressing_conflict` | A point and `element_ref` on one request. |
 | `check_unsupported` | A check on an action that dispatches no input, a string `semantic` check on an action that named no control, or a malformed check object. |
-| `invalid_argument` | A wrong value: an unknown scope, an empty query, a refused combination, a bad `until`, `toggle` without a boolean `on`, `type` without `text`; on Linux, `set_value` on a control that takes a number with text that is no finite number (nothing sent). |
+| `invalid_argument` | A wrong value: an unknown scope, an empty query, a refused combination, a bad `until`, `toggle` without a boolean `on`, `type` without `text`, a `scroll` `amount` that is not a whole number from 1 to 50 (the most notches one scroll turns; nothing sent, never turned down to the cap); on Linux, `set_value` on a control that takes a number with text that is no finite number (nothing sent). |
 
 **The gate**
 
@@ -650,11 +661,11 @@ Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux bu
 |---|---|
 | `text_outside_layout` | Linux (X11): `type` text the active keymap cannot produce; the detail names the characters and `paste`. Nothing sent. |
 | `keyboard_not_neutral` | Linux (X11): `type` while the keyboard is in a group other than the first, a modifier is held, or Caps Lock is on; the detail says which. Nothing sent. |
-| `no_active_window` | Linux: `type` without `element_ref`, `key` or `paste` while no window reads `ACTIVE` on the accessibility bus, so the keys would go where nobody chose. compux never activates a window to make room. Nothing sent. |
+| `no_active_window` | Linux: `type` without `element_ref`, `key` or `paste` while no window, or more than one, reads `ACTIVE` on the accessibility bus, so the keys would go where nobody chose. The detail says which: no window, or how many applications claim one. compux never activates a window to make room. Nothing sent. |
 | `pixels_unavailable` | Linux: a pixel action (or `type` without `element_ref`, or an image check) where the session's pixel route is refused (§1.1: a compositor with no qualified route, a portal without its `Registry`, no display), or one the route does not serve (`paste` and `windows` on GNOME Wayland). The detail is the route's reason. Nothing sent; work by control. |
 | `consent_refused` | Linux (GNOME Wayland): the portal answered no, now or by a stored answer. A stored no stays until the person resets it; `fermix doctor` prints how. compux never writes the PermissionStore. Nothing sent. |
 | `consent_timeout` | Linux (GNOME Wayland): the portal ended its dialog unanswered, or nobody answered it within 25 s; the dialog is closed. Nothing sent. |
-| `capture_unavailable` | Also Linux (GNOME Wayland): the portal's call failed, or its screenshot holds more than the session's one monitor. |
+| `capture_unavailable` | Also Linux (GNOME Wayland): the portal's call failed, a session set-up step (`CreateSession`, `SelectDevices`, `SelectSources`, which show no dialog) went unanswered for 5 s (the detail names the step), or its screenshot holds more than the session's one monitor. Nothing sent. |
 
 Legacy argument errors that the library refuses before they reach the sidecar (a missing `text`, an unknown key in a
 chord, a bad drag point) still answer their sentence as the code from the sidecar.
@@ -669,7 +680,7 @@ read-only and raising no prompt:
 {"type":"response","request_id":"p1","ok":true,"platform":"linux","display_server":"x11","x11_endpoint":true,
  "display_adopted":false,"screen_capture":true,"input_control":true,
  "x11_pixels":{"xtest":true,"keymap":true},
- "portal":{"version":"1.14.4-1ubuntu2~22.04.2","registry":false,"screenshot_permission":"unset"},
+ "portal":{"running":true,"version":"1.14.4-1ubuntu2~22.04.2","registry":false,"screenshot_permission":"unset"},
  "accessibility_bus":{"state":"answering","applications":7,
                       "status":{"is_enabled":false,"screen_reader_enabled":false}},
  "accessibility_packages":{"source":"dpkg","at_spi2_core":"2.44.0-3","atk_bridge":"2.38.0-3"},
@@ -686,12 +697,14 @@ read-only and raising no prompt:
   Wayland they do not say the person will allow it.
 - `x11_pixels` is the X11 route's two needs, read on a connection of its own where an X endpoint answers (`null`
   where none does): `xtest`, the XTEST extension; `keymap`, the server's keyboard map answered.
-- `portal` is read where a session bus answers (`null` where none does), without raising a dialog: `version`, the
-  installed xdg-desktop-portal as the package database records it (`null` where it does not say); `registry`,
-  whether the portal offers the host `Registry` (1.18 and later); `screenshot_permission`, the PermissionStore's
-  stored Screenshot answer for `io.tezra.fermix.ComputerUse`: `yes`, `no` (every screenshot is refused
-  `consent_refused` until the person resets it), or `unset` (no answer stored, or no table at all). `null` where
-  the store would not answer.
+- `portal` is read where a session bus answers (`null` where none does), without raising a dialog and without
+  starting the portal or its store: `running`, whether the portal answered (false where it is not running);
+  `version`, the installed xdg-desktop-portal as the package database records it (`null` where it does not say);
+  `registry`, whether the portal offers the host `Registry` (1.18 and later; `null` where the portal is not
+  running); `screenshot_permission`, the PermissionStore's stored Screenshot answer for
+  `io.tezra.fermix.ComputerUse`: `yes`, `no` (every screenshot is refused `consent_refused` until the person resets
+  it), `unset` (no answer stored, or no table at all), or `not_running` (the store is not running, so nothing was
+  read). `null` where the store would not answer.
 - `accessibility_bus.state`:
   - `answering`: the registry answers and lists `applications` applications, one or more;
   - `empty`: the registry answers and lists none (`applications` is 0);
@@ -714,5 +727,8 @@ asked yet as one without accessibility); two property `Get`s of `org.a11y.Status
 `ChildCount`. It registers for no event, reads no application, never sends `GetAll`, and sets nothing. It reads
 `/var/lib/dpkg/status` as a file. For the pixel facts it asks the X server for its XTEST extension and keyboard map,
 and the session bus `NameHasOwner` for `org.gnome.Shell` and `org.kde.KWin`, the portal object's `Introspect`, and
-the PermissionStore's `Lookup("screenshot", "screenshot")`: it never calls the portal itself and never writes the
-store.
+the PermissionStore's `Lookup("screenshot", "screenshot")`, the last two with `NO_AUTO_START`, so neither the portal
+nor the store is started to answer: one that is not running reads as such. It never calls the portal itself and
+never writes the store. Outside `probe`, the helper's start on GNOME Wayland decides its pixel route (§1.1) by the
+same `Introspect` without that flag, and so may start xdg-desktop-portal, as any portal client's first call does;
+on X11 the route is decided without asking the portal anything.

@@ -1,7 +1,8 @@
 //! The monitors, from RandR, and one monitor's frame, from the root window with
 //! the core `GetImage` in strips (`strips`). Like the xcap grab it replaces: what
 //! the root window holds, which under a compositor is only as honest as the
-//! compositor makes it (the owner's question Q2).
+//! compositor makes it: the live check on a GPU-composited desktop says whether
+//! it is.
 //!
 //! X has no logical coordinates. A monitor is reported in root pixels with a
 //! scale of 1, which is also what XTEST takes, so an image's pixel and the
