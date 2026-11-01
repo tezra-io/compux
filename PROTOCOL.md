@@ -505,6 +505,15 @@ walk is held to that deadline too, as is the look an action's check takes before
 deadline is what ended a wait that was not met, the reply says `"deadline_cut": true`: on `wait_for`'s reply, and
 in the receipt's semantic `check`. A wait its own `timeout_ms` ended says nothing extra.
 
+**An absence a look cannot prove.** Each look's walk has the bounds an `elements` walk has, and one that stops at
+them says why (`truncated`, §2.2). `disappears` by `role`/`name` holds only when a look saw the whole scope and
+listed no match, or when the scope is not open. A look that stopped short and listed no match does not hold: the
+control may be past where it stopped. When a wait for an absence ends not met and its last look was cut short, the
+reply says why, in the walk's word: `"truncated": "nodes"`, `"depth"` or `"time"`, on `wait_for`'s reply and in the
+receipt's semantic `check` beside `not_met`. Then wait on the control itself (`disappears` with `element_ref`, which
+reads that one control and is exact), or on a narrower scope. The look before an action's input follows the same
+rule, so a look cut short never reads as `held_before`.
+
 Two reads run after the wait and are **not** held to the deadline: an action's `element_after` (one read of its
 control, §3.1) and the surfaces scan on its receipt (at most 64 nodes, §3.2; a node that does not answer within its
 own 250 ms ends the scan). The 250 ms margin is for the reply, not for them, so a slow application can answer an
@@ -536,7 +545,8 @@ action after its `deadline_ms`.
 | `held_before` | It already held before the input, so it cannot show what the action did. Nothing is waited for: `looks` and `waited_ms` are 0. |
 
 `looks` counts the looks after the input (the baseline is not one of them). `deadline_cut: true` rides beside
-`not_met` when the request's deadline ended the wait (§5.1). The `until` outcome is evidence, not a verdict; `effect`
+`not_met` when the request's deadline ended the wait, and `truncated` when a wait for an absence ended unproven
+(§5.1). The `until` outcome is evidence, not a verdict; `effect`
 still comes from the action's own read-back.
 
 ### 5.3 `wait_for`
@@ -569,6 +579,12 @@ Not met by the deadline is an answer, not a failure:
 
 ```json
 {"type":"response","request_id":"r14","ok":true,"met":false,"looks":51,"waited_ms":5004}
+```
+
+A wait for an absence whose last look was cut short says so (§5.1):
+
+```json
+{"type":"response","request_id":"r16","ok":true,"met":false,"looks":4,"waited_ms":5120,"truncated":"time"}
 ```
 
 ## 6. Names

@@ -666,6 +666,10 @@ fn timeout_of(value: Option<&Value>) -> Result<u64, String> {
 pub enum Seen {
     Holds(Option<Walk>),
     Not,
+    /// Nothing it waits to be gone was seen, and the look stopped before it saw
+    /// everything, so the absence is not proven: the walk's word for why
+    /// (`"nodes"`, `"depth"`, `"time"`). It does not hold.
+    Unproven(&'static str),
 }
 
 /// What a look reads with.
@@ -698,7 +702,8 @@ pub fn look(at: &Looking<'_>, condition: &Condition, deadline_ms: u64) -> Result
         }),
         Condition::Disappears { query, scope } => Ok(match finding(query, scope)? {
             Some(found) if !found.nodes.is_empty() => Seen::Not,
-            _ => Seen::Holds(None),
+            Some(found) => absent(found.truncated),
+            None => Seen::Holds(None),
         }),
         Condition::DisappearsElement(reference) => {
             let (named, entry) = named_entry(at, reference)?;
@@ -732,6 +737,15 @@ fn holds(yes: bool) -> Seen {
         Seen::Holds(None)
     } else {
         Seen::Not
+    }
+}
+
+/// What a look that found nothing proves of an absence: that it holds when the
+/// look saw everything, and nothing when it stopped short.
+fn absent(truncated: Option<&'static str>) -> Seen {
+    match truncated {
+        None => Seen::Holds(None),
+        Some(word) => Seen::Unproven(word),
     }
 }
 
@@ -831,6 +845,9 @@ pub struct Waited {
     pub looks: u64,
     pub waited_ms: u64,
     pub found: Option<Walk>,
+    /// A wait for an absence that ended not met with its last look cut short:
+    /// why that look stopped. The absence may hold beyond what it saw.
+    pub truncated: Option<&'static str>,
 }
 
 /// Look until the condition holds or `timeout_ms` passes: a look every
@@ -852,20 +869,26 @@ pub fn wait(
         looks += 1;
         let seen = look(at.saturating_add(crate::tree::WALK_BUDGET_MS))?;
         let waited_ms = gate.now_ms().saturating_sub(started);
-        if let Seen::Holds(found) = seen {
-            return Ok(Waited {
-                met: true,
-                looks,
-                waited_ms,
-                found,
-            });
-        }
+        let truncated = match seen {
+            Seen::Holds(found) => {
+                return Ok(Waited {
+                    met: true,
+                    looks,
+                    waited_ms,
+                    found,
+                    truncated: None,
+                })
+            }
+            Seen::Not => None,
+            Seen::Unproven(word) => Some(word),
+        };
         if looks >= most || waited_ms >= timeout_ms {
             return Ok(Waited {
                 met: false,
                 looks,
                 waited_ms,
                 found: None,
+                truncated,
             });
         }
         let spent = gate.now_ms().saturating_sub(at);
@@ -1888,6 +1911,81 @@ mod tests {
             query: find("menuitem", "copy"),
             scope: Some(Scope::Dialog)
         }));
+    }
+
+    // A look that stopped before it saw everything proves no absence: a Save
+    // button the walk never reached is not gone, and the look says why it stopped.
+    // Only a complete look that lists no match holds; a match is no disappearance,
+    // as before.
+    #[test]
+    fn a_disappearance_by_query_holds_only_on_a_complete_look() {
+        let (_recorder, ax) = platform(desktop());
+        let clock = SystemClock::new();
+        let at = Looking {
+            ax: &ax,
+            scene: app_scene(),
+            named: None,
+            clock: &clock,
+        };
+        let gone = |name: &str| Condition::Disappears {
+            query: Query {
+                role: Some("button".to_string()),
+                name: Some(name.to_string()),
+            },
+            scope: None,
+        };
+        let spent = 0;
+
+        for name in ["save", "delete"] {
+            let cut = look(&at, &gone(name), spent).expect("a look");
+            assert!(matches!(cut, Seen::Unproven("time")), "{name}: {cut:?}");
+        }
+        assert!(holds(look(&at, &gone("delete"), u64::MAX).expect("a look")));
+        assert!(matches!(
+            look(&at, &gone("save"), u64::MAX).expect("a look"),
+            Seen::Not
+        ));
+    }
+
+    // A wait for an absence whose looks are all cut ends not met, never met by
+    // default, and says why its last look stopped; so does the look before an
+    // action's input, which never reads an incomplete look as held.
+    #[test]
+    fn a_wait_for_an_absence_its_looks_cannot_prove_says_they_were_cut() {
+        let (_recorder, ax) = platform(desktop());
+        let clock = SystemClock::new();
+        let at = Looking {
+            ax: &ax,
+            scene: app_scene(),
+            named: None,
+            clock: &clock,
+        };
+        let gone = Until {
+            condition: Condition::Disappears {
+                query: Query {
+                    role: Some("button".to_string()),
+                    name: Some("delete".to_string()),
+                },
+                scope: None,
+            },
+            timeout_ms: 300,
+        };
+
+        let waited = wait(&test_gate(), gone.timeout_ms, |_deadline| {
+            look(&at, &gone.condition, 0)
+        })
+        .expect("a wait");
+
+        assert!(!waited.met);
+        assert_eq!(waited.truncated, Some("time"));
+        assert!(!held_before(&at, &gone, 0, Some(0)).expect("a look"));
+
+        let whole = wait(&test_gate(), gone.timeout_ms, |deadline| {
+            look(&at, &gone.condition, deadline)
+        })
+        .expect("a wait");
+        assert!(whole.met);
+        assert_eq!(whole.truncated, None);
     }
 
     // A scope that is not open yet reads as empty: waiting for a dialog's button

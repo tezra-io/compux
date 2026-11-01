@@ -413,6 +413,9 @@ pub struct UntilSeen {
     /// The request's own deadline left less than the condition's timeout, and the
     /// wait ended there without the condition holding.
     pub deadline_cut: bool,
+    /// A wait for an absence that ended not met because its last look stopped
+    /// before it saw everything: the walk's word for why (PROTOCOL.md §5.1).
+    pub truncated: Option<&'static str>,
 }
 
 /// The evidence an action really came back with, as the receipt reports it.
@@ -454,6 +457,9 @@ impl Checked {
                 object.insert("waited_ms".to_string(), json!(until.waited_ms));
                 if until.deadline_cut {
                     object.insert("deadline_cut".to_string(), json!(true));
+                }
+                if let Some(truncated) = until.truncated {
+                    object.insert("truncated".to_string(), json!(truncated));
                 }
             }
         }
@@ -2530,6 +2536,7 @@ mod tests {
                 looks: 3,
                 waited_ms: 212,
                 deadline_cut: false,
+                truncated: None,
             }),
         };
         let receipt = Receipt::derive(true, true, Some(waited), Timings::default())
@@ -2605,6 +2612,7 @@ mod tests {
                 looks: 4,
                 waited_ms: 300,
                 deadline_cut: true,
+                truncated: None,
             }),
         };
         let receipt = Receipt::derive(true, true, Some(cut), Timings::default());
@@ -2614,6 +2622,32 @@ mod tests {
             value["receipt"]["check"],
             json!({"kind": "semantic", "until": "not_met", "looks": 4, "waited_ms": 300,
                    "deadline_cut": true})
+        );
+    }
+
+    // A wait for an absence that ended unproven says why its last look stopped,
+    // beside its outcome, in the walk's own word.
+    #[test]
+    fn a_wait_whose_last_look_was_cut_says_why() {
+        let cut = Checked {
+            kind: Check::Semantic,
+            settle: None,
+            changed: None,
+            until: Some(UntilSeen {
+                outcome: UntilOutcome::NotMet,
+                looks: 2,
+                waited_ms: 1_600,
+                deadline_cut: false,
+                truncated: Some("nodes"),
+            }),
+        };
+        let receipt = Receipt::derive(true, true, Some(cut), Timings::default());
+        let value = response(&envelope(), "r1", json!({}), Some(receipt));
+
+        assert_eq!(
+            value["receipt"]["check"],
+            json!({"kind": "semantic", "until": "not_met", "looks": 2, "waited_ms": 1600,
+                   "truncated": "nodes"})
         );
     }
 }

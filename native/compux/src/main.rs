@@ -4501,6 +4501,7 @@ fn waited_after(
             looks: 0,
             waited_ms: 0,
             deadline_cut: false,
+            truncated: None,
         },
         _ => {
             let (scene, named) = scene_for(request, worker)?;
@@ -4514,6 +4515,7 @@ fn waited_after(
                 looks: waited.looks,
                 waited_ms: waited.waited_ms,
                 deadline_cut: cut,
+                truncated: waited.truncated,
             }
         }
     };
@@ -4630,6 +4632,9 @@ fn wait_for(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result
     });
     if let (Some(object), true) = (payload.as_object_mut(), cut) {
         object.insert("deadline_cut".to_string(), json!(true));
+    }
+    if let (Some(object), Some(truncated)) = (payload.as_object_mut(), waited.truncated) {
+        object.insert("truncated".to_string(), json!(truncated));
     }
     let Some(found) = waited.found else {
         return Ok(payload);
@@ -11034,6 +11039,48 @@ mod tests {
             ran.get("deadline_cut").is_none(),
             "its own timeout ended it: {ran}"
         );
+    }
+
+    // A wait for an absence whose every look ran out of its budget before it
+    // reached the control ends not met, and says why the last look stopped: on
+    // wait_for's reply, and in the receipt's check beside `not_met`.
+    #[test]
+    fn a_wait_for_an_absence_no_look_could_prove_says_truncated() {
+        let clock = StepClock::new();
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        let rows = (0..40)
+            .map(|row| ax::Scripted::button(&format!("Row {row}"), frame_at(100.0, row as f64)))
+            .collect();
+        let app = ax::Recorder::new(FIXTURE_PID, rows);
+        let (mut worker, observation) = worker_listing(&gate, &app);
+        app.costs_per_node(100, clock.clone());
+        let last_row = || {
+            Box::new(
+                semantic::parse_until(
+                    &json!({"kind": "disappears", "name": "Row 39", "timeout_ms": 300}),
+                    true,
+                )
+                .expect("a condition"),
+            )
+        };
+
+        let mut waiting = running("wait_for", None);
+        waiting.observation_id = Some(observation.id.clone());
+        waiting.until = Some(last_row());
+        let cut = served(&waiting, &gate, &mut worker);
+        assert_eq!(cut["met"], json!(false), "{cut}");
+        assert_eq!(cut["truncated"], json!("time"), "{cut}");
+
+        let mut pressing = at_element("press", &observation, "e1");
+        pressing.check = wire::Check::Semantic;
+        pressing.until = Some(last_row());
+        let pressed = served(&pressing, &gate, &mut worker);
+        assert_eq!(
+            pressed["receipt"]["check"]["until"],
+            json!("not_met"),
+            "{pressed}"
+        );
+        assert_eq!(pressed["receipt"]["check"]["truncated"], json!("time"));
     }
 
     // The look before the input is held to the request's deadline, as the wait
