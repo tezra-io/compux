@@ -442,7 +442,8 @@ finite number, `NaN` and `inf` among it, is refused `invalid_argument` before an
 
 Replaces the control's current selection with `text`, or inserts it at the caret when nothing is selected, with
 **no keyboard** (macOS route: `AXSelectedText` settable; write it. Linux route: `EditableText.DeleteText` over the
-selection `Text.GetSelection(0)` names, then `InsertText` at `CaretOffset`, on a node that reads `EDITABLE`).
+selection `Text.GetSelection(0)` names, then `InsertText` at `CaretOffset`, on a node that reads `EDITABLE`; the
+offsets count characters and the inserted text's length its UTF-8 bytes, as ATK and GTK read it).
 `observation_id` is required with `element_ref` and refused without it. The value is read before and after: different is `changed`, the same is `not_observed`,
 a secure or unreadable field is `unknown`. The reply carries `value` (the value after, never for a secure field).
 Without `element_ref`, `type` types at the focus as before.

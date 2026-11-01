@@ -250,7 +250,8 @@ impl Real {
 
     /// `type` by reference: delete the selection where there is one, then insert
     /// the text where it began, or at the caret. Once a deletion went out, a
-    /// failure after it says so: the field has already changed.
+    /// failure after it says so: the field has already changed. The offsets read
+    /// and sent count characters; the inserted text's length counts its bytes.
     fn type_text(
         &self,
         bus: &Connection,
@@ -258,6 +259,7 @@ impl Real {
         text: &str,
         limit: Duration,
     ) -> Result<(), Refusal> {
+        let length = insert_length(text.len())?;
         let deadline = Instant::now() + limit;
         let selections: i32 = async_io::block_on(self.call_within(
             bus,
@@ -280,7 +282,6 @@ impl Real {
             in_time(deadline, "reading the caret")?;
             caret
         };
-        let length = i32::try_from(text.chars().count()).unwrap_or(i32::MAX);
         let done = async_io::block_on(self.call_within(
             bus,
             at,
@@ -521,6 +522,23 @@ impl Real {
     }
 }
 
+/// `InsertText`'s length for text of this many bytes: ATK and GTK read it in bytes,
+/// and Qt cuts only past its UTF-16 count, which a byte count never undercuts. A
+/// text too long for it is refused before anything is sent, never cut to fit: a
+/// shorter length types part of the text.
+fn insert_length(bytes: usize) -> Result<i32, Refusal> {
+    i32::try_from(bytes).map_err(|_| {
+        Refusal::unsent(
+            "invalid_argument",
+            format!(
+                "the text is {bytes} bytes, more than one insertion can carry ({}): nothing \
+                 was sent; type it in parts",
+                i32::MAX
+            ),
+        )
+    })
+}
+
 /// Where a scroll bar at `now` ends after moving by `delta`, held to its range.
 /// `None` for a range no application could mean, which it may still publish: a
 /// number that is not finite, or a minimum above the maximum (`f64::clamp`
@@ -742,6 +760,56 @@ mod tests {
         assert_eq!(fake.node(APP, "/w/greeting").text, "hello there");
         assert_eq!(fake.node(APP, "/w/code").text, "abcdef");
         assert_eq!(fake.sent("DeleteText"), vec!["/w/greeting 6"]);
+    }
+
+    // InsertText's length counts bytes, as ATK and GTK read it, and its offsets
+    // count characters: text that is not ASCII types whole, over a selection and
+    // at the caret, into a field whose own text is not ASCII either.
+    #[test]
+    fn type_inserts_text_that_is_not_ascii_whole() {
+        let selected = Node {
+            selection: Some((6, 11)),
+            caret: 11,
+            ..field("Greeting", "héllo wörld")
+        };
+        let at_caret = Node {
+            caret: 2,
+            ..field("Code", "ñbef")
+        };
+        let (fake, ax) = reader(fake::one_window(
+            &["/w/greeting", "/w/code"],
+            vec![("/w/greeting", selected), ("/w/code", at_caret)],
+        ));
+        let found = walk(&ax);
+
+        ax.write(
+            listed(&found, "Greeting"),
+            Write::SelectedText("éx🙂"),
+            WRITE_MS,
+        )
+        .expect("typed");
+        ax.write(listed(&found, "Code"), Write::SelectedText("é🙂"), WRITE_MS)
+            .expect("typed");
+
+        assert_eq!(fake.node(APP, "/w/greeting").text, "héllo éx🙂");
+        assert_eq!(fake.node(APP, "/w/code").text, "ñbé🙂ef");
+    }
+
+    // A text too long for InsertText's length is refused before anything is
+    // sent: a length cut to fit would type part of it.
+    #[test]
+    fn a_text_too_long_for_one_insert_is_refused_never_cut() {
+        assert_eq!(
+            super::insert_length(5).map_err(|refusal| refusal.code()),
+            Ok(5)
+        );
+        let most = usize::try_from(i32::MAX).expect("fits");
+        assert_eq!(super::insert_length(most).ok(), Some(i32::MAX));
+
+        let refused = super::insert_length(most + 1).expect_err("too long");
+
+        assert_eq!(refused.code(), Some("invalid_argument"));
+        assert!(!refused.sent());
     }
 
     // `select` asks the container's Selection for the item's own index, and the
