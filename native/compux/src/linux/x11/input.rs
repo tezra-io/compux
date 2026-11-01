@@ -13,6 +13,7 @@
 //!   first `paste` and kept for the session.
 
 use x11rb::connection::{Connection, RequestConnection};
+use x11rb::errors::ReplyError;
 use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     ConnectionExt as _, Mapping, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, KEY_PRESS_EVENT,
@@ -241,6 +242,9 @@ impl Input {
                 Some(Event::MappingNotify(notify)) if notify.request == Mapping::KEYBOARD => {
                     self.keymap = None;
                 }
+                Some(Event::Error(error)) => {
+                    eprintln!("compux: input: {}", super::refused(&error));
+                }
                 Some(_) => {}
             }
         }
@@ -264,11 +268,17 @@ impl Input {
         })
     }
 
+    /// One XTEST event, checked: a round trip says whether the server took it,
+    /// so input it refused is an error here, never a success.
     fn fake(&self, kind: u8, detail: u8, x: i16, y: i16) -> Result<(), String> {
         self.connection
             .xtest_fake_input(kind, detail, CURRENT_TIME, self.root, x, y, 0)
-            .map_err(|error| error.to_string())?;
-        Ok(())
+            .map_err(|error| error.to_string())?
+            .check()
+            .map_err(|error| match error {
+                ReplyError::X11Error(error) => super::refused(&error),
+                other => other.to_string(),
+            })
     }
 
     fn flush(&self) -> Result<(), String> {
@@ -282,11 +292,18 @@ impl Input {
             .as_mut()
             .ok_or("there is no runtime directory to journal a held key in, so none is pressed")?;
         journal.record(held)?;
-        match held {
-            Held::Key(code) => self.fake(KEY_PRESS_EVENT, code, 0, 0)?,
-            Held::Button(number) => self.fake(BUTTON_PRESS_EVENT, number, 0, 0)?,
+        let pressed = match held {
+            Held::Key(code) => self.fake(KEY_PRESS_EVENT, code, 0, 0),
+            Held::Button(number) => self.fake(BUTTON_PRESS_EVENT, number, 0, 0),
+        };
+        let Err(why) = pressed else {
+            return self.flush();
+        };
+        // The server took no press, so nothing is held to release next start.
+        if let Some(journal) = self.journal.as_mut() {
+            journal.forget(held)?;
         }
-        self.flush()
+        Err(why)
     }
 
     /// Release it, then forget it.
@@ -471,10 +488,17 @@ impl Platform for Desktop {
             .map_err(|e| format!("drag: {e}"))
     }
 
+    /// One press and release of a wheel button per notch, at most
+    /// [`MAX_SCROLL_NOTCHES`](crate::wire::MAX_SCROLL_NOTCHES), which the request
+    /// was held to before it got here.
     fn scroll(&mut self, length: i32, axis: Axis) -> Result<(), String> {
+        let notches = length.unsigned_abs();
+        if notches > crate::wire::MAX_SCROLL_NOTCHES.unsigned_abs() {
+            return Err(format!("scroll: {notches} notches is past the cap"));
+        }
         let input = self.input()?;
         let number = wheel(length, axis);
-        for _ in 0..length.unsigned_abs() {
+        for _ in 0..notches {
             input.fake(BUTTON_PRESS_EVENT, number, 0, 0)?;
             input.fake(BUTTON_RELEASE_EVENT, number, 0, 0)?;
         }
@@ -512,7 +536,75 @@ impl Platform for Desktop {
 
 #[cfg(test)]
 mod tests {
+    use super::super::fake_x::{self, FakeX};
     use super::*;
+
+    fn over(connection: RustConnection, journal: Option<Journal>) -> Input {
+        Input {
+            connection,
+            root: fake_x::ROOT,
+            keymap: None,
+            journal,
+        }
+    }
+
+    // A key or button the X server refused is an error the action sees, never a
+    // success: each XTEST request is checked.
+    #[test]
+    fn input_the_x_server_refuses_is_an_error_not_a_success() {
+        let (_server, connection) = FakeX::start(fake_x::BAD_VALUE);
+        let mut input = over(connection, None);
+
+        let released = input.release(Held::Button(1));
+        let tapped = input.tap(Stroke {
+            keycode: 38,
+            shift: Some(50),
+            level3: None,
+        });
+        let clicked = input.fake(BUTTON_PRESS_EVENT, 1, 0, 0);
+
+        let released = released.expect_err("the server refused the release");
+        assert!(released.contains("refused"), "{released}");
+        assert!(tapped.is_err(), "{tapped:?}");
+        assert!(clicked.is_err(), "{clicked:?}");
+    }
+
+    // The wire holds a scroll to its cap; the loop here holds itself to it too,
+    // and refuses past it before a notch is sent.
+    #[test]
+    fn a_scroll_past_the_notch_cap_is_refused_here_too() {
+        let (_server, connection) = FakeX::start(fake_x::BAD_VALUE);
+        let mut desktop = Desktop {
+            env: Env::default(),
+            input: Some(over(connection, None)),
+            clipboard: None,
+        };
+
+        let refused = desktop.scroll(crate::wire::MAX_SCROLL_NOTCHES + 1, Axis::Vertical);
+
+        let refused = refused.expect_err("past the cap");
+        assert!(refused.contains("past the cap"), "{refused}");
+    }
+
+    // A press the server refused holds nothing, so the journal does not say it
+    // does: the next start would release a key nobody pressed.
+    #[test]
+    fn a_press_the_x_server_refuses_is_not_left_in_the_journal() {
+        let dir = std::env::temp_dir().join(format!("compux-refused-{}", std::process::id()));
+        let (_server, connection) = FakeX::start(fake_x::BAD_VALUE);
+        let mut input = over(connection, Some(Journal::new(&dir, ":7", 4242, 99)));
+
+        let pressed = input.press(Held::Key(50));
+
+        assert!(pressed.is_err(), "{pressed:?}");
+        assert!(
+            !dir.join(journal::DIR).join("4242").exists(),
+            "the journal holds a key the server refused"
+        );
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).expect("cleaned up");
+        }
+    }
 
     #[test]
     fn the_wheel_is_buttons_four_to_seven() {

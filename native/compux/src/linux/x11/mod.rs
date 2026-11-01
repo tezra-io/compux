@@ -14,6 +14,8 @@
 
 mod capture;
 mod clipboard;
+#[cfg(test)]
+mod fake_x;
 mod input;
 pub mod journal;
 pub mod keymap;
@@ -30,6 +32,7 @@ pub use windows::{list as windows, Window};
 
 use x11rb::reexports::x11rb_protocol::parse_display::parse_display;
 use x11rb::rust_connection::{DefaultStream, RustConnection};
+use x11rb::x11_utils::X11Error;
 
 use super::display::Env;
 
@@ -62,4 +65,17 @@ pub fn connect(env: &Env) -> Result<(RustConnection, usize), String> {
         return Ok((connection, screen));
     }
     Err(format!("the X display {name} did not answer: {failed}"))
+}
+
+/// An X error as one line: the request it answered, and why it was refused.
+pub fn refused(error: &X11Error) -> String {
+    let request = match (error.request_name, error.extension_name.as_deref()) {
+        (Some(name), _) => name.to_string(),
+        (None, Some(extension)) => format!("{extension} request {}", error.minor_opcode),
+        (None, None) => format!("request {}", error.major_opcode),
+    };
+    format!(
+        "the X display refused {request} ({:?}, value {:#x}, sequence {})",
+        error.error_kind, error.bad_value, error.sequence
+    )
 }

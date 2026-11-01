@@ -264,6 +264,9 @@ fn serve(connection: &RustConnection, window: u32, names: Names, shared: &Mutex<
             Event::SelectionNotify(notify) if notify.requestor == window => {
                 converted(connection, window, names, shared, notify.property)
             }
+            // An answer written to a requestor that is gone, or any request of
+            // this connection the server would not take, comes back here.
+            Event::Error(error) => Err(super::refused(&error)),
             _ => Ok(()),
         };
         if let Err(error) = handled {
