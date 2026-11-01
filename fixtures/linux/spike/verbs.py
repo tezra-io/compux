@@ -90,8 +90,11 @@ class Helper:
             self.next_seq += 1
             frame["mutation_seq"] = self.next_seq
         deadline = time.monotonic() + REPLY_TIMEOUT_S
-        self.proc.stdin.write(json.dumps(frame) + "\n")
-        self.proc.stdin.flush()
+        try:
+            self.proc.stdin.write(json.dumps(frame) + "\n")
+            self.proc.stdin.flush()
+        except BrokenPipeError:
+            raise HelperFailed(f"the helper exited before {action} was sent") from None
         while True:
             reply = self._next_reply(action, deadline)
             if reply.get("request_id") == frame["request_id"]:
@@ -122,7 +125,11 @@ class Helper:
         return reply
 
     def close(self):
-        self.proc.stdin.close()
+        try:
+            self.proc.stdin.close()
+        except BrokenPipeError:
+            # The helper had already exited: its input has nobody to read it.
+            print("the helper exited before its input was closed", file=sys.stderr)
         try:
             self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:

@@ -47,6 +47,11 @@ class HelperFailed(RuntimeError):
     is not a reply. The run records it as a FAIL by that name."""
 
 
+class NeverListed(RuntimeError):
+    """The helper answered, but the fixture was never listed in the tries a run
+    has. The run records it as a FAIL by that name."""
+
+
 class Helper:
     """The compux helper on a pipe, one request at a time. Its replies are read on
     a thread into a bounded queue, each with the time it was read, so a helper that
@@ -75,8 +80,11 @@ class Helper:
                  **self.generations, **fields}
         started = time.monotonic()
         deadline = started + REPLY_TIMEOUT_S
-        self.proc.stdin.write(json.dumps(frame) + "\n")
-        self.proc.stdin.flush()
+        try:
+            self.proc.stdin.write(json.dumps(frame) + "\n")
+            self.proc.stdin.flush()
+        except BrokenPipeError:
+            raise HelperFailed(f"the helper exited before {action} was sent") from None
         while True:
             reply, read_at = self._next_reply(action, deadline)
             if reply.get("request_id") == frame["request_id"]:
@@ -109,7 +117,11 @@ class Helper:
         return reply
 
     def close(self):
-        self.proc.stdin.close()
+        try:
+            self.proc.stdin.close()
+        except BrokenPipeError:
+            # The helper had already exited: its input has nobody to read it.
+            print("the helper exited before its input was closed", file=sys.stderr)
         try:
             self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -137,7 +149,7 @@ def wait_until_listed(helper):
         time.sleep(READY_STEP_S)
     if last and last.get("ok"):
         return last
-    raise RuntimeError(f"the fixture was never listed; last reply: {json.dumps(last)[:400]}")
+    raise NeverListed(f"the fixture was never listed; last reply: {json.dumps(last)[:400]}")
 
 
 def percentile(values, share):
@@ -166,6 +178,8 @@ def run(args):
         timed(helper, args.runs, runs)
     except HelperFailed as why:
         failed = f"helper: {why}"
+    except NeverListed as why:
+        failed = f"fixture: {why}"
     finally:
         helper.close()
     walls = [run["wall_ms"] for run in runs if run["ok"]]
