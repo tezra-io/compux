@@ -83,6 +83,11 @@ POPUP, POPUP_COLOUR, POPUP_SIZE = "Compux Popup", 0xC08020, (160, 80)
 POPUP_AWAY = (900, 700)
 # At the top of the screen, so the badge has no room above it and sits inside.
 RAISED, RAISED_COLOUR, RAISED_AT = "Compux Raised", 0x8040A0, (300, 4)
+# Also at the top, for the badge held under a popup; nudged right so the
+# helper sends the badge a new place.
+HELD, HELD_COLOUR, HELD_AT, NUDGE = "Compux Held", 0x40A080, (300, 4), 16
+# How far a popup opened over the badge reaches past it on every side.
+POPUP_MARGIN = 20
 # A second X server, with no window manager on it.
 BARE_DISPLAY = 77
 BADGE_CLASS = "^compux-indicator-x11$"
@@ -827,7 +832,8 @@ def bare_steps(binary, out):
         helper.handshake()
         with x11_oracle.Display(display) as oracle:
             return [bordered_window_check(helper, display, out),
-                    badge_restack_check(helper, display, oracle)]
+                    badge_restack_check(helper, display, oracle),
+                    badge_held_check(helper, display, oracle)]
     finally:
         if helper is not None:
             helper.close()
@@ -903,6 +909,58 @@ def badge_restack_check(helper, display, oracle):
     finally:
         popup.destroy()
         raised.destroy()
+
+
+def badge_held_check(helper, display, oracle):
+    """A bound window at the top of the screen, the badge inside its top edge, and
+    a popup (the person's menu, as far as the server knows) opened over the badge.
+    The window nudged right has the helper send the badge a new place, and the
+    badge goes there under the popup; the window raised to the very top, over the
+    badge, does not bring the badge over the popup either. Once the popup closes,
+    the badge is back over the window. Judged by the server's stacking order and
+    the badge's place."""
+    flow = "the badge stays under a popup open over it through a new state, and is back on top once it closes"
+    held = Victim(HELD, HELD_COLOUR, place=HELD_AT, display=display)
+    held.create()
+    held.listed_on_root()
+    popup, closed = None, False
+    try:
+        window = wait_listed(helper, HELD)
+        _, bound = helper.ask("select_target", window_id=window["id"]) if window else (None, {})
+        shown = wait_for(lambda: len(badges(display=display)) == 1)
+        if not bound.get("ok") or not shown:
+            return {"flow": flow, "passed": False,
+                    "why": f"select {bound.get('error') or 'ok'} {bound.get('detail')}; badge {shown}"}
+        badge = int(badges(display=display)[0])
+        x, y, _, _ = geometry(badge, display)
+        popup = Victim(POPUP, POPUP_COLOUR, place=(x - POPUP_MARGIN, y - POPUP_MARGIN),
+                       display=display, override=True)
+        popup.create()
+        time.sleep(QUIET_S)
+        held.move_to(HELD_AT[0] + NUDGE, HELD_AT[1])
+        moved = wait_for(lambda: geometry(badge, display)[0] == x + NUDGE)
+        time.sleep(QUIET_S)
+        after_state = oracle.stacking()
+        held.raise_to_top()
+        time.sleep(QUIET_S)
+        after_raise = oracle.stacking()
+        popup.destroy()
+        closed = True
+        time.sleep(QUIET_S)
+        after_close = oracle.stacking()
+        helper.ask("release_target")
+        under_state = after_state.index(popup.id) > after_state.index(badge)
+        under_raise = after_raise.index(popup.id) > after_raise.index(badge)
+        back = after_close.index(badge) > after_close.index(held.id)
+        return {"flow": flow, "passed": moved and under_state and under_raise and back,
+                "why": f"badge {badge:#x} moved to the nudged window {moved}; under the popup after "
+                       f"the new state {under_state} ({[hex(w) for w in after_state]}), after the "
+                       f"window was raised {under_raise} ({[hex(w) for w in after_raise]}); over the "
+                       f"window once the popup closed {back} ({[hex(w) for w in after_close]})"}
+    finally:
+        if popup is not None and not closed:
+            popup.destroy()
+        held.destroy()
 
 
 # --- twenty cycles ----------------------------------------------------------------------------

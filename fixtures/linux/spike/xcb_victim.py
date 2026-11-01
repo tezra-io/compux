@@ -29,6 +29,8 @@ CW_BACK_PIXEL = 1 << 1
 CW_BORDER_PIXEL = 1 << 3
 CW_OVERRIDE_REDIRECT = 1 << 9
 CW_EVENT_MASK = 1 << 11
+CONFIG_WINDOW_X = 1 << 0
+CONFIG_WINDOW_Y = 1 << 1
 CONFIG_WINDOW_BORDER_WIDTH = 1 << 4
 CONFIG_WINDOW_STACK_MODE = 1 << 6
 STACK_MODE_ABOVE = 0
@@ -196,6 +198,13 @@ class Victim:
         """A new X border width, the window's size unchanged."""
         self.xcb.xcb_configure_window(self.conn, self.id, CONFIG_WINDOW_BORDER_WIDTH,
                                       ctypes.cast((ctypes.c_uint32 * 1)(width), ctypes.c_void_p))
+        self.xcb.xcb_flush(self.conn)
+
+    def move_to(self, x, y):
+        """Its corner at root (`x`, `y`), its size and stacking unchanged."""
+        corner = (ctypes.c_uint32 * 2)(x & 0xFFFFFFFF, y & 0xFFFFFFFF)
+        self.xcb.xcb_configure_window(self.conn, self.id, CONFIG_WINDOW_X | CONFIG_WINDOW_Y,
+                                      ctypes.cast(corner, ctypes.c_void_p))
         self.xcb.xcb_flush(self.conn)
 
     def raise_to_top(self):
