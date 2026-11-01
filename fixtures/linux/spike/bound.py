@@ -997,7 +997,10 @@ def badge_sibling_check(helper, display, oracle):
             return {"flow": flow, "passed": False,
                     "why": f"select {bound.get('error') or 'ok'} {bound.get('detail')}; badge {shown}"}
         badge = int(badges(display=display)[0])
+        # Each victim has its own connection, so the server may take the second
+        # one's map first: the popup is made only once the mover is stacked.
         mover.create()
+        wait_for(lambda: mover.id in oracle.stacking())
         popup.create()
         time.sleep(QUIET_S)
         before = oracle.stacking()
