@@ -27,8 +27,16 @@
 #    judged by what the fixture recorded (verbs.py); verbs-jammy: the same on GTK3 in
 #    jammy (ATK bridge 2.38), under the same bus monitor as L0(b), so its writes are
 #    counted and no GetActions and no GetAll may be among anything sent.
+# 9. pixels (M86 L2): the X11 pixel route on the GTK3 fixture in noble (pixels.py):
+#    XTEST clicks and keys judged by what the fixture recorded, a paste through the
+#    selection compux owns, the frame against a pattern tiled on the root, a refused
+#    character off the layout, and a button a killed helper held released by the
+#    next one, judged by the X server (x11_oracle.py).
 #
-# SPIKE_STAGES picks the stages (default "a b wayland chromium verbs verbs-jammy"). Docker is whatever
+# The helper is built with no C library but the C runtime (build.Dockerfile has no
+# X, XKB, xdo or D-Bus development package); no_c_deps.sh proves that on its own.
+#
+# SPIKE_STAGES picks the stages (default "a b wayland chromium verbs verbs-jammy pixels"). Docker is whatever
 # DOCKER (default `docker`) and DOCKER_HOST name. CHROMIUM_BASE is the Debian
 # bookworm image the Chromium one starts from (default debian:bookworm; any bookworm
 # image with apt works). Every image is built from images already present when the
@@ -50,7 +58,7 @@ CACHE=${SPIKE_CACHE:-$HOME/.cache/compux-l0-spike}
 BUILD_LIMIT_S=${BUILD_LIMIT_S:-3600}
 RUN_LIMIT_S=${RUN_LIMIT_S:-600}
 CHROMIUM_BASE=${CHROMIUM_BASE:-debian:bookworm}
-STAGES=${SPIKE_STAGES:-a b wayland chromium verbs verbs-jammy}
+STAGES=${SPIKE_STAGES:-a b wayland chromium verbs verbs-jammy pixels}
 mkdir -p "$OUT" "$CACHE"
 
 die() { echo "spike.sh: $*" >&2; exit 1; }
@@ -94,6 +102,7 @@ spike_images() {
   local context base
   context=$(mktemp -d)
   cp "$CACHE/compux" "$HERE"/{elements_timing.py,a11y_tree.py,measure.sh,atk_bridge_check.sh,verbs.py} \
+    "$HERE"/{pixels.py,x11_oracle.py} \
     "$HERE"/{wayland_session.sh,chromium_session.sh,chromium_page.html} "$context/"
   for base in noble jammy; do
     build -q -t "compux-spike:$base" --build-arg "BASE=compux-fixtures:$base" \
@@ -194,6 +203,14 @@ if staged verbs-jammy; then
   echo "== L1 verbs gtk3 under ATK bridge 2.38 (jammy)"
   in_session compux-spike:jammy gtk3 bash /opt/compux-spike/atk_bridge_check.sh verbs \
     || failed+=("verbs:gtk3-jammy")
+fi
+
+if staged pixels; then
+  echo "== L2 X11 pixels gtk3 (noble)"
+  in_session compux-spike:noble gtk3 python3 /opt/compux-spike/pixels.py \
+    --binary /opt/compux/compux --state /tmp/compux-fixture-state/gtk3.json \
+    --out /tmp/spike-out/gtk3-pixels.json \
+    || failed+=("pixels:gtk3")
 fi
 
 [ "${#failed[@]}" -eq 0 ] || die "failed: ${failed[*]} (see $OUT)"
