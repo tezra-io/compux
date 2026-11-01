@@ -4,8 +4,8 @@
 //! end is an ordinary `zbus::Connection`, and this end answers every call from a
 //! scripted table of nodes keyed by (bus name, object path) — the registry, the
 //! applications on it, the bus daemon's process lookup and the session bus's
-//! `org.a11y.Bus`. It answers the way the toolkits were measured to (agent-desktop
-//! ledger rows L17-1..L17-12): a destroyed object answers `UnknownObject` to every
+//! `org.a11y.Bus`. It answers the way agent-desktop measured the toolkits to: a
+//! destroyed object answers `UnknownObject` to every
 //! read, a live one answers `UnknownObject` for an interface it does not have, a
 //! GTK3 object keeps answering after it left its parent's list, and an application
 //! that quit is `ServiceUnknown`.
@@ -37,7 +37,7 @@ pub const ROOT: &str = "/org/a11y/atspi/accessible/root";
 /// The session bus's name for the accessibility bus launcher.
 pub const LAUNCHER: &str = "org.a11y.Bus";
 
-/// The error names the toolkits answer, as the ledger recorded them.
+/// The error names the toolkits answer, as they were measured to.
 pub const UNKNOWN_OBJECT: &str = "org.freedesktop.DBus.Error.UnknownObject";
 pub const UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
 pub const SERVICE_UNKNOWN: &str = "org.freedesktop.DBus.Error.ServiceUnknown";
@@ -68,7 +68,7 @@ pub const LABELLED_BY: u32 = 2;
 pub enum Life {
     Alive,
     /// Gone: `UnknownObject` to every call, `GetRole` included (GTK3 and Chromium
-    /// after their teardown window, L17-7; Qt at once, L17-1).
+    /// after their teardown window; Qt at once).
     Destroyed,
     /// Never answers, so the caller's timeout is what ends the call.
     Silent,
@@ -94,7 +94,8 @@ pub struct Node {
     pub text: String,
     pub value: f64,
     pub life: Life,
-    /// Members this live node answers `UnknownObject` for (L17-2).
+    /// Members this live node answers `UnknownObject` for, as a live object does
+    /// for what it does not implement.
     pub refuses: Vec<&'static str>,
     /// Members, or properties read through `Get`, it never answers: the caller's
     /// timeout ends the call.
@@ -122,7 +123,7 @@ pub struct Node {
     pub mints: bool,
     /// Where it says it sits, (parent, index), whatever lists it now: a destroyed
     /// GTK 3 or Chromium object keeps answering its old `Parent` and index for
-    /// about 16 s (L17-6, L17-8).
+    /// about 16 s.
     pub claims: Option<((String, String), i32)>,
 }
 
@@ -250,7 +251,7 @@ pub struct Call {
     pub member: String,
     /// The first argument as text, where the call has one worth asserting on.
     pub argument: String,
-    /// The call did not carry `NO_AUTO_START` (L1-5).
+    /// The call did not carry `NO_AUTO_START`, so it may start the service.
     pub auto_start: bool,
     /// The body's signature, without the parentheses a body of several arguments
     /// prints with.

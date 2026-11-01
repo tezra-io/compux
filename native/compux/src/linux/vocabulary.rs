@@ -8,8 +8,8 @@
 //! two 32-bit words, bit `n` in bit `n % 32` of word `n / 32`.
 //!
 //! Which numbers matter, and why ENABLED alone is not "enabled", come from
-//! agent-desktop's measurements (ledger L3-6, `tree/vocabulary/`); no code of
-//! theirs is copied here.
+//! agent-desktop's measurements (its `tree/vocabulary/`); no code of theirs is
+//! copied here.
 
 use crate::ax::States;
 
@@ -202,7 +202,7 @@ pub fn has(words: &[u32], bit: u32) -> bool {
 }
 
 /// Whether a control can be operated now. ENABLED **or** SENSITIVE: GTK4 never sets
-/// ENABLED, so reading it alone would grey out every GTK4 control (L3-6).
+/// ENABLED, so reading it alone would grey out every GTK4 control.
 pub fn enabled(words: &[u32]) -> bool {
     has(words, ENABLED) || has(words, SENSITIVE)
 }
@@ -294,8 +294,8 @@ mod tests {
         assert_eq!(states(&words(&[CHECKED]), true).on, Some(true));
     }
 
-    // The table is at-spi2-core's enum: spot-check the numbers the ledger and the
-    // fixtures name, at both ends of it.
+    // The table is at-spi2-core's enum: spot-check the numbers the toolkits were
+    // measured with and the fixtures name, at both ends of it.
     #[test]
     fn a_role_number_reads_as_its_constant() {
         assert_eq!(role(0), "invalid");
@@ -327,7 +327,7 @@ mod tests {
         assert!(!has(&[0], 33), "a word that is not there holds nothing");
     }
 
-    // L3-6: GTK4 sets SENSITIVE and never ENABLED.
+    // GTK4 sets SENSITIVE and never ENABLED.
     #[test]
     fn enabled_is_either_bit() {
         assert!(enabled(&[1 << ENABLED, 0]));

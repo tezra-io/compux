@@ -6,7 +6,7 @@
 //! X socket, and the session is the one whose socket answers: a Wayland socket that
 //! answers is Wayland, with an X11 endpoint beside it where `DISPLAY` answers too
 //! (XWayland); an X socket alone is X11. `XDG_SESSION_TYPE` is never read — it says
-//! `tty` over SSH (agent-desktop L1-4, L13-1).
+//! `tty` over SSH, as agent-desktop found.
 //!
 //! **A helper started before login.** A daemon that a systemd user unit
 //! started before anyone logged in hands its helper no display. When this process

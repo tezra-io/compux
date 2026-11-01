@@ -2558,13 +2558,14 @@ arrives; a stopwatch is enough):
   items are selected by their own `Toggle` (Qt lists no `Selection`; a tab is
   pressed), a tree cell has no `expand`, and there is no `scroll_to`.
 * **Wayland.** Controls on a Wayland session are listed without positions and act
-  by reference; nothing here runs one. Pixels on Wayland are L2's.
+  by reference; nothing here runs one. Pixels on Wayland are checked in the M86 L2
+  section below, part B.
 * **Chromium and Electron.** `scroll_to` through `Component.ScrollTo` and the
   `toolkit_accessibility_off` refusal are tested against fakes only here.
 * **An application that is not on the accessibility bus** (a Qt one without
   `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`, a GTK 4 one started before the bus) leaves
   no window reading ACTIVE there: `elements` says so and names the switches, but
-  cannot name the application until the window list arrives (L3).
+  cannot name the application until the window list arrives in a later stage.
 
 # Live check — Linux pixels on x11rb and the GNOME portal (M86 L2)
 

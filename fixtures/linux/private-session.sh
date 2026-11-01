@@ -20,7 +20,8 @@
 #
 # Order matters, and is the one a desktop login has: the X server and the window
 # manager, then the accessibility bus, then the applications. A GTK4 application
-# started before the accessibility bus never registers on it (agent-desktop L1-13).
+# started before the accessibility bus never registers on it, as agent-desktop
+# found.
 set -euo pipefail
 
 DISPLAY_NUMBER=99

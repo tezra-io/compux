@@ -115,9 +115,9 @@ const INTERACTIVE: &[&str] = &[
 /// list the whole tree.
 ///
 /// Then AT-SPI's, as `GetName(i)` names them: the press names (click, press,
-/// activate, jump, check, open) and Qt's toggle and stepping names (L3-19). Not
-/// `doDefault`, which Chromium advertises on plain text where it does nothing
-/// (L18-16), nor `clickAncestor`, Chromium's text inside a link or a clickable div,
+/// activate, jump, check, open) and Qt's toggle and stepping names. Not
+/// `doDefault`, which Chromium advertises on plain text where it does nothing,
+/// nor `clickAncestor`, Chromium's text inside a link or a clickable div,
 /// whose ancestor is the control, nor `showContextMenu`, `ShowMenu` or `SetFocus`.
 /// The toolkits disagree on case, so these are compared without it.
 const PRIMARY_ACTIONS: &[&str] = &[
@@ -926,7 +926,7 @@ mod tests {
 
     // The Linux reader answers AT-SPI's own words (M86 L1): its roles, and the
     // action names `GetName(i)` gives, which the toolkits spell in their own case —
-    // GTK `click`, Qt `Press` and `Toggle`, Chromium `clickAncestor` (L3-19).
+    // GTK `click`, Qt `Press` and `Toggle`, Chromium `clickAncestor`.
     #[test]
     fn an_at_spi_node_is_listed_for_its_role_or_a_primary_action_in_any_case() {
         let none: Vec<String> = Vec::new();
@@ -971,7 +971,7 @@ mod tests {
             );
         }
         // `clickAncestor` is Chromium's text inside a link or a clickable div: the
-        // ancestor is the control, and the text would list it twice (L18-16).
+        // ancestor is the control, and the text would list it twice.
         for secondary in [
             "showContextMenu",
             "ShowMenu",

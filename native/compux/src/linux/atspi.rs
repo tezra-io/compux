@@ -1,26 +1,26 @@
 //! The Linux reader: AT-SPI over D-Bus, behind [`Ax`] (M86 L1).
 //!
 //! The walk is the shared one in `tree.rs`; this module answers its per-node
-//! questions from the accessibility bus, and holds to four rules measured on real
-//! toolkits (agent-desktop's ledger):
+//! questions from the accessibility bus, and holds to four rules agent-desktop
+//! measured on real toolkits:
 //!
 //! - **Never `Action.GetActions`.** ATK bridge 2.38 (Ubuntu 22.04) aborts the
 //!   APPLICATION when asked it. Action names are read as
 //!   `NActions`, then `GetName(i)` for each index: the one call every toolkit
-//!   answers with the machine name (L3-20). An index that errors is left out, and
+//!   answers with the machine name. An index that errors is left out, and
 //!   the control says its actions are partial.
-//! - **Never `Properties.GetAll`.** It kills a Qt 6.4 application (L41-7).
+//! - **Never `Properties.GetAll`.** It kills a Qt 6.4 application.
 //!   Every property is a single `Get`, and an optional interface's are read only
 //!   after `GetInterfaces` lists it.
 //! - **An error name is not proof of absence.** `UnknownObject` is what a
 //!   destroyed object answers, and also what a live one answers for something it
-//!   does not implement (L17-2). Whether a node is there comes from its own
-//!   `GetRole`, which every live node of every toolkit answers (L17-11); whether it
+//!   does not implement. Whether a node is there comes from its own
+//!   `GetRole`, which every live node of every toolkit answers; whether it
 //!   is still in the tree comes from reaching it through its parent's child list,
-//!   because a destroyed GTK3 or Chromium object keeps answering for about 16 s
-//!   (L17-6, L17-8). `ServiceUnknown` means the application is gone.
+//!   because a destroyed GTK3 or Chromium object keeps answering for about 16 s.
+//!   `ServiceUnknown` means the application is gone.
 //! - **Concurrency.** A node's reads go out together, and up to [`IN_FLIGHT`]
-//!   nodes are read at once (L2-5: 2.5 to 3.5 times faster than one call at a
+//!   nodes are read at once (2.5 to 3.5 times faster than one call at a
 //!   time). The walker asks for one node at a time, so the first question about a
 //!   node that came in a page of children reads it together with the siblings
 //!   after it, and answers them from that read when the walker reaches them.
@@ -81,7 +81,7 @@ const UNKNOWN_OBJECT: &str = "org.freedesktop.DBus.Error.UnknownObject";
 const UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
 const UNKNOWN_INTERFACE: &str = "org.freedesktop.DBus.Error.UnknownInterface";
 
-/// How many nodes are read at once (L2-5: 16 in flight was within 5–15% of 128).
+/// How many nodes are read at once (16 in flight was measured within 5–15% of 128).
 pub const IN_FLIGHT: usize = 8;
 
 /// How many of one control's actions are named. More is a control that says its
@@ -123,7 +123,7 @@ pub(super) enum Failed {
     /// The application left the bus.
     Quit,
     /// What a destroyed object answers — and a live one, for what it does not
-    /// implement (L17-2). Alone it proves nothing.
+    /// implement. Alone it proves nothing.
     Suspect,
     /// No answer within the call's timeout.
     Late,
@@ -605,7 +605,7 @@ impl Real {
         usize::try_from(count).map_err(|_| Failed::Other)
     }
 
-    /// The six reads every live node answers (L17-11), sent together.
+    /// The six reads every live node of every toolkit answers, sent together.
     async fn universal(&self, bus: &Connection, at: &Address) -> Universal {
         let ((role, name, description), (states, interfaces, count)) = join(
             join3(
@@ -1739,8 +1739,7 @@ mod tests {
 
     // --- what a node says about itself ---------------------------------------------
 
-    // L3-6: GTK4 sets SENSITIVE and never ENABLED; a control with neither is
-    // disabled.
+    // GTK4 sets SENSITIVE and never ENABLED; a control with neither is disabled.
     #[test]
     fn ledger_l3_6_a_control_is_enabled_by_either_bit_and_disabled_by_neither() {
         let (_fake, ax) = reader(desktop(
@@ -1897,7 +1896,7 @@ mod tests {
         assert!(calls_to(&fake.calls(), "/w/dialog/yes").is_empty());
     }
 
-    // L17-2: a LIVE object answers UnknownObject for what it does not implement.
+    // A LIVE object answers UnknownObject for what it does not implement.
     // Its GetRole answers, so it is there: listed by what did read.
     #[test]
     fn a_live_object_that_answers_unknown_object_is_still_there() {
@@ -1918,7 +1917,7 @@ mod tests {
         assert_eq!(labels(&found), vec!["Save the file"]);
     }
 
-    // L17-6: a destroyed GTK3 object keeps answering its own reads for ~16 s. What
+    // A destroyed GTK3 object keeps answering its own reads for ~16 s. What
     // decides it is gone is its parent's list, which no longer holds it — and the
     // walk only ever reaches a node through that list.
     #[test]
@@ -2034,7 +2033,7 @@ mod tests {
         );
     }
 
-    // L2-5: up to eight siblings are read at once. The eighth sibling's first read
+    // Up to eight siblings are read at once. The eighth sibling's first read
     // goes out before the first sibling's second round (which waits on its first),
     // and the ninth waits for the walker to reach it.
     #[test]

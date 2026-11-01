@@ -3,19 +3,19 @@
 //! Pure: the reader reads a node once, and everything here decides from that read,
 //! so a listing costs no message per route and every rule is tested without a bus.
 //! Each route is the node's OWN: an action it names, an interface it lists, a state
-//! it reads. Nothing is inferred from what its role suggests (agent-desktop L3-19:
-//! the toolkits name their actions differently, and none names `expand`).
+//! it reads. Nothing is inferred from what its role suggests: agent-desktop found
+//! the toolkits name their actions differently, and none names `expand`.
 
 use super::vocabulary::{self, CHECKABLE, EDITABLE, EXPANDABLE, FOCUSABLE, SELECTABLE};
 use crate::ax::{Expander, Routes, PRESS, SCROLL_TO_VISIBLE};
 
 /// The action names that press a control, compared without case: GTK `click`,
-/// Chromium `press`, `jump` (a link) and `check`, Qt `Press` (L3-20, L18-16). Never
-/// `doDefault`, which Chromium advertises on plain text where it does nothing
-/// (L18-16), nor `clickAncestor`, whose ancestor is the control.
+/// Chromium `press`, `jump` (a link) and `check`, Qt `Press`. Never `doDefault`,
+/// which Chromium advertises on plain text where it does nothing, nor
+/// `clickAncestor`, whose ancestor is the control.
 const PRESS_NAMES: [&str; 6] = ["click", "press", "activate", "jump", "check", "open"];
 
-/// Qt names a check box's press `Toggle` (L3-19). Only a control that carries a
+/// Qt names a check box's press `Toggle`. Only a control that carries a
 /// check state is pressed by it: on a Qt list item the same name toggles the
 /// selection, and is that item's `select` ([`selector`]).
 const TOGGLE: &str = "toggle";
@@ -27,7 +27,7 @@ const SHOW_MENU: &str = "showmenu";
 
 /// The actions that expand and collapse the node they belong to, in one toggle:
 /// a GTK 3 tree cell's and a GTK 4 tree row's. A node with neither is expanded by
-/// its press, which is all a GTK 3 expander has (L4-6).
+/// its press, which is all a GTK 3 expander has.
 const EXPANDING: [&str; 2] = ["expand or contract", "listitem.toggle-expand"];
 
 /// Qt joins the accessibility bus only where an assistive technology is running,
@@ -47,7 +47,7 @@ pub const GTK4_SWITCH: &str = "start a GTK 4 application again once the accessib
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Toolkit {
     Gtk3,
-    /// Has no screen positions, and answers `GrabFocus` `NotSupported` (L4-16).
+    /// Has no screen positions, and answers `GrabFocus` `NotSupported`.
     Gtk4,
     Qt,
     /// Implements `Component.ScrollTo`.
@@ -184,7 +184,7 @@ pub fn routes(read: &Read<'_>) -> Routes {
     let editable = vocabulary::has(read.states, EDITABLE);
     Routes {
         value: settable(read),
-        // GTK 4 answers `GrabFocus` `NotSupported` (L4-16).
+        // GTK 4 answers `GrabFocus` `NotSupported`.
         focus: read.component
             && vocabulary::has(read.states, FOCUSABLE)
             && read.toolkit != Toolkit::Gtk4,
@@ -344,7 +344,7 @@ mod tests {
         assert!(!routes(&qt(CHECK_BOX, &checkable, &toggle)).select);
     }
 
-    // L3-20, L18-16: Chromium's press is the first of its press names, read by
+    // Chromium's press is the first of its press names, read by
     // index; `doDefault` (plain text) and `clickAncestor` (text in a link) never are.
     #[test]
     fn ledger_l18_16_press_is_the_first_press_name_and_never_do_default() {
@@ -376,7 +376,7 @@ mod tests {
         assert_eq!(press(&read(LIST_ITEM, &[], &qt)), None);
     }
 
-    // L4-6: a GTK 3 expander's only action is `activate`, and a tree cell's own
+    // A GTK 3 expander's only action is `activate`, and a tree cell's own
     // `expand or contract` comes first where it has one. Neither is a route unless
     // the node reads EXPANDABLE.
     #[test]
@@ -405,7 +405,7 @@ mod tests {
         );
     }
 
-    // L4-16: GTK 4 answers GrabFocus NotSupported, so focus is offered only on a
+    // GTK 4 answers GrabFocus NotSupported, so focus is offered only on a
     // focusable Component of any other toolkit.
     #[test]
     fn ledger_l4_16_focus_is_offered_where_grab_focus_works() {

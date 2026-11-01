@@ -3,8 +3,8 @@
 //! A reference is the object a walk read, at the place the walk reached it: its
 //! bus name and object path, and its child-index path from the application root.
 //! Neither alone proves the control is still the one the caller was shown. A
-//! destroyed GTK 3 or Chromium object keeps answering for about 16 s (L17-6, L17-8),
-//! so an object that answers is not proof it is still in the tree; and a list that
+//! destroyed GTK 3 or Chromium object keeps answering for about 16 s, so an
+//! object that answers is not proof it is still in the tree; and a list that
 //! changed puts another object at the same place. So both are read again:
 //!
 //! - the object at the place, reached through each parent's child list;
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(facts.label.as_deref(), Some("/w/b"));
     }
 
-    // L17-6: a destroyed GTK 3 object keeps answering, but its parent no longer
+    // A destroyed GTK 3 object keeps answering, but its parent no longer
     // lists it. Another object at its place is not it.
     #[test]
     fn a_reference_its_parent_no_longer_lists_is_stale() {
@@ -426,7 +426,7 @@ mod tests {
         assert_eq!(ax.identify(b).err(), Some(Identity::Unread(Unread::Gone)));
     }
 
-    // L17-6, L17-8: a destroyed GTK 3 or Chromium object keeps answering its old
+    // A destroyed GTK 3 or Chromium object keeps answering its old
     // parent and index for about 16 s after its parent dropped it. Its own account
     // of its place proves nothing there, and another object of its role sits at
     // that place now: stale. Only Qt's account is taken, where every ask for a

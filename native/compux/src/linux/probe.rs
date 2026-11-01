@@ -4,7 +4,7 @@
 //! and the toolkit notes that are known without reading any application.
 //!
 //! Read-only, and never a prompt. The bus is asked for the way the reader asks for
-//! it, with a `GetAddress` that may start it (L1-5: a presence check reports a
+//! it, with a `GetAddress` that may start it (a presence check reports a
 //! healthy cold session as one without accessibility); then the registry's child
 //! count, the launcher's status with two property `Get`s, and the package
 //! database's file. It registers for no event, reads no application, and changes

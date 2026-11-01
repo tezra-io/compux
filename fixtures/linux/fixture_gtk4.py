@@ -18,8 +18,8 @@ widgets in GTK4 would qualify something nobody ships:
   python3 fixtures/linux/fixture_gtk4.py --state-file /tmp/gtk4.json
   python3 fixtures/linux/fixture_gtk4.py --self-test --state-file /tmp/gtk4.json
 
-GTK4 registers on the accessibility bus only if the bus is up when it starts
-(agent-desktop L1-13), which is why `private-session.sh` starts the bus first.
+GTK4 registers on the accessibility bus only if the bus is up when it starts, as
+agent-desktop found, which is why `private-session.sh` starts the bus first.
 Run it only inside that private session, never on someone's desktop.
 """
 

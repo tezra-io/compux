@@ -5,7 +5,7 @@
 //! with an ordinary, auto-starting call: on a session where no assistive technology
 //! has run yet the accessibility bus does not exist until something asks, and a
 //! `NameHasOwner` check (or a call that refuses to auto-start) reports that healthy
-//! cold session as one without accessibility (agent-desktop L1-5).
+//! cold session as one without accessibility, as agent-desktop found.
 
 use std::time::Duration;
 
@@ -119,7 +119,7 @@ impl Unnamed {
 }
 
 /// The accessibility bus's address, from the session bus: one auto-starting
-/// `GetAddress`, never a presence check first (L1-5).
+/// `GetAddress`, never a presence check first.
 pub async fn address(session: &Connection) -> Result<String, Unnamed> {
     let reply = session
         .call_method(
@@ -237,7 +237,7 @@ mod tests {
         }
     }
 
-    // L1-5: a cold session has no accessibility bus until something asks for it, so
+    // A cold session has no accessibility bus until something asks for it, so
     // the address is asked with a call that may start it, and nothing checks for
     // the name first.
     #[test]

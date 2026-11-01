@@ -639,7 +639,7 @@ mod tests {
         }
     }
 
-    // L3-20, L18-16: press is DoAction on the index its press name was read at by
+    // Press is DoAction on the index its press name was read at by
     // GetName(i). GetActions is never sent, and `doDefault` is never done.
     #[test]
     fn ledger_l3_20_press_does_the_action_at_the_index_its_name_was_read_at() {
@@ -899,7 +899,7 @@ mod tests {
         assert_eq!(fake.sent("DoAction"), vec!["/w/actions 0"]);
     }
 
-    // L4-6: a GTK 3 expander's one action is `activate`. Expand sends it only while
+    // A GTK 3 expander's one action is `activate`. Expand sends it only while
     // the expander reads collapsed, and reads EXPANDED back.
     #[test]
     fn ledger_l4_6_expand_sends_the_one_action_only_while_collapsed() {
@@ -947,7 +947,7 @@ mod tests {
         desktop
     }
 
-    // L4-16: GrabFocus can activate an inactive window. focus is refused unless the
+    // GrabFocus can activate an inactive window. focus is refused unless the
     // control's frame reads ACTIVE, and nothing is sent.
     #[test]
     fn ledger_l4_16_focus_never_activates_a_window() {
@@ -960,7 +960,7 @@ mod tests {
         assert!(fake.sent("GrabFocus").is_empty());
     }
 
-    // L28-20: another application's popup holds the grab, so the target frame does
+    // Another application's popup holds the grab, so the target frame does
     // not read ACTIVE — whatever the window manager says is active. focus is
     // refused and nothing is sent.
     #[test]
