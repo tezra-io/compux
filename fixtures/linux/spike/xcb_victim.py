@@ -12,8 +12,9 @@ thread of its own, as an application would. A LAZY one has no background and
 paints only on its first expose, as a hung application would: whatever is later
 copied into it stays until something else draws there. A BORDERED one, on a
 display with no window manager, keeps the X border its client gives it, in a
-colour of its own. Runs only inside the private-session container; bound.py
-refuses to start anywhere else.
+colour of its own. An OVERRIDE one is override-redirect, as a menu or a popup
+is: no window manager frames, lists or moves it. Runs only inside the
+private-session container; bound.py refuses to start anywhere else.
 """
 
 import ctypes
@@ -26,8 +27,11 @@ EXPOSE = 12
 INPUT_OUTPUT = 1
 CW_BACK_PIXEL = 1 << 1
 CW_BORDER_PIXEL = 1 << 3
+CW_OVERRIDE_REDIRECT = 1 << 9
 CW_EVENT_MASK = 1 << 11
 CONFIG_WINDOW_BORDER_WIDTH = 1 << 4
+CONFIG_WINDOW_STACK_MODE = 1 << 6
+STACK_MODE_ABOVE = 0
 EXPOSURE_MASK = 1 << 15
 GC_FOREGROUND = 1 << 2
 PROP_MODE_REPLACE = 0
@@ -100,11 +104,13 @@ class Victim:
     repaint thread is blocked on it, and it closes, with any window still standing,
     when this process exits."""
 
-    def __init__(self, title, colour, lazy=False, place=PLACE, display=None, border=(0, 0)):
+    def __init__(self, title, colour, lazy=False, place=PLACE, display=None, border=(0, 0),
+                 override=False):
         self.xcb = _library()
         self.title = title.encode()
         self.colour = colour
         self.lazy, self.place, self.painted = lazy, place, False
+        self.override = override
         self.border, self.border_colour = border
         self.conn = self.xcb.xcb_connect(display.encode() if display else None, None)
         if not self.conn or self.xcb.xcb_connection_has_error(self.conn):
@@ -154,8 +160,9 @@ class Victim:
         if self.lazy:
             mask, values = CW_EVENT_MASK, (ctypes.c_uint32 * 1)(EXPOSURE_MASK)
         else:
-            mask = CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_EVENT_MASK
-            values = (ctypes.c_uint32 * 3)(self.colour, self.border_colour, EXPOSURE_MASK)
+            mask = CW_BACK_PIXEL | CW_BORDER_PIXEL | CW_OVERRIDE_REDIRECT | CW_EVENT_MASK
+            values = (ctypes.c_uint32 * 4)(self.colour, self.border_colour, int(self.override),
+                                           EXPOSURE_MASK)
         self.xcb.xcb_create_window(self.conn, self.depth, self.id, self.root, self.place[0],
                                    self.place[1], SIZE[0], SIZE[1], self.border, INPUT_OUTPUT,
                                    self.visual, mask, values)
@@ -178,6 +185,14 @@ class Victim:
         """A new X border width, the window's size unchanged."""
         self.xcb.xcb_configure_window(self.conn, self.id, CONFIG_WINDOW_BORDER_WIDTH,
                                       ctypes.cast((ctypes.c_uint32 * 1)(width), ctypes.c_void_p))
+        self.xcb.xcb_flush(self.conn)
+
+    def raise_to_top(self):
+        """Above every other window, as a window raised with no window manager
+        to say otherwise goes."""
+        self.xcb.xcb_configure_window(self.conn, self.id, CONFIG_WINDOW_STACK_MODE,
+                                      ctypes.cast((ctypes.c_uint32 * 1)(STACK_MODE_ABOVE),
+                                                  ctypes.c_void_p))
         self.xcb.xcb_flush(self.conn)
 
     def _property(self, name, kind, bits, data, window=None):

@@ -25,6 +25,9 @@ under where the badge floats. Then:
   rectangles only;
 - a click on the bound window's button lands (the fixture recorded it); one at a
   point the cover hides is `target_obstructed`, and nothing recorded it;
+- an override-redirect popup, which no window manager lists, over the button
+  refuses the click `target_obstructed`, naming it, and nothing is recorded; with
+  its input region set clear of that point, the same click lands;
 - the badge's Pause, clicked as the person clicks, reaches the gate (an
   `operator_pause`, and the next click is refused `paused`); Resume undoes it; a
   click on the badge outside its buttons reaches the floor under it; a press and
@@ -38,7 +41,9 @@ under where the badge floats. Then:
 - on a second X server with no window manager, a top-level window with an X
   border of its own is read from inside the border: every pixel of its frames is
   the window's colour, at the border it was bound with and after it is given
-  another;
+  another; and a bound window at the top of the screen, with the badge inside its
+  top edge, leaves a popup mapped later over the badge, and when it is raised to
+  the very top the badge goes back over it;
 - twenty select and release cycles leave no badge process, no zombie and no badge
   window, and the helper's resident memory flat.
 
@@ -70,6 +75,11 @@ VICTIM, VICTIM_COLOUR = "Compux Victim", 0x30A030
 LAZY, LAZY_COLOUR, LAZY_AT = "Compux Lazy", 0x2050C0, (400, 450)
 BORDERED, BORDERED_COLOUR, BORDERED_AT = "Compux Bordered", 0x30A0A0, (200, 300)
 BORDER_COLOUR, BORDER_WIDTHS = 0xE0E020, (8, 3)
+POPUP, POPUP_COLOUR, POPUP_SIZE = "Compux Popup", 0xC08020, (160, 80)
+# Clear of the bare server's badge, bottom right.
+POPUP_AWAY = (900, 700)
+# At the top of the screen, so the badge has no room above it and sits inside.
+RAISED, RAISED_COLOUR, RAISED_AT = "Compux Raised", 0x8040A0, (300, 4)
 # A second X server, with no window manager on it.
 BARE_DISPLAY = 77
 BADGE_CLASS = "^compux-indicator-x11$"
@@ -151,9 +161,10 @@ class Session(Helper):
 # --- the windows, through xdotool and the helper's own listing ---------------------------
 
 
-def xdotool(*arguments):
+def xdotool(*arguments, display=None):
+    env = {**os.environ, "DISPLAY": display} if display else None
     done = subprocess.run(["xdotool", *map(str, arguments)], capture_output=True, text=True,
-                          timeout=COMMAND_TIMEOUT_S, check=False)
+                          timeout=COMMAND_TIMEOUT_S, check=False, env=env)
     return done.stdout.split()
 
 
@@ -339,10 +350,10 @@ def first_frame_check(helper, display, bound, fixture, cover, out):
     if title is None or not bound.get("data"):
         return {"flow": flow, "passed": False,
                 "why": f"the cover {region(cover)} is not over the title bar above {client}"}
-    _, shot = helper.ask("screenshot")
-    keep(out, "first-frame-display.png", shot)
-    on_display, seen = colour_share(shot, scaled(title, (0, 0), shot["width"] / shot["physical"]["width"]),
-                                    COVER_COLOUR)
+    tx, ty, tw, th = title
+    band = (tx + INSET, ty + INSET, tw - 2 * INSET, th - 2 * INSET)
+    # The cover on screen is read from the X server's root, past compux.
+    on_display, seen = display.colour_share(band, COVER_COLOUR, COLOUR_TOLERANCE), band[2] * band[3]
     stray = cover_pixels(bound)
     frame, border = frame_border(display, int(window_id(FIXTURE)))
     passed = stray == 0 and seen > 0 and on_display > 0.95
@@ -355,18 +366,16 @@ def first_frame_check(helper, display, bound, fixture, cover, out):
 # --- the badge, as the X server and /proc see it ---------------------------------------------
 
 
-def badges(visible=True):
+def badges(visible=True, display=None):
     """The badge windows there are: mapped ones only, or every one."""
     if visible:
-        return xdotool("search", "--onlyvisible", "--classname", BADGE_CLASS)
-    return xdotool("search", "--classname", BADGE_CLASS)
+        return xdotool("search", "--onlyvisible", "--classname", BADGE_CLASS, display=display)
+    return xdotool("search", "--classname", BADGE_CLASS, display=display)
 
 
-def geometry(window):
-    fields = dict(line.split("=", 1) for line in
-                  subprocess.run(["xdotool", "getwindowgeometry", "--shell", str(window)],
-                                 capture_output=True, text=True, timeout=COMMAND_TIMEOUT_S,
-                                 check=False).stdout.split())
+def geometry(window, display=None):
+    fields = dict(line.split("=", 1)
+                  for line in xdotool("getwindowgeometry", "--shell", window, display=display))
     return tuple(int(fields[key]) for key in ("X", "Y", "WIDTH", "HEIGHT"))
 
 
@@ -510,6 +519,43 @@ def target_click_check(helper, target, state):
     return {"flow": "click in the bound window", "passed": bool(reply.get("ok")) and event is not None,
             "why": f"reply {reply.get('error') or 'ok'} {reply.get('detail') or ''}, recorded {event}",
             "input_method": reply.get("receipt", {}).get("input_method")}
+
+
+def popup_check(helper, target, state, display):
+    """An override-redirect popup over the fixture's button: no window manager lists
+    it, and a click there is refused `target_obstructed`, naming it, with nothing
+    recorded. With its input region set to a corner clear of the point, the same
+    click lands: the server's own input regions decide, not the popup's place."""
+    flow = "a popup over the point refuses the click, and one taking no input there does not"
+    element, _ = button_in(helper, target)
+    fixture = by_title(listed(helper), FIXTURE)
+    if element is None or fixture is None:
+        return {"flow": flow, "passed": False, "why": f"button {element}, fixture {fixture}"}
+    _, shot = helper.ask("screenshot", target_id=target)
+    fx, fy, fw, _ = region(fixture)
+    scale = shot["width"] / fw
+    px, py = fx + round(element["x"] / scale), fy + round(element["y"] / scale)
+    popup = Victim(POPUP, POPUP_COLOUR, place=(px - POPUP_SIZE[0] // 2, py - POPUP_SIZE[1] // 2),
+                   override=True)
+    popup.create()
+    shown = wait_for(lambda: bool(xdotool("search", "--onlyvisible", "--name", f"^{POPUP}$")))
+    time.sleep(QUIET_S)
+    since = len(events(state))
+    refused = click_button(helper, target)
+    time.sleep(QUIET_S)
+    arrived = events(state)[since:]
+    display.shape_input(popup.id, [(0, 0, 10, 10)])
+    since = len(events(state))
+    landed = click_button(helper, target)
+    event = recorded(state, since, "gtk3", "button", "press", None)
+    popup.destroy()
+    passed = (shown and refused.get("error") == "target_obstructed"
+              and POPUP in (refused.get("detail") or "") and not arrived
+              and bool(landed.get("ok")) and event is not None)
+    return {"flow": flow, "passed": passed,
+            "why": f"popup over ({px}, {py}) shown {shown}; refused {refused.get('error') or 'ok'}: "
+                   f"{refused.get('detail')}; recorded under it {arrived}; with its input clear of "
+                   f"the point {landed.get('error') or 'ok'}, recorded {event}"}
 
 
 def obstructed_check(helper, target, state, fixture, cover, record):
@@ -767,21 +813,34 @@ def all_window(shot):
     return whole, f"{size[0]}x{size[1]}, {own} pixels the window's, {border} the border's"
 
 
-def bordered_window_check(binary, out):
+def bare_steps(binary, out):
+    """The steps on a second X server with no window manager, with a helper of
+    their own."""
+    server = bare_display()
+    helper = None
+    display = f":{BARE_DISPLAY}"
+    try:
+        helper = Session(binary, out + ".bare.stderr", env={**os.environ, "DISPLAY": display})
+        helper.handshake()
+        with x11_oracle.Display(display) as oracle:
+            return [bordered_window_check(helper, display, out),
+                    badge_restack_check(helper, display, oracle)]
+    finally:
+        if helper is not None:
+            helper.close()
+        stop(server)
+
+
+def bordered_window_check(helper, display, out):
     """A top-level window with an X border of its own, bound on a display with no
     window manager: its frames hold the window's pixels and none of its border's,
     at the border it was bound with, and after it is given another."""
     flow = "a window with an X border is read from inside it"
-    server = bare_display()
-    helper = None
+    victim = Victim(BORDERED, BORDERED_COLOUR, place=BORDERED_AT, display=display,
+                    border=(BORDER_WIDTHS[0], BORDER_COLOUR))
+    victim.create()
+    victim.listed_on_root()
     try:
-        display = f":{BARE_DISPLAY}"
-        victim = Victim(BORDERED, BORDERED_COLOUR, place=BORDERED_AT, display=display,
-                        border=(BORDER_WIDTHS[0], BORDER_COLOUR))
-        victim.create()
-        victim.listed_on_root()
-        helper = Session(binary, out + ".bare.stderr", env={**os.environ, "DISPLAY": display})
-        helper.handshake()
         window = wait_listed(helper, BORDERED)
         if window is None:
             return {"flow": flow, "passed": False, "why": "the bordered window was never listed"}
@@ -798,9 +857,44 @@ def bordered_window_check(binary, out):
                 "why": f"border {BORDER_WIDTHS[0]}: {first_why}; border {BORDER_WIDTHS[1]}: "
                        f"{again_why}"}
     finally:
-        if helper is not None:
-            helper.close()
-        stop(server)
+        victim.destroy()
+
+
+def badge_restack_check(helper, display, oracle):
+    """A bound window at the top of the screen, the badge inside its top edge. A
+    popup mapped afterwards (the person's menu, as far as the server knows) stays
+    over the badge. The bound window raised to the very top, over the badge, has the
+    badge back over it. Judged by the server's stacking order."""
+    flow = "the badge stays under a popup, and goes back over its window raised onto it"
+    raised = Victim(RAISED, RAISED_COLOUR, place=RAISED_AT, display=display)
+    raised.create()
+    raised.listed_on_root()
+    popup = Victim(POPUP, POPUP_COLOUR, place=POPUP_AWAY, display=display, override=True)
+    try:
+        window = wait_listed(helper, RAISED)
+        _, bound = helper.ask("select_target", window_id=window["id"]) if window else (None, {})
+        shown = wait_for(lambda: len(badges(display=display)) == 1)
+        if not bound.get("ok") or not shown:
+            return {"flow": flow, "passed": False,
+                    "why": f"select {bound.get('error') or 'ok'} {bound.get('detail')}; badge {shown}"}
+        badge = int(badges(display=display)[0])
+        meets = overlap(geometry(badge, display), region(window))
+        popup.create()
+        time.sleep(QUIET_S)
+        before = oracle.stacking()
+        raised.raise_to_top()
+        time.sleep(QUIET_S)
+        after = oracle.stacking()
+        helper.ask("release_target")
+        under = before.index(popup.id) > before.index(badge)
+        over = after.index(badge) > after.index(raised.id)
+        return {"flow": flow, "passed": meets is not None and under and over,
+                "why": f"badge {badge:#x} meets the window at {meets}; popup over the badge {under} "
+                       f"(bottom to top {[hex(w) for w in before]}); badge over the raised window "
+                       f"{over} ({[hex(w) for w in after]})"}
+    finally:
+        popup.destroy()
+        raised.destroy()
 
 
 # --- twenty cycles ----------------------------------------------------------------------------
@@ -879,6 +973,7 @@ def bound_steps(helper, display, args, records):
     badge, shown = badge_check(display, helper, fixture)
     yield shown
     yield target_click_check(helper, target, args.state)
+    yield popup_check(helper, target, args.state, display)
     yield obstructed_check(helper, target, args.state, fixture, cover, records[COVER])
     if badge is None:
         return
@@ -913,7 +1008,7 @@ def run(args):
                 results.append(xid_reuse_check(helper))
                 results.append(lazy_window_check(helper))
                 results.append(cycles_check(helper, by_title(listed(helper), FIXTURE)))
-                results.append(bordered_window_check(args.binary, args.out))
+                results.extend(bare_steps(args.binary, args.out))
     except (HelperFailed, subprocess.SubprocessError, OSError, KeyError, ValueError) as why:
         results.append({"flow": "the run", "passed": False, "why": f"{type(why).__name__}: {why}"})
     finally:

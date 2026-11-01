@@ -35,12 +35,15 @@
 # 10. bound (M86 L3): one window bound on X11 and its badge, on the GTK3 fixture in
 #    noble (bound.py): none of a covering window's pixels in the first frame, frame
 #    and title bar included, a covered window captured, a covered point refused,
-#    the badge's buttons reaching the gate as the person clicks them and not when
-#    another program sends the click, a click off them passing through, a reused
-#    window id refused, a window that never repaints refused, twenty select and
-#    release cycles leaving no process behind, and, on a second X server with no
-#    window manager, a window with an X border read from inside it. The badge (compux-indicator-x11) is built
-#    beside the helper and installed beside it, as the release archive carries it.
+#    a click under an override-redirect popup refused and one where the popup
+#    takes no input landing, the badge's buttons reaching the gate as the person
+#    clicks them and not when another program sends the click, a click off them
+#    passing through, a reused window id refused, a window that never repaints
+#    refused, twenty select and release cycles leaving no process behind, and, on
+#    a second X server with no window manager, a window with an X border read from
+#    inside it and the badge staying under a popup and going back over its window
+#    raised onto it. The badge (compux-indicator-x11) is built beside the helper
+#    and installed beside it, as the release archive carries it.
 #
 # The helper is built with no C library but the C runtime (build.Dockerfile has no
 # X, XKB, xdo or D-Bus development package); no_c_deps.sh proves that on its own.
