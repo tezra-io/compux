@@ -40,9 +40,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use enigo::{Axis, Button, Direction, Key};
-
-use crate::held::Platform;
+use crate::held::{Axis, Button, Direction, Key, Platform};
 use crate::wire::{
     Checked, ControlAction, Effect, Envelope, InputMethod, Request, StateChange, Timings,
 };

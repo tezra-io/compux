@@ -2147,12 +2147,11 @@ mod tests {
         assert!(fake.sent("GetExtents").is_empty());
     }
 
-    // A display taken from the user manager draws nothing, even an X11 one that
-    // answers: the capture library cannot reach it, so controls are listed
-    // without positions, as on Wayland. The same display as this process's own
-    // places them.
+    // A display taken from the user manager is reached with the display and the
+    // authority it named, as values: its controls are placed exactly as on the
+    // process's own display, because its pixels are reached the same way.
     #[test]
-    fn a_reader_on_a_display_taken_from_the_user_manager_places_nothing() {
+    fn a_reader_on_a_display_taken_from_the_user_manager_places_it_as_its_own() {
         let (_x11, env) = display::answering_x11();
         let window = || desktop(&["/w/save"], vec![("/w/save", button("Save", 10))]);
         let listed_on = |adopted: bool| {
@@ -2170,13 +2169,12 @@ mod tests {
 
         assert!(own.nodes[0].frame.is_some(), "its own display places it");
         assert_eq!(labels(&adopted), vec!["Save"]);
-        assert_eq!(adopted.nodes[0].frame, None);
-        assert!(own_extents > 0);
-        assert_eq!(adopted_extents, 0);
+        assert_eq!(adopted.nodes[0].frame, own.nodes[0].frame);
+        assert_eq!(adopted_extents, own_extents);
     }
 
-    // A node that is not SHOWING is not listed on such a session either: it has no
-    // frame because it is not on screen, not because nothing is placed.
+    // A node that is not SHOWING is not listed where nothing is placed either: it
+    // has no frame because it is not on screen, not because nothing is placed.
     #[test]
     fn a_hidden_node_is_not_listed_where_nothing_is_placed() {
         let hidden = Node {

@@ -160,6 +160,27 @@ pub fn dpkg(database: &str) -> Packages {
     packages
 }
 
+/// One package's installed version in a dpkg status database.
+pub fn dpkg_version(database: &str, package: &str) -> Option<String> {
+    database
+        .split("\n\n")
+        .filter_map(installed_record)
+        .find(|(name, _)| *name == package)
+        .map(|(_, version)| version.to_string())
+}
+
+/// One package's installed version, from this system's dpkg database; `None`
+/// where it is not installed or there is no database.
+#[cfg(not(test))]
+pub fn installed_version(package: &str) -> Option<String> {
+    let database = Path::new(DPKG_DATABASE);
+    let fits = std::fs::metadata(database).is_ok_and(|file| file.len() <= MAX_DATABASE_BYTES);
+    if !fits {
+        return None;
+    }
+    dpkg_version(&std::fs::read_to_string(database).ok()?, package)
+}
+
 /// One record's package and version, where dpkg says it is installed: its
 /// `Status` ends in `installed` (not `half-installed`, not `config-files`).
 fn installed_record(record: &str) -> Option<(&str, &str)> {
@@ -408,6 +429,21 @@ mod tests {
             },
             "a package only configured is not installed"
         );
+    }
+
+    #[test]
+    fn one_packages_installed_version_is_read_from_dpkg() {
+        let portal = "Package: xdg-desktop-portal\nStatus: install ok installed\n\
+                      Version: 1.14.4-1ubuntu2~22.04.2\n";
+        let removed = "Package: xdg-desktop-portal\nStatus: deinstall ok config-files\n\
+                       Version: 1.18.4-1\n";
+
+        assert_eq!(
+            dpkg_version(&format!("{JAMMY}\n{portal}"), "xdg-desktop-portal").as_deref(),
+            Some("1.14.4-1ubuntu2~22.04.2")
+        );
+        assert_eq!(dpkg_version(removed, "xdg-desktop-portal"), None);
+        assert_eq!(dpkg_version(JAMMY, "xdg-desktop-portal"), None);
     }
 
     #[test]

@@ -460,7 +460,7 @@ defmodule Compux.Protocol12Test do
                      stale_mutation unknown_observation expired_observation stale_observation
                      point_outside_observation observation_required element_required
                      addressing_conflict check_unsupported unknown_field target_unavailable
-                     pixels_unavailable) do
+                     pixels_unavailable no_active_window keyboard_not_neutral) do
         assert code in refusals, code
       end
 

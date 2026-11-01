@@ -482,8 +482,8 @@ defmodule Compux do
     * `:x11_endpoint` — whether an X endpoint answers, as the session or beside
       Wayland (XWayland).
     * `:display_adopted` — the helper had no display of its own and took the
-      session's from the user manager: it works by control only, and every pixel
-      action is refused `pixels_unavailable`.
+      session's from the user manager, with its X authority, and reaches it as its
+      own.
     * `:accessibility_bus` — `%{state: "answering" | "empty" | "unavailable",
       applications:, cause:, detail:, status:}`: the registry's application count,
       or why no registry answered (`cause`: `"no_session_bus"`, `"not_installed"`,
@@ -493,6 +493,17 @@ defmodule Compux do
       package database's versions (`source: "dpkg"`; all `nil` where none is read).
     * `:toolkit_notes` — `[%{toolkit:, note:}]`, what is known without reading any
       application (Qt while the status reads off; Chromium's switches).
+    * `:x11_pixels` — `%{xtest:, keymap:}`: whether the X endpoint has the XTEST
+      extension and answers its keyboard map, the X11 pixel route's two needs
+      (`nil` where no X endpoint answers).
+    * `:portal` — `%{version:, registry:, screenshot_permission:}`, read without
+      raising a dialog where a session bus answers (`nil` where none does): the
+      installed xdg-desktop-portal's version (`nil` where the package database
+      does not say), whether its host Registry is there (1.18 or later; without
+      it GNOME Wayland's pixels are refused), and the PermissionStore's stored
+      Screenshot answer for `io.tezra.fermix.ComputerUse`: `"yes"`, `"no"` (every
+      screenshot is refused `consent_refused` until the person resets it) or
+      `"unset"`.
   """
   @spec probe(t()) :: {:ok, map()} | {:error, term()}
   def probe(%__MODULE__{driver: driver, state: state}) do
@@ -659,7 +670,9 @@ defmodule Compux do
       display_adopted: probe_boolean(Map.get(response, "display_adopted")),
       accessibility_bus: probe_bus(Map.get(response, "accessibility_bus")),
       accessibility_packages: probe_packages(Map.get(response, "accessibility_packages")),
-      toolkit_notes: probe_notes(Map.get(response, "toolkit_notes"))
+      toolkit_notes: probe_notes(Map.get(response, "toolkit_notes")),
+      x11_pixels: probe_x11_pixels(Map.get(response, "x11_pixels")),
+      portal: probe_portal(Map.get(response, "portal"))
     }
   end
 
@@ -714,6 +727,26 @@ defmodule Compux do
   end
 
   defp probe_notes(_absent), do: nil
+
+  defp probe_x11_pixels(%{} = pixels) do
+    %{xtest: probe_boolean(pixels["xtest"]), keymap: probe_boolean(pixels["keymap"])}
+  end
+
+  defp probe_x11_pixels(_absent), do: nil
+
+  @stored_answers ~w(yes no unset)
+
+  defp probe_portal(%{} = portal) do
+    stored = portal["screenshot_permission"]
+
+    %{
+      version: probe_text(portal["version"]),
+      registry: probe_boolean(portal["registry"]),
+      screenshot_permission: if(stored in @stored_answers, do: stored)
+    }
+  end
+
+  defp probe_portal(_absent), do: nil
 
   defp probe_count(count) when is_integer(count) and count >= 0, do: count
   defp probe_count(_absent), do: nil

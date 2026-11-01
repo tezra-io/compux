@@ -11,28 +11,23 @@
 //! **A helper started before login.** A daemon that a systemd user unit
 //! started before anyone logged in hands its helper no display. When this process
 //! has neither `DISPLAY` nor `WAYLAND_DISPLAY`, it reads exactly those two names
-//! from the systemd user manager's environment, where a GNOME login puts them, and
-//! carries them as a value ([`Endpoint`]): this process's environment is never
-//! written. It logs only which of the two it took, never a value and never another
-//! name, and changes nothing anywhere.
+//! and `XAUTHORITY` from the systemd user manager's environment, where a GNOME
+//! login puts them, and carries them as a value ([`Endpoint`]): this process's
+//! environment is never written. It logs only which names it took, never a value
+//! and never another name, and changes nothing anywhere.
 //!
-//! **Controls only, on a display taken that way.** The capture and input
-//! libraries cannot be handed a display: xcap connects with
-//! `xcb::Connection::connect(None)` and reads `WAYLAND_DISPLAY` itself, and
-//! enigo's `x11_display` names a display but leaves Xlib to read `XAUTHORITY` from
-//! the environment. So a display taken from the user manager serves the
-//! accessibility reader (which needs only whether its sockets answer), lists
-//! controls without positions, and refuses every pixel action
-//! (`pixels_unavailable`). `XAUTHORITY` is not read: nothing here could be handed
-//! it.
+//! **Pixels on a display taken that way.** Every X connection compux makes is
+//! handed the display and the authority file as values (`x11::connect`), and the
+//! portal needs only the session bus, so a display taken from the user manager
+//! serves pixels as the process's own does.
 
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The names read from the user manager, and the only ones: the two that locate a
-/// display.
-pub const NAMES: [&str; 2] = ["DISPLAY", "WAYLAND_DISPLAY"];
+/// display, and the X authority that lets compux connect to it.
+pub const NAMES: [&str; 3] = ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"];
 
 /// Where X servers put their sockets.
 const X11_SOCKETS: &str = "/tmp/.X11-unix";
@@ -103,12 +98,14 @@ pub fn decide(wayland: bool, x11: bool) -> Server {
     }
 }
 
-/// The variables that locate a display.
+/// The variables that locate a display, and the X authority file for it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Env {
     pub display: Option<String>,
     pub wayland_display: Option<String>,
     pub runtime_dir: Option<PathBuf>,
+    /// `XAUTHORITY`, or Xlib's default beside it, `~/.Xauthority`.
+    pub xauthority: Option<PathBuf>,
 }
 
 impl Env {
@@ -118,8 +115,16 @@ impl Env {
             display: var("DISPLAY"),
             wayland_display: var("WAYLAND_DISPLAY"),
             runtime_dir: var("XDG_RUNTIME_DIR").map(PathBuf::from),
+            xauthority: authority(var("XAUTHORITY"), var("HOME")),
         }
     }
+}
+
+/// The X authority file: the one named, else `~/.Xauthority`, as Xlib reads it.
+pub fn authority(named: Option<String>, home: Option<String>) -> Option<PathBuf> {
+    named
+        .map(PathBuf::from)
+        .or_else(|| home.map(|home| PathBuf::from(home).join(".Xauthority")))
 }
 
 /// The Wayland socket `WAYLAND_DISPLAY` names: a path as it is, or a name under
@@ -270,16 +275,9 @@ impl Endpoint {
         Server::of(&self.env)
     }
 
-    /// Whether pixels reach this display. The capture and input libraries read
-    /// this process's environment, which never holds a display taken from the
-    /// user manager.
-    pub fn pixels(&self) -> bool {
-        !self.adopted
-    }
-
     /// Whether a client's accessible extents are positions compux can draw.
     pub fn places(&self) -> bool {
-        self.pixels() && self.server().places()
+        self.server().places()
     }
 }
 
@@ -298,20 +296,30 @@ pub async fn adopt(own: Env, session: &zbus::Connection) -> Endpoint {
     };
     let taken = picked(&environment);
     let names: Vec<&str> = taken.iter().map(|(name, _)| name.as_str()).collect();
-    eprintln!("compux: no display of its own; took {names:?} from the user manager, for controls");
+    eprintln!("compux: no display of its own; took {names:?} from the user manager");
     let value = |wanted: &str| {
         taken
             .iter()
             .find(|(name, _)| name == wanted)
             .map(|(_, value)| value.clone())
     };
+    let display = value("DISPLAY");
+    let wayland_display = value("WAYLAND_DISPLAY");
+    let adopted = display.is_some() || wayland_display.is_some();
+    // The authority belongs to the display it came with; with none taken, the
+    // process keeps its own.
+    let xauthority = match value("XAUTHORITY") {
+        Some(named) if adopted => Some(PathBuf::from(named)),
+        _ => own.xauthority,
+    };
     Endpoint {
         env: Env {
-            display: value("DISPLAY"),
-            wayland_display: value("WAYLAND_DISPLAY"),
+            display,
+            wayland_display,
             runtime_dir: own.runtime_dir,
+            xauthority,
         },
-        adopted: !taken.is_empty(),
+        adopted,
     }
 }
 
@@ -412,10 +420,9 @@ mod tests {
         assert!(!answers_unix(&path));
     }
 
-    // A display taken from the user manager is carried as a value: this process's
-    // environment is the same after as before. It serves controls only: the
-    // capture and input libraries read that environment, never a value, so they
-    // cannot reach it, and nothing is drawn where nothing can be captured.
+    // A display taken from the user manager is carried as a value, with its X
+    // authority beside it: this process's environment is the same after as before,
+    // and every X connection is handed both.
     #[test]
     fn a_display_taken_from_the_user_manager_leaves_the_environment_as_it_was() {
         let desktop = Desktop {
@@ -434,37 +441,48 @@ mod tests {
         let after: Vec<_> = std::env::vars_os().collect();
         assert_eq!(before, after, "the environment is untouched");
         assert_eq!(endpoint.env.display.as_deref(), Some(":7"));
+        assert_eq!(
+            endpoint.env.xauthority.as_deref(),
+            Some(Path::new("/run/user/1000/gdm/Xauthority"))
+        );
         assert!(endpoint.adopted);
-        assert!(!endpoint.pixels());
-        assert!(!endpoint.places());
+        assert!(!endpoint.places(), ":7 does not answer here");
     }
 
-    // A manager that names no display adopts nothing, and a process with a
-    // display of its own keeps its pixels.
+    // A manager that names no display adopts nothing, not even an authority.
     #[test]
-    fn a_display_of_its_own_serves_pixels_and_no_display_adopts_nothing() {
+    fn a_manager_that_names_no_display_adopts_nothing() {
         let desktop = Desktop {
-            manager_environment: vec!["HOME=/h".to_string()],
+            manager_environment: vec![
+                "HOME=/h".to_string(),
+                "XAUTHORITY=/run/user/1000/gdm/Xauthority".to_string(),
+            ],
             ..Desktop::default()
         };
         let (_fake, session) = Fake::start(desktop, Duration::from_millis(200));
 
         let nothing = async_io::block_on(adopt(Env::default(), &session));
-        let own = Endpoint {
-            env: Env {
-                display: Some(":0".to_string()),
-                ..Env::default()
-            },
-            adopted: false,
-        };
 
         assert_eq!(nothing, Endpoint::default());
-        assert!(own.pixels());
     }
 
-    // Exactly the display names, and nothing else the manager holds.
     #[test]
-    fn only_the_display_names_are_taken_from_the_user_manager() {
+    fn the_authority_is_the_one_named_or_xlibs_default_beside_home() {
+        assert_eq!(
+            authority(Some("/run/a".to_string()), Some("/h".to_string())),
+            Some(PathBuf::from("/run/a"))
+        );
+        assert_eq!(
+            authority(None, Some("/h".to_string())),
+            Some(PathBuf::from("/h/.Xauthority"))
+        );
+        assert_eq!(authority(None, None), None);
+    }
+
+    // Exactly the display names and the authority, and nothing else the manager
+    // holds.
+    #[test]
+    fn only_the_display_names_and_the_authority_are_taken_from_the_user_manager() {
         let environment: Vec<String> = [
             "HOME=/home/someone",
             "DISPLAY=:1",
@@ -480,7 +498,13 @@ mod tests {
 
         assert_eq!(
             picked(&environment),
-            vec![("DISPLAY".to_string(), ":1".to_string())]
+            vec![
+                ("DISPLAY".to_string(), ":1".to_string()),
+                (
+                    "XAUTHORITY".to_string(),
+                    "/run/user/1000/gdm/Xauthority".to_string()
+                ),
+            ]
         );
     }
 

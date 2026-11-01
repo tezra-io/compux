@@ -30,10 +30,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use enigo::{Axis, Button, Enigo, Key, Mouse, Settings};
+#[cfg(target_os = "macos")]
+use enigo::{Enigo, Mouse, Settings};
+use held::{Axis, Button, Key};
 use image::ImageEncoder as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
+#[cfg(target_os = "macos")]
 use xcap::Monitor;
 
 use gate::{Gate, Gated, Phase, SystemClock};
@@ -379,7 +382,7 @@ fn main() {
 
     // Linux: where this process's display is, decided once and carried as a value,
     // never written into the environment: its own, or for a helper started with
-    // none, the session's from the user manager (controls only).
+    // none, the session's from the user manager, with its X authority.
     #[cfg(target_os = "linux")]
     let endpoint = Endpoint::of_session();
     #[cfg(not(target_os = "linux"))]
@@ -438,11 +441,30 @@ use linux::display::Endpoint;
 #[derive(Clone, Debug, Default)]
 struct Endpoint {}
 
+/// Which way pixels reach this session. Linux decides it once, at start
+/// (`linux::pixels`): X11 through x11rb, GNOME Wayland through the portal, or
+/// refused with the reason. macOS has one way, enigo and xcap, always.
+#[cfg(target_os = "linux")]
+use linux::pixels::Pixels;
+
 #[cfg(not(target_os = "linux"))]
-impl Endpoint {
-    /// Pixels always reach the session's own display.
-    fn pixels(&self) -> bool {
+#[derive(Default)]
+struct Pixels;
+
+#[cfg(not(target_os = "linux"))]
+impl Pixels {
+    fn serves(&self, _action: &str) -> bool {
         true
+    }
+
+    fn refusal(&self, action: &str) -> String {
+        format!("{action} has no pixel route here")
+    }
+
+    fn release(&mut self) {}
+
+    fn portal(&self) -> bool {
+        false
     }
 }
 
@@ -487,9 +509,11 @@ struct Worker {
     /// When the request in hand must have answered, on the gate's clock, where it
     /// named a `deadline_ms`: a wait never outlives it.
     cutoff_ms: Option<u64>,
-    /// Where this process's display is: what the handshake, the probe and the
-    /// pixel actions read to know whether pixels reach it.
+    /// Where this process's display is: what the handshake and the probe report.
     endpoint: Endpoint,
+    /// How pixels reach it: what the handshake offers, what a pixel action is
+    /// refused by, and on Linux the input platform kept for the session.
+    pixels: Pixels,
 }
 
 /// The accessibility reader of this process, on its display.
@@ -503,6 +527,17 @@ fn reader(_endpoint: &Endpoint) -> ax::Real {
     ax::Real::new()
 }
 
+/// How pixels reach this session, decided once at start.
+#[cfg(target_os = "linux")]
+fn pixels_of(endpoint: &Endpoint) -> Pixels {
+    Pixels::of(endpoint)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pixels_of(_endpoint: &Endpoint) -> Pixels {
+    Pixels
+}
+
 /// The serial action worker. One request at a time, to completion, on this thread.
 fn run_worker(
     jobs: mpsc::Receiver<control::Job>,
@@ -510,14 +545,15 @@ fn run_worker(
     emitter: &capture::Emitter,
     endpoint: Endpoint,
 ) {
+    let pixels = pixels_of(&endpoint);
     let mut worker = Worker {
         observations: Observations::new(&gate.envelope().sidecar_generation, gate.clock()),
         measured: Measured::new(),
         ax: Rc::new(reader(&endpoint)),
-        frames: Rc::new(Screen),
+        frames: Rc::new(Screen::of(&pixels)),
         windows: Arc::new(window_server::Real::new()),
         launcher: Arc::new(indicator::Bundled::new()),
-        displays: Rc::new(RealDisplays),
+        displays: Rc::new(RealDisplays::of(&pixels)),
         target: None,
         target_generation: 0,
         emitter: emitter.clone(),
@@ -525,6 +561,7 @@ fn run_worker(
         until_held: None,
         cutoff_ms: None,
         endpoint,
+        pixels,
     };
 
     for job in jobs {
@@ -540,6 +577,8 @@ fn run_worker(
             // stops its stream and its badge, so letting go of the seat lets go of
             // the screen the person can see it on.
             worker.target = None;
+            // And of the portal's remote-desktop session, which the shell shows.
+            worker.pixels.release();
         }
 
         let frame = serve(&request, gate, emitter, &mut worker);
@@ -676,11 +715,11 @@ fn handle(
     let req = &request.body;
 
     match request.action.as_str() {
-        "hello" => hello(&worker.launcher, &worker.endpoint),
-        "probe" => probe(&worker.endpoint),
+        "hello" => hello(&worker.launcher, &worker.pixels),
+        "probe" => probe(&worker.endpoint, &worker.pixels),
         "idle_ms" => idle_ms(worker),
         "wait_for_idle" => wait_for_idle(req, gate),
-        "request_permissions" => request_permissions(req, &worker.endpoint),
+        "request_permissions" => request_permissions(req, &worker.pixels),
         // Capture control verbs (MILESTONE_32 §8.4a) — NOT model actions, excluded
         // from `hello`. They return a type-discriminated `ack` frame (even on
         // refusal), never the generic `{ok:false,error}` shape, so the consumer's
@@ -740,14 +779,13 @@ fn before_dispatch(
                 .to_string(),
         ));
     }
-    if needs_pixels(request) && !worker.endpoint.pixels() {
-        return Err(Failure::new(
-            "pixels_unavailable",
-            "this helper has no display of its own: it took the session's from the user \
-             manager, which its screen capture and input cannot reach, so it works by control \
-             only (`elements` and the verbs on a reference); nothing was sent"
-                .to_string(),
-        ));
+    if let Some(action) = pixel_need(request) {
+        if !worker.pixels.serves(action) {
+            return Err(Failure::new(
+                "pixels_unavailable",
+                worker.pixels.refusal(action),
+            ));
+        }
     }
     if POINT_ACTIONS.contains(&request.action.as_str()) && !points_readable() {
         return Err(Failure::new(
@@ -769,13 +807,19 @@ fn before_dispatch(
     Ok(())
 }
 
-/// Does this request capture the screen or post input to it? `type` does at the
-/// focus (by reference it acts through the accessibility API), and any action does
-/// that asks for an image check.
-fn needs_pixels(request: &wire::Request) -> bool {
+/// The pixel action this request needs, if it captures the screen or posts input
+/// to it: a pixel verb itself, `type` at the focus (by reference it acts through
+/// the accessibility API), and a `screenshot` for any action that asks for an
+/// image check.
+fn pixel_need(request: &wire::Request) -> Option<&'static str> {
     let action = request.action.as_str();
-    let typed_at_focus = action == "type" && request.element_ref.is_none();
-    PIXEL_ACTIONS.contains(&action) || typed_at_focus || request.check == wire::Check::Image
+    if let Some(pixel) = PIXEL_ACTIONS.iter().find(|pixel| **pixel == action) {
+        return Some(pixel);
+    }
+    if action == "type" && request.element_ref.is_none() {
+        return Some("type");
+    }
+    (request.check == wire::Check::Image).then_some("screenshot")
 }
 
 /// What a reply needs to reach the caller before its deadline: a wait gives this
@@ -1117,18 +1161,18 @@ fn observe_ack(action: &str, ok: bool, error: Option<String>) -> Value {
 /// is the model-facing verb set (probe/hello are operational, excluded), and it
 /// lists only what THIS build can do (F1): the engine builds the model's verbs
 /// from it, and a verb whose every use is a refusal is a turn wasted on it.
-fn hello(launcher: &Arc<dyn indicator::Launcher>, endpoint: &Endpoint) -> Result<Value, Failure> {
+fn hello(launcher: &Arc<dyn indicator::Launcher>, pixels: &Pixels) -> Result<Value, Failure> {
     Ok(json!({
         "ok": true,
         "protocol_version": PROTOCOL_VERSION,
         "compux_version": env!("CARGO_PKG_VERSION"),
-        "actions": advertised_actions(endpoint),
+        "actions": advertised_actions(pixels),
         // Listed only because this build really has them: the input methods an
         // action can carry, the three controls the gate implements, and the
         // bounds of the observation table — a caller mirrors those numbers to know
         // which ids it may still address before it asks.
         "capabilities": {
-            "input_methods": input_methods(endpoint),
+            "input_methods": input_methods(pixels),
             "controls": ["pause", "resume", "release"],
             "observations": {
                 "max": observation::MAX_OBSERVATIONS,
@@ -1140,7 +1184,7 @@ fn hello(launcher: &Arc<dyn indicator::Launcher>, endpoint: &Endpoint) -> Result
             // it, and finding that out by selecting a window and being refused
             // would be finding it out too late.
             "targets": targets_supported(),
-            "capture_methods": capture_methods(endpoint),
+            "capture_methods": capture_methods(pixels),
             "indicator": indicator_presence(launcher),
         },
     }))
@@ -1198,9 +1242,9 @@ const POINT_ACTIONS: [&str; 1] = ["inspect"];
 /// The verbs that bind a window.
 const TARGET_ACTIONS: [&str; 2] = ["select_target", "release_target"];
 
-/// The verbs that capture the screen or post input to it, through xcap and enigo.
-/// On Linux those reach only this process's own display: they read its
-/// environment, and are never handed a display as a value.
+/// The verbs that capture the screen or post input to it: through xcap and enigo
+/// on macOS, and on Linux through the session's pixel route, which may serve some
+/// of them or none.
 const PIXEL_ACTIONS: [&str; 11] = [
     "screenshot",
     "left_click",
@@ -1217,14 +1261,14 @@ const PIXEL_ACTIONS: [&str; 11] = [
 
 /// The verbs this build can really serve: the accessibility ones only where there
 /// is an accessibility API, `inspect` only where it can read a point, the window
-/// ones only where a window can be bound, and the pixel ones only where pixels
-/// reach this process's display.
-fn advertised_actions(endpoint: &Endpoint) -> Vec<&'static str> {
+/// ones only where a window can be bound, and the pixel ones only where this
+/// session's pixel route serves them.
+fn advertised_actions(pixels: &Pixels) -> Vec<&'static str> {
     ACTIONS
         .into_iter()
         .filter(|action| accessibility_served(action))
         .filter(|action| targets_supported() || !TARGET_ACTIONS.contains(action))
-        .filter(|action| endpoint.pixels() || !PIXEL_ACTIONS.contains(action))
+        .filter(|action| !PIXEL_ACTIONS.contains(action) || pixels.serves(action))
         .collect()
 }
 
@@ -1238,11 +1282,11 @@ fn accessibility_served(action: &str) -> bool {
 }
 
 /// How an action can reach the machine in this build: `foreground_hid` only where
-/// pixels reach this process's display, `ax` only where there is an accessibility
-/// API to carry it.
-fn input_methods(endpoint: &Endpoint) -> Vec<&'static str> {
+/// the session's pixel route posts input, `ax` only where there is an
+/// accessibility API to carry it.
+fn input_methods(pixels: &Pixels) -> Vec<&'static str> {
     let mut methods = Vec::new();
-    if endpoint.pixels() {
+    if pixels.serves("left_click") {
         methods.push("foreground_hid");
     }
     if accessibility_supported() {
@@ -1276,8 +1320,8 @@ fn targets_supported() -> bool {
 /// Which capture this build really has. `window` is a bound target's stream, and it
 /// is listed only where it exists: a caller that reads it and gets
 /// `capture_unavailable` on every selection has been lied to.
-fn capture_methods(endpoint: &Endpoint) -> Vec<&'static str> {
-    match (endpoint.pixels(), targets_supported()) {
+fn capture_methods(pixels: &Pixels) -> Vec<&'static str> {
+    match (pixels.serves("screenshot"), targets_supported()) {
         (false, _) => Vec::new(),
         (true, true) => vec!["display", "window"],
         (true, false) => vec!["display"],
@@ -1305,29 +1349,30 @@ fn indicator_presence(launcher: &Arc<dyn indicator::Launcher>) -> &'static str {
 /// notes known without reading an application (`linux::probe`), read-only as
 /// well. Surfaced by the consumer's diagnostics (a doctor/setup surface); the
 /// model never calls this.
-fn probe(endpoint: &Endpoint) -> Result<Value, Failure> {
-    probe_with(endpoint, accessibility_facts)
+fn probe(endpoint: &Endpoint, pixels: &Pixels) -> Result<Value, Failure> {
+    probe_with(endpoint, pixels, || platform_facts(endpoint))
 }
 
-/// `probe` with the accessibility facts `accessibility` reads: on Linux the
-/// accessibility bus, its packages and the toolkit notes; none on macOS, whose
-/// grants are the two booleans.
+/// `probe` with the facts `platform` reads: on Linux the accessibility bus, its
+/// packages and the toolkit notes, and both pixel routes' state; none on macOS,
+/// whose grants are the two booleans.
 fn probe_with(
     endpoint: &Endpoint,
-    accessibility: impl FnOnce() -> serde_json::Map<String, Value>,
+    pixels: &Pixels,
+    platform: impl FnOnce() -> serde_json::Map<String, Value>,
 ) -> Result<Value, Failure> {
     let mut reply = with_x11_endpoint(
         json!({
             "ok": true,
             "platform": std::env::consts::OS,
             "display_server": display_server(endpoint),
-            "screen_capture": screen_capture_ok(endpoint),
-            "input_control": input_control_ok(endpoint),
+            "screen_capture": screen_capture_ok(pixels),
+            "input_control": input_control_ok(pixels),
         }),
         endpoint,
     );
     if let Some(object) = reply.as_object_mut() {
-        object.extend(accessibility());
+        object.extend(platform());
     }
     Ok(reply)
 }
@@ -1353,14 +1398,17 @@ fn with_x11_endpoint(reply: Value, _endpoint: &Endpoint) -> Value {
     reply
 }
 
-/// What `probe` reports of the accessibility bus, its packages and the toolkits.
+/// What `probe` reports of the accessibility bus, its packages and the toolkits,
+/// and of the X11 and portal pixel routes.
 #[cfg(target_os = "linux")]
-fn accessibility_facts() -> serde_json::Map<String, Value> {
-    linux::probe::report(Duration::from_millis(ax::READ_TIMEOUT_MS))
+fn platform_facts(endpoint: &Endpoint) -> serde_json::Map<String, Value> {
+    let mut facts = linux::probe::report(Duration::from_millis(ax::READ_TIMEOUT_MS));
+    facts.extend(linux::pixels::probe(endpoint));
+    facts
 }
 
 #[cfg(not(target_os = "linux"))]
-fn accessibility_facts() -> serde_json::Map<String, Value> {
+fn platform_facts(_endpoint: &Endpoint) -> serde_json::Map<String, Value> {
     serde_json::Map::new()
 }
 
@@ -1374,34 +1422,35 @@ fn accessibility_facts() -> serde_json::Map<String, Value> {
 /// variants RAISE the system dialog. The prompts are async, so the returned booleans
 /// are the pre-response snapshot (typically `false` on first call) — the consumer
 /// re-runs `probe` after the user approves. No-op on Linux (no TCC).
-fn request_permissions(_req: &Value, endpoint: &Endpoint) -> Result<Value, Failure> {
+fn request_permissions(_req: &Value, pixels: &Pixels) -> Result<Value, Failure> {
     Ok(json!({
         "ok": true,
         "platform": std::env::consts::OS,
-        "screen_capture": request_screen_capture_ok(endpoint),
-        "input_control": request_input_control_ok(endpoint),
+        "screen_capture": request_screen_capture_ok(pixels),
+        "input_control": request_input_control_ok(pixels),
     }))
 }
 
 #[cfg(target_os = "macos")]
-fn request_screen_capture_ok(_endpoint: &Endpoint) -> bool {
+fn request_screen_capture_ok(_pixels: &Pixels) -> bool {
     permissions::request_screen_capture()
 }
 
 #[cfg(target_os = "macos")]
-fn request_input_control_ok(_endpoint: &Endpoint) -> bool {
+fn request_input_control_ok(_pixels: &Pixels) -> bool {
     permissions::request_input_control()
 }
 
-// No TCC off macOS: report the same reality `probe` does (there is nothing to prompt).
+// No TCC off macOS: report the same reality `probe` does (there is nothing to
+// prompt, and a portal dialog is raised by first use, never by asking).
 #[cfg(not(target_os = "macos"))]
-fn request_screen_capture_ok(endpoint: &Endpoint) -> bool {
-    screen_capture_ok(endpoint)
+fn request_screen_capture_ok(pixels: &Pixels) -> bool {
+    screen_capture_ok(pixels)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn request_input_control_ok(endpoint: &Endpoint) -> bool {
-    input_control_ok(endpoint)
+fn request_input_control_ok(pixels: &Pixels) -> bool {
+    input_control_ok(pixels)
 }
 
 #[cfg(target_os = "macos")]
@@ -1564,62 +1613,37 @@ mod pointer {
     }
 }
 
-/// X11 injects motion synchronously (`XTestFakeMotionEvent` + flush) and
-/// `XTestFakeButtonEvent` carries no coordinate, so there is nothing to settle.
-#[cfg(not(target_os = "macos"))]
-mod pointer {
-    pub fn settle(_x: i32, _y: i32) -> Result<(), String> {
-        Ok(())
-    }
-}
-
 #[cfg(target_os = "macos")]
 fn display_server(_endpoint: &Endpoint) -> &'static str {
     "quartz"
 }
 
 #[cfg(target_os = "macos")]
-fn screen_capture_ok(_endpoint: &Endpoint) -> bool {
+fn screen_capture_ok(_pixels: &Pixels) -> bool {
     permissions::screen_capture()
 }
 
 #[cfg(target_os = "macos")]
-fn input_control_ok(_endpoint: &Endpoint) -> bool {
+fn input_control_ok(_pixels: &Pixels) -> bool {
     permissions::input_control()
 }
 
-// Linux: X11 is permissive (no TCC — any local client may capture/inject); Wayland
-// deliberately blocks global capture + injection (no uniform API). Capability tracks
-// the display server, decided by which socket answers; a real capture/input still
-// fails loud per action.
+// Linux: the display server is decided by which socket answers, and capture and
+// input by the session's pixel route (X11 through x11rb, GNOME Wayland through the
+// portal); a real capture or input still fails loud per action.
 #[cfg(target_os = "linux")]
 fn display_server(endpoint: &Endpoint) -> &'static str {
     endpoint.server().name()
 }
 
 #[cfg(target_os = "linux")]
-fn screen_capture_ok(endpoint: &Endpoint) -> bool {
-    endpoint.pixels() && endpoint.server() == linux::display::Server::X11
+fn screen_capture_ok(pixels: &Pixels) -> bool {
+    pixels.serves("screenshot")
 }
 
 #[cfg(target_os = "linux")]
-fn input_control_ok(endpoint: &Endpoint) -> bool {
-    endpoint.pixels() && endpoint.server() == linux::display::Server::X11
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn display_server(_endpoint: &Endpoint) -> &'static str {
-    "unknown"
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn screen_capture_ok(_endpoint: &Endpoint) -> bool {
-    false
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn input_control_ok(_endpoint: &Endpoint) -> bool {
-    false
+fn input_control_ok(pixels: &Pixels) -> bool {
+    pixels.serves("left_click")
 }
 
 // --- display selection ------------------------------------------------------
@@ -1650,13 +1674,38 @@ trait Displays {
     fn at(&self, index: usize) -> Result<Display, String>;
 }
 
-/// The real one: `xcap`'s monitor list.
-struct RealDisplays;
+/// The real one: `xcap`'s monitor list on macOS; on Linux the pixel route's
+/// (RandR on X11, the portal session's monitor on Wayland).
+struct RealDisplays {
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(test, allow(dead_code))]
+    screen: linux::pixels::Screen,
+}
+
+impl RealDisplays {
+    #[cfg(target_os = "linux")]
+    fn of(pixels: &Pixels) -> RealDisplays {
+        RealDisplays {
+            screen: pixels.screen(),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn of(_pixels: &Pixels) -> RealDisplays {
+        RealDisplays {}
+    }
+}
 
 impl Displays for RealDisplays {
-    #[cfg(not(test))]
+    #[cfg(all(not(test), target_os = "macos"))]
     fn at(&self, index: usize) -> Result<Display, String> {
         enumerate_display(index)
+    }
+
+    #[cfg(all(not(test), target_os = "linux"))]
+    fn at(&self, index: usize) -> Result<Display, String> {
+        let (facts, id) = self.screen.monitor(index)?;
+        Ok(Display { facts, id })
     }
 
     /// Under test there is no screen this process may look at, whatever this
@@ -1680,6 +1729,7 @@ impl Displays for RealDisplays {
 /// which a different `display` index can fix. Reporting that as `display 0 not
 /// found` reads like a bad index and sends the caller hunting for another monitor;
 /// the typed `no_active_display` lets the Elixir layer say what is actually wrong.
+#[cfg(target_os = "macos")]
 fn select_monitor(monitors: Vec<Monitor>, index: usize) -> Result<Monitor, String> {
     if monitors.is_empty() {
         return Err("no_active_display".to_string());
@@ -1709,7 +1759,7 @@ fn target_display(req: &Value, worker: &Worker) -> Result<Display, String> {
 
 /// The enumeration itself. Only [`RealDisplays`] calls it, and only on a build
 /// that is not the test binary.
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "macos"))]
 fn enumerate_display(index: usize) -> Result<Display, String> {
     let monitors = Monitor::all().map_err(|e| format!("enumerate displays: {e}"))?;
     let monitor = select_monitor(monitors, index)?;
@@ -1750,7 +1800,7 @@ fn measured_geometry(
     worker: &mut Worker,
 ) -> Result<Geometry, Failure> {
     if let Some(measured) = worker.measured.get(display.id, &display.facts) {
-        return Ok(Geometry::from_facts(&display.facts, measured, Host::HERE));
+        return Ok(Geometry::from_facts(&display.facts, measured, host(worker)));
     }
 
     let image = take_frame(display, gate, &worker.frames)?;
@@ -1764,13 +1814,23 @@ fn measure_geometry(
     image: &image::RgbaImage,
     worker: &mut Worker,
 ) -> Result<Geometry, Failure> {
-    let measured = geometry::measure(&display.facts, image.width(), image.height(), Host::HERE)
+    let measured = geometry::measure(&display.facts, image.width(), image.height(), host(worker))
         .map_err(|detail| Failure::new("capture_geometry_mismatch", detail))?;
 
     worker
         .measured
         .remember(display.id, &display.facts, measured);
-    Ok(Geometry::from_facts(&display.facts, measured, Host::HERE))
+    Ok(Geometry::from_facts(&display.facts, measured, host(worker)))
+}
+
+/// Which reading of the display's numbers applies: the platform's, or on GNOME
+/// Wayland the portal's logical points with the scale measured off each frame.
+fn host(worker: &Worker) -> Host {
+    if worker.pixels.portal() {
+        Host::Portal
+    } else {
+        Host::HERE
+    }
 }
 
 fn parse_region(req: &Value) -> Result<Option<Region>, String> {
@@ -2400,11 +2460,6 @@ fn ensure_display_awake(display_id: u32) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(all(not(target_os = "macos"), not(test)))]
-fn ensure_display_awake(_display_id: u32) -> Result<(), String> {
-    Ok(())
-}
-
 // --- bounded capture (the anti-stall watchdog) -------------------------------
 
 /// Hard budget for one physical frame grab. A real capture takes ~0.2–0.5s; one
@@ -2438,13 +2493,17 @@ static CAPTURE_WEDGED: AtomicBool = AtomicBool::new(false);
 /// body, and a unit test that reached the real screen would be a test that cannot
 /// run headless.
 #[cfg(not(test))]
-fn capture_display_image(monitor_id: u32) -> Result<image::RgbaImage, String> {
+fn capture_display_image(
+    grab: impl FnOnce() -> Result<image::RgbaImage, String> + Send + 'static,
+) -> Result<image::RgbaImage, String> {
     let (tx, rx) = mpsc::channel();
 
     let spawned = thread::Builder::new()
         .name("compux-capture".to_string())
         .spawn(move || {
-            let _ = tx.send(capture_by_id(monitor_id));
+            // The receiver is gone only once the budget ran out, and then the
+            // stall is already what was answered.
+            let _ = tx.send(grab());
         });
 
     if spawned.is_err() {
@@ -2469,7 +2528,7 @@ fn capture_display_image(monitor_id: u32) -> Result<image::RgbaImage, String> {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "macos"))]
 fn capture_by_id(monitor_id: u32) -> Result<image::RgbaImage, String> {
     let monitors = Monitor::all().map_err(|e| format!("enumerate displays: {e}"))?;
 
@@ -2529,14 +2588,51 @@ trait Frames {
     fn capture(&self, display_id: u32) -> Result<image::RgbaImage, Failure>;
 }
 
-/// The real screen.
-struct Screen;
+/// The real screen: xcap on macOS; on Linux the pixel route's (`GetImage` on
+/// X11 under the same stall budget, the portal's screenshot on Wayland under its
+/// consent budget).
+struct Screen {
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(test, allow(dead_code))]
+    screen: linux::pixels::Screen,
+}
+
+impl Screen {
+    #[cfg(target_os = "linux")]
+    fn of(pixels: &Pixels) -> Screen {
+        Screen {
+            screen: pixels.screen(),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn of(_pixels: &Pixels) -> Screen {
+        Screen {}
+    }
+}
 
 impl Frames for Screen {
-    #[cfg(not(test))]
+    #[cfg(all(not(test), target_os = "macos"))]
     fn capture(&self, display_id: u32) -> Result<image::RgbaImage, Failure> {
         ensure_display_awake(display_id)?;
-        Ok(capture_display_image(display_id)?)
+        Ok(capture_display_image(move || capture_by_id(display_id))?)
+    }
+
+    #[cfg(all(not(test), target_os = "linux"))]
+    fn capture(&self, display_id: u32) -> Result<image::RgbaImage, Failure> {
+        match &self.screen {
+            linux::pixels::Screen::X11(env) => {
+                let env = env.clone();
+                Ok(capture_display_image(move || {
+                    linux::x11::capture(&env, display_id)
+                })?)
+            }
+            linux::pixels::Screen::Portal(portal) => linux::pixels::portal_frame(portal)
+                .map_err(|refusal| Failure::new(refusal.code(), refusal.detail().to_string())),
+            linux::pixels::Screen::Refused(why) => {
+                Err(Failure::new("pixels_unavailable", why.clone()))
+            }
+        }
     }
 
     /// Under test there is no screen this process may capture, whatever this
@@ -2663,9 +2759,10 @@ fn capture_payload_encoded(
 
     // The cursor's position in this image's coordinates, when it falls inside the
     // captured region — useful for drag/hover reasoning. Absent if off-region.
-    if let (Some((cursor_x, cursor_y)), Some(object)) =
-        (cursor_point(&geom, &region), payload.as_object_mut())
-    {
+    if let (Some((cursor_x, cursor_y)), Some(object)) = (
+        cursor_point(worker, &geom, &region),
+        payload.as_object_mut(),
+    ) {
         object.insert(
             "cursor".to_string(),
             json!({ "x": cursor_x, "y": cursor_y }),
@@ -2859,6 +2956,7 @@ struct Point {
     y: f64,
 }
 
+#[cfg(target_os = "macos")]
 fn enigo() -> Result<Enigo, String> {
     // Never let library INIT raise the macOS Accessibility dialog mid-action:
     // prompting is an operator flow that belongs exclusively to the
@@ -2874,10 +2972,71 @@ fn enigo() -> Result<Enigo, String> {
 
 // Best-effort cursor position in sent-image coords (None if input can't be read or
 // the cursor lies outside the region) — a screenshot never fails on the cursor read.
-fn cursor_point(geom: &Geometry, region: &Region) -> Option<(i64, i64)> {
+#[cfg(target_os = "macos")]
+fn cursor_point(_worker: &mut Worker, geom: &Geometry, region: &Region) -> Option<(i64, i64)> {
     let input = enigo().ok()?;
     let (lx, ly) = input.location().ok()?;
     to_sent(geom, region, lx as f64, ly as f64)
+}
+
+/// On Linux the pixel route says where the pointer is: X11 does, the portal never.
+#[cfg(target_os = "linux")]
+fn cursor_point(worker: &mut Worker, geom: &Geometry, region: &Region) -> Option<(i64, i64)> {
+    let (lx, ly) = worker.pixels.pointer()?;
+    to_sent(geom, region, lx as f64, ly as f64)
+}
+
+/// The desktop an input sequence posts through. macOS builds one per action (its
+/// enigo paces the events it posted when it drops); Linux keeps the session's,
+/// whose clipboard owner and journal must outlive the action.
+#[cfg(target_os = "macos")]
+fn desktop(_worker: &mut Worker) -> Result<held::Real, Failure> {
+    Ok(held::Real::default())
+}
+
+#[cfg(target_os = "linux")]
+fn desktop(worker: &mut Worker) -> Result<&mut dyn held::Platform, Failure> {
+    worker
+        .pixels
+        .input()
+        .map_err(|why| Failure::new("pixels_unavailable", why))
+}
+
+/// Keys go only into a window that reads ACTIVE on the accessibility bus, and
+/// text only where the layout types every character and the keyboard is neutral.
+/// Each refusal is made before anything is sent. A window is never activated to
+/// make room, and `_NET_ACTIVE_WINDOW` is not asked: under another application's
+/// grab it names a window whose frame is not ACTIVE (L28-20).
+#[cfg(target_os = "linux")]
+fn ready_for_keys(worker: &mut Worker, text: Option<&str>) -> Result<(), Failure> {
+    if worker.ax.frontmost_pid().is_none() {
+        return Err(Failure::new(
+            "no_active_window",
+            "no window reads ACTIVE on the accessibility bus, so keys would go nowhere anyone \
+             chose; compux never activates a window to make room: nothing was sent"
+                .to_string(),
+        ));
+    }
+    let Some(text) = text else {
+        return Ok(());
+    };
+    match worker.pixels.ready_to_type(text)? {
+        Ok(()) => Ok(()),
+        Err(linux::x11::Refusal::Outside(outside)) => {
+            Err(Failure::new("text_outside_layout", outside.describe()))
+        }
+        Err(linux::x11::Refusal::Keyboard(why)) => Err(Failure::new(
+            "keyboard_not_neutral",
+            format!("{why}; nothing was typed"),
+        )),
+    }
+}
+
+/// macOS types into the key window of the application in front, which always has
+/// one.
+#[cfg(target_os = "macos")]
+fn ready_for_keys(_worker: &mut Worker, _text: Option<&str>) -> Result<(), Failure> {
+    Ok(())
 }
 
 fn coords(req: &Value) -> Result<(f64, f64), String> {
@@ -2985,7 +3144,7 @@ fn mouse_move(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resu
     reachable(&view, worker, lx, ly)?;
     // Read-only on the wire and still the human's pointer, so it goes through the
     // gate like every other input and a pause stops it.
-    let mut platform = Gated::new(gate, held::Real::default());
+    let mut platform = Gated::new(gate, desktop(worker)?);
     platform.move_mouse(lx, ly)?;
     // Same settle as the acting verbs: this action's entire promise is "the pointer
     // is now here", and a posted move alone leaves that pending (hover would land on
@@ -3014,7 +3173,7 @@ fn click(
     // A local, not a temporary: enigo's own `Drop` paces the events it posted, and
     // it ran after the check image before. Inlining this into the call below would
     // move that pacing sleep in front of the screenshot.
-    let mut platform = Gated::new(gate, held::Real::default());
+    let mut platform = Gated::new(gate, desktop(worker)?);
     click_seq(&mut platform, lx, ly, button, count, &mods)?;
     gate.input_complete();
 
@@ -3075,7 +3234,7 @@ fn drag(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Val
     reachable(&view, worker, tx, ty)?;
 
     // A local for the same reason as `click`: enigo's pacing runs on its drop.
-    let mut platform = Gated::new(gate, held::Real::default());
+    let mut platform = Gated::new(gate, desktop(worker)?);
     drag_seq(&mut platform, fx, fy, tx, ty)?;
     gate.input_complete();
 
@@ -3160,7 +3319,7 @@ fn scroll(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<V
 
     // One call with the repeat count inside it, so there is no loop of ours to
     // check: it is admitted at the gate and is not interruptible after that.
-    let mut platform = Gated::new(gate, held::Real::default());
+    let mut platform = Gated::new(gate, desktop(worker)?);
     platform.move_mouse(lx, ly)?;
     platform.settle(lx, ly)?;
     platform.scroll(length, axis)?;
@@ -3187,7 +3346,8 @@ fn type_text(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resul
     // A window may still be named: typing goes to the focus wherever it is, and the
     // check then shows the window the caller is working in rather than the screen.
     let view = view(request, gate, worker)?;
-    let mut platform = Gated::new(gate, held::Real::default());
+    ready_for_keys(worker, Some(text))?;
+    let mut platform = Gated::new(gate, desktop(worker)?);
     platform.text(text)?;
     gate.input_complete();
     // Typing executes at the focus, not at a coordinate: it names no image and
@@ -3209,8 +3369,9 @@ fn key_chord(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Resul
     let main = named_key(key_name).ok_or_else(|| format!("unknown key: {key_name}"))?;
 
     let view = view(request, gate, worker)?;
+    ready_for_keys(worker, None)?;
     // A local for the same reason as `click`: enigo's pacing runs on its drop.
-    let mut platform = Gated::new(gate, held::Real::default());
+    let mut platform = Gated::new(gate, desktop(worker)?);
     key_chord_seq(&mut platform, &mods, main)?;
     gate.input_complete();
 
@@ -3561,9 +3722,10 @@ fn paste(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Va
         .ok_or("missing text")?;
 
     let view = view(request, gate, worker)?;
+    ready_for_keys(worker, None)?;
     // A local for the same reason as `click`: enigo's pacing runs on its drop, and
     // the clipboard handle lived this long too.
-    let mut platform = Gated::new(gate, held::Real::default());
+    let mut platform = Gated::new(gate, desktop(worker)?);
     paste_seq(&mut platform, text)?;
     gate.input_complete();
 
@@ -4736,7 +4898,7 @@ fn windows(req: &Value, gate: &Gate, worker: &mut Worker) -> Result<Value, Failu
     let display = target_display(req, worker)?;
     let geom = measured_geometry(&display, gate, worker)?;
     let full = Region::full(&geom);
-    let mut listed = window_entries(&geom, &full)?;
+    let mut listed = window_entries(&geom, &full, listed_windows(worker)?)?;
     listed.truncate(MAX_WINDOWS);
 
     let mut payload = json!({ "ok": true, "windows": listed });
@@ -4759,13 +4921,70 @@ fn windows(req: &Value, gate: &Gate, worker: &mut Worker) -> Result<Value, Failu
     Ok(payload)
 }
 
-fn window_entries(geom: &Geometry, full: &Region) -> Result<Vec<Value>, String> {
+/// One window as the platform lists it, front-most first: its LOGICAL bounds
+/// (`kCGWindowBounds` on macOS, root pixels on X11 — the unit `Geometry` uses).
+struct Listed {
+    id: u32,
+    app: String,
+    title: String,
+    focused: bool,
+    minimized: bool,
+    bounds: (f64, f64, f64, f64),
+}
+
+/// The windows, front-most first: xcap's `z` grows toward the front.
+#[cfg(target_os = "macos")]
+fn listed_windows(_worker: &Worker) -> Result<Vec<Listed>, String> {
     let mut windows = xcap::Window::all().map_err(|e| format!("enumerate windows: {e}"))?;
-
-    // Front-most first: xcap's `z` grows toward the front, so the caller reads the
-    // window it most likely means at the top of the list.
     windows.sort_by_cached_key(|w| std::cmp::Reverse(w.z().unwrap_or(0)));
+    Ok(windows
+        .into_iter()
+        .filter_map(|window| {
+            Some(Listed {
+                id: window.id().unwrap_or_default(),
+                app: window.app_name().unwrap_or_default(),
+                title: window.title().unwrap_or_default(),
+                focused: window.is_focused().unwrap_or(false),
+                minimized: window.is_minimized().unwrap_or(false),
+                bounds: (
+                    window.x().ok()? as f64,
+                    window.y().ok()? as f64,
+                    window.width().ok()? as f64,
+                    window.height().ok()? as f64,
+                ),
+            })
+        })
+        .collect())
+}
 
+/// The windows the X11 window manager lists, front-most first.
+#[cfg(target_os = "linux")]
+fn listed_windows(worker: &Worker) -> Result<Vec<Listed>, String> {
+    Ok(worker
+        .pixels
+        .windows()?
+        .into_iter()
+        .map(|window| Listed {
+            id: window.id,
+            app: window.app,
+            title: window.title,
+            focused: window.focused,
+            minimized: window.minimized,
+            bounds: (
+                f64::from(window.x),
+                f64::from(window.y),
+                f64::from(window.width),
+                f64::from(window.height),
+            ),
+        })
+        .collect())
+}
+
+fn window_entries(
+    geom: &Geometry,
+    full: &Region,
+    windows: Vec<Listed>,
+) -> Result<Vec<Value>, String> {
     // Shell-layer windows (the Dock, the menu bar, floating overlays) are not
     // windows a caller can work IN — listing them invites zooming into a
     // phantom region (observed live: "Dock — region {0,0,1931,543}").
@@ -4773,20 +4992,21 @@ fn window_entries(geom: &Geometry, full: &Region) -> Result<Vec<Value>, String> 
 
     let mut entries = Vec::new();
     for window in windows {
-        if window.is_minimized().unwrap_or(false) {
+        if window.minimized {
             continue;
         }
-        if let (Some(normal), Ok(id)) = (&normal, window.id()) {
-            if !normal.contains(&id) {
+        if let Some(normal) = &normal {
+            if !normal.contains(&window.id) {
                 continue;
             }
         }
-        if let Some(region) = window_region(geom, full, &window) {
+        let (x, y, w, h) = window.bounds;
+        if let Some(region) = logical_bounds_to_region(geom, full, x, y, w, h) {
             entries.push(json!({
-                "id": window.id().unwrap_or_default(),
-                "app": window.app_name().unwrap_or_default(),
-                "title": window.title().unwrap_or_default(),
-                "focused": window.is_focused().unwrap_or(false),
+                "id": window.id,
+                "app": window.app,
+                "title": window.title,
+                "focused": window.focused,
                 "region": {
                     "x": region.x.round() as i64,
                     "y": region.y.round() as i64,
@@ -4799,9 +5019,10 @@ fn window_entries(geom: &Geometry, full: &Region) -> Result<Vec<Value>, String> 
     Ok(entries)
 }
 
-/// A window's LOGICAL bounds (`kCGWindowBounds` on macOS — the same unit `Geometry`
-/// uses) converted into this display's sent-image space. Thin effectful shell; the
+/// A window's LOGICAL bounds (`kCGWindowBounds`, the unit `Geometry` uses)
+/// converted into this display's sent-image space. Thin effectful shell; the
 /// arithmetic is `logical_bounds_to_region` so it can be tested without a desktop.
+#[cfg(target_os = "macos")]
 fn window_region(geom: &Geometry, full: &Region, window: &xcap::Window) -> Option<Region> {
     let (x, y) = (window.x().ok()? as f64, window.y().ok()? as f64);
     let (w, h) = (window.width().ok()? as f64, window.height().ok()? as f64);
@@ -5613,9 +5834,10 @@ fn named_key(name: &str) -> Option<Key> {
 mod tests {
     use super::*;
 
-    use crate::held::{sweep_injected_failures, Call, Recorder, CLIPBOARD_RESTORE_DWELL_MS};
+    use crate::held::{
+        sweep_injected_failures, Call, Direction, Recorder, CLIPBOARD_RESTORE_DWELL_MS,
+    };
     use crate::listing::element_value;
-    use enigo::Direction;
 
     /// A launcher a test can ask about without a bundle: the badge is "there", and
     /// nothing is ever spawned unless a test spawns it.
@@ -5726,7 +5948,20 @@ mod tests {
             until_held: None,
             cutoff_ms: None,
             endpoint: Endpoint::default(),
+            pixels: test_pixels(),
         }
+    }
+
+    /// Pixels a test worker can post through and never reach a screen with: on
+    /// Linux a recording platform that serves every pixel action.
+    #[cfg(target_os = "linux")]
+    fn test_pixels() -> Pixels {
+        Pixels::Recorded(crate::held::Recorder::new(None))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn test_pixels() -> Pixels {
+        Pixels
     }
 
     /// Run one action through the real dispatch table, as the worker does.
@@ -5794,6 +6029,7 @@ mod tests {
     // `no_active_display` for ANY requested index — never the bad-index message,
     // which would wrongly suggest another monitor could work. The non-empty path
     // needs a real `Monitor` (an OS handle) and is covered by on-device runs.
+    #[cfg(target_os = "macos")]
     #[test]
     fn empty_monitor_list_is_no_active_display_for_any_index() {
         assert_eq!(
@@ -6112,7 +6348,7 @@ mod tests {
     fn the_handshake_offers_targets_exactly_where_a_window_can_be_captured() {
         assert_eq!(
             targets_supported(),
-            capture_methods(&Endpoint::default()).contains(&"window"),
+            capture_methods(&test_pixels()).contains(&"window"),
             "`targets` and the window capture method are one fact"
         );
     }
@@ -6217,7 +6453,7 @@ mod tests {
 
     #[test]
     fn hello_reports_the_protocol_version_and_verbs() {
-        let v = hello(&test_launcher(), &Endpoint::default()).unwrap();
+        let v = hello(&test_launcher(), &test_pixels()).unwrap();
         assert_eq!(v["ok"], json!(true));
         assert_eq!(v["protocol_version"], json!(PROTOCOL_VERSION));
         assert!(v["compux_version"].is_string());
@@ -6251,7 +6487,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn on_linux_the_handshake_offers_the_controls_and_their_verbs_and_no_inspect() {
-        let v = hello(&test_launcher(), &Endpoint::default()).unwrap();
+        let v = hello(&test_launcher(), &test_pixels()).unwrap();
 
         assert_eq!(
             advertised(&v),
@@ -6289,7 +6525,7 @@ mod tests {
     }
 
     // The probe says which display server answered, and whether an X endpoint
-    // answers, as or beside it. Pixels are offered on X11 alone.
+    // answers, as or beside it. Capture and input are the pixel route's.
     #[cfg(target_os = "linux")]
     #[test]
     fn on_linux_the_probe_says_which_display_answered() {
@@ -6298,8 +6534,8 @@ mod tests {
             env,
             adopted: false,
         };
-        let shown = |endpoint: &Endpoint| {
-            let v = probe_with(endpoint, serde_json::Map::new).unwrap();
+        let shown = |endpoint: &Endpoint, pixels: &Pixels| {
+            let v = probe_with(endpoint, pixels, serde_json::Map::new).unwrap();
             let keys = [
                 "display_server",
                 "x11_endpoint",
@@ -6310,11 +6546,12 @@ mod tests {
         };
 
         assert_eq!(
-            shown(&own),
+            shown(&own, &test_pixels()),
             [json!("x11"), json!(true), json!(true), json!(true)]
         );
+        let refused = Pixels::Refused("no display answers".to_string());
         assert_eq!(
-            shown(&Endpoint::default()),
+            shown(&Endpoint::default(), &refused),
             [json!("none"), json!(false), json!(false), json!(false)]
         );
     }
@@ -6330,7 +6567,7 @@ mod tests {
             &linux::probe::Packages::default(),
         );
 
-        let v = probe_with(&Endpoint::default(), || facts.clone()).unwrap();
+        let v = probe_with(&Endpoint::default(), &test_pixels(), || facts.clone()).unwrap();
 
         for key in [
             "accessibility_bus",
@@ -6342,21 +6579,22 @@ mod tests {
         assert!(v["display_server"].is_string(), "{v}");
     }
 
-    // A display taken from the user manager serves controls only: the capture and
-    // input libraries read this process's environment, which never holds it. The
-    // handshake offers no pixel verb and no foreground input, the probe says the
-    // display was adopted and captures and posts nothing, and a pixel request is
-    // refused by name before anything is sent.
+    // A session whose pixel route is refused (a compositor compux has not
+    // qualified, a portal with no Registry, no display at all) serves controls only.
+    // The handshake offers no pixel verb and no foreground input, the probe says it
+    // captures and posts nothing, and a pixel request is refused by name, with the
+    // route's reason, before anything is sent.
     #[cfg(target_os = "linux")]
     #[test]
-    fn on_linux_a_display_taken_from_the_user_manager_serves_controls_only() {
+    fn on_linux_a_session_whose_pixel_route_is_refused_serves_controls_only() {
+        let refused = || Pixels::Refused("KDE Plasma on Wayland has no pixel route".to_string());
         let adopted = Endpoint {
             adopted: true,
             ..Endpoint::default()
         };
 
-        let v = hello(&test_launcher(), &adopted).unwrap();
-        let probed = probe_with(&adopted, serde_json::Map::new).unwrap();
+        let v = hello(&test_launcher(), &refused()).unwrap();
+        let probed = probe_with(&adopted, &refused(), serde_json::Map::new).unwrap();
 
         let actions = advertised(&v);
         for pixel in PIXEL_ACTIONS {
@@ -6374,6 +6612,7 @@ mod tests {
         let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
         let mut worker = Worker {
             endpoint: adopted.clone(),
+            pixels: refused(),
             ..idle_worker(&gate)
         };
         let mut typed = running("type", Some(2));
@@ -6391,14 +6630,118 @@ mod tests {
         for request in pixel_requests {
             let frame = served(&request, &gate, &mut worker);
             assert_eq!(frame["error"], json!("pixels_unavailable"), "{frame}");
+            let detail = frame["detail"].as_str().unwrap_or_default();
+            assert!(detail.contains("KDE Plasma"), "the route's reason: {frame}");
         }
+    }
+
+    // Keys go only into a window that reads ACTIVE, as macOS types into the key
+    // window of the application in front. With none, typing, a chord and a paste
+    // are refused before a key is posted; compux never activates a window to make
+    // room.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_keys_go_only_into_a_window_that_reads_active() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        app.set_frontmost(None);
+        let mut worker = worker_with(&gate, app.clone());
+        let bodies = [
+            json!({"action": "type", "text": "hi"}),
+            json!({"action": "key", "chord": "ctrl+a"}),
+            json!({"action": "paste", "text": "hi"}),
+        ];
+
+        for (seq, body) in (1..).zip(bodies) {
+            let mut request = running(body["action"].as_str().unwrap_or_default(), Some(seq));
+            request.body = body;
+            let frame = served(&request, &gate, &mut worker);
+            assert_eq!(frame["error"], json!("no_active_window"), "{frame}");
+        }
+        let Pixels::Recorded(recorder) = &worker.pixels else {
+            panic!("a test worker records its input");
+        };
+        assert!(recorder.calls.is_empty(), "posted: {:?}", recorder.calls);
+
+        app.set_frontmost(Some(FIXTURE_PID));
+        let mut typed = running("type", Some(4));
+        typed.body = json!({"action": "type", "text": "hi"});
+        let frame = served(&typed, &gate, &mut worker);
+
+        assert!(frame["error"].is_null(), "{frame}");
+        let Pixels::Recorded(recorder) = &worker.pixels else {
+            panic!("a test worker records its input");
+        };
+        assert_eq!(recorder.calls, [held::Call::Text("hi".to_string())]);
+    }
+
+    // On GNOME Wayland the portal serves the pointer, the keys and the screen,
+    // and `hello` lists exactly that: no `paste` (no portal clipboard compux can
+    // own) and no `windows` (no portal lists them). Nothing is asked of the portal
+    // to say so.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_the_portal_route_lists_what_it_serves_and_asks_nothing_to_say_so() {
+        let portal = linux::portal::Portal::with(
+            Box::new(|| panic!("hello asked the portal")),
+            None,
+            Duration::from_millis(1),
+        );
+        let pixels = Pixels::on_portal(portal);
+
+        let v = hello(&test_launcher(), &pixels).unwrap();
+
+        let actions = advertised(&v);
+        for served in [
+            "screenshot",
+            "left_click",
+            "left_click_drag",
+            "scroll",
+            "key",
+            "type",
+        ] {
+            assert!(actions.contains(&served), "{served} not offered: {v}");
+        }
+        for unserved in ["paste", "windows"] {
+            assert!(!actions.contains(&unserved), "{unserved} offered: {v}");
+        }
+        assert_eq!(
+            v["capabilities"]["input_methods"],
+            json!(["foreground_hid", "ax"]),
+            "{v}"
+        );
+        assert_eq!(
+            v["capabilities"]["capture_methods"],
+            json!(["display"]),
+            "{v}"
+        );
+    }
+
+    // handed it and its authority as values. Only the route decides, never where
+    // the display came from.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_a_display_taken_from_the_user_manager_serves_pixels() {
+        let (_x11, env) = linux::display::answering_x11();
+        let adopted = Endpoint { env, adopted: true };
+
+        let v = hello(&test_launcher(), &test_pixels()).unwrap();
+        let probed = probe_with(&adopted, &test_pixels(), serde_json::Map::new).unwrap();
+
+        assert!(advertised(&v).contains(&"screenshot"), "{v}");
+        assert_eq!(probed["display_adopted"], json!(true), "{probed}");
+        assert_eq!(probed["screen_capture"], json!(true), "{probed}");
+        assert_eq!(
+            linux::pixels::decide(adopted.server(), None),
+            linux::pixels::Decision::X11
+        );
     }
 
     // And the macOS build offers every verb it offered before, in the same order.
     #[cfg(target_os = "macos")]
     #[test]
     fn on_macos_the_handshake_offers_every_verb_and_both_input_methods() {
-        let v = hello(&test_launcher(), &Endpoint::default()).unwrap();
+        let v = hello(&test_launcher(), &test_pixels()).unwrap();
 
         assert_eq!(
             advertised(&v),
@@ -6543,7 +6886,7 @@ mod tests {
     // model verbs — same posture as `probe`. Lock that so they aren't offered to a model.
     #[test]
     fn idle_verbs_are_not_advertised_model_actions() {
-        let actions = hello(&test_launcher(), &Endpoint::default()).unwrap()["actions"]
+        let actions = hello(&test_launcher(), &test_pixels()).unwrap()["actions"]
             .as_array()
             .unwrap()
             .clone();
@@ -6555,7 +6898,7 @@ mod tests {
     // no model tool call must reach observe_start/observe_stop (MILESTONE_32 §8.4a).
     #[test]
     fn observe_verbs_are_not_advertised_model_actions() {
-        let actions = hello(&test_launcher(), &Endpoint::default()).unwrap()["actions"]
+        let actions = hello(&test_launcher(), &test_pixels()).unwrap()["actions"]
             .as_array()
             .unwrap()
             .clone();

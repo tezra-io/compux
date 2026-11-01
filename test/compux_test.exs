@@ -340,7 +340,9 @@ defmodule CompuxTest do
                display_adopted: nil,
                accessibility_bus: nil,
                accessibility_packages: nil,
-               toolkit_notes: nil
+               toolkit_notes: nil,
+               x11_pixels: nil,
+               portal: nil
              } = probe
     end
 
@@ -363,7 +365,13 @@ defmodule CompuxTest do
           "at_spi2_core" => "2.44.0-3",
           "atk_bridge" => "2.38.0-3"
         },
-        "toolkit_notes" => [%{"toolkit" => "qt", "note" => "start it with the switch"}]
+        "toolkit_notes" => [%{"toolkit" => "qt", "note" => "start it with the switch"}],
+        "x11_pixels" => %{"xtest" => true, "keymap" => true},
+        "portal" => %{
+          "version" => "1.14.4-1ubuntu2",
+          "registry" => false,
+          "screenshot_permission" => "unset"
+        }
       }
 
       cu = start!(responses: %{"probe" => {:ok, linux}})
@@ -387,6 +395,35 @@ defmodule CompuxTest do
              }
 
       assert probe.toolkit_notes == [%{toolkit: "qt", note: "start it with the switch"}]
+      assert probe.x11_pixels == %{xtest: true, keymap: true}
+
+      assert probe.portal == %{
+               version: "1.14.4-1ubuntu2",
+               registry: false,
+               screenshot_permission: "unset"
+             }
+    end
+
+    # A stored refusal is the one portal fact the doctor acts on: it names the
+    # reset. Anything but the three answers the store gives reads unknown.
+    test "carries the portal's stored Screenshot answer, and nil where a route is not there" do
+      wayland = %{
+        "ok" => true,
+        "platform" => "linux",
+        "display_server" => "wayland",
+        "x11_pixels" => nil,
+        "portal" => %{"version" => nil, "registry" => true, "screenshot_permission" => "no"}
+      }
+
+      odd = put_in(wayland, ["portal", "screenshot_permission"], "maybe")
+
+      cu = start!(responses: %{"probe" => {:ok, wayland}})
+      assert {:ok, probe} = Compux.probe(cu)
+      assert probe.x11_pixels == nil
+      assert probe.portal == %{version: nil, registry: true, screenshot_permission: "no"}
+
+      cu = start!(responses: %{"probe" => {:ok, odd}})
+      assert {:ok, %{portal: %{screenshot_permission: nil}}} = Compux.probe(cu)
     end
 
     test "names why the accessibility bus is unavailable" do

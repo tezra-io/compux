@@ -24,21 +24,21 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Cross-platform synthetic input (macOS CGEvent, Linux XTEST/uinput).
-enigo = "0.3"
-# Cross-platform screen capture (macOS ScreenCaptureKit/CG, Linux X11).
-xcap = "0.4"
 # PNG encoding + downscale of the captured frame.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 base64 = "0.22"
-# Clipboard access for the `paste` action (macOS NSPasteboard, Linux X11/Wayland).
-arboard = "3"
 
 # macOS Accessibility query (`inspect`) + the non-prompting permission probe +
 # the Accessibility grant PROMPT (`request_permissions`). core-foundation handles
 # CFString/CFType/CFDictionary memory safety for the AX FFI. Already in the tree
 # transitively via xcap, so this adds no new compilation.
 [target.'cfg(target_os = "macos")'.dependencies]
+# Synthetic input (CGEvent), screen capture (ScreenCaptureKit/CG) and the
+# clipboard for `paste` (NSPasteboard). macOS only: Linux posts, captures and
+# owns the clipboard through x11rb or the portal (M86 L2), with no C library.
+enigo = "0.3"
+xcap = "0.4"
+arboard = "3"
 core-foundation = "0.10"
 dispatch2 = "0.3"
 # posix_spawn + dlsym for the TCC responsibility self-disclaim re-exec (see
@@ -67,6 +67,13 @@ objc2-screen-capture-kit = { version = "0.3.2", default-features = false, featur
 zbus = { version = "5", default-features = false, features = ["async-io"] }
 async-io = "2"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+# Linux pixels (M86 L2): the X protocol in pure Rust, handed its display and its
+# authority as values. XTEST posts input, RandR names the monitors, XKB says
+# which group and modifiers the keyboard is in; capture is the core GetImage.
+x11rb = { version = "0.13", default-features = false, features = ["xtest", "randr", "xkb"] }
+# What character an X keysym types, for every keysym a layout can name (the
+# legacy Cyrillic, Greek and other tables as well as Unicode's).
+xkeysym = "0.2"
 
 # The reader's unit tests answer it from fake AT-SPI servers over a peer-to-peer
 # connection: no bus daemon, no desktop.

@@ -225,7 +225,7 @@ defmodule Compux.Protocol do
                focus_refused ax_action_failed ax_timed_out scope_not_found
                accessibility_unavailable ambiguous_element identity_unknown
                toolkit_accessibility_off text_outside_layout consent_refused consent_timeout
-               pixels_unavailable)
+               pixels_unavailable no_active_window keyboard_not_neutral)
 
   # v12: what each kind of `until` condition reads, beside `kind` and `timeout_ms`
   # (PROTOCOL.md §5.1). A field a kind does not read is refused, never dropped.

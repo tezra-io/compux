@@ -298,7 +298,9 @@ dependencies = [
  "objc2-screen-capture-kit",
  "serde",
  "serde_json",
+ "x11rb",
  "xcap",
+ "xkeysym",
  "zbus",
 ]
 
