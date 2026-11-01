@@ -84,6 +84,8 @@ def _library():
         "xcb_intern_atom": (ctypes.c_uint, [void, u8, u16, ctypes.c_char_p]),
         "xcb_intern_atom_reply": (void, [void, ctypes.c_uint, void]),
         "xcb_create_gc": (ctypes.c_uint, [void, u32, u32, u32, ctypes.POINTER(u32)]),
+        "xcb_change_gc": (ctypes.c_uint, [void, u32, u32, void]),
+        "xcb_change_window_attributes": (ctypes.c_uint, [void, u32, u32, void]),
         "xcb_poly_fill_rectangle": (ctypes.c_uint, [void, u32, u32, u32,
                                                     ctypes.POINTER(_Rectangle)]),
         "xcb_wait_for_event": (void, [void]),
@@ -179,6 +181,15 @@ class Victim:
         ids = (ctypes.c_uint32 * 1)(self.id)
         for name in (b"_NET_CLIENT_LIST_STACKING", b"_NET_CLIENT_LIST"):
             self._property(self.atoms[name], ATOM_WINDOW, 32, ids, window=self.root)
+        self.xcb.xcb_flush(self.conn)
+
+    def set_colour(self, colour):
+        """Paint in `colour` from the next expose on, its background included.
+        Nothing is drawn now."""
+        self.colour = colour
+        value = ctypes.cast((ctypes.c_uint32 * 1)(colour), ctypes.c_void_p)
+        self.xcb.xcb_change_gc(self.conn, self.gc, GC_FOREGROUND, value)
+        self.xcb.xcb_change_window_attributes(self.conn, self.id, CW_BACK_PIXEL, value)
         self.xcb.xcb_flush(self.conn)
 
     def set_border(self, width):

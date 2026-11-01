@@ -75,6 +75,9 @@ VICTIM, VICTIM_COLOUR = "Compux Victim", 0x30A030
 LAZY, LAZY_COLOUR, LAZY_AT = "Compux Lazy", 0x2050C0, (400, 450)
 BORDERED, BORDERED_COLOUR, BORDERED_AT = "Compux Bordered", 0x30A0A0, (200, 300)
 BORDER_COLOUR, BORDER_WIDTHS = 0xE0E020, (8, 3)
+# The bordered window's colour from its new border on: only a frame read after
+# the change can show it.
+RECOLOURED = 0xA03050
 POPUP, POPUP_COLOUR, POPUP_SIZE = "Compux Popup", 0xC08020, (160, 80)
 # Clear of the bare server's badge, bottom right.
 POPUP_AWAY = (900, 700)
@@ -802,13 +805,13 @@ def stop(process):
         process.wait()
 
 
-def all_window(shot):
+def all_window(shot, colour):
     """Whether a frame is the bordered window's own picture: its size, and every
-    pixel its colour, none the border's."""
+    pixel `colour`, none the border's."""
     if not shot.get("data"):
         return False, f"{shot.get('error')}: {shot.get('detail')}"
     size = (shot["width"], shot["height"])
-    own, border = cover_pixels(shot, BORDERED_COLOUR), cover_pixels(shot, BORDER_COLOUR)
+    own, border = cover_pixels(shot, colour), cover_pixels(shot, BORDER_COLOUR)
     whole = size == xcb_victim.SIZE and own == size[0] * size[1] and border == 0
     return whole, f"{size[0]}x{size[1]}, {own} pixels the window's, {border} the border's"
 
@@ -834,7 +837,10 @@ def bare_steps(binary, out):
 def bordered_window_check(helper, display, out):
     """A top-level window with an X border of its own, bound on a display with no
     window manager: its frames hold the window's pixels and none of its border's,
-    at the border it was bound with, and after it is given another."""
+    at the border it was bound with, and after it is given another. It takes a new
+    colour with the new border, so the frame after is one read since: the binding's
+    first frame served again would still be the old colour. An observation id
+    cannot show that, since every reply mints a new one."""
     flow = "a window with an X border is read from inside it"
     victim = Victim(BORDERED, BORDERED_COLOUR, place=BORDERED_AT, display=display,
                     border=(BORDER_WIDTHS[0], BORDER_COLOUR))
@@ -845,17 +851,19 @@ def bordered_window_check(helper, display, out):
         if window is None:
             return {"flow": flow, "passed": False, "why": "the bordered window was never listed"}
         _, bound = helper.ask("select_target", window_id=window["id"])
-        first, first_why = all_window(bound)
+        first, first_why = all_window(bound, BORDERED_COLOUR)
+        victim.set_colour(RECOLOURED)
         victim.set_border(BORDER_WIDTHS[1])
         time.sleep(QUIET_S)
         _, after = helper.ask("screenshot", target_id=bound.get("target_id"))
-        again, again_why = all_window(after)
+        again, again_why = all_window(after, RECOLOURED)
         helper.ask("release_target")
         keep(os.path.dirname(out), "bordered-first.png", bound)
         keep(os.path.dirname(out), "bordered-after.png", after)
         return {"flow": flow, "passed": first and again,
-                "why": f"border {BORDER_WIDTHS[0]}: {first_why}; border {BORDER_WIDTHS[1]}: "
-                       f"{again_why}"}
+                "why": f"border {BORDER_WIDTHS[0]}: {first_why}; border {BORDER_WIDTHS[1]}, "
+                       f"recoloured: {again_why}; observations {bound.get('observation_id')} "
+                       f"then {after.get('observation_id')}"}
     finally:
         victim.destroy()
 
