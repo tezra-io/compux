@@ -112,14 +112,21 @@ they are as protocol 11 had them.
   of the binding, even when the X server has given its id to a new window of the same process: each request first
   has the watch read everything the server sent it, so a window closed before the request is never answered with
   its last picture.
-- **Frames** come from Composite: the window is redirected (Automatic), and its pixmap is named and read, so a
-  window another one covers is still seen. Where a compositing manager (GNOME Shell's Mutter) already redirects
-  it, that pixmap is the one the manager draws from. Where compux redirects it itself, the first picture must be
-  proved to be the window's own: the windows above it must not move while it is redirected, and it must repaint
-  every part of itself the screen was not showing within 1 s. A window that cannot be proved is
-  `capture_unavailable` and nothing is held. A window mapped again or resized is proved the same way before its
-  next frame. The picture is the window's listed bounds, frame included, in root pixels at a scale of 1. A
-  damaged window is read again at most ten times a second; an undamaged one reports idle frames.
+- **Frames** come from Composite: the window is redirected (Automatic) unless a compositing manager (GNOME
+  Shell's Mutter) already redirects it, and its pixmap is named and read, so a window another one covers is
+  still seen. A redirect fills the new pixmap with what the screen showed there, another window's pixels where
+  one covered it, so no pixel is sent until it is proved the window's own, whoever redirected it. Every
+  window the picture is drawn from (the window manager's frame and its decorations, the client and the
+  client's own windows) is cleared and sent an Expose (`ClearArea` with exposures), and the drawing that
+  follows must reach every pixel of the picture, frame included, within 1 s. That Expose is the one side
+  effect a selection has on the application: it repaints. A window that does not repaint in time (a hung
+  application, or one that draws only once) is `capture_unavailable` and nothing is held. The proof does not
+  depend on which windows are over it, so a window moving meanwhile changes nothing; one resized, hidden or
+  shown during it is refused at selection, and proved again later. A window mapped again or resized is
+  proved the same way before its next frame, and any part of a picture the proof did not reach (the frame
+  extents moved it) is sent black. The picture is the window's listed bounds, frame included, in root pixels
+  at a scale of 1. A damaged window is read again at most ten times a second; an undamaged one reports idle
+  frames.
 - **Pixel actions** on a bound window need it topmost at the point, as on macOS (`target_obstructed`, naming the
   window in front). In front means listed by the window manager: menus, tooltips and other override-redirect
   windows are not, so they never refuse a click.
@@ -132,7 +139,10 @@ they are as protocol 11 had them.
   Pause and Stop reach the same gate. It is an override-redirect window, so the window manager never manages or
   focuses it: 28 pixels high and at most 448 wide, at the window's left above its top edge, or just inside that
   edge where there is no room above, kept on the window's monitor and out of its panels. Only its two buttons take
-  clicks (a Shape input region); a click anywhere else on it reaches the window under it. It hides while the
+  clicks (a Shape input region); a click anywhere else on it reaches the window under it. A button event another
+  program sends to it (`SendEvent`) is dropped and logged, so no program can pause, resume or stop the session
+  that way; input made through XTEST is the server's own, as the person's is, and nothing on X11 tells the two
+  apart, for the badge or any other window. It hides while the
   window is minimized or gone, or while another window covers the area it would take, and it raises itself over a
   window that comes above it at most ten times a second. Its text is Noto Sans Regular, built in, at 13 pixels,
   in root pixels at a scale of 1 on any screen. It draws glyphs in the order the characters come, with kerning

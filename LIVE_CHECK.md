@@ -2818,9 +2818,11 @@ reach the helper's gate. All of this passes in private containers: Xvfb, openbox
 and the GTK 3 fixture (`fixtures/linux/spike/spike.sh`, stage `bound`). There, the
 person's clicks on the badge are judged by the gate and by what the window under a
 missed click recorded. None of it has met GNOME Shell. Mutter redirects every
-window itself, so on your desktop compux reads Mutter's pixmap instead of
-redirecting the window and proving it. That path, a real GPU, your monitor and the
-badge's look are what this check is for.
+window itself, so on your desktop compux reads Mutter's pixmap rather than
+redirecting the window. It still sends nothing until it has asked the window and
+GNOME's frame around it to repaint and seen them draw every pixel, which has only
+been seen under openbox. That path, a real GPU, your monitor and the badge's look
+are what this check is for.
 
 Expected outcome in one line: the bound fixture is seen under a covering window, a
 click there is refused, and twenty bindings leave no badge behind. The badge sits
@@ -2882,8 +2884,10 @@ eval "$B --save ~/l3-images"
   whether its text is sharp at your scale. The badge draws at a scale of 1 on any
   screen, so on a HiDPI panel it is small.
 * A refusal here of `capture_unavailable` that says the picture "could not be
-  proved" means compux found the window not redirected and redirected it itself:
-  Mutter is not compositing it. Write down the detail and stop.
+  proved" means the fixture, or GNOME's frame around it, did not repaint within a
+  second of being asked to (the detail counts the parts not drawn). Write down the
+  detail, try once more, and stop if it repeats: every binding on this desktop
+  would be refused the same way.
 
 Ctrl-D ends the session: the badge goes with it.
 
@@ -2968,6 +2972,9 @@ Each with the window still bound, in the session:
   Chinese or Japanese shows the font's missing-glyph boxes, and right-to-left text
   reads in the wrong order. If you have such a window, bind it and write down
   how the badge reads.
-* The proof compux runs when it redirects a window itself, which happens only
-  under a window manager that does not composite. The containers prove it under
-  openbox; on GNOME it never runs.
+* A window that does not repaint when asked (a hung application) is refused
+  `capture_unavailable`; the containers prove it with a window that paints only
+  once. Nothing here hangs one on GNOME.
+* A program clicking the badge through `SendEvent` is dropped, and the containers
+  prove it; a program clicking it through XTEST cannot be told from you, on X11,
+  and nothing here tries.
