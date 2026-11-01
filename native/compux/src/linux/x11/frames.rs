@@ -20,7 +20,8 @@
 //! during the proof voids it, and so does one read in the drain at the cut-off:
 //! the window is renewed from the moment its pixmap is named. A window mapped
 //! again, resized or given a new border width gets a new pixmap, and is proved
-//! again the same way before anything more is published; a proof that falls
+//! again the same way before anything more is published, and so is one whose
+//! new size shows first in the geometry a read is given; a proof that falls
 //! short then is retried at each of the next [`MAX_REPROOF_RETRIES`] intervals,
 //! and the binding ends if none holds. While a window waits to be proved again,
 //! no frame of it is served: the one held is of the window before it changed.
@@ -999,17 +1000,37 @@ impl Watch {
 
     /// Read the window as it is now, and publish it stamped `stamp`.
     fn read(&mut self, slot: &Slot, stamp: u64, clock: &dyn Clock) -> Result<(), FrameError> {
+        if let Some(frame) = self.picture(slot, stamp, clock)? {
+            slot.offer(frame);
+        }
+        Ok(())
+    }
+
+    /// The window as it is now, stamped `stamp`. `None` where the server gives
+    /// it a size other than the one its pixmap was named at: it was resized
+    /// after the interval's look, so nothing is read from a pixmap it no longer
+    /// draws into, and it is renewed, still damaged, to be proved again.
+    fn picture(
+        &mut self,
+        slot: &Slot,
+        stamp: u64,
+        clock: &dyn Clock,
+    ) -> Result<Option<WindowFrame>, FrameError> {
+        let (crop, size) = self.places()?;
+        if size != self.size {
+            self.renewed = true;
+            return Ok(None);
+        }
         self.connection
             .damage_subtract(self.damage, 0u32, 0u32)
             .map_err(lost)?;
         self.damaged = false;
-        let (crop, border) = self.places()?;
-        let mut pixels = self.grab(in_pixmap(crop, border)?)?;
+        let mut pixels = self.grab(in_pixmap(crop, size.2)?)?;
         // The frame extents can move the picture within the window without a new
         // pixmap; whatever of it the proof did not reach is not sent.
         black_out(&mut pixels, crop, self.proven);
         let width = crop.width;
-        slot.offer(WindowFrame {
+        Ok(Some(WindowFrame {
             pixels,
             width,
             height: crop.height,
@@ -1020,8 +1041,7 @@ impl Watch {
             content_rect: None,
             reported_scale: None,
             status: Health::Live,
-        });
-        Ok(())
+        }))
     }
 
     /// Where the listed window is inside the redirected one, in its pixels.
@@ -1031,8 +1051,9 @@ impl Watch {
 
     /// Where the listed window (the client's place, less GTK's shadow, with the
     /// window manager's frame) is inside the redirected one, in its pixels, and
-    /// the redirected window's X border, from the same reading.
-    fn places(&self) -> Result<(Rect, u16), FrameError> {
+    /// the redirected window's width, height and X border, from the same
+    /// reading.
+    fn places(&self) -> Result<(Rect, (u16, u16, u16)), FrameError> {
         let connection = &self.connection;
         let outer = connection.get_geometry(self.top).map_err(lost)?;
         let client = connection.get_geometry(self.client).map_err(lost)?;
@@ -1056,8 +1077,9 @@ impl Watch {
             width: u32::from(client.width),
             height: u32::from(client.height),
         };
+        let size = (outer.width, outer.height, outer.border_width);
         let crop = placed(inner, frame.reply_extents()?, shadow.reply_extents()?)
-            .map(|(seen, _)| (seen, outer.border_width))
+            .map(|(seen, _)| (seen, size))
             .filter(|(seen, _)| inside(*seen, outer.width, outer.height));
         crop.ok_or_else(|| {
             FrameError::Unavailable(format!(
