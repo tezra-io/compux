@@ -10,6 +10,13 @@ name: linux-desktop
 #   jammy  Ubuntu 22.04, whose ATK bridge 2.38 aborts an application on
 #          Action.GetActions: the GTK 3 fixture read, then every verb on it, each
 #          under a bus monitor that must show no GetActions and no GetAll.
+#   x11-pixels  Ubuntu 24.04: the X11 pixel route on the GTK 3 fixture (pixels.py):
+#          XTEST clicks and keys, a paste through the selection compux owns, the
+#          frame against a pattern on the root, a refused character off the
+#          layout, and a button a killed helper held released by the next one.
+#   no-c-deps  the helper built and tested in plain Ubuntu 24.04 with no C library
+#          but the C runtime (no_c_deps.sh), its links checked, and clippy for
+#          aarch64-unknown-linux-gnu.
 
 # Each job builds its images from scratch (the fixture images for both releases,
 # the helper's build image, the helper, the spike images) before its sessions run,
@@ -70,4 +77,39 @@ jobs:
         with:
           name: linux-desktop-jammy
           path: ${{ runner.temp }}/spike-out
+          if-no-files-found: warn
+
+  x11-pixels:
+    name: X11 pixels on GTK 3 (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: XTEST, GetImage, the owned selection and the held-input journal
+        env:
+          SPIKE_STAGES: pixels
+          SPIKE_CACHE: ${{ runner.temp }}/spike-cache
+        run: fixtures/linux/spike/spike.sh "$RUNNER_TEMP/spike-out" 1
+      - name: Keep what the session wrote
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-desktop-x11-pixels
+          path: ${{ runner.temp }}/spike-out
+          if-no-files-found: warn
+
+  no-c-deps:
+    name: no C library but the C runtime (build, test, aarch64 clippy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test in plain Ubuntu 24.04
+        run: fixtures/linux/spike/no_c_deps.sh "$RUNNER_TEMP/no-c-deps-out"
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-desktop-no-c-deps
+          path: ${{ runner.temp }}/no-c-deps-out
           if-no-files-found: warn
