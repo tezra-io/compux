@@ -6842,6 +6842,64 @@ mod tests {
         assert_eq!(v["capabilities"]["targets"], json!(false), "{v}");
     }
 
+    // Every reading of a Wayland session, with XWayland beside it or not, takes a
+    // route that binds no window, and its handshake leaves both verbs and the
+    // window capture out. A caller words a capture failure as a bound window's or
+    // the display's by whether `select_target` is listed, so a Wayland handshake
+    // that listed it would have its portal's failures told as a bound window's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_no_reading_of_a_wayland_session_lists_the_bound_window_verbs() {
+        use linux::display::Server;
+        use linux::pixels::{decide, Decision, Wayland};
+        let gnome = Wayland {
+            gnome: true,
+            running: Some(true),
+            registry: true,
+            screenshot: true,
+            remote_desktop: true,
+            screen_cast: true,
+            ..Wayland::default()
+        };
+        let readings = [
+            Some(gnome.clone()),
+            Some(Wayland {
+                gnome: false,
+                kde: true,
+                ..gnome.clone()
+            }),
+            Some(Wayland {
+                registry: false,
+                ..gnome.clone()
+            }),
+            Some(Wayland {
+                running: Some(false),
+                ..gnome.clone()
+            }),
+            None,
+        ];
+        for x11 in [false, true] {
+            for reading in &readings {
+                let pixels = match decide(Server::Wayland { x11 }, reading.as_ref()) {
+                    Decision::X11 => panic!("a Wayland session took the X11 route: {reading:?}"),
+                    Decision::Portal => Pixels::on_portal(linux::portal::Portal::with(
+                        Box::new(|| panic!("hello asked the portal")),
+                        None,
+                        linux::portal::Budgets::PORTAL,
+                    )),
+                    Decision::Refused(why) => Pixels::Refused(why),
+                };
+                let v = hello(&test_launcher(), &pixels).unwrap();
+                let actions = advertised(&v);
+                assert!(!actions.contains(&"select_target"), "{reading:?}: {v}");
+                assert!(!actions.contains(&"release_target"), "{reading:?}: {v}");
+                assert_eq!(v["capabilities"]["targets"], json!(false), "{v}");
+                let methods = v["capabilities"]["capture_methods"].to_string();
+                assert!(!methods.contains("window"), "{reading:?}: {v}");
+            }
+        }
+    }
+
     // A session that binds no window refuses a selection by name, before any
     // window server is asked anything.
     #[cfg(target_os = "linux")]
