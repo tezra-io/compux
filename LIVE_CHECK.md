@@ -2864,6 +2864,11 @@ the helper.
 
 ## C1. The handshake, one binding, and the badge (fails fastest; no input)
 
+This is the first L3 step, and the one most likely to fail on GNOME: compux sends
+no picture of a window until the window and GNOME's frame around it have redrawn
+every pixel of it after being asked to, and under Mutter that has never been
+seen.
+
 ```sh
 eval "$B --save ~/l3-images"
 ```
@@ -2872,6 +2877,14 @@ eval "$B --save ~/l3-images"
   `capabilities` say `"targets": true`, `"capture_methods": ["display",
   "window"]` and **`"indicator": "present"`**. `"missing"` means the badge is not
   beside the helper, and every step below fails. Stop and check C0's `ls`.
+* **What failure looks like.** The `bound` line is refused
+  `capture_unavailable`, its detail starting "the window's own picture could not
+  be proved" and counting the parts "not drawn within 1000 ms of asking it to
+  repaint". No picture is saved and no badge appears. Run it twice more, then
+  once with `--title` naming Text Editor's window. If every binding is refused
+  this way, the frame is never proved on this desktop: stop here, and send us
+  each detail line and how long each `bound` line took. Nothing from C2 on can
+  run.
 * The `bound` line says `"ok": true`, `"ax_binding": "bound"`, and a `width` and
   `height` that are the fixture window's size with its title bar. Open the saved
   picture (`saved` names it): it is the fixture window, title bar included, and
@@ -2883,11 +2896,6 @@ eval "$B --save ~/l3-images"
   sits just inside the window's top edge instead. Write down where it sits, and
   whether its text is sharp at your scale. The badge draws at a scale of 1 on any
   screen, so on a HiDPI panel it is small.
-* A refusal here of `capture_unavailable` that says the picture "could not be
-  proved" means the fixture, or GNOME's frame around it, did not repaint within a
-  second of being asked to (the detail counts the parts not drawn). Write down the
-  detail, try once more, and stop if it repeats: every binding on this desktop
-  would be refused the same way.
 
 Ctrl-D ends the session: the badge goes with it.
 
