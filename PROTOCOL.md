@@ -114,25 +114,25 @@ they are as protocol 11 had them.
   the rest of the binding, even when the X server has given its id to a new window of the same process: each
   request first has the watch read everything the server sent it, so a window closed before the request is never
   answered with its last picture.
-- **Frames** come from Composite: the window is redirected (Automatic) unless a compositing manager (GNOME
-  Shell's Mutter) already redirects it, and its pixmap is named and read, so a window another one covers is
-  still seen. A redirect fills the new pixmap with what the screen showed there, another window's pixels where
-  one covered it, so no pixel is sent until it is proved the window's own, whoever redirected it. Every
-  window the picture is drawn from (the window manager's frame and its decorations, the client and the
-  client's own windows) is cleared to its background and sent an Expose (`ClearArea` with exposures), and the
-  drawing that follows must reach every pixel of the picture, frame included, within 1 s. Clearing and that
-  Expose are the one side effect a selection has: the application repaints, and under a window manager that
-  composites nothing the window flashes its background once. A window that does not repaint in time (a hung
-  application, or one that draws only once) is `capture_unavailable` and nothing is held. The proof does not
-  depend on which windows are over it, so a window moving meanwhile changes nothing; one resized, hidden or
-  shown during it is refused at selection, and proved again later. A window mapped again, resized or given a
-  new border width is proved the same way before its next frame, and nothing of it is read until that holds;
-  a proof that falls short then is tried again at each of the next three intervals, and the binding ends
-  (`capture_unavailable`) if none holds. While it waits, a request for its picture is `capture_unavailable`
-  (retry in a moment), never the last frame: that one has the window's old size and contents. Any part of a
-  picture the proof did not reach (the frame extents moved it) is sent black. The picture is the window's listed
-  bounds, frame included, in root pixels at a scale of 1. A damaged window is read again at most ten times a
-  second; an undamaged one reports idle frames.
+- **Frames** come from Composite: the window is redirected (Automatic) unless a compositing manager (GNOME Shell's
+  Mutter) already redirects it, and its pixmap is named and read, so a window another one covers is still seen. A
+  redirect fills the new pixmap with what the screen showed there, another window's pixels where one covered it, so
+  no pixel is sent until it is proved the window's own, whoever redirected it. Every window the picture is drawn
+  from (the window manager's frame and its decorations, the client and the client's own windows) is cleared to its
+  background and sent an Expose (`ClearArea` with exposures), and the drawing that follows must reach every pixel
+  of the picture, frame included, within 1 s. Clearing and that Expose are the one side effect a selection has: the
+  application repaints, and under a window manager that composites nothing the window flashes its background once.
+  A window that does not repaint in time (a hung application, or one that draws only once) is `capture_unavailable`
+  and nothing is held, and so is a selection the X server does not let finish (the window watched, proved and its
+  first frame read) within 3 s. The proof does not depend on which windows are over it, so a window moving
+  meanwhile changes nothing; one resized, hidden or shown during it is refused at selection, and proved again
+  later. A window mapped again, resized or given a new border width is proved the same way before its next frame,
+  and nothing of it is read until that holds; a proof that falls short then is tried again at each of the next
+  three intervals, and the binding ends (`capture_unavailable`) if none holds. While it waits, a request for its
+  picture is `capture_unavailable` (retry in a moment), never the last frame: that one has the window's old size
+  and contents. Any part of a picture the proof did not reach (the frame extents moved it) is sent black. The
+  picture is the window's listed bounds, frame included, in root pixels at a scale of 1. A damaged window is read
+  again at most ten times a second; an undamaged one reports idle frames.
 - **Pixel actions** on a bound window need it topmost at the point, as on macOS (`target_obstructed`, naming the
   window in front). In front means a window the window manager lists in front of it, or any window the X server
   stacks above it that takes input at that point: menus, tooltips, notifications and a desktop shell's own
@@ -151,19 +151,19 @@ they are as protocol 11 had them.
   focuses it: 28 pixels high and at most 440 wide, at the window's left above its top edge, or just inside that
   edge where there is no room above, kept on the window's monitor and out of its panels. Only its two buttons take
   clicks (a Shape input region); a click anywhere else on it reaches the window under it. A button event another
-  program sends to it (`SendEvent`) is dropped and logged, so no program can pause, resume or stop the session
-  that way; input made through XTEST is the server's own, as the person's is, and nothing on X11 tells the two
-  apart, for the badge or any other window. It hides while the window is minimized or gone, or while another
-  window covers the area it would take. It raises itself, at most ten times a second, over a window the window
-  manager manages that moves, restacks or maps onto it (the bound window raised over it among them), and never
-  over an override-redirect one: the person's own menus and tooltips stay over it. While one of those is open
-  over it (above it, and taking input where the badge is), it does not raise itself at all, for a new state
-  either, and goes back on top when that window is unmapped. Its text is Noto Sans Regular, built in, at 13
-  pixels, in root pixels at a scale of 1 on any screen. It draws glyphs in the order the characters come, with
-  kerning and no shaping: right-to-left text reads in the wrong order, and a character the font lacks (CJK,
-  among others) is its missing-glyph box. It is a real window, so it shows in display screenshots, never in the
-  bound window's frames. A badge that cannot show itself (no SHAPE 1.1, or a display other than 24-bit TrueColor
-  with 32-bit pixels) exits, and a mutation on the window is then `control_surface_unavailable`.
+  program sends to it (`SendEvent`) is dropped and logged, so no program can pause, resume or stop the session that
+  way; input made through XTEST is the server's own, as the person's is, and nothing on X11 tells the two apart,
+  for the badge or any other window. It hides while the window is minimized or gone, or while another window covers
+  the area it would take. It goes back, at most ten times a second, just over a window the window manager manages
+  that moves, restacks or maps onto it (the bound window raised over it among them), never higher, and never over
+  an override-redirect one: the person's own menus and tooltips stay over it. While one of those is open over it
+  (above it, and taking input where the badge is), it does not raise itself at all, for a new state either, and
+  goes back on top when that window is unmapped. Its text is Noto Sans Regular, built in, at 13 pixels, in root
+  pixels at a scale of 1 on any screen. It draws glyphs in the order the characters come, with kerning and no
+  shaping: right-to-left text reads in the wrong order, and a character the font lacks (CJK, among others) is its
+  missing-glyph box. It is a real window, so it shows in display screenshots, never in the bound window's frames. A
+  badge that cannot show itself (no SHAPE 1.1, or a display other than 24-bit TrueColor with 32-bit pixels) exits,
+  and a mutation on the window is then `control_surface_unavailable`.
 
 ## 2. `elements`
 
