@@ -6,8 +6,8 @@ unchanged: the tagged frames, the generations, `mutation_seq`, `deadline_ms`, ob
 `check` kinds `image` and `none`. The README describes the protocol-11 surface in prose.
 
 Protocol 12 is M86 stage P2: the model's surface, defined once for macOS and Linux. The macOS build answers all of
-it. The Linux build answers the same wire through AT-SPI from M86 L1, all but `inspect` and the bound windows, and
-the refusals only Linux answers are named here with the rest.
+it. The Linux build answers the same wire through AT-SPI from M86 L1, all but `inspect`, and binds a window on X11
+only (M86 L3, §1.2). The refusals only Linux answers are named here with the rest.
 
 Every example is one JSON line on the wire, shown wrapped. Envelope fields (`sidecar_generation`,
 `session_generation`, `authorization_generation`, `mutation_seq`, `deadline_ms`) are left out of the examples where
@@ -29,9 +29,12 @@ they are as protocol 11 had them.
 - `protocol_version` is 12. A library at 12 refuses any other sidecar, as before.
 - `actions` lists only what this build can do (protocol 11 rule, M86 F1).
   - **macOS:** the list above.
-  - **Linux:** the list above without `inspect`, `select_target` and `release_target`. A request for `inspect` is
-    `unknown_action`: a Linux session does not place every control (GTK 4, Wayland), so no control is read at a
-    point.
+  - **Linux:** the list above without `inspect`. A request for `inspect` is `unknown_action`: a Linux session does
+    not place every control (GTK 4, Wayland), so no control is read at a point. `select_target` and
+    `release_target` are listed only on X11, the one session that can bind a window (§1.2); there `targets` is
+    true and `capture_methods` is `["display","window"]`. Elsewhere `targets` is false, `capture_methods` is
+    `["display"]` at most, and a `select_target` sent anyway is `target_binding_unavailable`. `indicator` says
+    whether the X11 badge, `compux-indicator-x11`, is beside the helper.
 - A Linux helper started with no display of its own takes the session's `DISPLAY`, `WAYLAND_DISPLAY` and
   `XAUTHORITY` from the user manager, as values; it never writes them into its environment. Its X connection is made
   to that display with that authority, so an adopted display is reached as the helper's own.
@@ -94,6 +97,49 @@ they are as protocol 11 had them.
   `Screenshot` wait on the person. A dialog answered no is `consent_refused`; one ended by the portal, or not
   answered within 25 s, is `consent_timeout`. Keys go only into a window that reads `ACTIVE` (`no_active_window`);
   the compositor drops a character its layout cannot type without saying so, so `type` is not refused for one here.
+
+### 1.2 Bound windows on X11
+
+`select_target` and `release_target` work on X11 as on macOS (the README's "One window, bound"). What differs:
+
+- **The windows.** `windows` reads the window manager's `_NET_CLIENT_LIST_STACKING`, front to back, at most 512
+  clients (a longer list is refused, never cut). A window's `bounds` are what the person sees: the client's
+  rectangle less the shadow GTK draws inside it (`_GTK_FRAME_EXTENTS`), plus the frame the window manager draws
+  around it (`_NET_FRAME_EXTENTS`). Its process is its `_NET_WM_PID`.
+- **The binding** is the window's X id, the X connection that watches it from the moment it is bound, and its
+  process with that process's start time. A window that names no process (no `_NET_WM_PID`, as a Qt popup) is
+  refused `target_binding_unavailable`. A window destroyed after it was bound is `target_unavailable` for the rest
+  of the binding, even when the X server has given its id to a new window of the same process: each request first
+  has the watch read everything the server sent it, so a window closed before the request is never answered with
+  its last picture.
+- **Frames** come from Composite: the window is redirected (Automatic), and its pixmap is named and read, so a
+  window another one covers is still seen. Where a compositing manager (GNOME Shell's Mutter) already redirects
+  it, that pixmap is the one the manager draws from. Where compux redirects it itself, the first picture must be
+  proved to be the window's own: the windows above it must not move while it is redirected, and it must repaint
+  every part of itself the screen was not showing within 1 s. A window that cannot be proved is
+  `capture_unavailable` and nothing is held. A window mapped again or resized is proved the same way before its
+  next frame. The picture is the window's listed bounds, frame included, in root pixels at a scale of 1. A
+  damaged window is read again at most ten times a second; an undamaged one reports idle frames.
+- **Pixel actions** on a bound window need it topmost at the point, as on macOS (`target_obstructed`, naming the
+  window in front). In front means listed by the window manager: menus, tooltips and other override-redirect
+  windows are not, so they never refuse a click.
+- **Controls.** `ax_binding` is `bound` when exactly one of the application's AT-SPI windows has the X window's
+  title and place (with or without the window manager's frame). GTK 4 places no window on X11 (its screen extents
+  are 0, 0), so a GTK 4 window binds with `ax_binding: "unavailable"`, and `elements` in it is
+  `ax_binding_unavailable`.
+- **The badge** is `compux-indicator-x11`, a second binary beside the helper, which starts it when a window is
+  bound and ends it at release (its pipe closes) or with the helper. It speaks the macOS badge's line wire, and its
+  Pause and Stop reach the same gate. It is an override-redirect window, so the window manager never manages or
+  focuses it: 28 pixels high and at most 448 wide, at the window's left above its top edge, or just inside that
+  edge where there is no room above, kept on the window's monitor and out of its panels. Only its two buttons take
+  clicks (a Shape input region); a click anywhere else on it reaches the window under it. It hides while the
+  window is minimized or gone, or while another window covers the area it would take, and it raises itself over a
+  window that comes above it at most ten times a second. Its text is Noto Sans Regular, built in, at 13 pixels,
+  in root pixels at a scale of 1 on any screen. It draws glyphs in the order the characters come, with kerning
+  and no shaping: right-to-left text reads in the wrong order, and a character the font lacks (CJK, among
+  others) is its missing-glyph box. It is a real window, so it shows in display screenshots, never in the bound
+  window's frames. A badge that cannot show itself (no SHAPE 1.1, or a display other than 24-bit TrueColor with
+  32-bit pixels) exits, and a mutation on the window is then `control_surface_unavailable`.
 
 ## 2. `elements`
 
@@ -635,12 +681,12 @@ Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux bu
 
 | Code | When |
 |---|---|
-| `target_unavailable` | The bound window is gone, or the `target_id` is not the one bound. |
+| `target_unavailable` | The bound window is gone, or the `target_id` is not the one bound. On Linux (X11) also a window destroyed after it was bound, whatever window has its id now, and a window whose process would not say when it started. |
 | `target_minimized` | The bound window is minimized. |
 | `target_obstructed` | A pixel action on the bound window where something covers that point. |
-| `control_surface_unavailable` | No ownership badge is running for a mutation on a bound window. |
+| `control_surface_unavailable` | No ownership badge is running for a mutation on a bound window: on Linux, `compux-indicator-x11` is not beside the helper, or it exited (§1.2). |
 | `ax_binding_unavailable` | The bound window has no accessibility element to list from. |
-| `target_binding_unavailable` | Linux: a window that cannot be proven to be the frame it claims (X11 EWMH match), or any binding on Wayland. |
+| `target_binding_unavailable` | Linux: `select_target` on a session that can bind no window (any but X11's), or on an X11 window that names no process (`_NET_WM_PID`). |
 
 **Controls**
 

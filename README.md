@@ -99,6 +99,13 @@ it carries the numbers rather than mapping a coordinate through them.
 There is no "desktop" target: a call with no `:target_id` is the display-level path
 this library has always had, unchanged.
 
+On Linux a window is bound on X11 only, where the window manager says which window
+is which and Composite reads one: `hello` lists `select_target` and
+`release_target` there and nowhere else, and a selection sent anyway is
+`target_binding_unavailable`. The X11 differences (which window counts as in
+front, GTK 4's `ax_binding`, what the badge draws) are in PROTOCOL.md, "Bound
+windows on X11".
+
 ## Coordinates name their image
 
 Every reply that hands you coordinates carries an `observation_id`, and every call
@@ -371,7 +378,10 @@ end
 
 `Compux.Binary.path!/0` resolves the sidecar for the host: a checksum-verified
 per-target binary downloaded once from the GitHub release and cached, or — with
-`COMPUX_BUILD=1` — the local `cargo build --release` output (the dev loop). An
+`COMPUX_BUILD=1` — the local `cargo build --release` output (the dev loop). On
+Linux the release archive carries the X11 badge, `compux-indicator-x11`, beside
+the helper, and the licence of the font built into it; an archive without the
+badge is refused and nothing is cached. An
 embedder that manages its own signed install passes an explicit `:binary_path` to
 `Compux.start/1` instead.
 
@@ -394,7 +404,11 @@ routes"):
   action is journalled under `$XDG_RUNTIME_DIR`, and the next helper releases what
   a killed one left held; without a journal it can write there, a drag, a click
   or chord with modifiers, or a paste sends nothing and fails, naming the
-  directory.
+  directory. One window can be bound (see "One window, bound"): it is read
+  through Composite, so it is seen while another window covers it, and the
+  badge over it is `compux-indicator-x11`, a second binary that ships beside the
+  helper and draws its text from the Noto Sans font built into it
+  (PROTOCOL.md, "Bound windows on X11").
 - **GNOME Wayland:** capture and input through the XDG desktop portal
   (xdg-desktop-portal 1.18 or later, which registers compux as
   `io.tezra.fermix.ComputerUse`): the portal asks the person once, and a restore

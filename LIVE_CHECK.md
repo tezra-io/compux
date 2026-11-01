@@ -2804,3 +2804,170 @@ the click lands where it was aimed.
   as one 1280×800 monitor at 200%, and compux takes them as that one monitor (its
   clicks would then land in the wrong place). If the VM can show four monitors,
   write down what compux's screenshot and one click do there.
+
+---
+
+# Live check — one window bound on X11, and its badge (M86 L3)
+
+**What this is for.** On X11 the Linux build now binds a window. It reads the
+bound window through Composite, so the window is still seen while another covers
+it. It refuses a click on a covered point and refuses a window that was closed,
+even when a new window gets its X id. It puts a badge over the window
+(`compux-indicator-x11`, a second binary beside the helper) whose Pause and Stop
+reach the helper's gate. All of this passes in private containers: Xvfb, openbox
+and the GTK 3 fixture (`fixtures/linux/spike/spike.sh`, stage `bound`). There, the
+person's clicks on the badge are judged by the gate and by what the window under a
+missed click recorded. None of it has met GNOME Shell. Mutter redirects every
+window itself, so on your desktop compux reads Mutter's pixmap instead of
+redirecting the window and proving it. That path, a real GPU, your monitor and the
+badge's look are what this check is for.
+
+Expected outcome in one line: the bound fixture is seen under a covering window, a
+click there is refused, and twenty bindings leave no badge behind. The badge sits
+on the fixture's top edge, never takes your focus, and its buttons pause and stop
+the helper.
+
+> **Steps C3 to C6 POST REAL INPUT**: clicks into the GTK 3 fixture, and your own
+> clicks and typing. C1 and C2 send no input, but every step from C1 on reads
+> one window and puts the badge on your screen. Nothing here may be run by an
+> agent. Run it yourself, at the machine, with nothing confidential on screen.
+
+## C0. Preconditions
+
+* The build, from the branch with L3 on it. One `cargo build` builds the helper
+  and the badge into the same directory, which is where the helper looks for it:
+
+  ```sh
+  cd ~/src/compux && git switch feat/m86
+  (cd native/compux && cargo build --release)
+  CX=$PWD/native/compux/target/release/compux
+  ls native/compux/target/release/compux-indicator-x11      # must exist
+  ```
+
+* The GTK 3 fixture in its own terminal: `python3 fixtures/linux/fixture_gtk3.py
+  --state-file /tmp/gtk3.json`. To read what it recorded: `python3 -m json.tool
+  /tmp/gtk3.json | tail -20`. Text Editor open beside it, as the window you type
+  into and cover the fixture with.
+* `fixtures/linux/spike/owner/owner_bound.py` drives every step. `cx.py` cannot
+  drive them: a badge press writes an event line, which cx.py would read as the
+  next reply. The script binds the window titled exactly `--title` and reads one
+  JSON action per line. It sends each action in the bound window, takes a fresh
+  picture of the window before a click, prints every badge press the moment it
+  arrives (`event`), and with `--save` writes every picture to that directory.
+  The commands below shorten it to `B`:
+
+  ```sh
+  B="python3 fixtures/linux/spike/owner/owner_bound.py --binary $CX --title 'Compux Fixture GTK3'"
+  ```
+
+## C1. The handshake, one binding, and the badge (fails fastest; no input)
+
+```sh
+eval "$B --save ~/l3-images"
+```
+
+* The `hello` line lists `select_target` and `release_target`, and its
+  `capabilities` say `"targets": true`, `"capture_methods": ["display",
+  "window"]` and **`"indicator": "present"`**. `"missing"` means the badge is not
+  beside the helper, and every step below fails. Stop and check C0's `ls`.
+* The `bound` line says `"ok": true`, `"ax_binding": "bound"`, and a `width` and
+  `height` that are the fixture window's size with its title bar. Open the saved
+  picture (`saved` names it): it is the fixture window, title bar included, and
+  nothing around it. Write down how long the line took to come.
+* **The badge is on screen**, a dark strip 28 pixels high: a green dot,
+  `Fermix`, `Fixture_gtk3.py — Compux Fixture GTK3`, then **Pause** and
+  **Stop**. It sits at the fixture's left, just above its title bar. With the
+  fixture maximized there is no room above it (the top bar is there), so the badge
+  sits just inside the window's top edge instead. Write down where it sits, and
+  whether its text is sharp at your scale. The badge draws at a scale of 1 on any
+  screen, so on a HiDPI panel it is small.
+* A refusal here of `capture_unavailable` that says the picture "could not be
+  proved" means compux found the window not redirected and redirected it itself:
+  Mutter is not compositing it. Write down the detail and stop.
+
+Ctrl-D ends the session: the badge goes with it.
+
+## C2. Twenty bindings, and nothing left behind (no input)
+
+```sh
+eval "$B --cycles 20"
+pgrep -fc compux-indicator-x11      # after it ends: 0
+```
+
+Twenty lines of `bound True … badge up True, released True, badge gone True`, and
+a last line `PASS` with no failed cycles, no badges left and resident memory
+growth under 4096 kB after the fifth cycle. The badge flickers on and off twenty
+times. It must not once take the focus from the window you were in.
+
+## C3. A covered window is seen, and a click on it is refused
+
+Start a session (`eval "$B --save ~/l3-images"`). Put Text Editor over the
+fixture so that none of the fixture shows, and keep Text Editor clear of the strip
+above the fixture where the badge sits. Then:
+
+* `{"action":"screenshot"}`: the saved picture is the fixture window, complete,
+  with none of Text Editor in it.
+* **`{"action":"left_click","x":200,"y":120}`**, a point inside the fixture and
+  under Text Editor: it must be refused **`target_obstructed`**, naming Text
+  Editor's window. The pointer does not move, nothing is raised, and
+  `/tmp/gtk3.json` records nothing new. A click that lands anywhere is a defect: write down
+  where.
+* Now move Text Editor over the badge's strip as well: the badge hides. Move
+  Text Editor away: the badge comes back within about a quarter of a second.
+
+## C4. The badge takes nothing from you (your own input)
+
+With the session still bound and the badge showing:
+
+* **Click into Text Editor and type a sentence.** Every character lands in Text
+  Editor. The badge does not appear in Alt-Tab and never takes the caret.
+* **Drag the fixture window** a few hundred pixels: the badge follows it within
+  about a quarter of a second.
+* **Click on the badge's text, away from its two buttons.** The click reaches the
+  window under it (the fixture's title bar, or whatever is there), as if the badge
+  were not there.
+
+## C5. Pause, Resume and Stop reach the helper (POSTS INPUT)
+
+In the same session, Text Editor focused:
+
+* **Press Pause on the badge.** The session prints `event` with `operator_pause`.
+  The badge's green dot becomes two orange bars, and **Pause** becomes
+  **Resume**. Text Editor still has the focus: type a word and it lands there.
+  **`{"action":"left_click","element_ref":"<GTK3 button>"}`** is refused
+  `paused`, and the fixture records nothing. Take the reference from an
+  `{"action":"elements"}` line.
+* **Press Resume.** `event` with `operator_resume`; the badge is green again.
+  **The same click** now lands: the fixture records the press.
+* **Press Stop.** `event` with `operator_stop`, and the next click is refused
+  `paused`. **Press Resume** to go on.
+
+## C6. Minimize, close, relaunch
+
+Each with the window still bound, in the session:
+
+* **Minimize the fixture**, then `{"action":"screenshot"}`: `target_minimized`,
+  and the badge hides. Restore the fixture, then `{"action":"screenshot"}`: the
+  picture is the fixture again.
+* **Close the fixture window** (its close button), then
+  `{"action":"screenshot"}`: `target_unavailable`, and the detail says the
+  window was closed after it was bound. The badge hides.
+* **Start the fixture again**, then `{"action":"screenshot"}` once more: still
+  `target_unavailable`. The new window is another window even if it got the same
+  X id, and only a new `select_target` binds it. The containers prove the case of
+  the same id given to a new window of the same process. GNOME cannot be made to
+  reuse an id on demand.
+
+## C7. What C cannot prove
+
+* A GTK 4 window. Bind one (GNOME Settings, `--title Settings`): the binding
+  should say `"ax_binding": "unavailable"`, and `elements` in it should be
+  `ax_binding_unavailable`, because GTK 4 places no window on X11. Write down
+  what it says.
+* A title the badge's font cannot draw. Noto Sans has no CJK, so a title in
+  Chinese or Japanese shows the font's missing-glyph boxes, and right-to-left text
+  reads in the wrong order. If you have such a window, bind it and write down
+  how the badge reads.
+* The proof compux runs when it redirects a window itself, which happens only
+  under a window manager that does not composite. The containers prove it under
+  openbox; on GNOME it never runs.
