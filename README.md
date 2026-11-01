@@ -290,7 +290,9 @@ that promises not to take the focus should have to say when it did.
 `PROTOCOL.md` is the contract; in short:
 
 * **Where a listing looks.** `scope` is `window`, `app`, `focused`, `menu` or
-  `dialog`; `query` lists only what matches a role and/or a name, wherever it is;
+  `dialog`; with a target, `focused`, `menu` and `dialog` are the bound
+  window's alone, and a reference is used only under the binding it was listed
+  under; `query` lists only what matches a role and/or a name, wherever it is;
   `skeleton` stops three levels down and names what each cut hides; `root` drills
   into one control of a listing, keeping the listing's other references, and takes
   a `query` or a `skeleton` inside it.

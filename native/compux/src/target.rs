@@ -627,23 +627,39 @@ fn matches_window(
         return false;
     };
     let titled = facts.label.unwrap_or_default() == window.title;
-    let placed = facts
-        .frame
-        .map(|frame| {
-            let frame = Bounds {
-                x: frame.x,
-                y: frame.y,
-                w: frame.w,
-                h: frame.h,
-            };
-            [Some(window.bounds), window.content]
-                .into_iter()
-                .flatten()
-                .any(|bounds| frame.matches(&bounds, AX_MATCH_TOLERANCE))
-        })
-        .unwrap_or(false);
+    let placed = facts.frame.is_some_and(|frame| placed(frame, window));
 
     titled && placed
+}
+
+/// Whether an accessibility frame is this window's rectangle: its bounds, or its
+/// own area without the window manager's frame where the window server tells the
+/// two apart, within [`AX_MATCH_TOLERANCE`].
+fn placed(frame: crate::ax::Frame, window: &WindowFacts) -> bool {
+    let frame = Bounds {
+        x: frame.x,
+        y: frame.y,
+        w: frame.w,
+        h: frame.h,
+    };
+    [Some(window.bounds), window.content]
+        .into_iter()
+        .flatten()
+        .any(|bounds| frame.matches(&bounds, AX_MATCH_TOLERANCE))
+}
+
+/// Whether a surface in a top-level accessibility window of its own, at `frame`,
+/// is the bound window's: exactly one of the application's windows (`family`) is
+/// placed there, as a bound window is matched, and it is one of the `owned`. The
+/// title is not compared: toolkits name a dialog's or a menu's window differently
+/// on the two sides. Two windows at one rectangle could be either, and neither is
+/// claimed.
+pub fn tied(frame: crate::ax::Frame, family: &[WindowFacts], owned: &[u32]) -> bool {
+    let mut there = family.iter().filter(|window| placed(frame, window));
+    match (there.next(), there.next()) {
+        (Some(window), None) => owned.contains(&window.id),
+        _ => false,
+    }
 }
 
 /// The methods this binding really offers. `ax` only where an accessibility window
@@ -1615,6 +1631,44 @@ mod tests {
         assert_eq!(
             bind_accessibility(&off_ax, &listed).0,
             AxBinding::Unavailable
+        );
+    }
+
+    // A surface in a window of its own is the bound window's when exactly one of
+    // the application's windows sits at its frame, at either side of the window
+    // manager's frame, and the window server says that window belongs to the
+    // bound one. The title is not compared: a GTK 3 message dialog is named by its
+    // message type where its window has its title, and a menu's window is named
+    // nothing on one side and the program on the other.
+    #[test]
+    fn a_surface_is_tied_to_the_one_window_at_its_frame_and_owned_through_it() {
+        let dialog = at(115.0, 189.0, 214.0, 102.0);
+        let client = at(116.0, 209.0, 212.0, 81.0);
+        let family = vec![
+            window(10, 200, at(0.0, 0.0, 400.0, 300.0)),
+            WindowFacts {
+                content: Some(client),
+                transient_for: Some(10),
+                ..window(12, 200, dialog)
+            },
+        ];
+        let owned = [12];
+
+        assert!(tied(ax_frame(dialog), &family, &owned));
+        assert!(tied(ax_frame(client), &family, &owned));
+        assert!(
+            !tied(ax_frame(dialog), &family, &[]),
+            "at its frame, and nobody's"
+        );
+        assert!(
+            !tied(ax_frame(at(155.0, 189.0, 214.0, 102.0)), &family, &owned),
+            "somewhere else"
+        );
+
+        let twins = vec![family[1].clone(), window(13, 200, dialog)];
+        assert!(
+            !tied(ax_frame(dialog), &twins, &owned),
+            "two windows there: either could be it"
         );
     }
 

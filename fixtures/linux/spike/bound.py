@@ -25,6 +25,11 @@ under where the badge floats. Then:
   rectangles only;
 - a click on the bound window's button lands (the fixture recorded it); one at a
   point the cover hides is `target_obstructed`, and nothing recorded it;
+- the fixture's Clear All, pressed through the binding, opens its dialog in a
+  window of its own, WM_TRANSIENT_FOR the fixture: the press's check and its
+  receipt see it, the dialog scope lists its Cancel, focus in it is not the bound
+  window's own (`focused` says it is in another window), Cancel pressed from that
+  listing closes it, and the scope then says no dialog of the bound window is open;
 - an override-redirect popup, which no window manager lists, over the button
   refuses the click `target_obstructed`, naming it, and nothing is recorded; with
   its input region set clear of that point, the same click lands;
@@ -541,6 +546,95 @@ def target_click_check(helper, target, state):
     return {"flow": "click in the bound window", "passed": bool(reply.get("ok")) and event is not None,
             "why": f"reply {reply.get('error') or 'ok'} {reply.get('detail') or ''}, recorded {event}",
             "input_method": reply.get("receipt", {}).get("input_method")}
+
+
+def bound_find(helper, target, role, name, scope=None):
+    """The one control of this role named `name` in the bound window's listing (of
+    `scope`, else the window), and the listing; asked again while it comes up."""
+    fields = {"target_id": target, "deadline_ms": 10000,
+              "query": {"role": role, "name": name}}
+    if scope:
+        fields["scope"] = scope
+    listing = {}
+    for _ in range(WAIT_TRIES // 4):
+        _, listing = helper.ask("elements", **fields)
+        matches = [element for element in listing.get("elements", [])
+                   if element.get("label") == name and element.get("element_ref")]
+        if listing.get("ok") and matches:
+            return matches[0], listing
+        time.sleep(WAIT_STEP_S * 4)
+    return None, listing
+
+
+def no_dialog(helper, target):
+    """The dialog scope's refusal once no dialog of the bound window is open."""
+    listing = {}
+    for _ in range(WAIT_TRIES // 4):
+        _, listing = helper.ask("elements", target_id=target, scope="dialog", deadline_ms=10000)
+        if listing.get("error") == "scope_not_found":
+            return listing
+        time.sleep(WAIT_STEP_S * 4)
+    return listing
+
+
+def close_unbound(helper):
+    """Cancel the dialog through the application's own listing, so a check that
+    could not reach it through the binding leaves no modal window over the steps
+    after it."""
+    _, listing = helper.ask("elements", scope="dialog", deadline_ms=10000,
+                            query={"role": "button", "name": "Cancel"})
+    matches = [element for element in listing.get("elements", [])
+               if element.get("label") == "Cancel" and element.get("element_ref")]
+    if listing.get("ok") and matches:
+        helper.ask("press", mutation=True, observation_id=listing["observation_id"],
+                   element_ref=matches[0]["element_ref"])
+
+
+def bound_dialog_check(helper, target, state):
+    """The fixture's modal dialog is a window of its own, WM_TRANSIENT_FOR the bound
+    one, so it is the bound window's: Clear All pressed through the binding opens it
+    and the press's check and receipt see it; the dialog scope lists Cancel; focus in
+    the dialog is in another window than the bound one; Cancel, pressed from that
+    listing through the binding, closes it; then no dialog of the bound window is
+    open."""
+    flow = "the bound window's transient dialog is its own, and focus in it is not"
+    clear, listing = bound_find(helper, target, "button", "Clear All…")
+    if clear is None:
+        return {"flow": flow, "passed": False, "why": f"Clear All… not listed: {listing}"}
+    since = len(events(state))
+    _, pressed = helper.ask("press", mutation=True, observation_id=listing["observation_id"],
+                            element_ref=clear["element_ref"], target_id=target,
+                            check={"kind": "semantic",
+                                   "until": {"kind": "appears", "role": "button",
+                                             "name": "Cancel", "scope": "dialog",
+                                             "timeout_ms": 3000}},
+                            deadline_ms=10000)
+    opened = recorded(state, since, "gtk3", "dialog", "open", None)
+    receipt = pressed.get("receipt", {})
+    surfaces = [surface.get("kind") for surface in receipt.get("surfaces", [])]
+    until = receipt.get("check", {}).get("until")
+    _, focused = helper.ask("elements", target_id=target, scope="focused", deadline_ms=10000)
+    elsewhere = (focused.get("error") == "scope_not_found"
+                 and "another window" in (focused.get("detail") or ""))
+    cancel, dialog = bound_find(helper, target, "button", "Cancel", scope="dialog")
+    cancelled, event = {"error": "not sent"}, None
+    if cancel is not None:
+        since = len(events(state))
+        _, cancelled = helper.ask("press", mutation=True, observation_id=dialog["observation_id"],
+                                  element_ref=cancel["element_ref"], target_id=target)
+        event = recorded(state, since, "gtk3", "dialog", "cancel", None)
+    else:
+        close_unbound(helper)
+    closed = no_dialog(helper, target)
+    gone = "of the bound window" in (closed.get("detail") or "")
+    passed = (bool(pressed.get("ok")) and bool(opened) and until == "met"
+              and bool({"dialog", "alert"} & set(surfaces)) and elsewhere
+              and cancel is not None and bool(cancelled.get("ok")) and bool(event) and gone)
+    return {"flow": flow, "passed": passed,
+            "why": f"press {pressed.get('error') or 'ok'}, opened {bool(opened)}, until {until}, "
+                   f"surfaces {surfaces}; focused {focused.get('error')}: {focused.get('detail')}; "
+                   f"Cancel listed {cancel is not None}, pressed {cancelled.get('error') or 'ok'}, "
+                   f"recorded {bool(event)}; then {closed.get('error')}: {closed.get('detail')}"}
 
 
 def popup_check(helper, target, state, display):
@@ -1199,6 +1293,7 @@ def bound_steps(helper, display, args, records):
     badge, shown = badge_check(display, helper, fixture)
     yield shown
     yield target_click_check(helper, target, args.state)
+    yield bound_dialog_check(helper, target, args.state)
     yield popup_check(helper, target, args.state, display)
     yield obstructed_check(helper, target, args.state, fixture, cover, records[COVER])
     if badge is None:

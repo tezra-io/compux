@@ -404,7 +404,9 @@ defmodule Compux do
 
   Options beside `:region`, `:display` and `:observation_id`:
     * `:scope` — where the walk starts: `:window`, `:app`, `:focused`, `:menu`,
-      `:dialog`.
+      `:dialog`. With a `:target_id`, `:focused`, `:menu` and `:dialog` are the
+      bound window's own: focus or a surface in another window of the
+      application is `scope_not_found`, saying so.
     * `:query` — `%{"role" => role, "name" => text}` (either or both): only the
       matching nodes, wherever they are in the scope.
     * `:skeleton` — `true` cuts the walk at depth 3; a cut container says how many

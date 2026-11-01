@@ -12,6 +12,7 @@
 //! timeout passes.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
@@ -22,6 +23,7 @@ use crate::ax::{
 use crate::gate::{Clock, Gate, Phase};
 use crate::roles;
 use crate::tree::{Query, Shape, Walk};
+use crate::window_server::{owned_by, WindowFacts, Windows};
 use crate::wire::{Effect, Failure};
 
 /// How often a wait looks at the tree.
@@ -99,10 +101,20 @@ impl Scope {
 
 /// The application a listing or a condition reads, and the bound window when
 /// there is one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Scene {
     pub pid: i32,
-    pub window: Option<Handle>,
+    pub window: Option<Bound>,
+}
+
+/// A bound window, as a scene reads it: its accessibility element, which the
+/// target holds, its id on the window server, and the window server that says
+/// which windows are its own.
+#[derive(Clone)]
+pub struct Bound {
+    pub element: Handle,
+    pub id: u32,
+    pub windows: Arc<dyn Windows>,
 }
 
 /// What an `elements` request asks for beyond protocol 11.
@@ -260,26 +272,49 @@ pub fn roots(ax: &Rc<dyn Ax>, scene: &Scene, scope: Scope) -> Result<Roots, NoRo
                 .to_string(),
         ))),
         Scope::App => Ok(Roots::App),
-        Scope::Window => match scene.window {
-            Some(window) => Ok(Roots::Window(window)),
+        Scope::Window => match &scene.window {
+            Some(bound) => Ok(Roots::Window(bound.element)),
             None => ax
                 .focused(ax, scene.pid, Focus::Window)
                 .map(|window| Roots::Held(vec![window]))
                 .ok_or_else(|| missing("there is no focused window")),
         },
-        Scope::Focused => ax
-            .focused(ax, scene.pid, Focus::Element)
-            .map(|element| Roots::Held(vec![element]))
-            .ok_or_else(|| missing("nothing is focused")),
-        Scope::Menu => open(ax, scene.pid, &["menu"], "menu"),
-        Scope::Dialog => open(ax, scene.pid, &["dialog", "alert"], "dialog"),
+        Scope::Focused => focused(ax, scene),
+        Scope::Menu => open(ax, scene, &["menu"], "menu"),
+        Scope::Dialog => open(ax, scene, &["dialog", "alert"], "dialog"),
     }
 }
 
-/// The surfaces of these kinds open in the application, as roots. None open is
+/// The focused element, as a root: under a binding, only one inside the bound
+/// window. Focus in another window of the application is no root, and the
+/// sentence says where it is.
+fn focused(ax: &Rc<dyn Ax>, scene: &Scene) -> Result<Roots, NoRoot> {
+    let found = match &scene.window {
+        None => ax.focused(ax, scene.pid, Focus::Element),
+        Some(bound) => ax.focused_in(ax, bound.element),
+    };
+    if let Some(element) = found {
+        return Ok(Roots::Held(vec![element]));
+    }
+    let detail = match &scene.window {
+        None => "nothing is focused in the application",
+        Some(_) if ax.focused(ax, scene.pid, Focus::Element).is_some() => {
+            "focus is in another window of the application, not the bound one: list the bound \
+             window (scope window) or a dialog or menu of it (scope dialog, scope menu), or \
+             release the target to read the application's focus"
+        }
+        Some(_) => "nothing is focused in the bound window",
+    };
+    Err(NoRoot::Missing {
+        detail: detail.to_string(),
+        unseen: None,
+    })
+}
+
+/// The surfaces of these kinds the scene sees, as roots. None open is
 /// `scope_not_found` naming `what`, proven only by a scan that saw everything.
-fn open(ax: &Rc<dyn Ax>, pid: i32, kinds: &[&str], what: &str) -> Result<Roots, NoRoot> {
-    let seen = surfaces(ax, pid);
+fn open(ax: &Rc<dyn Ax>, scene: &Scene, kinds: &[&str], what: &str) -> Result<Roots, NoRoot> {
+    let seen = surfaces(ax, scene).map_err(NoRoot::Refused)?;
     let held: Vec<Retained> = seen
         .found
         .into_iter()
@@ -289,9 +324,14 @@ fn open(ax: &Rc<dyn Ax>, pid: i32, kinds: &[&str], what: &str) -> Result<Roots, 
     if !held.is_empty() {
         return Ok(Roots::Held(held));
     }
-    let detail = match seen.stopped {
-        None => format!("no {what} is open in the application"),
-        Some(why) => format!(
+    let detail = match (seen.stopped, &scene.window) {
+        (None, None) => format!("no {what} is open in the application"),
+        (None, Some(_)) => format!(
+            "no {what} of the bound window is open, and one open in another window of the \
+             application is not this window's: release the target to list the application's \
+             {what}s"
+        ),
+        (Some(why), _) => format!(
             "the look for an open {what} stopped before it finished ({}), so whether one is \
              open is not known: look again, or list the window and find its controls there",
             stopped_because(why)
@@ -355,34 +395,36 @@ pub struct Surfaces {
     pub stopped: Option<&'static str>,
 }
 
-/// The surfaces open in one application: its windows and their children, and the
-/// menu of a menu-bar item that reads selected, reading at most
-/// [`MAX_SURFACE_NODES`] nodes. A node the platform says is off screen is no
-/// surface, and nothing below it is looked at.
+/// The surfaces a scene sees, the one answer the `menu` and `dialog` scopes, the
+/// menu conditions and a receipt all read. Unbound, those open in the application:
+/// its windows and their children, and the menu of a menu-bar item that reads
+/// selected. Bound, the bound window's own: the window and what is inside it, and
+/// what is in a window the window server says is its own, transient for it
+/// directly or through a chain ([`MAX_TRANSIENT_HOPS`]). Where the window server
+/// marks no window as another's (macOS), that is only what is inside it.
 ///
-/// A node that will not answer is passed over, and one that does not answer in time
-/// ends the scan: it is a bounded look, not a census, and what it reports is what
-/// it could name, and whether it saw all it looks at.
-pub fn surfaces(ax: &Rc<dyn Ax>, pid: i32) -> Surfaces {
-    let Some(app) = ax.application(ax, pid) else {
-        return Surfaces {
-            found: Vec::new(),
-            stopped: None,
-        };
-    };
+/// A scan reads at most [`MAX_SURFACE_NODES`] nodes. A node the platform says is
+/// off screen is no surface, and nothing below it is looked at. A node that will
+/// not answer is passed over, and one that does not answer in time ends the scan:
+/// it is a bounded look, not a census, and what it reports is what it could name,
+/// and whether it saw all it looks at.
+///
+/// [`MAX_TRANSIENT_HOPS`]: crate::window_server::MAX_TRANSIENT_HOPS
+pub fn surfaces(ax: &Rc<dyn Ax>, scene: &Scene) -> Result<Surfaces, Failure> {
     let mut scan = Scan {
         ax,
         read: 0,
         stopped: None,
         found: Vec::new(),
     };
-    for child in scan.kids(app.handle()) {
-        scan.top(child);
+    match &scene.window {
+        None => scan.application(scene.pid),
+        Some(bound) => scan.bound(scene.pid, bound)?,
     }
-    Surfaces {
+    Ok(Surfaces {
         found: scan.found,
         stopped: scan.stopped,
-    }
+    })
 }
 
 /// One scan for surfaces in progress.
@@ -397,6 +439,52 @@ struct Scan<'a> {
 }
 
 impl Scan<'_> {
+    /// Every child of the application.
+    fn application(&mut self, pid: i32) {
+        let Some(app) = self.ax.application(self.ax, pid) else {
+            return;
+        };
+        for child in self.kids(app.handle()) {
+            self.top(child);
+        }
+    }
+
+    /// A bound window's own surfaces: the window read as a child of the
+    /// application is, then the children of the application that sit in one of
+    /// the windows the window server says are its own.
+    fn bound(&mut self, pid: i32, bound: &Bound) -> Result<(), Failure> {
+        let family = bound.windows.family(pid).map_err(|why| {
+            Failure::new(
+                "target_unavailable",
+                format!(
+                    "the window server would not say which windows are the bound window's \
+                     ({why}): release the target to read the application's"
+                ),
+            )
+        })?;
+        let window = self
+            .ax
+            .retain_again(self.ax, bound.element)
+            .ok_or_else(|| {
+                Failure::new(
+                    "target_unavailable",
+                    "the bound window is no longer held: select the target again".to_string(),
+                )
+            })?;
+        self.top(window);
+        let owned = owned_by(&family, bound.id);
+        if owned.is_empty() {
+            return Ok(());
+        }
+        let Some(app) = self.ax.application(self.ax, pid) else {
+            return Ok(());
+        };
+        for child in self.kids(app.handle()) {
+            self.owned_top(child, &family, &owned);
+        }
+        Ok(())
+    }
+
     /// Stop asking anything, for the first reason met.
     fn stop(&mut self, why: &'static str) {
         self.stopped.get_or_insert(why);
@@ -452,14 +540,34 @@ impl Scan<'_> {
     /// A child of the application: the menu bar, a surface, or a window whose
     /// children may be. Held while its children are read through it.
     fn top(&mut self, node: Retained) {
-        let handle = node.handle();
-        let Some(facts) = self.facts(handle).filter(|facts| !facts.hidden) else {
+        let Some(facts) = self.facts(node.handle()).filter(|facts| !facts.hidden) else {
             return;
         };
-        if is_menu_bar(&facts) {
+        self.top_read(&facts, node);
+    }
+
+    /// A child of the application read as [`Scan::top`] reads it, when its frame
+    /// ties it to one of the bound window's own windows (`owned`, out of the
+    /// application's windows `family`).
+    fn owned_top(&mut self, node: Retained, family: &[WindowFacts], owned: &[u32]) {
+        let Some(facts) = self.facts(node.handle()).filter(|facts| !facts.hidden) else {
+            return;
+        };
+        if facts
+            .frame
+            .is_some_and(|frame| crate::target::tied(frame, family, owned))
+        {
+            self.top_read(&facts, node);
+        }
+    }
+
+    /// What [`Scan::top`] does with a child of the application once read.
+    fn top_read(&mut self, facts: &Facts, node: Retained) {
+        let handle = node.handle();
+        if is_menu_bar(facts) {
             return self.menu_bar(handle);
         }
-        let Some(_held) = self.keep(&facts, node) else {
+        let Some(_held) = self.keep(facts, node) else {
             return;
         };
         for child in self.kids(handle) {
@@ -811,7 +919,7 @@ pub fn look(at: &Looking<'_>, condition: &Condition, deadline_ms: u64) -> Result
             },
         ),
         Condition::MenuClosed => {
-            let seen = surfaces(at.ax, at.scene.pid);
+            let seen = surfaces(at.ax, &at.scene)?;
             let open = seen.found.iter().any(|surface| surface.kind == "menu");
             Ok(if open {
                 Seen::Not
@@ -923,8 +1031,8 @@ fn value_holds(at: &Looking<'_>, reference: &str, wanted: &str) -> Result<Seen, 
 /// ignoring case. No window is no title.
 fn titled(at: &Looking<'_>, text: &str) -> bool {
     let focused;
-    let window = match at.scene.window {
-        Some(window) => window,
+    let window = match &at.scene.window {
+        Some(bound) => bound.element,
         None => {
             focused = at.ax.focused(at.ax, at.scene.pid, Focus::Window);
             let Some(window) = focused.as_ref() else {
@@ -1445,6 +1553,7 @@ mod tests {
     use super::*;
     use crate::ax::{Focus, Recorder, Routes, Scripted, States, Unread, PRESS};
     use crate::gate::SystemClock;
+    use crate::window_server::{Bounds, Recorder as WindowRecorder, WindowFacts};
     use crate::wire::ControlAction;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
@@ -1501,6 +1610,11 @@ mod tests {
             pid: PID,
             window: None,
         }
+    }
+
+    /// The surfaces open in the application, as an unbound scene sees them.
+    fn every(ax: &Rc<dyn Ax>) -> Surfaces {
+        surfaces(ax, &app_scene()).expect("an unbound scan is never refused")
     }
 
     /// A node of this role and label at a frame, with these children.
@@ -1654,10 +1768,7 @@ mod tests {
         let (recorder, ax) = platform(desktop());
         recorder.windows_are(&[0]);
         let windows = crate::ax::application_windows(&ax, PID);
-        let bound = Scene {
-            pid: PID,
-            window: Some(windows[0].handle()),
-        };
+        let bound = bound_to(&windows[0], 10, &WindowRecorder::new(Vec::new()));
 
         let refused = whole(&ax, &bound, Scope::App).expect_err("app with a target");
         assert_eq!(refused.code, "invalid_argument");
@@ -1727,6 +1838,245 @@ mod tests {
         }
     }
 
+    // --- a bound window's scopes ---------------------------------------------------
+
+    /// A scene bound to `window`, whose window-server id is `id`.
+    fn bound_to(window: &Retained, id: u32, windows: &Arc<WindowRecorder>) -> Scene {
+        Scene {
+            pid: PID,
+            window: Some(Bound {
+                element: window.handle(),
+                id,
+                windows: windows.clone(),
+            }),
+        }
+    }
+
+    fn span(x: f64, w: f64) -> Frame {
+        Frame {
+            x,
+            y: 100.0,
+            w,
+            h: 300.0,
+        }
+    }
+
+    /// Two windows of one application: the first holds Save, the second a field
+    /// and a menu, and each has a dialog of its own in a window of its own.
+    fn two_windows() -> Vec<Scripted> {
+        let placed = |frame: Frame, node: Scripted| Scripted {
+            frame: Some(frame),
+            ..node
+        };
+        vec![
+            placed(span(0.0, 400.0), holding("AXWindow", "First", &[4])),
+            placed(span(500.0, 400.0), holding("AXWindow", "Second", &[5, 6])),
+            placed(
+                span(100.0, 200.0),
+                subroled("AXWindow", "AXDialog", "Save first?", &[8]),
+            ),
+            placed(
+                span(600.0, 200.0),
+                subroled("AXWindow", "AXDialog", "Save second?", &[9]),
+            ),
+            Scripted::button("Save", frame(0.0, 120.0)),
+            Scripted::field("Name", "ada", frame(500.0, 120.0)),
+            holding("AXMenu", "Context", &[7]),
+            Scripted {
+                label: Some("Copy".to_string()),
+                actions: vec![PRESS.to_string()],
+                frame: Some(frame(500.0, 160.0)),
+                ..Scripted::of("AXMenuItem")
+            },
+            Scripted::button("Keep first", frame(100.0, 200.0)),
+            Scripted::button("Keep second", frame(600.0, 200.0)),
+        ]
+    }
+
+    /// What the window server says of them: the windows are 10 and 11, and each
+    /// dialog's window is transient for its own.
+    fn two_windows_server() -> Arc<WindowRecorder> {
+        let window = |id: u32, frame: Frame, of: Option<u32>| WindowFacts {
+            transient_for: of,
+            ..crate::window_server::window(
+                id,
+                PID,
+                Bounds {
+                    x: frame.x,
+                    y: frame.y,
+                    w: frame.w,
+                    h: frame.h,
+                },
+            )
+        };
+        WindowRecorder::new(vec![
+            window(10, span(0.0, 400.0), None),
+            window(11, span(500.0, 400.0), None),
+            window(12, span(100.0, 200.0), Some(10)),
+            window(13, span(600.0, 200.0), Some(11)),
+        ])
+    }
+
+    // Two windows of one application, the first bound, focus in the second. The
+    // focused scope answers only a control inside the bound window, so focus
+    // elsewhere is no scope at all, with a sentence that says where it is, and no
+    // reference to the second window's control is minted.
+    #[test]
+    fn focus_in_another_window_of_the_application_is_not_the_bound_windows() {
+        let (recorder, ax) = platform(two_windows());
+        recorder.windows_are(&[0, 1]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let first = bound_to(&windows[0], 10, &two_windows_server());
+        recorder.focuses(Some(1), Some(5));
+
+        let refused = whole(&ax, &first, Scope::Focused).expect_err("focus elsewhere");
+        assert_eq!(refused.code, "scope_not_found");
+        let detail = refused.detail.unwrap_or_default();
+        assert!(detail.contains("another window"), "{detail}");
+        drop(windows);
+        assert_eq!(
+            recorder.counts().2,
+            0,
+            "nothing of the second window is held"
+        );
+
+        let windows = crate::ax::application_windows(&ax, PID);
+        let first = bound_to(&windows[0], 10, &two_windows_server());
+        recorder.focuses(Some(0), Some(4));
+        let found = whole(&ax, &first, Scope::Focused).expect("focus in the bound window");
+        assert_eq!(labels(&found), vec!["Save"]);
+
+        recorder.focuses(Some(1), Some(5));
+        let found = whole(&ax, &app_scene(), Scope::Focused).expect("unbound, as before");
+        assert_eq!(labels(&found), vec!["Name"]);
+    }
+
+    // A dialog in a window of its own is the bound window's only when the window
+    // server says its window is transient for the bound one; without a binding
+    // every dialog of the application is listed, as before.
+    #[test]
+    fn a_dialog_is_listed_only_under_the_window_it_is_transient_for() {
+        let (recorder, ax) = platform(two_windows());
+        recorder.windows_are(&[0, 1]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let server = two_windows_server();
+
+        let first = whole(&ax, &bound_to(&windows[0], 10, &server), Scope::Dialog)
+            .expect("the first window's dialog");
+        assert_eq!(labels(&first), vec!["Keep first"]);
+        let second = whole(&ax, &bound_to(&windows[1], 11, &server), Scope::Dialog)
+            .expect("the second window's dialog");
+        assert_eq!(labels(&second), vec!["Keep second"]);
+
+        let every = whole(&ax, &app_scene(), Scope::Dialog).expect("unbound");
+        assert_eq!(labels(&every), vec!["Keep first", "Keep second"]);
+    }
+
+    // A window transient for a window that is the bound one's belongs to it too,
+    // and a dialog no window marks as anybody's is no bound window's: then the
+    // dialog scope says none of the bound window's is open, and how to list the
+    // application's.
+    #[test]
+    fn a_dialog_belongs_through_its_transient_chain_and_never_without_one() {
+        let (recorder, ax) = platform(two_windows());
+        recorder.windows_are(&[0, 1]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let server = two_windows_server();
+        server.change(13, |dialog| dialog.transient_for = Some(12));
+
+        let first =
+            whole(&ax, &bound_to(&windows[0], 10, &server), Scope::Dialog).expect("both dialogs");
+        assert_eq!(labels(&first), vec!["Keep first", "Keep second"]);
+
+        server.change(12, |dialog| dialog.transient_for = None);
+        server.change(13, |dialog| dialog.transient_for = None);
+        let refused = whole(&ax, &bound_to(&windows[0], 10, &server), Scope::Dialog)
+            .expect_err("no dialog is the first window's");
+        assert_eq!(refused.code, "scope_not_found");
+        let detail = refused.detail.unwrap_or_default();
+        assert!(detail.contains("bound window"), "{detail}");
+        assert!(detail.contains("release the target"), "{detail}");
+    }
+
+    // A menu open in another window of the application neither satisfies
+    // menu_open nor keeps menu_closed from holding under a binding, and the menu
+    // scope does not list it; without a binding it is the application's menu, as
+    // before.
+    #[test]
+    fn a_menu_in_another_window_is_not_the_bound_windows() {
+        let (recorder, ax) = platform(two_windows());
+        recorder.windows_are(&[0, 1]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let server = two_windows_server();
+        let clock = SystemClock::new();
+        let seen = |scene: Scene, condition: Condition| {
+            let at = Looking {
+                ax: &ax,
+                scene,
+                named: None,
+                clock: &clock,
+            };
+            holds(look(&at, &condition, u64::MAX).expect("a look"))
+        };
+
+        let first = bound_to(&windows[0], 10, &server);
+        assert!(!seen(first.clone(), Condition::MenuOpen));
+        assert!(seen(first.clone(), Condition::MenuClosed));
+        let refused = whole(&ax, &first, Scope::Menu).expect_err("not the first's");
+        assert_eq!(refused.code, "scope_not_found");
+        let receipt = surfaces(&ax, &first).expect("a scan");
+        let open: Vec<(&str, Option<&str>)> = kinds(&receipt.found)
+            .into_iter()
+            .map(|(kind, _native, label)| (kind, label))
+            .collect();
+        assert_eq!(
+            open,
+            vec![("dialog", Some("Save first?"))],
+            "a receipt sees the first window's dialog and not the second's menu"
+        );
+
+        let second = bound_to(&windows[1], 11, &server);
+        assert!(seen(second.clone(), Condition::MenuOpen));
+        assert!(!seen(second.clone(), Condition::MenuClosed));
+        let menu = whole(&ax, &second, Scope::Menu).expect("the second's menu");
+        assert_eq!(labels(&menu), vec!["Copy"]);
+
+        assert!(seen(app_scene(), Condition::MenuOpen));
+        assert!(!seen(app_scene(), Condition::MenuClosed));
+    }
+
+    // A bound window that is itself a dialog is the dialog its scope lists, as
+    // without a binding: its own subtree starts at it.
+    #[test]
+    fn a_bound_dialog_window_is_its_own_dialog() {
+        let (recorder, ax) = platform(two_windows());
+        recorder.windows_are(&[0, 1, 2, 3]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let dialog = bound_to(&windows[2], 12, &two_windows_server());
+
+        let found = whole(&ax, &dialog, Scope::Dialog).expect("the bound dialog");
+        assert_eq!(labels(&found), vec!["Keep first"]);
+    }
+
+    // Where the window server marks no window as another's (macOS), a bound
+    // window's surfaces are the ones inside it: a sheet of its own, never a
+    // dialog in a window of its own.
+    #[test]
+    fn where_nothing_marks_ownership_a_bound_window_sees_only_what_is_inside_it() {
+        let (recorder, ax) = platform(desktop());
+        recorder.windows_are(&[0]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let unmarked = WindowRecorder::new(Vec::new());
+        let bound = bound_to(&windows[0], 10, &unmarked);
+
+        let sheet = whole(&ax, &bound, Scope::Dialog).expect("its own sheet");
+        assert_eq!(labels(&sheet), vec!["Clear"]);
+        assert!(
+            whole(&ax, &bound, Scope::Menu).is_err(),
+            "the context menu is the application's, not the window's"
+        );
+    }
+
     // --- surfaces ----------------------------------------------------------------
 
     fn kinds(found: &[Surface]) -> Vec<(&str, &str, Option<&str>)> {
@@ -1755,7 +2105,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            kinds(&surfaces(&ax, PID).found),
+            kinds(&every(&ax).found),
             vec![
                 ("dialog", "AXSheet", Some("Save changes?")),
                 ("popup", "AXPopover", Some("Font")),
@@ -1780,11 +2130,11 @@ mod tests {
             holding("AXMenuBarItem", "Edit", &[4]),
             holding("AXMenu", "Edit", &[]),
         ]);
-        assert!(surfaces(&ax, PID).found.is_empty(), "no item is selected");
+        assert!(every(&ax).found.is_empty(), "no item is selected");
 
         recorder.change(3, |item| item.states = selected);
         assert_eq!(
-            kinds(&surfaces(&ax, PID).found),
+            kinds(&every(&ax).found),
             vec![("menu", "AXMenu", Some("Edit"))]
         );
     }
@@ -1799,7 +2149,7 @@ mod tests {
         let (_recorder, ax) = platform(many);
         let before = ax.messages();
 
-        let found = surfaces(&ax, PID);
+        let found = every(&ax);
 
         assert!(
             found.found.is_empty(),
@@ -1822,12 +2172,12 @@ mod tests {
             holding("AXMenu", "Context", &[]),
         ]);
         recorder.fails_facts_for(0, Unread::NoAnswer);
-        let slow = surfaces(&ax, PID);
+        let slow = every(&ax);
         assert!(slow.found.is_empty(), "nothing after the slow node is read");
         assert_eq!(slow.stopped, Some("time"));
 
         let (_recorder, ax) = platform(desktop());
-        let whole = surfaces(&ax, PID);
+        let whole = every(&ax);
         assert_eq!(whole.found.len(), 2);
         assert_eq!(whole.stopped, None);
     }
@@ -1922,7 +2272,7 @@ mod tests {
             holding("AXWindow", "Document", &[1]),
             holding("AXSheet", "Save changes?", &[]),
         ]);
-        let found = surfaces(&ax, PID);
+        let found = every(&ax);
         assert_eq!(found.found.len(), 1);
         drop(found);
         assert_eq!(recorder.counts().2, 0, "nothing is still held");
@@ -2054,7 +2404,7 @@ mod tests {
                 element: node.element,
             })
             .collect();
-        Elements::new(PID, recorder.started_at(), entries)
+        Elements::new(PID, recorder.started_at(), None, entries)
     }
 
     fn holds(seen: Seen) -> bool {

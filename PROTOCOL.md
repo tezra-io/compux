@@ -194,24 +194,33 @@ The scopes, on macOS:
 |---|---|---|
 | `app` | The application element of the application in view (as protocol 11), or of the bound window's application. Refused with a target: a bound window's controls are the window's (release the target to list the application). | no |
 | `window` | The bound window; without a target, the application's focused window (`AXFocusedWindow`). | no |
-| `focused` | The application's focused element (`AXFocusedUIElement`), and what is inside it. | yes |
-| `menu` | Every menu open in the application (§6.2): a context menu, a pop-up's menu, a menu-bar menu. | no |
-| `dialog` | Every dialog or alert open in the application (§6.2), sheets included. | no |
+| `focused` | The application's focused element (`AXFocusedUIElement`), and what is inside it. With a target, only one whose `AXWindow` is the bound window. | yes |
+| `menu` | Every menu open in the application (§6.2): a context menu, a pop-up's menu, a menu-bar menu. With a target, only a menu inside the bound window: the menu bar's menus and a menu in a window of its own (a context menu, a pop-up's menu) are the application's, not the window's. | no |
+| `dialog` | Every dialog or alert open in the application (§6.2), sheets included. With a target, the bound window itself when it is one and those inside it (a sheet): a dialog in a window of its own is the application's, not the window's. | no |
 
 The scopes, on Linux (AT-SPI):
 
 | Scope | Root of the walk | Root listed |
 |---|---|---|
 | `app` | The application's root on the accessibility bus: the application whose window reads `ACTIVE`, or the bound window's. | no |
-| `window` | The application's window (`frame`) that reads `ACTIVE`. | no |
-| `focused` | The node that reads `FOCUSED` inside that window, found breadth first among at most 512 nodes (AT-SPI has no focused-element query). | yes |
-| `menu` | Every menu open in the application (§6.2). | no |
-| `dialog` | Every dialog or alert open in the application (§6.2). | no |
+| `window` | The bound window; without a target, the application's window (`frame`) that reads `ACTIVE`. | no |
+| `focused` | The node that reads `FOCUSED` inside that window, found breadth first among at most 512 nodes (AT-SPI has no focused-element query). With a target, inside the bound window while it reads `ACTIVE`: focus in another window of the application, a dialog of the bound window included, is not the bound window's. | yes |
+| `menu` | Every menu open in the application (§6.2). With a target, the bound window's: one inside it (a menu-bar menu, a GTK 4 popover's menu), and one in a window of its own whose X window is `WM_TRANSIENT_FOR` the bound window, directly or through at most 8 such links (a GTK 3 pop-up or combo box menu). A menu whose window names no owner (Chromium's) is the application's, not the window's. | no |
+| `dialog` | Every dialog or alert open in the application (§6.2). With a target, the bound window itself when it is one, those inside it, and one in a window of its own that is `WM_TRANSIENT_FOR` the bound window as above (a GTK 3 or Qt dialog). | no |
 
 A scope whose root does not exist (no focused window, nothing focused, no menu or dialog open) is refused
 `scope_not_found`, with a detail that names what is missing. A `menu` or `dialog` scope whose scan for surfaces
 (§6.2) stopped before it finished and found none is refused the same way, and its detail says the look stopped
 short, not that nothing is open: look again, or list the window and find the controls there.
+
+A target confines `focused`, `menu` and `dialog` to the bound window, as the tables say. Focus in another window of
+the application is refused `scope_not_found`, and the detail says it is there: list the bound window, a dialog or
+menu of it, or release the target to read the application's focus. A `menu` or `dialog` scope that finds none of the
+bound window's is refused `scope_not_found` saying so: one open in another window of the application is not this
+window's, and releasing the target lists the application's. A window is tied to its accessibility element as the
+binding ties the bound one (§1.2): exactly one of the application's windows on screen sits at the element's frame. On
+Linux these are the window manager's clients and the root's own children, where an override-redirect menu sits; a
+window server that will not list them is `target_unavailable`. Without a target nothing here changes.
 
 ### 2.2 Reply
 
@@ -279,7 +288,8 @@ Reply fields beside `elements`:
   including its wait for an application whose tree is still empty. A request with any of them reads the tree
   as it is, without that wait.
 - **Drill (`root`).** The root is re-validated first, like an action's target (process, role); a root that no longer
-  names what it named is `stale_element`. The walk reads the root's subtree, without listing the root again, as
+  names what it named is `stale_element`, and so is one a request naming a target drills into when it was listed
+  without that window bound (§4.8). The walk reads the root's subtree, without listing the root again, as
   `query` or `skeleton` ask: a find lists only the matches inside it, and a skeleton cuts three levels below the
   root and replies with `skeleton`, as a scope's does.
 - **References after a drill.** The reply's new observation holds the named listing's references **minus those
@@ -313,9 +323,10 @@ turn secure after the walk that listed it, and the value is withheld at the sour
 ### 3.2 `surfaces` on receipts
 
 Every receipt of an action that **dispatched input** (`dispatch` is `sent` or `partial`) carries `surfaces`: the
-dialogs, alerts, menus and popups open in the action's application once it has run (§6.2). `[]` means none is open.
-A receipt with nothing dispatched carries none, and neither does a build with no accessibility API: absent means
-"not looked", never "nothing open". A scan that stopped before it finished says why beside the list:
+dialogs, alerts, menus and popups open in the action's application once it has run (§6.2), and for an action naming a
+target only the bound window's, as its `menu` and `dialog` scopes list them (§2.1). `[]` means none is open.
+A receipt with nothing dispatched carries none, and neither does a build with no accessibility API, or a bound
+window whose window server would not list its windows: absent means "not looked", never "nothing open". A scan that stopped before it finished says why beside the list:
 `"surfaces_truncated": "time"` (a node did not answer in time) or `"nodes"` (it read as many nodes as it may). Then
 `surfaces` is what it saw, and a surface it did not reach may be open.
 
@@ -468,6 +479,11 @@ the same cell. Such an object is the control only while its label is the one lis
 there) is `stale_element`. On every other toolkit its own account proves nothing: a destroyed GTK 3 or Chromium object
 keeps answering its old parent and index for a while. A `ServiceUnknown` error means the application quit.
 
+A request naming a target uses only references listed while that window was bound (by any binding of it): one
+listed without a target, or while another window was bound, may name a control of another window, and is
+`stale_element` with nothing sent; the detail says to list the bound window and use a reference from that list. A
+request naming no target uses any listing, as before.
+
 ## 5. Waiting on the tree
 
 ### 5.1 The condition
@@ -485,7 +501,7 @@ One object, used by `wait_for` (§5.3) and by an action's check (§5.2):
 | `enabled` | `element_ref` | That control reads enabled. |
 | `value` | `element_ref`, `value` (string) | That control's value (bounded to 80 characters) equals `value`. Refused on a secure field. |
 | `window_title` | `contains` (string) | The scope's window title contains it (case-insensitive): the bound window, else the application's focused window. |
-| `menu_open`, `menu_closed` | none | A menu is open / no menu is open in the application (§6.2); `menu_closed` only by a scan that saw everything it looks at. |
+| `menu_open`, `menu_closed` | none | A menu is open / no menu is open in the application (§6.2), or with a target in the bound window (§2.1): a menu of another window neither opens nor keeps open the bound window's; `menu_closed` only by a scan that saw everything it looks at. |
 | `text` | `contains` (string) | Some node in the scope has that text (case-insensitive) in its label, or for a static text in its value. |
 
 - `scope` (optional): as `elements`' scope; default `window` with a target, else `app`. Not accepted on the
@@ -671,6 +687,17 @@ application, and a context menu the menu inside the window a toolkit puts up for
 `SHOWING` is no surface, and nothing below it is looked at: GTK 3 keeps a menu's window after it closes, and Qt every
 menu it has made.
 
+With a target, the scan reads the bound window as it reads a child of the application, so the window itself when it
+is a surface and the surfaces inside it, and then, on X11, each child of the application whose frame ties it to a
+window `WM_TRANSIENT_FOR` the bound one (§2.1). It reads the same 64 nodes at most. What the toolkits do on X11:
+
+| Toolkit | Dialog | Menu |
+|---|---|---|
+| GTK 3 | Its own managed window, `WM_TRANSIENT_FOR` its parent; a child of the application at that window's frame. | A pop-up or combo box menu: an override-redirect window `WM_TRANSIENT_FOR` its parent, and a child of the application (`window`) at its frame holding the `menu`. A menu-bar menu is inside the window. A context menu attached to a widget is not in the tree at all. |
+| GTK 4 | Its own managed window, `WM_TRANSIENT_FOR` its parent; GTK 4 places nothing on X11 (§2.2), so none is tied to one. | A popover's menu, inside the window. |
+| Qt | Its own managed window, `WM_TRANSIENT_FOR` its parent; a child of the application at that window's own area. | A menu-bar menu, inside the window under its item. A context menu's window is override-redirect and `WM_TRANSIENT_FOR` its parent, and is not in the tree. |
+| Chromium | A page's `alert()` is a `dialog` inside the window. | A context or `<select>` menu: an override-redirect window that names no owner, and a child of the application (`frame`) at its frame: the application's, never a bound window's. |
+
 ### 6.3 Which verbs a control lists
 
 | Verb | Listed when (macOS) | Listed when (Linux) |
@@ -745,14 +772,14 @@ Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux bu
 
 | Code | When |
 |---|---|
-| `stale_element` | The reference names nothing now: its process quit or its pid was reused, it is gone, its role changed, it did not answer in time, or the reply listed no such reference; on Qt, the control at that place no longer has the label it was listed with. Nothing sent. |
+| `stale_element` | The reference names nothing now: its process quit or its pid was reused, it is gone, its role changed, it did not answer in time, or the reply listed no such reference; on Qt, the control at that place no longer has the label it was listed with; or the request names a target and the reference was listed without that window bound (§4.8). Nothing sent. |
 | `element_disabled` | The control reads disabled. Nothing sent. |
 | `ax_action_unsupported` | The control has no route for this verb. Nothing sent, nothing clicked instead. |
 | `state_unreadable` | A verb could not read the state it acts from, so it could not decide whether or how to act. Nothing sent. That state is a toggle's or an expander's; on Linux also a scroll bar's range (or one that reads as no range), a field's selection or caret before `type`, and an item's place in its container before `select`. On Linux the reads before a write are held to the verb's own time: reads that use it up end the verb here too. |
 | `focus_refused` | `focus` on a control whose window is not the active one. Nothing sent. |
 | `ax_action_failed` | The application refused the message. Nothing went out. |
 | `ax_timed_out` | The message went out and no answer came; never repeated. |
-| `scope_not_found` | An `elements` scope has no root: no focused window, nothing focused, no menu or dialog open, or the scan for a menu or dialog stopped before it finished (the detail says which). A condition reads such a scope as empty instead (§5.1), and one a scan stopped short of as unproven. |
+| `scope_not_found` | An `elements` scope has no root: no focused window, nothing focused, no menu or dialog open, focus or the only menu or dialog in another window than the bound one (§2.1), or the scan for a menu or dialog stopped before it finished (the detail says which). A condition reads such a scope as empty instead (§5.1), and one a scan stopped short of as unproven. |
 | `accessibility_unavailable` | A build with no accessibility API (neither macOS nor Linux) was asked to read or act on controls. |
 | `ambiguous_element` | Linux: re-validation found several candidates for one reference. |
 | `identity_unknown` | Linux: a candidate stayed unreadable after two re-reads. |

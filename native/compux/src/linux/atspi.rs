@@ -1218,7 +1218,11 @@ impl Real {
     /// The node inside `top` that reads FOCUSED, and its path below `top`: a
     /// breadth-first look at [`MAX_FOCUS_SEARCH`] nodes at most. AT-SPI has no
     /// question for an application's focused element.
-    async fn focused_in(&self, bus: &Connection, top: &Address) -> Option<(Address, Vec<usize>)> {
+    async fn focused_below(
+        &self,
+        bus: &Connection,
+        top: &Address,
+    ) -> Option<(Address, Vec<usize>)> {
         let mut level = vec![(top.clone(), Vec::new())];
         let mut read = 0;
         while !level.is_empty() && read < MAX_FOCUS_SEARCH {
@@ -1554,7 +1558,7 @@ impl Ax for Real {
             match what {
                 Focus::Window => Some((window, vec![index])),
                 Focus::Element => {
-                    let (element, below) = self.focused_in(&bus, &window).await?;
+                    let (element, below) = self.focused_below(&bus, &window).await?;
                     Some((element, std::iter::once(index).chain(below).collect()))
                 }
             }
@@ -1564,6 +1568,33 @@ impl Ax for Real {
             path: Some(path.into()),
             ..Place::default()
         };
+        Some(self.mint_one(owner, at, place))
+    }
+
+    /// The node inside this window that reads FOCUSED, when the window reads
+    /// ACTIVE: a focused node in a window that is not active is not where typing
+    /// goes.
+    fn focused_in(&self, owner: &Rc<dyn Ax>, window: Handle) -> Option<Retained> {
+        let top = self.address(window)?;
+        let path = self.place(window)?.path?;
+        let bus = self.bus()?;
+        let (at, below) = async_io::block_on(async {
+            let words: Vec<u32> = self.accessible(&bus, &top, "GetState").await.ok()?;
+            if !vocabulary::has(&words, ACTIVE) {
+                return None;
+            }
+            self.focused_below(&bus, &top).await
+        })?;
+        let place = Place {
+            path: Some(path.iter().copied().chain(below).collect()),
+            ..Place::default()
+        };
+        Some(self.mint_one(owner, at, place))
+    }
+
+    fn retain_again(&self, owner: &Rc<dyn Ax>, handle: Handle) -> Option<Retained> {
+        let at = self.address(handle)?;
+        let place = self.place(handle)?;
         Some(self.mint_one(owner, at, place))
     }
 }
@@ -1639,6 +1670,15 @@ mod tests {
 
     fn calls_to<'a>(calls: &'a [Call], path: &str) -> Vec<&'a Call> {
         calls.iter().filter(|call| call.path == path).collect()
+    }
+
+    /// The surfaces open in the application, as an unbound scene sees them.
+    fn surfaces_of(ax: &Rc<dyn Ax>) -> crate::semantic::Surfaces {
+        let scene = crate::semantic::Scene {
+            pid: PID,
+            window: None,
+        };
+        crate::semantic::surfaces(ax, &scene).expect("an unbound scan is never refused")
     }
 
     // --- what is asked: never GetActions, never GetAll ----------------------------
@@ -2491,6 +2531,62 @@ mod tests {
         assert_eq!(ax.frontmost_pid(), None, "no window reads active");
     }
 
+    // A bound window's focus is the node inside it that reads FOCUSED while the
+    // window reads ACTIVE: a field focused in the application's other window is
+    // not the bound window's, and neither is one in a window that is not active.
+    #[test]
+    fn a_windows_focus_is_a_focused_node_inside_it_while_it_is_active() {
+        let mut two = desktop(
+            &["/w/save"],
+            vec![
+                ("/w/save", button("Save", 10)),
+                (
+                    "/w2/name",
+                    Node {
+                        states: vec![ENABLED, FOCUSABLE, fake::FOCUSED, SHOWING, VISIBLE],
+                        ..Node::of(vocabulary::ENTRY)
+                            .named("Name")
+                            .at(910, 10, 200, 24)
+                    },
+                ),
+            ],
+        );
+        two.put(
+            APP,
+            "/w2",
+            Node {
+                states: vec![ENABLED, SENSITIVE, SHOWING, VISIBLE],
+                ..Node::of(23)
+                    .named("Second")
+                    .at(900, 0, 400, 300)
+                    .holding(APP, &["/w2/name"])
+            },
+        );
+        two.nodes
+            .get_mut(&(APP.to_string(), fake::ROOT.to_string()))
+            .expect("the application")
+            .children
+            .push((APP.to_string(), "/w2".to_string()));
+        let (fake, ax) = reader(two);
+        let windows = ax.windows(&ax, PID);
+        assert_eq!(windows.len(), 2);
+
+        assert!(
+            ax.focused_in(&ax, windows[0].handle()).is_none(),
+            "focus is in the other window"
+        );
+        assert!(
+            ax.focused_in(&ax, windows[1].handle()).is_none(),
+            "that window is not active"
+        );
+        fake.change(APP, "/w2", |window| window.states.push(ACTIVE));
+        let focused = ax
+            .focused_in(&ax, windows[1].handle())
+            .expect("focus inside the active window");
+        let facts = ax.facts(focused.handle()).expect("it answers");
+        assert_eq!(facts.label.as_deref(), Some("Name"));
+    }
+
     // Two applications whose windows both read ACTIVE: neither is the one in
     // front, and the reader says how many claim it rather than that none does.
     #[test]
@@ -2600,7 +2696,7 @@ mod tests {
         );
         let (_fake, ax) = reader(desktop);
 
-        let found: Vec<(&str, String, Option<String>)> = crate::semantic::surfaces(&ax, PID)
+        let found: Vec<(&str, String, Option<String>)> = surfaces_of(&ax)
             .found
             .into_iter()
             .map(|surface| (surface.kind, surface.native_kind, surface.label))
@@ -2648,7 +2744,7 @@ mod tests {
             ],
         ));
         let kinds = |ax: &Rc<dyn Ax>| -> Vec<(&'static str, Option<String>)> {
-            crate::semantic::surfaces(ax, PID)
+            surfaces_of(ax)
                 .found
                 .into_iter()
                 .map(|surface| (surface.kind, surface.label))
@@ -2697,7 +2793,7 @@ mod tests {
             ],
         ));
         let kinds = |ax: &Rc<dyn Ax>| -> Vec<(&'static str, String)> {
-            crate::semantic::surfaces(ax, PID)
+            surfaces_of(ax)
                 .found
                 .into_iter()
                 .map(|surface| (surface.kind, surface.native_kind))

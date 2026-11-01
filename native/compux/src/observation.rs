@@ -441,7 +441,7 @@ mod tests {
             })
             .collect();
 
-        Rc::new(Elements::new(4711, recorder.started_at(), entries))
+        Rc::new(Elements::new(4711, recorder.started_at(), None, entries))
     }
 
     fn recorder() -> Rc<crate::ax::Recorder> {
