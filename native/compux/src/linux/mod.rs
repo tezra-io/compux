@@ -11,7 +11,8 @@
 //! - `atspi`: the reader itself;
 //! - `pixels`: which route pixels take on this session (M86 L2), decided once;
 //! - `x11`: X11 pixels on x11rb: XTEST, the keymap, GetImage, the clipboard;
-//! - `portal`: GNOME Wayland pixels through the XDG desktop portal.
+//! - `portal`: GNOME Wayland pixels through the XDG desktop portal;
+//! - `private_file`: a file only its owner reads, for the token and the journal.
 //!
 //! Compiled only on Linux.
 
@@ -22,6 +23,7 @@ pub mod display;
 mod identity;
 pub mod pixels;
 pub mod portal;
+mod private_file;
 pub mod probe;
 pub mod routes;
 pub mod session;

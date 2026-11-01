@@ -381,12 +381,9 @@ fn write_state(path: &Path, token: Option<&str>) -> Result<(), String> {
             Err(error) => Err(error.to_string()),
         };
     };
-    let dir = path.parent().ok_or("the state file has no directory")?;
-    std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
-    let scratch = path.with_extension("writing");
     let state = serde_json::json!({ "restore_token": token });
-    std::fs::write(&scratch, state.to_string()).map_err(|error| error.to_string())?;
-    std::fs::rename(&scratch, path).map_err(|error| error.to_string())
+    super::private_file::write(path, state.to_string().as_bytes())
+        .map_err(|error| error.to_string())
 }
 
 /// The handle tokens one session start uses, one per Request and one for the
@@ -894,6 +891,33 @@ mod tests {
         assert!(
             sources[0].detail.starts_with("types=1 "),
             "a monitor: {sources:?}"
+        );
+    }
+
+    // The token restores a grant without a dialog: it is the person's alone to
+    // read, and a link planted beside it is never written through.
+    #[test]
+    fn the_restore_token_is_kept_for_the_person_alone_and_never_through_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("private");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "the person's").expect("a victim");
+        let state = dir.join("compux").join("portal.json");
+        std::fs::create_dir_all(dir.join("compux")).expect("the state directory");
+        std::os::unix::fs::symlink(&victim, dir.join("compux").join("portal.writing"))
+            .expect("a planted link");
+
+        write_state(&state, Some("secret")).expect("kept");
+
+        let mode = std::fs::metadata(&state)
+            .expect("there")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(stored(&state).as_deref(), Some("secret"));
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("it reads"),
+            "the person's"
         );
     }
 
