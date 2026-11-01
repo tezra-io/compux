@@ -11,8 +11,8 @@
 
 use std::io::Write;
 use std::process::ExitCode;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Instant;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
 
 use x11rb::protocol::Event;
 
@@ -32,6 +32,12 @@ pub const MAX_LOGGED_IGNORED: u32 = 5;
 /// How many sent button events are described on stderr before they are only
 /// counted.
 pub const MAX_LOGGED_FORGED: u32 = 5;
+
+/// How often the badge looks again while a menu or popup holds it under. A
+/// window that takes input over the badge and never unmaps (a desktop shell's
+/// stage while its calendar or a notification is open) lets it back on top once
+/// it no longer takes input there.
+pub const HELD_LOOK_MS: u64 = 500;
 
 /// Raises left in the current second.
 pub struct RaiseBudget {
@@ -98,26 +104,16 @@ pub fn popup_over(badge: Rect, above: &[Stacked]) -> Option<u32> {
         .map(|window| window.id)
 }
 
-/// Where the badge goes when it goes back on top.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Restack {
-    /// Just over this window, which came over it: still under anything over that.
-    Above(u32),
-    /// Over every window: nothing names one it should go just over.
-    Top,
-    /// Where it is: the window that moved is under it already.
-    Stay,
-}
-
-/// Where the badge goes back on top, `came_over` being the managed window that
-/// moved, restacked or mapped onto it (`None` when none did), among `above`, the
-/// windows stacked over the badge now.
-pub fn restack(came_over: Option<u32>, above: &[Stacked]) -> Restack {
-    match came_over {
-        Some(window) if above.iter().any(|stacked| stacked.id == window) => Restack::Above(window),
-        Some(_under) => Restack::Stay,
-        None => Restack::Top,
-    }
+/// The window the badge goes just over (still under anything over that), when
+/// `came_over`, the managed window that moved, restacked or mapped onto it, is
+/// among `above`, the windows stacked over the badge now. `None` where it is
+/// under the badge already: the badge stays where it is, since going just over
+/// it would lower the badge.
+pub fn restack(came_over: u32, above: &[Stacked]) -> Option<u32> {
+    above
+        .iter()
+        .any(|stacked| stacked.id == came_over)
+        .then_some(came_over)
 }
 
 /// Everything the loop is handed.
@@ -126,6 +122,35 @@ enum Message {
     InputEnded,
     InputFailed(String),
     X(Delivered),
+}
+
+/// What the loop takes next.
+enum Next {
+    Message(Message),
+    /// The badge is held under a window and nothing arrived in a while: look
+    /// again whether it still is.
+    LookAgain,
+    /// Every sender is gone.
+    Closed,
+}
+
+/// The next message, waited for as long as it takes; or, while the badge is
+/// held under a window, for `look_after` at most.
+fn next(receiver: &Receiver<Message>, look_after: Option<Duration>) -> Next {
+    let Some(wait) = look_after else {
+        return receiver.recv().map_or(Next::Closed, Next::Message);
+    };
+    match receiver.recv_timeout(wait) {
+        Ok(message) => Next::Message(message),
+        Err(RecvTimeoutError::Timeout) => Next::LookAgain,
+        Err(RecvTimeoutError::Disconnected) => Next::Closed,
+    }
+}
+
+/// How long the loop waits before it looks again, while `held_by` holds the
+/// badge under; forever while nothing does.
+fn look_after(held_by: Option<u32>) -> Option<Duration> {
+    held_by.map(|_| Duration::from_millis(HELD_LOOK_MS))
 }
 
 /// Whether the loop goes on.
@@ -204,9 +229,19 @@ struct Badge {
 }
 
 impl Badge {
-    /// Bounded by the pipe and the connection: it ends when either does.
+    /// Bounded by the pipe and the connection: it ends when either does. While
+    /// a window holds the badge under, it also looks again every
+    /// [`HELD_LOOK_MS`].
     fn run(&mut self, receiver: &Receiver<Message>) -> Result<(), String> {
-        for message in receiver.iter() {
+        loop {
+            let message = match next(receiver, look_after(self.held_by)) {
+                Next::Message(message) => message,
+                Next::LookAgain => {
+                    self.back_on_top()?;
+                    continue;
+                }
+                Next::Closed => break,
+            };
             let flow = match message {
                 Message::Input(line) => self.line(line)?,
                 Message::InputEnded => Flow::Finish,
@@ -283,6 +318,8 @@ impl Badge {
         let Some(frame) = badge_frame(&self.state, (self.row.width, HEIGHT), &screens) else {
             self.canvas = None;
             self.frame = None;
+            // A hidden badge is held under nothing.
+            self.held_by = None;
             return self.window.hide();
         };
         let canvas = self.painter.render(&self.row, self.state.activity);
@@ -321,7 +358,7 @@ impl Badge {
             // The menu or popup the badge stayed under closed.
             Event::UnmapNotify(e) if Some(e.window) == self.held_by => {
                 self.held_by = None;
-                self.on_top(None)?
+                self.back_on_top()?
             }
             Event::RandrScreenChangeNotify(_) => self.render()?,
             Event::Error(e) => {
@@ -383,7 +420,7 @@ impl Badge {
     /// the window is the person's menu or tooltip.
     fn over(&mut self, window: u32, at: Rect, override_redirect: bool) -> Result<(), String> {
         match self.frame {
-            Some(frame) if comes_over(frame, at, override_redirect) => self.on_top(Some(window)),
+            Some(frame) if comes_over(frame, at, override_redirect) => self.on_top(window),
             _elsewhere => Ok(()),
         }
     }
@@ -397,10 +434,10 @@ impl Badge {
         }
     }
 
-    /// Back on top while shown, within the budget, unless the person's menu or
-    /// popup is open over it: just over `came_over`, the window that came over
-    /// it, or over every window where none did.
-    fn on_top(&mut self, came_over: Option<u32>) -> Result<(), String> {
+    /// Back over `came_over`, the window that came over the badge, while shown
+    /// and within the budget, unless the person's menu or popup is open over
+    /// it.
+    fn on_top(&mut self, came_over: u32) -> Result<(), String> {
         let Some(frame) = self.frame else {
             return Ok(());
         };
@@ -412,10 +449,23 @@ impl Badge {
             return Ok(());
         };
         match restack(came_over, &above) {
-            Restack::Above(window) => self.window.raise_above(window),
-            Restack::Top => self.window.raise(),
-            Restack::Stay => Ok(()),
+            Some(window) => self.window.raise_above(window),
+            None => Ok(()),
         }
+    }
+
+    /// Back on top once the window that held the badge under is unmapped or no
+    /// longer takes input over it, unless another one does. Outside the raise
+    /// budget: it runs once for each popup that closes, and otherwise at most
+    /// every [`HELD_LOOK_MS`], so a spent budget never leaves the badge under.
+    fn back_on_top(&mut self) -> Result<(), String> {
+        let Some(frame) = self.frame else {
+            return Ok(());
+        };
+        if self.free_above(frame)?.is_some() {
+            self.window.raise()?;
+        }
+        Ok(())
     }
 
     /// The windows stacked above the badge at `frame`, where nothing the person
@@ -616,13 +666,41 @@ mod tests {
     #[test]
     fn the_badge_goes_just_over_the_window_that_came_over_it() {
         let above = [stacked(7, true, false, &[]), stacked(9, true, true, &[])];
-        assert_eq!(restack(Some(7), &above), Restack::Above(7));
+        assert_eq!(restack(7, &above), Some(7));
         assert_eq!(
-            restack(Some(5), &above),
-            Restack::Stay,
+            restack(5, &above),
+            None,
             "a window under the badge needs nothing"
         );
-        assert_eq!(restack(None, &above), Restack::Top);
+    }
+
+    // A window that holds the badge under and never unmaps is looked at again on
+    // a timer; nothing else wakes a loop that waits only for messages.
+    #[test]
+    fn a_held_badge_looks_again_on_its_own_and_a_free_one_waits_for_a_message() {
+        let wait = Duration::from_millis(20);
+        let (sender, receiver) = mpsc::channel::<Message>();
+        let started = Instant::now();
+        assert!(matches!(next(&receiver, Some(wait)), Next::LookAgain));
+        assert!(started.elapsed() >= wait);
+        sender.send(Message::InputEnded).unwrap();
+        assert!(matches!(
+            next(&receiver, Some(wait)),
+            Next::Message(Message::InputEnded)
+        ));
+        sender.send(Message::InputEnded).unwrap();
+        assert!(matches!(
+            next(&receiver, None),
+            Next::Message(Message::InputEnded)
+        ));
+        drop(sender);
+        assert!(matches!(next(&receiver, None), Next::Closed));
+        assert!(matches!(next(&receiver, Some(wait)), Next::Closed));
+        assert_eq!(
+            look_after(Some(7)),
+            Some(Duration::from_millis(HELD_LOOK_MS))
+        );
+        assert_eq!(look_after(None), None);
     }
 
     #[test]
