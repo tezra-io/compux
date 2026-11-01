@@ -41,10 +41,19 @@
 //! window that holds the id later is another window, and the stream answers
 //! [`FrameError::Gone`] for the rest of the binding.
 //!
+//! **The bind is bounded.** The window is watched, redirected and proved, and
+//! its first frame read, on the watch's own thread, where every request waits
+//! on the server for as long as it takes. The start waits for that at most
+//! [`START_WAIT_MS`]; past it nothing is bound, and the watch's socket is shut,
+//! which ends any wait on the server it is in.
+//!
 //! Everything the server holds for the stream (the redirect, the damage, the
 //! pixmap, the event selections) belongs to its connection, and goes when the
 //! connection closes, on every path out.
 
+use std::net::Shutdown;
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -97,6 +106,11 @@ const PROOF_POLL_MS: u64 = 2;
 /// How many times in a row a window already bound is proved again at the next
 /// interval after a proof that fell short, before the binding ends.
 pub const MAX_REPROOF_RETRIES: u32 = 3;
+
+/// How long `start` waits for the watch to bind the window: to watch it,
+/// redirect it, prove its picture and read its first frame. That covers the
+/// redirect's report and the repaint, with room for a slow server.
+pub const START_WAIT_MS: u64 = 3_000;
 
 /// How long a request waits for the watch to catch up with the server. A watch
 /// mid-proof answers once the proof is done, so this covers the redirect's report
@@ -351,7 +365,6 @@ pub fn bgra(mut rgba: Vec<u8>) -> Vec<u8> {
 pub struct Composite {
     env: Env,
     clock: Arc<dyn Clock>,
-    slot: Arc<Slot>,
     running: Mutex<Option<Running>>,
 }
 
@@ -360,7 +373,6 @@ impl Composite {
         Composite {
             env,
             clock,
-            slot: Slot::new(),
             running: Mutex::new(None),
         }
     }
@@ -371,45 +383,121 @@ impl Composite {
 }
 
 impl WindowFrames for Composite {
-    /// The window is watched, redirected and proved here, and its first frame
-    /// published, before the watch thread takes over: a window that cannot be
-    /// proved is a start that failed, and nothing is left running.
+    /// The window is watched, redirected and proved, and its first frame read,
+    /// on the watch's own thread, where every request waits on the server for
+    /// as long as it takes; this waits for it at most [`START_WAIT_MS`]. Past
+    /// that, or for a window that cannot be proved, the start fails and nothing
+    /// is left running: the watch's socket is shut, which ends any wait on the
+    /// server it is in.
     fn start(&self, window: StreamWindow) -> Result<(), FrameError> {
         self.stop();
-        let mut watch = Watch::open(&self.env, &window)?;
-        watch.read(&self.slot, self.clock.now_mach(), &*self.clock)?;
-        let running = Running::spawn(watch, self.slot.clone(), self.clock.clone())?;
-        *self.lock() = Some(running);
-        Ok(())
+        let socket = Arc::new(Socket::default());
+        let (running, started) =
+            Running::spawn(self.env.clone(), window, self.clock.clone(), socket.clone())?;
+        match opened_within(&started, Duration::from_millis(START_WAIT_MS)) {
+            Ok(()) => {
+                *self.lock() = Some(running);
+                Ok(())
+            }
+            Err(fault) => {
+                socket.shut();
+                running.end();
+                Err(fault)
+            }
+        }
     }
 
     /// The window can be closed, and another made under its id, between two
     /// intervals: the watch catches up with the server first, so a window
     /// destroyed before this request is never answered with its last frame.
     fn latest(&self, after: Option<Fence>) -> Result<WindowFrame, FrameError> {
-        let caught = match self.lock().as_ref() {
-            Some(running) => running.catch_up(),
-            None => {
-                return Err(FrameError::Unavailable(
-                    "no window capture is running".to_string(),
-                ))
-            }
+        let running = self.lock();
+        let Some(running) = running.as_ref() else {
+            return Err(FrameError::Unavailable(
+                "no window capture is running".to_string(),
+            ));
         };
-        served(caught, self.slot.peek(after, self.clock.now_ns()))
+        served(
+            running.catch_up(),
+            running.slot.peek(after, self.clock.now_ns()),
+        )
     }
 
     fn stop(&self) {
         let running = self.lock().take();
         if let Some(running) = running {
+            let slot = running.slot.clone();
             running.end();
+            // A released target holds no pixels, even where its watch outlives
+            // the stop.
+            slot.clear();
         }
-        self.slot.clear();
     }
 }
 
 impl Drop for Composite {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// What the watch says once it has opened the window: its first frame is in the
+/// watch's slot, or why there is none.
+type Opened = Result<(), FrameError>;
+
+/// What the watch said of the window within `wait`: it is bound, or why not.
+fn opened_within(started: &Receiver<Opened>, wait: Duration) -> Opened {
+    match started.recv_timeout(wait) {
+        Ok(opened) => opened,
+        Err(RecvTimeoutError::Timeout) => Err(FrameError::Unavailable(format!(
+            "the X server did not let the window be bound within {} ms (watched, its picture \
+             proved and its first frame read), so nothing was bound; select it again",
+            wait.as_millis()
+        ))),
+        Err(RecvTimeoutError::Disconnected) => Err(FrameError::Unavailable(
+            "the window capture's watch ended before it said whether the window could be bound"
+                .to_string(),
+        )),
+    }
+}
+
+/// A second handle on the watch's socket, held while a start waits for the
+/// watch: a start past its bound shuts it, which ends whatever wait on the
+/// server the watch is in, and the server then lets go of everything it holds
+/// for the watch.
+#[derive(Default)]
+struct Socket(Mutex<Option<OwnedFd>>);
+
+impl Socket {
+    fn keep(&self, connection: &RustConnection) -> Result<(), FrameError> {
+        let fd = connection
+            .stream()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|error| {
+                FrameError::Unavailable(format!(
+                    "the window capture could not hold its X connection's socket: {error}"
+                ))
+            })?;
+        *self.lock() = Some(fd);
+        Ok(())
+    }
+
+    /// Shut it, both ways. One not held yet (the watch is still connecting) is
+    /// left alone: that watch ends by itself once it finds nobody waiting.
+    fn shut(&self) {
+        let Some(fd) = self.lock().take() else {
+            return;
+        };
+        // shutdown(2) acts on the socket whatever its family; `UnixStream` is
+        // only the std wrapper that offers it.
+        if let Err(error) = UnixStream::from(fd).shutdown(Shutdown::Both) {
+            eprintln!("compux: the window capture could not shut its X connection: {error}");
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<OwnedFd>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -472,32 +560,51 @@ enum Command {
     Stop,
 }
 
-/// The watch's thread, and the two channels that command it and confirm its end.
+/// The watch's thread, the two channels that command it and confirm its end,
+/// and the slot it publishes to. Each start has a slot of its own, so a watch
+/// that outlives the start that gave up on it publishes nowhere anyone reads.
 struct Running {
     commands: Sender<Command>,
     ended: Receiver<()>,
     thread: std::thread::JoinHandle<()>,
+    slot: Arc<Slot>,
 }
 
 impl Running {
-    fn spawn(watch: Watch, slot: Arc<Slot>, clock: Arc<dyn Clock>) -> Result<Running, FrameError> {
+    /// The watch's thread: it binds the window ([`Watch::first`]), says so on
+    /// the receiver returned, and then takes over.
+    fn spawn(
+        env: Env,
+        window: StreamWindow,
+        clock: Arc<dyn Clock>,
+        socket: Arc<Socket>,
+    ) -> Result<(Running, Receiver<Opened>), FrameError> {
+        let slot = Slot::new();
         let (commands, commanded) = mpsc::channel();
         let (finished, ended) = mpsc::channel();
+        let (opened, started) = mpsc::channel();
+        let publishing = slot.clone();
         let thread = std::thread::Builder::new()
             .name("compux-window-frames".to_string())
             .spawn(move || {
-                watch.run(&slot, &*clock, &commanded);
+                let first = Watch::first(&env, &window, &publishing, &*clock, &socket, &opened);
+                drop(socket);
+                if let Some(watch) = first {
+                    watch.run(&publishing, &*clock, &commanded);
+                }
                 // Nobody waiting for this is a stop that already gave up.
                 finished.send(()).ok();
             })
             .map_err(|error| {
                 FrameError::Unavailable(format!("the window capture would not start: {error}"))
             })?;
-        Ok(Running {
+        let running = Running {
             commands,
             ended,
             thread,
-        })
+            slot,
+        };
+        Ok((running, started))
     }
 
     /// Ask the watch to catch up, and wait for it, bounded. A watch that already
@@ -569,12 +676,45 @@ struct Watch {
 }
 
 impl Watch {
+    /// The listed window bound: watched, redirected, proved and its first frame
+    /// put in `slot`, which is said on `opened`. The watch is returned where the
+    /// start still waits for it; one that stopped waiting dropped the receiver,
+    /// and the watch then ends here, its connection with it.
+    fn first(
+        env: &Env,
+        listed: &StreamWindow,
+        slot: &Slot,
+        clock: &dyn Clock,
+        socket: &Socket,
+        opened: &Sender<Opened>,
+    ) -> Option<Watch> {
+        let bound = Watch::open(env, listed, socket).and_then(|mut watch| {
+            match watch.picture(slot, clock.now_mach(), clock)? {
+                Some(frame) => {
+                    slot.offer(frame);
+                    Ok(watch)
+                }
+                None => Err(unproven(
+                    "it was resized while it was being bound".to_string(),
+                )),
+            }
+        });
+        match bound {
+            Ok(watch) => opened.send(Ok(())).ok().map(|()| watch),
+            Err(fault) => {
+                opened.send(Err(fault)).ok();
+                None
+            }
+        }
+    }
+
     /// The listed window, watched from here on: a window destroyed after this
     /// is caught by the watch, and one replaced before it by its process, read
     /// again on the watch's own connection.
-    fn open(env: &Env, listed: &StreamWindow) -> Result<Watch, FrameError> {
+    fn open(env: &Env, listed: &StreamWindow, socket: &Socket) -> Result<Watch, FrameError> {
         let client = listed.id;
         let (connection, _) = super::connect(env).map_err(unavailable)?;
+        socket.keep(&connection)?;
         versions(&connection)?;
         let top = top_level(&connection, client)?;
         watch_structure(&connection, client, top)?;
@@ -1575,6 +1715,27 @@ mod tests {
             OnClear::NotAClear
         );
         assert_eq!(on_clear(&[], 70_002, ErrorKind::Window), OnClear::NotAClear);
+    }
+
+    // The bind runs on the watch's thread, where every request waits on the
+    // server for as long as it takes; the start waits for it only so long.
+    #[test]
+    fn a_bind_the_watch_does_not_finish_in_time_is_refused() {
+        let wait = Duration::from_millis(20);
+        let (silent, started) = mpsc::channel::<Opened>();
+        let refused = opened_within(&started, wait).expect_err("past the bound");
+        assert_eq!(refused.code(), "capture_unavailable");
+        assert!(refused.detail().contains("20 ms"), "{}", refused.detail());
+        drop(silent);
+        let ended = opened_within(&started, wait).expect_err("the watch ended");
+        assert_eq!(ended.code(), "capture_unavailable");
+        let (said, started) = mpsc::channel::<Opened>();
+        said.send(Err(FrameError::Minimized("hidden".to_string())))
+            .unwrap();
+        let hidden = opened_within(&started, wait).expect_err("its own refusal");
+        assert_eq!(hidden.code(), "target_minimized");
+        said.send(Ok(())).unwrap();
+        assert!(opened_within(&started, wait).is_ok());
     }
 
     #[test]
