@@ -347,7 +347,7 @@ mod tests {
     // Chromium's press is the first of its press names, read by
     // index; `doDefault` (plain text) and `clickAncestor` (text in a link) never are.
     #[test]
-    fn ledger_l18_16_press_is_the_first_press_name_and_never_do_default() {
+    fn press_is_the_first_press_name_and_never_do_default() {
         let chromium = named(&["showContextMenu", "press"]);
         assert_eq!(press(&read(PUSH_BUTTON, &[], &chromium)), Some(1));
         let link = named(&["jump", "showContextMenu"]);
@@ -380,7 +380,7 @@ mod tests {
     // `expand or contract` comes first where it has one. Neither is a route unless
     // the node reads EXPANDABLE.
     #[test]
-    fn ledger_l4_6_an_expander_is_expanded_by_its_one_toggle_style_action() {
+    fn an_expander_is_expanded_by_its_one_toggle_style_action() {
         let expander_actions = named(&["activate"]);
         let expandable = words(&[EXPANDABLE, SENSITIVE, SHOWING]);
         assert_eq!(
@@ -408,7 +408,7 @@ mod tests {
     // GTK 4 answers GrabFocus NotSupported, so focus is offered only on a
     // focusable Component of any other toolkit.
     #[test]
-    fn ledger_l4_16_focus_is_offered_where_grab_focus_works() {
+    fn focus_is_offered_where_grab_focus_works() {
         let none = named(&[]);
         let focusable = words(&[FOCUSABLE, SHOWING]);
         assert!(routes(&read(PUSH_BUTTON, &focusable, &none)).focus);

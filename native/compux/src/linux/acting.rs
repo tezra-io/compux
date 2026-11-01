@@ -642,7 +642,7 @@ mod tests {
     // Press is DoAction on the index its press name was read at by
     // GetName(i). GetActions is never sent, and `doDefault` is never done.
     #[test]
-    fn ledger_l3_20_press_does_the_action_at_the_index_its_name_was_read_at() {
+    fn press_does_the_action_at_the_index_its_name_was_read_at() {
         let (fake, ax) = reader(fake::one_window(
             &["/w/new_tab"],
             vec![(
@@ -902,7 +902,7 @@ mod tests {
     // A GTK 3 expander's one action is `activate`. Expand sends it only while
     // the expander reads collapsed, and reads EXPANDED back.
     #[test]
-    fn ledger_l4_6_expand_sends_the_one_action_only_while_collapsed() {
+    fn expand_sends_the_one_action_only_while_collapsed() {
         let expander = Node {
             flips: Some(EXPANDED),
             ..Node::of(62)
@@ -950,7 +950,7 @@ mod tests {
     // GrabFocus can activate an inactive window. focus is refused unless the
     // control's frame reads ACTIVE, and nothing is sent.
     #[test]
-    fn ledger_l4_16_focus_never_activates_a_window() {
+    fn focus_never_activates_a_window() {
         let (fake, ax) = reader(focus_desktop(false));
         let found = walk(&ax);
 
@@ -964,7 +964,7 @@ mod tests {
     // not read ACTIVE — whatever the window manager says is active. focus is
     // refused and nothing is sent.
     #[test]
-    fn ledger_l28_20_focus_is_refused_while_another_application_holds_the_grab() {
+    fn focus_is_refused_while_another_application_holds_the_grab() {
         let mut desktop = focus_desktop(false);
         desktop.pids.insert(OTHER.to_string(), OTHER_PID);
         desktop.put(
