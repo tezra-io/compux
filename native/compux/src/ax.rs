@@ -82,6 +82,19 @@ pub fn write_timeout_ms(remaining_ms: u64) -> u64 {
     (remaining_ms / 2).max(READ_TIMEOUT_MS)
 }
 
+/// Which application's window reads active, where the platform reads that state
+/// (AT-SPI on Linux): keys go into it only when exactly one does.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Active {
+    /// One application's window reads active: its process.
+    One(i32),
+    /// No application's window does.
+    None,
+    /// This many applications' windows do, so none of them is the one in front.
+    Many(usize),
+}
+
 /// One native element this process is holding a reference to.
 ///
 /// Opaque above the platform that minted it: nothing outside the macOS
@@ -447,6 +460,13 @@ pub trait Ax {
     /// The application in front. `None` when the platform will not say, in which
     /// case an action reports no foreground change rather than inventing one.
     fn frontmost_pid(&self) -> Option<i32>;
+
+    /// Which application's window reads active: one, none, or several. Where the
+    /// platform reads no such state (macOS), the application in front.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn active(&self) -> Active {
+        self.frontmost_pid().map_or(Active::None, Active::One)
+    }
 
     /// How many messages this platform has sent to applications since it was made
     /// (M7). A reply reports the difference across its own reads, which is the
@@ -2333,6 +2353,10 @@ struct Recorded {
     fail_next: Option<Refusal>,
     started_at: Option<u64>,
     frontmost: Option<i32>,
+    /// How many applications claim an active window, where a test says more than
+    /// one does.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    active_many: Option<usize>,
     /// What the front application becomes WHILE the next action runs, so a
     /// foreground change is observed between the two readings rather than set up
     /// before either of them.
@@ -2423,6 +2447,21 @@ impl Recorder {
     /// which must never be reported as a change.
     pub fn set_frontmost(&self, pid: Option<i32>) {
         self.state().frontmost = pid;
+    }
+
+    /// What the accessibility bus says is active: one application, none, or
+    /// several, none of which is then in front.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn set_active(&self, active: Active) {
+        let mut state = self.state();
+        state.frontmost = match active {
+            Active::One(pid) => Some(pid),
+            Active::None | Active::Many(_) => None,
+        };
+        state.active_many = match active {
+            Active::Many(count) => Some(count),
+            Active::One(_) | Active::None => None,
+        };
     }
 
     /// The next action takes the foreground for this application.
@@ -2909,6 +2948,16 @@ impl Ax for Recorder {
         let mut state = self.state();
         state.messages += 1;
         state.frontmost
+    }
+
+    fn active(&self) -> Active {
+        let mut state = self.state();
+        state.messages += 1;
+        match (state.active_many, state.frontmost) {
+            (Some(count), _) => Active::Many(count),
+            (None, Some(pid)) => Active::One(pid),
+            (None, None) => Active::None,
+        }
     }
 
     fn messages(&self) -> u64 {

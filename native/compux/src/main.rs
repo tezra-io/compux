@@ -3004,16 +3004,25 @@ fn desktop(worker: &mut Worker) -> Result<&mut dyn held::Platform, Failure> {
 /// Keys go only into a window that reads ACTIVE on the accessibility bus, and
 /// text only where the layout types every character and the keyboard is neutral.
 /// Each refusal is made before anything is sent. A window is never activated to
-/// make room, and `_NET_ACTIVE_WINDOW` is not asked: under another application's
-/// grab it names a window whose frame is not ACTIVE (L28-20).
+/// make room, and `_NET_ACTIVE_WINDOW` is not asked: while another application's
+/// popup holds the grab, the window manager still names a window whose frame
+/// does not read ACTIVE.
 #[cfg(target_os = "linux")]
 fn ready_for_keys(worker: &mut Worker, text: Option<&str>) -> Result<(), Failure> {
-    if worker.ax.frontmost_pid().is_none() {
+    let claims = match worker.ax.active() {
+        ax::Active::One(_) => None,
+        ax::Active::None => Some("no window reads ACTIVE".to_string()),
+        ax::Active::Many(count) => Some(format!(
+            "{count} applications have a window that reads ACTIVE"
+        )),
+    };
+    if let Some(claims) = claims {
         return Err(Failure::new(
             "no_active_window",
-            "no window reads ACTIVE on the accessibility bus, so keys would go nowhere anyone \
-             chose; compux never activates a window to make room: nothing was sent"
-                .to_string(),
+            format!(
+                "{claims} on the accessibility bus, so keys would go nowhere anyone chose; \
+                 compux never activates a window to make room: nothing was sent"
+            ),
         ));
     }
     let Some(text) = text else {
@@ -6656,6 +6665,8 @@ mod tests {
             request.body = body;
             let frame = served(&request, &gate, &mut worker);
             assert_eq!(frame["error"], json!("no_active_window"), "{frame}");
+            let detail = frame["detail"].as_str().unwrap_or_default();
+            assert!(detail.starts_with("no window reads ACTIVE"), "{frame}");
         }
         let Pixels::Recorded(recorder) = &worker.pixels else {
             panic!("a test worker records its input");
@@ -6672,6 +6683,33 @@ mod tests {
             panic!("a test worker records its input");
         };
         assert_eq!(recorder.calls, [held::Call::Text("hi".to_string())]);
+    }
+
+    // Two applications that both claim an active window leave none in front:
+    // keys are refused as with none, and the detail says how many claim it, so
+    // the reason is not mistaken for an empty desktop.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_keys_are_refused_where_several_windows_read_active_saying_how_many() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        let app = fixture_app();
+        app.set_active(ax::Active::Many(2));
+        let mut worker = worker_with(&gate, app.clone());
+        let mut typed = running("type", Some(1));
+        typed.body = json!({"action": "type", "text": "hi"});
+
+        let frame = served(&typed, &gate, &mut worker);
+
+        assert_eq!(frame["error"], json!("no_active_window"), "{frame}");
+        let detail = frame["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.starts_with("2 applications have a window that reads ACTIVE"),
+            "{frame}"
+        );
+        let Pixels::Recorded(recorder) = &worker.pixels else {
+            panic!("a test worker records its input");
+        };
+        assert!(recorder.calls.is_empty(), "posted: {:?}", recorder.calls);
     }
 
     // On GNOME Wayland the portal serves the pointer, the keys and the screen,

@@ -54,8 +54,8 @@ use super::vocabulary::{
 };
 use super::{bus, session};
 use crate::ax::{
-    self, Ax, Facts, Focus, Frame, Handle, Identity, Refusal, Retained, Route, Routes, States,
-    Unread, Write,
+    self, Active, Ax, Facts, Focus, Frame, Handle, Identity, Refusal, Retained, Route, Routes,
+    States, Unread, Write,
 };
 use crate::roles;
 
@@ -1120,8 +1120,9 @@ impl Real {
             .any(|(_, words)| vocabulary::has(words, ACTIVE))
     }
 
-    /// The process whose window reads ACTIVE, when exactly one does.
-    async fn active_process(&self, bus: &Connection) -> Option<i32> {
+    /// Which application's window reads ACTIVE: the process of the one that
+    /// does, none, or how many do.
+    async fn active_process(&self, bus: &Connection) -> Active {
         let applications = self.applications(bus).await;
         let active: Vec<Address> = stream::iter(applications)
             .map(|app| async move { self.has_active_window(bus, &app).await.then_some(app) })
@@ -1130,14 +1131,17 @@ impl Real {
             .collect()
             .await;
         match <[Address; 1]>::try_from(active) {
-            Ok([app]) => self.process(bus, &app.bus).await,
-            Err(active) if active.is_empty() => None,
+            Ok([app]) => self
+                .process(bus, &app.bus)
+                .await
+                .map_or(Active::None, Active::One),
+            Err(active) if active.is_empty() => Active::None,
             Err(active) => {
                 eprintln!(
                     "compux: {} applications have a window that reads active",
                     active.len()
                 );
-                None
+                Active::Many(active.len())
             }
         }
     }
@@ -1442,7 +1446,16 @@ impl Ax for Real {
     }
 
     fn frontmost_pid(&self) -> Option<i32> {
-        let bus = self.bus()?;
+        match self.active() {
+            Active::One(pid) => Some(pid),
+            Active::None | Active::Many(_) => None,
+        }
+    }
+
+    fn active(&self) -> Active {
+        let Some(bus) = self.bus() else {
+            return Active::None;
+        };
         async_io::block_on(self.active_process(&bus))
     }
 
@@ -2477,6 +2490,36 @@ mod tests {
             window.states.retain(|bit| *bit != ACTIVE)
         });
         assert_eq!(ax.frontmost_pid(), None, "no window reads active");
+    }
+
+    // Two applications whose windows both read ACTIVE: neither is the one in
+    // front, and the reader says how many claim it rather than that none does.
+    #[test]
+    fn two_applications_whose_windows_read_active_are_several_not_none() {
+        let mut both = desktop(&[], vec![]);
+        both.pids.insert(OTHER.to_string(), OTHER_PID as u32);
+        both.put(
+            OTHER,
+            fake::ROOT,
+            Node::of(APPLICATION).named("other").holding(OTHER, &["/o"]),
+        );
+        both.put(
+            OTHER,
+            "/o",
+            Node {
+                states: vec![ACTIVE, SHOWING, VISIBLE],
+                ..Node::of(23).named("Other")
+            },
+        );
+        both.nodes
+            .get_mut(&(fake::REGISTRY.to_string(), fake::ROOT.to_string()))
+            .expect("the registry")
+            .children
+            .push((OTHER.to_string(), fake::ROOT.to_string()));
+        let (_fake, ax) = reader(both);
+
+        assert_eq!(ax.active(), Active::Many(2));
+        assert_eq!(ax.frontmost_pid(), None, "neither is in front");
     }
 
     // A node that answers with a refusal is alive and unreadable — not
