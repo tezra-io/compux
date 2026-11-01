@@ -22,8 +22,9 @@
 //! again, resized or given a new border width gets a new pixmap, and is proved
 //! again the same way before anything more is published; a proof that falls
 //! short then is retried at each of the next [`MAX_REPROOF_RETRIES`] intervals,
-//! and the binding ends if none holds. Any part of a picture the proof did not
-//! reach is sent black.
+//! and the binding ends if none holds. While a window waits to be proved again,
+//! no frame of it is served: the one held is of the window before it changed.
+//! Any part of a picture the proof did not reach is sent black.
 //!
 //! **What a frame carries.** The window manager's frame and GTK's shadow are
 //! accounted for exactly as the window list accounts for them, so a picture is
@@ -388,19 +389,40 @@ impl Drop for Composite {
 enum Caught {
     /// It synced its connection and read every report sent before the sync.
     Up,
+    /// It caught up, and the window is waiting to be proved again: it was
+    /// resized, shown again or given a new border, or its last proof fell short.
+    Reproving,
     /// It is not running: it ended on a fault the slot holds, or without one.
     Ended,
     /// It did not answer within [`CATCH_UP_WAIT_MS`].
     Late,
 }
 
+/// Where the watch stands once it has caught up: a window renewed since its
+/// pixmap was named, or with no proof holding, waits to be proved again.
+fn standing(renewed: bool, proven: Option<Rect>) -> Caught {
+    if renewed || proven.is_none() {
+        Caught::Reproving
+    } else {
+        Caught::Up
+    }
+}
+
 /// What the slot holds, as far as the watch's catching up lets it be served.
+/// While the window waits to be proved again, the frame held is of the window
+/// before it changed, and is not served.
 fn served(
     caught: Caught,
     peeked: Result<WindowFrame, FrameError>,
 ) -> Result<WindowFrame, FrameError> {
     match (caught, peeked) {
         (Caught::Up, peeked) => peeked,
+        (Caught::Reproving, Ok(_before)) => Err(FrameError::Unavailable(
+            "the window is being proved again after it changed size, was shown again or got a new \
+             border, and nothing of it is sent until that holds; retry in a moment"
+                .to_string(),
+        )),
+        (Caught::Reproving, refused) => refused,
         (Caught::Late, _) => Err(FrameError::Unavailable(format!(
             "the window capture did not catch up with the X server within {CATCH_UP_WAIT_MS} ms"
         ))),
@@ -414,8 +436,9 @@ fn served(
 
 /// What the watch's thread is asked to do between two intervals.
 enum Command {
-    /// Sync, read every report the server sent before the sync, and say so.
-    CatchUp(Sender<()>),
+    /// Sync, read every report the server sent before the sync, and say where
+    /// the watch stands.
+    CatchUp(Sender<Caught>),
     Stop,
 }
 
@@ -455,7 +478,7 @@ impl Running {
             return Caught::Ended;
         }
         match answered.recv_timeout(Duration::from_millis(CATCH_UP_WAIT_MS)) {
-            Ok(()) => Caught::Up,
+            Ok(caught) => caught,
             Err(RecvTimeoutError::Disconnected) => Caught::Ended,
             Err(RecvTimeoutError::Timeout) => Caught::Late,
         }
@@ -855,7 +878,7 @@ impl Watch {
             }
             // Nobody waiting for the answer is a request that already gave up.
             if let Some(answer) = answer {
-                answer.send(()).ok();
+                answer.send(standing(self.renewed, self.proven)).ok();
             }
             if ended {
                 return;
@@ -878,7 +901,7 @@ impl Watch {
         let viewable = self.viewable()?;
         self.drain()?;
         // A window no proof holds for is proved before it is read.
-        let renewed = self.renewed || self.proven.is_none();
+        let renewed = standing(self.renewed, self.proven) == Caught::Reproving;
         match step(viewable, self.hidden, renewed, self.damaged) {
             Step::Hidden => {
                 self.hidden = true;
@@ -1431,6 +1454,36 @@ mod tests {
         let closed = FrameError::Gone("the window was closed after it was bound".to_string());
         let refused = served(Caught::Up, Err(closed)).expect_err("gone");
         assert_eq!(refused.code(), "target_unavailable");
+    }
+
+    // A window resized, shown again or given a new border is proved again before
+    // anything more of it is sent, and so is one whose last proof fell short: the
+    // frame held is the window before the change, at its old size.
+    #[test]
+    fn a_pending_re_proof_serves_nothing() {
+        let refused = served(Caught::Reproving, Ok(frame())).expect_err("the held frame");
+        assert_eq!(refused.code(), "capture_unavailable");
+        let detail = refused.detail();
+        assert!(
+            detail.contains("proved again") && detail.contains("retry"),
+            "{detail}"
+        );
+        // A look fenced after an action keeps waiting for the frame the proof reads.
+        assert!(matches!(
+            served(Caught::Reproving, Err(FrameError::NotYet)),
+            Err(FrameError::NotYet)
+        ));
+        let closed = FrameError::Gone("the window was closed after it was bound".to_string());
+        let refused = served(Caught::Reproving, Err(closed)).expect_err("gone");
+        assert_eq!(refused.code(), "target_unavailable");
+    }
+
+    #[test]
+    fn a_window_renewed_or_with_no_proof_holding_waits_to_be_proved_again() {
+        let crop = rect(0, 0, 8, 4);
+        assert_eq!(standing(false, Some(crop)), Caught::Up);
+        assert_eq!(standing(true, Some(crop)), Caught::Reproving);
+        assert_eq!(standing(false, None), Caught::Reproving);
     }
 
     #[test]

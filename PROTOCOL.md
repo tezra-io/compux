@@ -128,10 +128,11 @@ they are as protocol 11 had them.
   shown during it is refused at selection, and proved again later. A window mapped again, resized or given a
   new border width is proved the same way before its next frame, and nothing of it is read until that holds;
   a proof that falls short then is tried again at each of the next three intervals, and the binding ends
-  (`capture_unavailable`) if none holds. Any part of a picture the proof did not reach (the frame extents moved
-  it) is sent black. The picture is the window's listed bounds, frame included, in root pixels
-  at a scale of 1. A damaged window is read again at most ten times a second; an undamaged one reports idle
-  frames.
+  (`capture_unavailable`) if none holds. While it waits, a request for its picture is `capture_unavailable`
+  (retry in a moment), never the last frame: that one has the window's old size and contents. Any part of a
+  picture the proof did not reach (the frame extents moved it) is sent black. The picture is the window's listed
+  bounds, frame included, in root pixels at a scale of 1. A damaged window is read again at most ten times a
+  second; an undamaged one reports idle frames.
 - **Pixel actions** on a bound window need it topmost at the point, as on macOS (`target_obstructed`, naming the
   window in front). In front means a window the window manager lists in front of it, or any window the X server
   stacks above it that takes input at that point: menus, tooltips, notifications and a desktop shell's own
