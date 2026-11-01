@@ -308,6 +308,13 @@ pub enum FrameError {
     /// No frame has passed the fence YET. Not a failure: the caller polls, and only
     /// its own deadline turns this into an answer.
     NotYet,
+    /// The window the stream was bound to is gone for good: destroyed under the
+    /// watch that bound it, or that watch's connection ended. Its own code,
+    /// because a window id may be reused and the window that has it now is
+    /// another one. Only the X11 stream watches a window this way; on macOS the
+    /// window server's listing says a window is gone before any frame is asked.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    Gone(String),
 }
 
 impl FrameError {
@@ -319,6 +326,7 @@ impl FrameError {
             FrameError::Denied(_) => "screen_recording_not_granted",
             FrameError::BudgetExceeded(_) => "capture_budget_exceeded",
             FrameError::NotYet => "capture_unavailable",
+            FrameError::Gone(_) => "target_unavailable",
         }
     }
 
@@ -327,7 +335,8 @@ impl FrameError {
             FrameError::Unavailable(detail)
             | FrameError::Minimized(detail)
             | FrameError::Denied(detail)
-            | FrameError::BudgetExceeded(detail) => detail.clone(),
+            | FrameError::BudgetExceeded(detail)
+            | FrameError::Gone(detail) => detail.clone(),
             FrameError::NotYet => {
                 "no frame of that window arrived after the action was dispatched".to_string()
             }
@@ -1095,9 +1104,9 @@ pub mod sck {
     }
 }
 
-/// Linux has no window capture this build speaks. A typed refusal rather than an
-/// empty stream: a caller that cannot tell "nothing arrived" from "not supported
-/// here" writes the wrong sentence about both. [M42.1] owns the Linux half.
+/// A session with no window capture this build speaks: Linux off X11. A typed
+/// refusal rather than an empty stream: a caller that cannot tell "nothing
+/// arrived" from "not supported here" writes the wrong sentence about both.
 #[cfg(not(target_os = "macos"))]
 pub struct Unsupported;
 
@@ -1105,13 +1114,13 @@ pub struct Unsupported;
 impl WindowFrames for Unsupported {
     fn start(&self, _window: StreamWindow) -> Result<(), FrameError> {
         Err(FrameError::Unavailable(
-            "window capture is only supported on macOS".to_string(),
+            "a window is captured on macOS, and on Linux on X11 only".to_string(),
         ))
     }
 
     fn latest(&self, _after: Option<Fence>) -> Result<WindowFrame, FrameError> {
         Err(FrameError::Unavailable(
-            "window capture is only supported on macOS".to_string(),
+            "a window is captured on macOS, and on Linux on X11 only".to_string(),
         ))
     }
 

@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 use zbus::Connection;
@@ -20,8 +21,11 @@ use zbus::Connection;
 use super::display::{Endpoint, Env, Server};
 use super::portal::{self, Portal, Refusal};
 use super::x11;
+use crate::gate::Clock;
 use crate::geometry::MonitorFacts;
 use crate::held::{Axis, Button, Direction, Key, Platform};
+use crate::window_frames::{self, WindowFrames};
+use crate::window_server::{self, Windows};
 
 /// What the portal route does not serve: there is no portal clipboard compux
 /// owns, and no portal lists windows.
@@ -274,9 +278,35 @@ impl Pixels {
     /// The client windows, front-most first: X11 only.
     pub fn windows(&self) -> Result<Vec<x11::Window>, String> {
         match self {
-            Pixels::X11(_, env) => x11::windows(env),
+            Pixels::X11(_, env) => x11::windows(env).map(|listed| listed.windows),
             _ => Err("windows are listed on X11 only".to_string()),
         }
+    }
+
+    /// The window server a bound window lives by: X11's, or one that says why
+    /// no window can be bound on this session.
+    pub fn window_server(&self) -> Arc<dyn Windows> {
+        match self {
+            Pixels::X11(_, env) => Arc::new(x11::WindowServer::new(env.clone())),
+            _ => Arc::new(window_server::Unlisted::new(
+                "a window is bound on X11 only: this session has no X11 window manager to say \
+                 which window is which",
+            )),
+        }
+    }
+
+    /// A fresh stream for one bound window: Composite on X11. Nothing else can
+    /// bind one, and a selection there is refused before this is asked.
+    pub fn window_stream(&self, clock: Arc<dyn Clock>) -> Rc<dyn WindowFrames> {
+        match self {
+            Pixels::X11(_, env) => Rc::new(x11::Composite::new(env.clone(), clock)),
+            _ => Rc::new(window_frames::Unsupported),
+        }
+    }
+
+    /// Whether a window can be bound on this session: X11 only.
+    pub fn binds(&self) -> bool {
+        matches!(self, Pixels::X11(..))
     }
 
     /// Let go of the portal session: on release, and at exit by drop.

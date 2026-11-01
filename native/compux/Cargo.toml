@@ -70,7 +70,9 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 # Linux pixels (M86 L2): the X protocol in pure Rust, handed its display and its
 # authority as values. XTEST posts input, RandR names the monitors, XKB says
 # which group and modifiers the keyboard is in; capture is the core GetImage.
-x11rb = { version = "0.13", default-features = false, features = ["xtest", "randr", "xkb"] }
+# A bound window (M86 L3) is read through Composite, watched through Damage, and
+# its badge takes clicks only where Shape says.
+x11rb = { version = "0.13", default-features = false, features = ["xtest", "randr", "xkb", "composite", "damage", "shape"] }
 # What character an X keysym types, for every keysym a layout can name (the
 # legacy Cyrillic, Greek and other tables as well as Unicode's).
 xkeysym = "0.2"

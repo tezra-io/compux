@@ -533,6 +533,30 @@ fn pixels_of(endpoint: &Endpoint) -> Pixels {
     Pixels::of(endpoint)
 }
 
+/// The window server a bound window lives by: on Linux the session's own, which
+/// only X11 has.
+#[cfg(target_os = "linux")]
+fn windows_of(pixels: &Pixels) -> Arc<dyn window_server::Windows> {
+    pixels.window_server()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn windows_of(_pixels: &Pixels) -> Arc<dyn window_server::Windows> {
+    Arc::new(window_server::Real::new())
+}
+
+/// What starts the badge: on Linux it draws on this process's display, which may
+/// be one taken from the user manager.
+#[cfg(target_os = "linux")]
+fn launcher_of(endpoint: &Endpoint) -> Arc<dyn indicator::Launcher> {
+    Arc::new(indicator::Bundled::on(&endpoint.env))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn launcher_of(_endpoint: &Endpoint) -> Arc<dyn indicator::Launcher> {
+    Arc::new(indicator::Bundled::new())
+}
+
 #[cfg(not(target_os = "linux"))]
 fn pixels_of(_endpoint: &Endpoint) -> Pixels {
     Pixels
@@ -551,8 +575,8 @@ fn run_worker(
         measured: Measured::new(),
         ax: Rc::new(reader(&endpoint)),
         frames: Rc::new(Screen::of(&pixels)),
-        windows: Arc::new(window_server::Real::new()),
-        launcher: Arc::new(indicator::Bundled::new()),
+        windows: windows_of(&pixels),
+        launcher: launcher_of(&endpoint),
         displays: Rc::new(RealDisplays::of(&pixels)),
         target: None,
         target_generation: 0,
@@ -1182,7 +1206,7 @@ fn hello(launcher: &Arc<dyn indicator::Launcher>, pixels: &Pixels) -> Result<Val
             // executable is beside this one: a target cannot be worked in without
             // it, and finding that out by selecting a window and being refused
             // would be finding it out too late.
-            "targets": targets_supported(),
+            "targets": targets_supported(pixels),
             "capture_methods": capture_methods(pixels),
             "indicator": indicator_presence(launcher),
         },
@@ -1266,7 +1290,7 @@ fn advertised_actions(pixels: &Pixels) -> Vec<&'static str> {
     ACTIONS
         .into_iter()
         .filter(|action| accessibility_served(action))
-        .filter(|action| targets_supported() || !TARGET_ACTIONS.contains(action))
+        .filter(|action| targets_supported(pixels) || !TARGET_ACTIONS.contains(action))
         .filter(|action| !PIXEL_ACTIONS.contains(action) || pixels.serves(action))
         .collect()
 }
@@ -1306,13 +1330,20 @@ fn points_readable() -> bool {
     cfg!(target_os = "macos")
 }
 
-/// Can this build bind a window at all?
+/// Can this session bind a window at all?
 ///
-/// False where every selection would fail: there is no window server this build
-/// reads off macOS and no stream behind it, so `targets: true` there would be the
-/// handshake advertising a feature whose first use is a refusal. [M42.1] owns the
-/// Linux half and flips this with it.
-fn targets_supported() -> bool {
+/// False where every selection would fail, so `targets: true` there would be the
+/// handshake advertising a feature whose first use is a refusal. macOS binds
+/// everywhere; Linux only on X11, where the window manager says which window is
+/// which and Composite captures one. A Wayland session gives an ordinary client
+/// neither.
+#[cfg(target_os = "linux")]
+fn targets_supported(pixels: &Pixels) -> bool {
+    pixels.binds()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn targets_supported(_pixels: &Pixels) -> bool {
     cfg!(target_os = "macos")
 }
 
@@ -1320,7 +1351,7 @@ fn targets_supported() -> bool {
 /// is listed only where it exists: a caller that reads it and gets
 /// `capture_unavailable` on every selection has been lied to.
 fn capture_methods(pixels: &Pixels) -> Vec<&'static str> {
-    match (pixels.serves("screenshot"), targets_supported()) {
+    match (pixels.serves("screenshot"), targets_supported(pixels)) {
         (false, _) => Vec::new(),
         (true, true) => vec!["display", "window"],
         (true, false) => vec!["display"],
@@ -2096,6 +2127,17 @@ fn select_target(
             )
         })? as u32;
 
+    // A session that can bind no window says so by name, before anything is read.
+    if !targets_supported(&worker.pixels) {
+        return Err(Failure::new(
+            "target_binding_unavailable",
+            "no window can be bound on this session: compux binds a window only on X11, where \
+             the window manager says which window is which; work by control (`elements` and the \
+             verbs on a reference) or at the display instead"
+                .to_string(),
+        ));
+    }
+
     // The display the window is on, so a target observation records the same facts
     // every other observation does and a display that changes mode is still caught.
     let display = target_display(&request.body, worker)?;
@@ -2116,7 +2158,7 @@ fn select_target(
             ax: &worker.ax,
             launcher: &worker.launcher,
             emitter,
-            stream: new_window_stream(gate),
+            stream: new_window_stream(gate, &worker.pixels),
             display_id: display.id,
             facts: display.facts,
         },
@@ -2158,15 +2200,14 @@ fn release_target(worker: &mut Worker) -> Result<Value, Failure> {
 
 /// A fresh stream for one binding.
 #[cfg(target_os = "macos")]
-fn new_window_stream(gate: &Gate) -> Rc<dyn window_frames::WindowFrames> {
+fn new_window_stream(gate: &Gate, _pixels: &Pixels) -> Rc<dyn window_frames::WindowFrames> {
     Rc::new(window_frames::sck::Stream::new(gate.clock()))
 }
 
-/// Linux has no window capture this build speaks, so a selection fails typed rather
-/// than binding a window nothing can look at. [M42.1] owns the Linux half.
-#[cfg(not(target_os = "macos"))]
-fn new_window_stream(_gate: &Gate) -> Rc<dyn window_frames::WindowFrames> {
-    Rc::new(window_frames::Unsupported)
+/// On Linux, the session's own: Composite on X11.
+#[cfg(target_os = "linux")]
+fn new_window_stream(gate: &Gate, pixels: &Pixels) -> Rc<dyn window_frames::WindowFrames> {
+    pixels.window_stream(gate.clock())
 }
 
 /// Fold one payload into another, which is how `select_target` answers both what it
@@ -4989,10 +5030,10 @@ fn listed_windows(worker: &Worker) -> Result<Vec<Listed>, String> {
             focused: window.focused,
             minimized: window.minimized,
             bounds: (
-                f64::from(window.x),
-                f64::from(window.y),
-                f64::from(window.width),
-                f64::from(window.height),
+                f64::from(window.bounds.x),
+                f64::from(window.bounds.y),
+                f64::from(window.bounds.width),
+                f64::from(window.bounds.height),
             ),
         })
         .collect())
@@ -6365,7 +6406,7 @@ mod tests {
     #[test]
     fn the_handshake_offers_targets_exactly_where_a_window_can_be_captured() {
         assert_eq!(
-            targets_supported(),
+            targets_supported(&test_pixels()),
             capture_methods(&test_pixels()).contains(&"window"),
             "`targets` and the window capture method are one fact"
         );
@@ -6762,6 +6803,62 @@ mod tests {
             json!(["display"]),
             "{v}"
         );
+    }
+
+    // On X11 a window can be bound, and the handshake says so; the portal route
+    // binds none, and leaves the two verbs and the window capture out.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_the_handshake_offers_bound_windows_on_x11_only() {
+        let env = linux::display::Env {
+            display: Some(":99".to_string()),
+            ..linux::display::Env::default()
+        };
+        let x11 = Pixels::X11(Box::new(linux::x11::Desktop::new(env.clone())), env);
+        let v = hello(&test_launcher(), &x11).unwrap();
+        let actions = advertised(&v);
+        assert!(actions.contains(&"select_target"), "{v}");
+        assert!(actions.contains(&"release_target"), "{v}");
+        assert_eq!(v["capabilities"]["targets"], json!(true), "{v}");
+        assert_eq!(
+            v["capabilities"]["capture_methods"],
+            json!(["display", "window"]),
+            "{v}"
+        );
+
+        let portal = Pixels::on_portal(linux::portal::Portal::with(
+            Box::new(|| panic!("hello asked the portal")),
+            None,
+            linux::portal::Budgets::PORTAL,
+        ));
+        let v = hello(&test_launcher(), &portal).unwrap();
+        let actions = advertised(&v);
+        assert!(!actions.contains(&"select_target"), "{v}");
+        assert!(!actions.contains(&"release_target"), "{v}");
+        assert_eq!(v["capabilities"]["targets"], json!(false), "{v}");
+    }
+
+    // A session that binds no window refuses a selection by name, before any
+    // window server is asked anything.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_a_selection_off_x11_is_refused_by_name_and_reads_nothing() {
+        let gate = Gate::new("boot-test".to_string(), Arc::new(SystemClock::new()));
+        let mut worker = idle_worker(&gate);
+        let windows = window_server::Recorder::new(Vec::new());
+        worker.windows = windows.clone();
+        let request = request_for(&json!({"action": "select_target", "window_id": 20}));
+
+        let refused = handle(&request, &gate, &capture::Emitter::new(), &mut worker)
+            .expect_err("no window can be bound here");
+
+        assert_eq!(refused.code, "target_binding_unavailable");
+        assert!(
+            refused.detail.as_deref().is_some_and(|d| d.contains("X11")),
+            "{refused:?}"
+        );
+        assert_eq!(windows.calls(), 0);
+        assert!(worker.target.is_none());
     }
 
     // A display taken from the user manager is decided as the helper's own would

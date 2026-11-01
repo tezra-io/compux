@@ -9,13 +9,16 @@
 //!   file-only, tested without a display;
 //! - `input`: the XTEST platform behind `held::Platform`;
 //! - `capture`: the monitors and one display's frame;
-//! - `windows`: the EWMH window listing;
+//! - `windows`: the EWMH window listing, and the window server a bound window
+//!   lives by;
+//! - `frames`: a bound window's frames, through Composite;
 //! - `clipboard`: the selection owner's thread.
 
 mod capture;
 mod clipboard;
 #[cfg(test)]
 mod fake_x;
+mod frames;
 mod input;
 pub mod journal;
 pub mod keymap;
@@ -27,8 +30,9 @@ pub mod xauth;
 #[cfg(not(test))]
 pub use capture::capture;
 pub use capture::{monitors, Monitor};
+pub use frames::Composite;
 pub use input::{Desktop, Facts, Refusal, KEY_PACE_MS};
-pub use windows::{list as windows, Window};
+pub use windows::{list as windows, Window, WindowServer};
 
 use x11rb::reexports::x11rb_protocol::parse_display::parse_display;
 use x11rb::rust_connection::{DefaultStream, RustConnection};

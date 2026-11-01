@@ -79,6 +79,10 @@ pub struct WindowFacts {
     pub app: String,
     pub title: String,
     pub bounds: Bounds,
+    /// The window's own area without the frame its window manager draws around
+    /// it, where the window server tells the two apart (X11). An accessibility
+    /// frame may be placed at either, depending on the toolkit.
+    pub content: Option<Bounds>,
     /// The window server's own layer. Zero is "a window a person works in"; the
     /// Dock, the menu bar and floating panels live above it.
     pub layer: i64,
@@ -331,6 +335,7 @@ pub mod mac {
             app: read_text(dict, &keys.owner),
             title: read_text(dict, &keys.name),
             bounds,
+            content: None,
             layer: read_i64(dict, &keys.layer).unwrap_or(0),
             on_screen: read_bool(dict, &keys.on_screen),
         })
@@ -412,31 +417,29 @@ pub use mac::Real;
 
 // --- everywhere else ----------------------------------------------------------
 
-/// Linux has no window server this build reads, and saying so is not the same as
-/// answering an empty desktop: a caller that cannot tell them apart writes the
-/// wrong sentence about both.
+/// A session whose window server this build does not read, and why. Saying so is
+/// not the same as answering an empty desktop: a caller that cannot tell them
+/// apart writes the wrong sentence about both.
 #[cfg(not(target_os = "macos"))]
-mod stub {
-    use super::{WindowFacts, Windows};
+pub struct Unlisted {
+    why: String,
+}
 
-    #[derive(Default)]
-    pub struct Real;
-
-    impl Real {
-        pub fn new() -> Real {
-            Real
-        }
-    }
-
-    impl Windows for Real {
-        fn list(&self) -> Result<Vec<WindowFacts>, String> {
-            Err("window targeting is only supported on macOS".to_string())
+#[cfg(not(target_os = "macos"))]
+impl Unlisted {
+    pub fn new(why: &str) -> Unlisted {
+        Unlisted {
+            why: why.to_string(),
         }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-pub use stub::Real;
+impl Windows for Unlisted {
+    fn list(&self) -> Result<Vec<WindowFacts>, String> {
+        Err(self.why.clone())
+    }
+}
 
 // --- the recording window server (tests only) ---------------------------------
 
@@ -507,6 +510,7 @@ pub fn window(id: u32, pid: i32, bounds: Bounds) -> WindowFacts {
         app: format!("App{pid}"),
         title: format!("Window {id}"),
         bounds,
+        content: None,
         layer: 0,
         on_screen: true,
     }
