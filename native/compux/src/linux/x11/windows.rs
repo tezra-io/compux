@@ -16,10 +16,12 @@
 
 use x11rb::connection::Connection;
 use x11rb::cookie::Cookie;
+use x11rb::errors::ReplyError;
 use x11rb::protocol::xproto::{
     AtomEnum, ConnectionExt as _, GetGeometryReply, GetPropertyReply, GetWindowAttributesReply,
     MapState, TranslateCoordinatesReply, Window as XWindow,
 };
+use x11rb::protocol::ErrorKind;
 use x11rb::rust_connection::RustConnection;
 
 use crate::linux::display::Env;
@@ -139,11 +141,28 @@ pub fn list(env: &Env) -> Result<Listed, String> {
         .into_iter()
         .map(|id| Asked::send(&connection, root, &atoms, id))
         .collect::<Result<Vec<_>, String>>()?;
-    let windows = asked
-        .into_iter()
-        .filter_map(|asked| asked.answer(&atoms, active))
-        .collect();
+    let mut windows = Vec::with_capacity(asked.len());
+    for asked in asked {
+        if let Some(window) = asked.answer(&atoms, active)? {
+            windows.push(window);
+        }
+    }
     Ok(Listed { windows, stacked })
+}
+
+/// A reply about one window, or `None` where the window went away while it was
+/// being read. Any other refusal, and a connection that failed, is the
+/// listing's fault, never a window quietly left out.
+fn present<T>(reply: Result<T, ReplyError>) -> Result<Option<T>, String> {
+    match reply {
+        Ok(reply) => Ok(Some(reply)),
+        Err(ReplyError::X11Error(error))
+            if matches!(error.error_kind, ErrorKind::Window | ErrorKind::Drawable) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(format!("enumerate windows: {error}")),
+    }
 }
 
 /// The stacking list runs bottom to top, and a window listed twice is the
@@ -302,31 +321,38 @@ impl<'c> Asked<'c> {
     }
 
     /// The window, or `None` where it went away while it was being read, or
-    /// cannot be placed.
-    fn answer(self, atoms: &Atoms, active: Option<u32>) -> Option<Window> {
-        let geometry = self.geometry.reply().ok()?;
-        let at = self.at.reply().ok()?;
-        let attributes = self.attributes.reply().ok()?;
-        let title = text(self.net_name.reply().ok())
-            .filter(|title| !title.is_empty())
-            .or_else(|| text(self.wm_name.reply().ok()))
+    /// cannot be placed. Any other refusal, and a connection that failed, is the
+    /// listing's fault ([`present`]).
+    fn answer(self, atoms: &Atoms, active: Option<u32>) -> Result<Option<Window>, String> {
+        let (Some(geometry), Some(at), Some(attributes)) = (
+            present(self.geometry.reply())?,
+            present(self.at.reply())?,
+            present(self.attributes.reply())?,
+        ) else {
+            return Ok(None);
+        };
+        let net_name = text(present(self.net_name.reply())?).filter(|title| !title.is_empty());
+        let title = net_name
+            .or(text(present(self.wm_name.reply())?))
             .unwrap_or_default();
-        let class = text(self.class.reply().ok()).unwrap_or_default();
-        let states = values(self.state.reply().ok());
-        let pid = values(self.pid.reply().ok())
+        let class = text(present(self.class.reply())?).unwrap_or_default();
+        let states = values(present(self.state.reply())?);
+        let pid = values(present(self.pid.reply())?)
             .first()
             .and_then(|&pid| i32::try_from(pid).ok())
             .filter(|&pid| pid > 0);
-        let frame = extents(&values(self.frame.reply().ok())).unwrap_or_default();
-        let shadow = extents(&values(self.shadow.reply().ok())).unwrap_or_default();
+        let frame = extents(&values(present(self.frame.reply())?)).unwrap_or_default();
+        let shadow = extents(&values(present(self.shadow.reply())?)).unwrap_or_default();
         let client = Rect {
             x: i32::from(at.dst_x),
             y: i32::from(at.dst_y),
             width: u32::from(geometry.width),
             height: u32::from(geometry.height),
         };
-        let (bounds, content) = placed(client, frame, shadow)?;
-        Some(Window {
+        let Some((bounds, content)) = placed(client, frame, shadow) else {
+            return Ok(None);
+        };
+        Ok(Some(Window {
             id: self.id,
             pid,
             // WM_CLASS is "instance\0Class\0": the class names the application.
@@ -337,7 +363,7 @@ impl<'c> Asked<'c> {
             viewable: attributes.map_state == MapState::VIEWABLE,
             bounds,
             content,
-        })
+        }))
     }
 }
 
@@ -453,6 +479,8 @@ pub fn facts(window: Window) -> WindowFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use x11rb::errors::ConnectionError;
+    use x11rb::x11_utils::X11Error;
 
     fn rect(x: i32, y: i32, width: u32, height: u32) -> Rect {
         Rect {
@@ -548,6 +576,33 @@ mod tests {
         assert_eq!(extents(&[1, 2, 3, 4, 5]), None);
         assert_eq!(extents(&[1, 2, MAX_EXTENT + 1, 4]), None);
         assert_eq!(extents(&[]), None);
+    }
+
+    #[test]
+    fn a_window_that_went_away_is_left_out_and_a_failed_connection_is_the_listings_fault() {
+        let gone = X11Error {
+            error_kind: ErrorKind::Window,
+            error_code: 3,
+            sequence: 9,
+            bad_value: 0x40_0001,
+            minor_opcode: 0,
+            major_opcode: 14,
+            extension_name: None,
+            request_name: Some("GetGeometry"),
+        };
+        assert_eq!(present::<u32>(Ok(7)), Ok(Some(7)));
+        assert_eq!(
+            present::<u32>(Err(ReplyError::X11Error(gone.clone()))),
+            Ok(None)
+        );
+        let refused = X11Error {
+            error_kind: ErrorKind::Atom,
+            error_code: 5,
+            ..gone
+        };
+        assert!(present::<u32>(Err(ReplyError::X11Error(refused))).is_err());
+        let lost = ReplyError::ConnectionError(ConnectionError::UnknownError);
+        assert!(present::<u32>(Err(lost)).is_err());
     }
 
     #[test]
