@@ -112,6 +112,30 @@ impl Transfers {
     }
 }
 
+/// What the first read of another application's answer holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Converted {
+    /// The whole text.
+    Text(Vec<u8>),
+    /// An `INCR` property: the text follows in chunks.
+    Incremental,
+    /// More than one read takes, so more than compux keeps.
+    TooLarge,
+}
+
+/// The answer as one read of it found it. `bytes_after` is what the read left
+/// behind: a read is as long as the largest text compux keeps, so anything left
+/// is too large.
+pub fn converted(type_: u32, value: Vec<u8>, bytes_after: u32, atoms: &Atoms) -> Converted {
+    if bytes_after != 0 {
+        return Converted::TooLarge;
+    }
+    if type_ == atoms.incr {
+        return Converted::Incremental;
+    }
+    Converted::Text(value)
+}
+
 /// Reading another application's text that came in INCR chunks.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Receiving {
@@ -127,8 +151,13 @@ pub enum Received {
 }
 
 impl Receiving {
-    /// One chunk; the empty one ends the text.
-    pub fn chunk(&mut self, bytes: &[u8]) -> Received {
+    /// One chunk; the empty one ends the text. `bytes_after` is what the read of
+    /// it left behind.
+    pub fn chunk(&mut self, bytes: &[u8], bytes_after: u32) -> Received {
+        if bytes_after != 0 {
+            self.data.clear();
+            return Received::TooLarge;
+        }
         if bytes.is_empty() {
             return Received::Done(std::mem::take(&mut self.data));
         }
@@ -211,13 +240,39 @@ mod tests {
     #[test]
     fn a_text_read_in_chunks_ends_at_the_empty_one_and_a_huge_one_is_dropped() {
         let mut receiving = Receiving::default();
-        assert_eq!(receiving.chunk(b"ab"), Received::More);
-        assert_eq!(receiving.chunk(b"cd"), Received::More);
-        assert_eq!(receiving.chunk(b""), Received::Done(b"abcd".to_vec()));
+        assert_eq!(receiving.chunk(b"ab", 0), Received::More);
+        assert_eq!(receiving.chunk(b"cd", 0), Received::More);
+        assert_eq!(receiving.chunk(b"", 0), Received::Done(b"abcd".to_vec()));
 
         let mut huge = Receiving::default();
         let big = vec![b'x'; MAX_TEXT_BYTES];
-        assert_eq!(huge.chunk(&big), Received::More);
-        assert_eq!(huge.chunk(b"y"), Received::TooLarge);
+        assert_eq!(huge.chunk(&big, 0), Received::More);
+        assert_eq!(huge.chunk(b"y", 0), Received::TooLarge);
+    }
+
+    // A read takes at most what compux keeps; the server says what it left
+    // behind. Anything left is a text too large to keep, never a cut one.
+    #[test]
+    fn an_answer_one_read_does_not_reach_the_end_of_is_too_large_not_cut() {
+        let whole = converted(ATOMS.utf8_string, b"abc".to_vec(), 0, &ATOMS);
+        let cut = converted(ATOMS.utf8_string, b"abc".to_vec(), 4, &ATOMS);
+        let incr = converted(ATOMS.incr, vec![0, 0, 0, 9], 0, &ATOMS);
+
+        assert_eq!(whole, Converted::Text(b"abc".to_vec()));
+        assert_eq!(cut, Converted::TooLarge);
+        assert_eq!(incr, Converted::Incremental);
+    }
+
+    #[test]
+    fn a_chunk_one_read_does_not_reach_the_end_of_ends_the_text_as_too_large() {
+        let mut receiving = Receiving::default();
+        assert_eq!(receiving.chunk(b"ab", 0), Received::More);
+
+        assert_eq!(receiving.chunk(b"cd", 1), Received::TooLarge);
+        assert_eq!(
+            receiving.chunk(b"", 0),
+            Received::Done(Vec::new()),
+            "nothing of the text is kept"
+        );
     }
 }

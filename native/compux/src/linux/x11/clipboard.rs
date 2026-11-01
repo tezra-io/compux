@@ -29,7 +29,9 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME, NONE};
 
-use super::selection::{self, Answer, Atoms, Received, Receiving, Transfers, MAX_TEXT_BYTES};
+use super::selection::{
+    self, Answer, Atoms, Converted, Received, Receiving, Transfers, MAX_TEXT_BYTES,
+};
 use crate::linux::display::Env;
 
 /// The most bytes one property carries; a larger text goes out in INCR chunks.
@@ -411,15 +413,19 @@ fn converted(
     if property == NONE {
         return finish_read(shared, None);
     }
-    let reply = take_landed(connection, window, names)?;
-    if reply.0 == names.atoms.incr {
-        // Deleting the INCR property (done by the read) starts the chunks.
-        if let Some(reading) = lock(shared).reading.as_mut() {
-            reading.incremental = Some(Receiving::default());
+    let landed = take_landed(connection, window, names)?;
+    let read = selection::converted(landed.type_, landed.value, landed.bytes_after, &names.atoms);
+    match read {
+        Converted::Text(text) => finish_read(shared, Some(text)),
+        Converted::TooLarge => finish_read(shared, None),
+        Converted::Incremental => {
+            // Deleting the INCR property (done by the read) starts the chunks.
+            if let Some(reading) = lock(shared).reading.as_mut() {
+                reading.incremental = Some(Receiving::default());
+            }
+            Ok(())
         }
-        return Ok(());
     }
-    finish_read(shared, Some(reply.1))
 }
 
 /// One chunk of an INCR read arrived.
@@ -436,32 +442,49 @@ fn landed_chunk(
     if !incremental {
         return Ok(());
     }
-    let (_, bytes) = take_landed(connection, window, names)?;
+    let landed = take_landed(connection, window, names)?;
     let step = lock(shared)
         .reading
         .as_mut()
         .and_then(|reading| reading.incremental.as_mut())
-        .map(|receiving| receiving.chunk(&bytes));
+        .map(|receiving| receiving.chunk(&landed.value, landed.bytes_after));
     match step {
         Some(Received::Done(text)) => finish_read(shared, Some(text)),
         Some(Received::TooLarge) => finish_read(shared, None),
-        _ => Ok(()),
+        Some(Received::More) | None => Ok(()),
     }
 }
 
-/// Read and delete the landing property: its type and its bytes.
-fn take_landed(
-    connection: &RustConnection,
-    window: u32,
-    names: Names,
-) -> Result<(u32, Vec<u8>), String> {
+/// The landing property as one read found it.
+struct Landed {
+    type_: u32,
+    value: Vec<u8>,
+    /// What the read left behind; anything is more than compux keeps.
+    bytes_after: u32,
+}
+
+/// Read and delete the landing property. The read is as long as the largest
+/// text compux keeps; the server deletes only a property read to its end, so one
+/// with more left is deleted here, and none of a text too large stays on
+/// compux's window. (An INCR owner may then write one more chunk, which no read
+/// takes; the next read replaces it.)
+fn take_landed(connection: &RustConnection, window: u32, names: Names) -> Result<Landed, String> {
     let longest = u32::try_from(MAX_TEXT_BYTES / 4).unwrap_or(u32::MAX);
     let reply = connection
         .get_property(true, window, names.landing, AtomEnum::ANY, 0, longest)
         .map_err(|e| e.to_string())?
         .reply()
         .map_err(|e| e.to_string())?;
-    Ok((reply.type_, reply.value))
+    if reply.bytes_after != 0 {
+        connection
+            .delete_property(window, names.landing)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(Landed {
+        type_: reply.type_,
+        value: reply.value,
+        bytes_after: reply.bytes_after,
+    })
 }
 
 fn finish_read(shared: &Mutex<Shared>, text: Option<Vec<u8>>) -> Result<(), String> {
