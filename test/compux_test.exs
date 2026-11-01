@@ -368,6 +368,7 @@ defmodule CompuxTest do
         "toolkit_notes" => [%{"toolkit" => "qt", "note" => "start it with the switch"}],
         "x11_pixels" => %{"xtest" => true, "keymap" => true},
         "portal" => %{
+          "running" => true,
           "version" => "1.14.4-1ubuntu2",
           "registry" => false,
           "screenshot_permission" => "unset"
@@ -398,21 +399,54 @@ defmodule CompuxTest do
       assert probe.x11_pixels == %{xtest: true, keymap: true}
 
       assert probe.portal == %{
+               running: true,
                version: "1.14.4-1ubuntu2",
                registry: false,
                screenshot_permission: "unset"
              }
     end
 
+    # probe starts neither the portal nor the PermissionStore: one that is not
+    # running reads as such, never as a portal without a Registry or a store
+    # holding nothing.
+    test "says when the portal or its PermissionStore is not running" do
+      stopped = %{
+        "ok" => true,
+        "platform" => "linux",
+        "display_server" => "x11",
+        "portal" => %{
+          "running" => false,
+          "version" => "1.18.4-1",
+          "registry" => nil,
+          "screenshot_permission" => "not_running"
+        }
+      }
+
+      cu = start!(responses: %{"probe" => {:ok, stopped}})
+      assert {:ok, probe} = Compux.probe(cu)
+
+      assert probe.portal == %{
+               running: false,
+               version: "1.18.4-1",
+               registry: nil,
+               screenshot_permission: "not_running"
+             }
+    end
+
     # A stored refusal is the one portal fact the doctor acts on: it names the
-    # reset. Anything but the three answers the store gives reads unknown.
+    # reset. Anything but the store's three answers and `not_running` reads unknown.
     test "carries the portal's stored Screenshot answer, and nil where a route is not there" do
       wayland = %{
         "ok" => true,
         "platform" => "linux",
         "display_server" => "wayland",
         "x11_pixels" => nil,
-        "portal" => %{"version" => nil, "registry" => true, "screenshot_permission" => "no"}
+        "portal" => %{
+          "running" => true,
+          "version" => nil,
+          "registry" => true,
+          "screenshot_permission" => "no"
+        }
       }
 
       odd = put_in(wayland, ["portal", "screenshot_permission"], "maybe")
@@ -420,7 +454,13 @@ defmodule CompuxTest do
       cu = start!(responses: %{"probe" => {:ok, wayland}})
       assert {:ok, probe} = Compux.probe(cu)
       assert probe.x11_pixels == nil
-      assert probe.portal == %{version: nil, registry: true, screenshot_permission: "no"}
+
+      assert probe.portal == %{
+               running: true,
+               version: nil,
+               registry: true,
+               screenshot_permission: "no"
+             }
 
       cu = start!(responses: %{"probe" => {:ok, odd}})
       assert {:ok, %{portal: %{screenshot_permission: nil}}} = Compux.probe(cu)

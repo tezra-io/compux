@@ -496,14 +496,17 @@ defmodule Compux do
     * `:x11_pixels` — `%{xtest:, keymap:}`: whether the X endpoint has the XTEST
       extension and answers its keyboard map, the X11 pixel route's two needs
       (`nil` where no X endpoint answers).
-    * `:portal` — `%{version:, registry:, screenshot_permission:}`, read without
-      raising a dialog where a session bus answers (`nil` where none does): the
-      installed xdg-desktop-portal's version (`nil` where the package database
-      does not say), whether its host Registry is there (1.18 or later; without
-      it GNOME Wayland's pixels are refused), and the PermissionStore's stored
-      Screenshot answer for `io.tezra.fermix.ComputerUse`: `"yes"`, `"no"` (every
-      screenshot is refused `consent_refused` until the person resets it) or
-      `"unset"`.
+    * `:portal` — `%{running:, version:, registry:, screenshot_permission:}`,
+      read where a session bus answers (`nil` where none does), raising no dialog
+      and starting neither the portal nor its store: whether the portal answered
+      (`false` where it is not running), the installed xdg-desktop-portal's
+      version (`nil` where the package database does not say), whether its host
+      Registry is there (1.18 or later; without it GNOME Wayland's pixels are
+      refused; `nil` where the portal is not running), and the PermissionStore's
+      stored Screenshot answer for `io.tezra.fermix.ComputerUse`: `"yes"`, `"no"`
+      (every screenshot is refused `consent_refused` until the person resets it),
+      `"unset"`, or `"not_running"` (the store is not running, so nothing was
+      read).
   """
   @spec probe(t()) :: {:ok, map()} | {:error, term()}
   def probe(%__MODULE__{driver: driver, state: state}) do
@@ -734,12 +737,13 @@ defmodule Compux do
 
   defp probe_x11_pixels(_absent), do: nil
 
-  @stored_answers ~w(yes no unset)
+  @stored_answers ~w(yes no unset not_running)
 
   defp probe_portal(%{} = portal) do
     stored = portal["screenshot_permission"]
 
     %{
+      running: probe_boolean(portal["running"]),
       version: probe_text(portal["version"]),
       registry: probe_boolean(portal["registry"]),
       screenshot_permission: if(stored in @stored_answers, do: stored)

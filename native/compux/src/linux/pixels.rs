@@ -35,15 +35,38 @@ const KWIN: &str = "org.kde.KWin";
 #[cfg_attr(test, allow(dead_code))]
 const PORTAL_PACKAGE: &str = "xdg-desktop-portal";
 
+/// The portal frontend's object, introspected for the interfaces it offers.
+const PORTAL_DESKTOP: (&str, &str, &str) = (
+    "org.freedesktop.portal.Desktop",
+    "/org/freedesktop/portal/desktop",
+    "org.freedesktop.DBus.Introspectable",
+);
+
 /// The PermissionStore, read (never written) for a stored Screenshot answer.
-const PERMISSION_STORE: &str = "org.freedesktop.impl.portal.PermissionStore";
-const PERMISSION_STORE_PATH: &str = "/org/freedesktop/impl/portal/PermissionStore";
+const PERMISSION_STORE: (&str, &str, &str) = (
+    "org.freedesktop.impl.portal.PermissionStore",
+    "/org/freedesktop/impl/portal/PermissionStore",
+    "org.freedesktop.impl.portal.PermissionStore",
+);
+
+/// Whether a read of the portal may start it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Activation {
+    /// The route decision: the portal starts on its first call, as it does for
+    /// any client.
+    Allowed,
+    /// `probe`: the portal and the PermissionStore are read as they are.
+    Never,
+}
 
 /// What a Wayland session says of its portal, read without a dialog.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Wayland {
     pub gnome: bool,
     pub kde: bool,
+    /// Whether the portal answered at all; nothing else about it is known when
+    /// it did not.
+    pub running: bool,
     pub registry: bool,
     pub screenshot: bool,
     pub remote_desktop: bool,
@@ -58,6 +81,16 @@ pub enum Decision {
     X11,
     Portal,
     Refused(String),
+}
+
+/// The route for a session's server: its portal facts are read, by `read`, on
+/// Wayland alone. An X11 session's decision never touches the portal.
+pub fn route(server: Server, read: impl FnOnce() -> Option<Wayland>) -> Decision {
+    let wayland = match server {
+        Server::Wayland { .. } => read(),
+        _ => None,
+    };
+    decide(server, wayland.as_ref())
 }
 
 /// Pure: the route a session's server and portal facts give.
@@ -85,6 +118,13 @@ pub fn decide(server: Server, wayland: Option<&Wayland>) -> Decision {
         return Decision::Refused(format!(
             "{which} on Wayland has no pixel route compux has qualified; only GNOME's portal is"
         ));
+    }
+    if !facts.running {
+        return Decision::Refused(
+            "the XDG desktop portal is not running on this session and did not start, so \
+             compux has no route to the screen or the input"
+                .to_string(),
+        );
     }
     if !facts.registry {
         let version = facts.version.as_deref().unwrap_or("of unknown version");
@@ -129,13 +169,9 @@ impl Pixels {
     /// died here left held.
     #[cfg(not(test))]
     pub fn of(endpoint: &Endpoint) -> Pixels {
-        let server = endpoint.server();
-        let wayland = match server {
-            Server::Wayland { .. } => wayland_facts(),
-            _ => None,
-        };
+        let decision = route(endpoint.server(), wayland_facts);
         let state = state_file(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"));
-        Pixels::from_decision(decide(server, wayland.as_ref()), endpoint, state)
+        Pixels::from_decision(decision, endpoint, state)
     }
 
     /// Under test there is no session this process may reach: a worker under test
@@ -507,18 +543,27 @@ pub fn state_file(state_home: Option<OsString>, home: Option<OsString>) -> Optio
 fn wayland_facts() -> Option<Wayland> {
     async_io::block_on(async {
         let session = super::bus::session().await.ok()?;
-        Some(read_wayland(&session, super::probe::installed_version(PORTAL_PACKAGE)).await)
+        let version = super::probe::installed_version(PORTAL_PACKAGE);
+        Some(read_wayland(&session, version, Activation::Allowed).await)
     })
 }
 
 /// What the session bus says of the compositor and the portal: two name checks
-/// and one introspection, nothing that raises a dialog.
-pub async fn read_wayland(session: &Connection, version: Option<String>) -> Wayland {
-    let interfaces = introspected(session).await.unwrap_or_default();
+/// and one introspection, nothing that raises a dialog. The introspection starts
+/// the portal only where `activation` allows it.
+pub async fn read_wayland(
+    session: &Connection,
+    version: Option<String>,
+    activation: Activation,
+) -> Wayland {
+    let introspection = introspected(session, activation).await;
+    let running = introspection.is_some();
+    let interfaces = introspection.unwrap_or_default();
     let has = |name: &str| interfaces.contains(&format!("\"{name}\""));
     Wayland {
         gnome: owned(session, GNOME_SHELL).await,
         kde: owned(session, KWIN).await,
+        running,
         registry: has(portal::REGISTRY),
         screenshot: has(portal::SCREENSHOT),
         remote_desktop: has(portal::REMOTE_DESKTOP),
@@ -540,42 +585,73 @@ async fn owned(session: &Connection, name: &str) -> bool {
     reply.is_ok_and(|reply| reply.body().deserialize::<bool>().unwrap_or(false))
 }
 
-async fn introspected(session: &Connection) -> Option<String> {
-    let reply = session
-        .call_method(
-            Some("org.freedesktop.portal.Desktop"),
-            "/org/freedesktop/portal/desktop",
-            Some("org.freedesktop.DBus.Introspectable"),
-            "Introspect",
-            &(),
-        )
-        .await
-        .ok()?;
-    reply.body().deserialize::<String>().ok()
+/// The portal object's introspection: `None` where the portal did not answer,
+/// which with [`Activation::Never`] is a portal that is not running.
+async fn introspected(session: &Connection, activation: Activation) -> Option<String> {
+    let (destination, path, interface) = PORTAL_DESKTOP;
+    match activation {
+        Activation::Allowed => {
+            let reply = session
+                .call_method(Some(destination), path, Some(interface), "Introspect", &())
+                .await
+                .ok()?;
+            reply.body().deserialize::<String>().ok()
+        }
+        Activation::Never => call_unstarted(session, PORTAL_DESKTOP, "Introspect", &())
+            .await
+            .ok(),
+    }
+}
+
+/// A method call that never starts the service it goes to: a name nobody owns
+/// answers `ServiceUnknown` instead of being started to answer it.
+async fn call_unstarted<B, R>(
+    session: &Connection,
+    (destination, path, interface): (&'static str, &'static str, &'static str),
+    method: &'static str,
+    body: &B,
+) -> zbus::Result<R>
+where
+    B: serde::Serialize + zbus::zvariant::DynamicType,
+    R: for<'d> zbus::zvariant::DynamicDeserialize<'d>,
+{
+    let proxy: zbus::Proxy<'_> = zbus::proxy::Builder::new(session)
+        .destination(destination)?
+        .path(path)?
+        .interface(interface)?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await?;
+    let flags = zbus::proxy::MethodFlags::NoAutoStart.into();
+    proxy
+        .call_with_flags(method, flags, body)
+        .await?
+        .ok_or_else(|| zbus::Error::Failure(format!("{method} answered nothing")))
 }
 
 /// A stored Screenshot answer for compux's app id: `yes`, `no`, or `unset`;
-/// `None` where the store would not answer. Read with `Lookup`, never written.
+/// `not_running` where the store is not running (it is not started to answer);
+/// `None` where it would not answer. Read with `Lookup`, never written.
 pub async fn stored_screenshot(session: &Connection) -> Option<&'static str> {
-    let reply = session
-        .call_method(
-            Some(PERMISSION_STORE),
-            PERMISSION_STORE_PATH,
-            Some(PERMISSION_STORE),
+    let reply: zbus::Result<(HashMap<String, Vec<String>>, zbus::zvariant::OwnedValue)> =
+        call_unstarted(
+            session,
+            PERMISSION_STORE,
             "Lookup",
             &("screenshot", "screenshot"),
         )
         .await;
-    let reply = match reply {
+    let (permissions, _data) = match reply {
         Ok(reply) => reply,
         // No table and no entry are the same fact: nothing was ever stored.
         Err(zbus::Error::MethodError(name, _, _)) if name.as_str().ends_with(".NotFound") => {
             return Some("unset")
         }
+        Err(zbus::Error::MethodError(name, _, _)) if name.as_str().ends_with(".ServiceUnknown") => {
+            return Some("not_running")
+        }
         Err(_) => return None,
     };
-    let (permissions, _data): (HashMap<String, Vec<String>>, zbus::zvariant::OwnedValue) =
-        reply.body().deserialize().ok()?;
     Some(
         match permissions
             .get(portal::APP_ID)
@@ -605,7 +681,8 @@ pub fn probe_fields(
     fields.insert(
         "portal".to_string(),
         portal.map_or(Value::Null, |(facts, stored)| {
-            json!({"version": facts.version, "registry": facts.registry,
+            json!({"running": facts.running, "version": facts.version,
+                   "registry": facts.running.then_some(facts.registry),
                    "screenshot_permission": stored})
         }),
     );
@@ -622,7 +699,8 @@ pub fn probe(endpoint: &Endpoint) -> Map<String, Value> {
         .flatten();
     let portal = async_io::block_on(async {
         let session = super::bus::session().await.ok()?;
-        let facts = read_wayland(&session, super::probe::installed_version(PORTAL_PACKAGE)).await;
+        let version = super::probe::installed_version(PORTAL_PACKAGE);
+        let facts = read_wayland(&session, version, Activation::Never).await;
         let stored = stored_screenshot(&session).await;
         Some((facts, stored))
     });
@@ -638,13 +716,14 @@ pub fn probe(_endpoint: &Endpoint) -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linux::fake_portal::{FakePortal, Script};
+    use crate::linux::fake_portal::{Call, FakePortal, Script};
     use std::time::Duration;
 
     fn gnome() -> Wayland {
         Wayland {
             gnome: true,
             kde: false,
+            running: true,
             registry: true,
             screenshot: true,
             remote_desktop: true,
@@ -739,6 +818,37 @@ mod tests {
         let why = refused(decide(Server::Wayland { x11: false }, Some(&no_input)));
 
         assert!(why.contains("RemoteDesktop"), "{why}");
+    }
+
+    // A portal that is not running and would not start leaves GNOME Wayland no
+    // route, and the refusal says that, not that the portal lacks a Registry.
+    #[test]
+    fn a_portal_that_is_not_running_is_refused_saying_so() {
+        let stopped = Wayland {
+            running: false,
+            registry: false,
+            screenshot: false,
+            remote_desktop: false,
+            screen_cast: false,
+            ..gnome()
+        };
+
+        let why = refused(decide(Server::Wayland { x11: false }, Some(&stopped)));
+
+        assert!(why.contains("not running"), "{why}");
+    }
+
+    // The route is decided by the server first: an X11 session (or none) is
+    // decided without a single call to the portal.
+    #[test]
+    fn an_x11_session_decides_its_route_without_reading_the_portal() {
+        let x11 = route(Server::X11, || panic!("an X11 session read the portal"));
+        let none = route(Server::None, || panic!("no display read the portal"));
+        let wayland = route(Server::Wayland { x11: true }, || Some(gnome()));
+
+        assert_eq!(x11, Decision::X11);
+        assert!(matches!(none, Decision::Refused(_)), "{none:?}");
+        assert_eq!(wayland, Decision::Portal);
     }
 
     #[test]
@@ -865,8 +975,12 @@ mod tests {
             ..Script::default()
         });
 
-        let read = async_io::block_on(read_wayland(&client, Some("1.18.4".to_string())));
-        let older = async_io::block_on(read_wayland(&old_client, None));
+        let read = async_io::block_on(read_wayland(
+            &client,
+            Some("1.18.4".to_string()),
+            Activation::Allowed,
+        ));
+        let older = async_io::block_on(read_wayland(&old_client, None, Activation::Allowed));
 
         assert_eq!(read, gnome());
         assert!(
@@ -880,6 +994,68 @@ mod tests {
                 .all(|m| m == "NameHasOwner" || m == "Introspect"),
             "{members:?}"
         );
+    }
+
+    // `probe` reads the portal and the PermissionStore as they are: each read
+    // goes with NO_AUTO_START, so neither is started to answer it.
+    #[test]
+    fn the_probes_reads_start_neither_the_portal_nor_the_store() {
+        let (fake, client) = FakePortal::start(Script::default());
+
+        async_io::block_on(read_wayland(&client, None, Activation::Never));
+        async_io::block_on(stored_screenshot(&client));
+
+        let calls = fake.calls();
+        let reads: Vec<&Call> = calls
+            .iter()
+            .filter(|call| call.member == "Introspect" || call.member == "Lookup")
+            .collect();
+        assert_eq!(reads.len(), 2, "{calls:?}");
+        assert!(reads.iter().all(|call| !call.auto_start), "{calls:?}");
+    }
+
+    // Not running, each reads as not running: never as a portal without a
+    // Registry, nor as a store that holds nothing.
+    #[test]
+    fn a_portal_or_store_that_is_not_running_reads_as_not_running() {
+        let (_fake, client) = FakePortal::start(Script {
+            portal_running: false,
+            store_running: false,
+            ..Script::default()
+        });
+
+        let version = Some("1.18.4".to_string());
+        let facts = async_io::block_on(read_wayland(&client, version, Activation::Never));
+        let stored = async_io::block_on(stored_screenshot(&client));
+        let fields = probe_fields(None, Some((facts.clone(), stored)));
+
+        assert!(!facts.running, "{facts:?}");
+        assert_eq!(stored, Some("not_running"));
+        assert_eq!(
+            fields["portal"],
+            json!({"running": false, "version": "1.18.4", "registry": null,
+                   "screenshot_permission": "not_running"})
+        );
+    }
+
+    // The route decision is the portal's first client call on this session: it
+    // may start the portal, as any client's first call does.
+    #[test]
+    fn the_route_decision_may_start_the_portal() {
+        let (fake, client) = FakePortal::start(Script {
+            portal_running: false,
+            ..Script::default()
+        });
+
+        let facts = async_io::block_on(read_wayland(&client, None, Activation::Allowed));
+
+        assert!(facts.running, "{facts:?}");
+        let calls = fake.calls();
+        let asked = calls
+            .iter()
+            .find(|call| call.member == "Introspect")
+            .expect("the portal was asked");
+        assert!(asked.auto_start, "{calls:?}");
     }
 
     // The PermissionStore is read with Lookup for compux's own app id, and
@@ -1030,7 +1206,8 @@ mod tests {
         assert_eq!(both["x11_pixels"], json!({"xtest": true, "keymap": false}));
         assert_eq!(
             both["portal"],
-            json!({"version": "1.18.4", "registry": true, "screenshot_permission": "no"})
+            json!({"running": true, "version": "1.18.4", "registry": true,
+                   "screenshot_permission": "no"})
         );
         assert_eq!(neither["x11_pixels"], Value::Null);
         assert_eq!(neither["portal"], Value::Null);

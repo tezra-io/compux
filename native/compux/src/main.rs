@@ -1378,8 +1378,8 @@ fn probe_with(
 
 /// Linux: whether an X endpoint answers, beside Wayland (XWayland) or as the
 /// session itself, since that is all an X client of this helper can reach; and
-/// whether the display was taken from the user manager, which serves controls
-/// only.
+/// whether the display was taken from the user manager, which the helper then
+/// reaches as its own.
 #[cfg(target_os = "linux")]
 fn with_x11_endpoint(mut reply: Value, endpoint: &Endpoint) -> Value {
     if let Some(object) = reply.as_object_mut() {
@@ -6754,24 +6754,28 @@ mod tests {
         );
     }
 
-    // handed it and its authority as values. Only the route decides, never where
-    // the display came from.
+    // A display taken from the user manager is decided as the helper's own would
+    // be: its server gives the route, and where it came from plays no part. (The
+    // X connection is then made to it with the authority it came with, as values:
+    // `x11::connect`.)
     #[cfg(target_os = "linux")]
     #[test]
-    fn on_linux_a_display_taken_from_the_user_manager_serves_pixels() {
+    fn on_linux_an_adopted_display_takes_the_route_its_server_gives() {
         let (_x11, env) = linux::display::answering_x11();
+        let own = Endpoint {
+            env: env.clone(),
+            adopted: false,
+        };
         let adopted = Endpoint { env, adopted: true };
 
-        let v = hello(&test_launcher(), &test_pixels()).unwrap();
+        let route = linux::pixels::route(adopted.server(), || {
+            panic!("an X display's route read the portal")
+        });
         let probed = probe_with(&adopted, &test_pixels(), serde_json::Map::new).unwrap();
 
-        assert!(advertised(&v).contains(&"screenshot"), "{v}");
+        assert_eq!(adopted.server(), own.server());
+        assert_eq!(route, linux::pixels::Decision::X11);
         assert_eq!(probed["display_adopted"], json!(true), "{probed}");
-        assert_eq!(probed["screen_capture"], json!(true), "{probed}");
-        assert_eq!(
-            linux::pixels::decide(adopted.server(), None),
-            linux::pixels::Decision::X11
-        );
     }
 
     // And the macOS build offers every verb it offered before, in the same order.
