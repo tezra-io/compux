@@ -525,6 +525,12 @@ impl Platform for PortalInput {
     fn set_clipboard_text(&mut self, _text: &str) -> Result<(), String> {
         Err("clipboard: the portal route owns no clipboard".to_string())
     }
+
+    /// The portal route keeps no journal of held input, so nothing refuses a
+    /// hold here.
+    fn ready_to_hold(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Where the portal's restore token is kept: compux's own state file, under

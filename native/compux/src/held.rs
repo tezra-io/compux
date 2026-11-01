@@ -136,6 +136,11 @@ pub trait Platform {
 
     /// Replace the clipboard's text.
     fn set_clipboard_text(&mut self, text: &str) -> Result<(), String>;
+
+    /// Whether a key or button pressed now could be released by the next helper
+    /// if this one were killed holding it. A sequence that holds one asks before
+    /// its first input, so a refusal sends nothing.
+    fn ready_to_hold(&mut self) -> Result<(), String>;
 }
 
 /// Any platform, borrowed: what lets a sequence run over a desktop the worker
@@ -179,6 +184,10 @@ impl<P: Platform + ?Sized> Platform for &mut P {
 
     fn set_clipboard_text(&mut self, text: &str) -> Result<(), String> {
         (**self).set_clipboard_text(text)
+    }
+
+    fn ready_to_hold(&mut self) -> Result<(), String> {
+        (**self).ready_to_hold()
     }
 }
 
@@ -291,6 +300,11 @@ impl Platform for Real {
             .set_text(text)
             .map_err(|e| format!("clipboard set: {e}"))
     }
+
+    /// macOS keeps no journal of held input, so nothing refuses a hold here.
+    fn ready_to_hold(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -399,6 +413,12 @@ impl<'a, P: Platform> Guard<'a, P> {
             self.press(Item::Key(*key))?;
         }
         Ok(())
+    }
+
+    /// Refuse, before the sequence's first input, a sequence whose held key or
+    /// button the platform could not release after a killed helper.
+    pub fn ready_to_hold(&mut self) -> Result<(), String> {
+        self.platform.ready_to_hold()
     }
 
     /// Press a mouse button.
@@ -575,6 +595,8 @@ pub struct Recorder {
     pub calls: Vec<Call>,
     pub down: Vec<Item>,
     pub clipboard: Option<String>,
+    /// Why nothing can be held here, as a platform with no journal says.
+    pub cannot_hold: Option<String>,
     fail_at: Vec<usize>,
 }
 
@@ -585,6 +607,7 @@ impl Recorder {
             calls: Vec::new(),
             down: Vec::new(),
             clipboard: clipboard.map(str::to_string),
+            cannot_hold: None,
             fail_at: Vec::new(),
         }
     }
@@ -661,6 +684,12 @@ impl Platform for Recorder {
         self.step(Call::ClipboardWrite(text.to_string()))?;
         self.clipboard = Some(text.to_string());
         Ok(())
+    }
+
+    /// Not a call: it sends nothing, and the sequences' recorded order stays
+    /// what it always was.
+    fn ready_to_hold(&mut self) -> Result<(), String> {
+        self.cannot_hold.clone().map_or(Ok(()), Err)
     }
 }
 

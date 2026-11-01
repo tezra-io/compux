@@ -92,6 +92,28 @@ impl Journal {
         self.write()
     }
 
+    /// Whether a press could be written down now: the journal is written as it
+    /// stands, as a press would write it, and cleared again if it holds
+    /// nothing. A process killed in between leaves a journal that holds nothing.
+    pub fn ready(&self) -> Result<(), String> {
+        let text = render(&self.display, self.pid, self.started, &self.held);
+        let written = crate::linux::private_file::write(&self.path, text.as_bytes());
+        let cleared = written.and_then(|()| {
+            if self.held.is_empty() {
+                std::fs::remove_file(&self.path)
+            } else {
+                Ok(())
+            }
+        });
+        let dir = self.path.parent().unwrap_or(&self.path);
+        cleared.map_err(|error| {
+            format!(
+                "the held-input journal cannot be written in {}: {error}",
+                dir.display()
+            )
+        })
+    }
+
     #[cfg(test)]
     pub fn held(&self) -> &[Held] {
         &self.held
@@ -231,6 +253,58 @@ mod tests {
         }
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         dir
+    }
+
+    // Asked before an action's first input: a journal that can be written says
+    // so, and leaves no file while nothing is held.
+    #[test]
+    fn a_journal_that_can_be_written_is_ready_and_leaves_nothing_behind() {
+        let dir = scratch("ready");
+        let journal = Journal::new(&dir, ":7", 4242, 99);
+
+        journal.ready().expect("ready");
+
+        assert!(!dir.join(DIR).join("4242").exists(), "a file stays");
+        std::fs::remove_dir_all(&dir).expect("cleaned up");
+    }
+
+    // A journal that holds something keeps it through the check.
+    #[test]
+    fn a_ready_check_keeps_what_the_journal_holds() {
+        let dir = scratch("ready-held");
+        let mut journal = Journal::new(&dir, ":7", 4242, 99);
+        journal.record(Held::Button(1)).expect("written");
+
+        journal.ready().expect("ready");
+
+        let text = std::fs::read_to_string(dir.join(DIR).join("4242")).expect("it reads");
+        assert_eq!(
+            parse(&text).map(|parsed| parsed.held),
+            Some(vec![Held::Button(1)])
+        );
+        std::fs::remove_dir_all(&dir).expect("cleaned up");
+    }
+
+    // A journal directory planted as a link cannot take the journal: the check
+    // fails and names the directory.
+    #[test]
+    fn a_journal_that_cannot_be_written_is_not_ready_and_names_its_directory() {
+        let dir = scratch("unready");
+        std::fs::create_dir_all(dir.join("elsewhere")).expect("a directory");
+        std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join(DIR)).expect("a link");
+        let journal = Journal::new(&dir, ":7", 4242, 99);
+
+        let refused = journal.ready().expect_err("not ready");
+
+        assert!(
+            refused.contains(&dir.join(DIR).display().to_string()),
+            "{refused}"
+        );
+        assert!(
+            !dir.join("elsewhere").join("4242").exists(),
+            "written through the link"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleaned up");
     }
 
     // Written before the press, gone after the release: a file exists exactly

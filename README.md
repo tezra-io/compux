@@ -392,8 +392,9 @@ routes"):
   (`text_outside_layout`, use `paste`) or while a modifier, Caps Lock or a second
   layout group is on (`keyboard_not_neutral`). A key or button held across an
   action is journalled under `$XDG_RUNTIME_DIR`, and the next helper releases what
-  a killed one left held; without that directory a drag or a chord with modifiers
-  presses nothing and fails.
+  a killed one left held; without a journal it can write there, a drag, a click
+  or chord with modifiers, or a paste sends nothing and fails, naming the
+  directory.
 - **GNOME Wayland:** capture and input through the XDG desktop portal
   (xdg-desktop-portal 1.18 or later, which registers compux as
   `io.tezra.fermix.ComputerUse`): the portal asks the person once, and a restore

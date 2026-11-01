@@ -5,7 +5,8 @@
 //!   never changes the map (`keymap`).
 //! - **Held keys and buttons** are written to this process's journal before their
 //!   press is posted and forgotten after their release (`journal`), so a helper
-//!   killed in between has them released by the next one.
+//!   killed in between has them released by the next one. An action that would
+//!   hold one is refused before its first input where no journal can be written.
 //! - **Text** is typed only once every character is known to be on the layout,
 //!   and only while the keyboard is neutral; the caller refuses otherwise before
 //!   anything is posted ([`Desktop::ready_to_type`]).
@@ -532,6 +533,29 @@ impl Platform for Desktop {
     fn set_clipboard_text(&mut self, text: &str) -> Result<(), String> {
         self.clipboard()?.own(text)
     }
+
+    /// A press goes only where its journal can be written, and this says so
+    /// before the action's first input rather than at the press: without
+    /// `$XDG_RUNTIME_DIR` there is no journal at all.
+    fn ready_to_hold(&mut self) -> Result<(), String> {
+        let Some(dir) = self.env.runtime_dir.clone() else {
+            return Err(
+                "there is no $XDG_RUNTIME_DIR to journal a held key or button in, so \
+                        nothing that holds one is sent"
+                    .to_string(),
+            );
+        };
+        let journal = self.input()?.journal.as_ref().ok_or_else(|| {
+            format!(
+                "no held-input journal can be kept in {}: this process's start time would not \
+                 read, so nothing that holds a key or button is sent",
+                dir.display()
+            )
+        })?;
+        journal
+            .ready()
+            .map_err(|why| format!("{why}, so nothing that holds a key or button is sent"))
+    }
 }
 
 #[cfg(test)]
@@ -604,6 +628,46 @@ mod tests {
         if dir.exists() {
             std::fs::remove_dir_all(&dir).expect("cleaned up");
         }
+    }
+
+    // A drag or a chord with modifiers asks before its first input: with no
+    // runtime directory there is no journal, and the refusal names it before
+    // the X display is even opened.
+    #[test]
+    fn nothing_can_be_held_without_a_runtime_directory_and_the_refusal_names_it() {
+        let mut desktop = Desktop::new(Env::default());
+
+        let refused = desktop.ready_to_hold().expect_err("no journal");
+
+        assert!(refused.contains("$XDG_RUNTIME_DIR"), "{refused}");
+        assert!(desktop.input.is_none(), "the display was opened");
+    }
+
+    // A runtime directory the journal cannot be written in refuses too, and the
+    // refusal names the directory.
+    #[test]
+    fn nothing_can_be_held_where_the_journal_cannot_be_written() {
+        let dir = std::env::temp_dir().join(format!("compux-unheld-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("elsewhere")).expect("a directory");
+        std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join(journal::DIR))
+            .expect("a planted link");
+        let (_server, connection) = FakeX::start(fake_x::BAD_VALUE);
+        let env = Env {
+            runtime_dir: Some(dir.clone()),
+            ..Env::default()
+        };
+        let journal = Journal::new(&dir, ":7", 4242, 99);
+        let mut desktop = Desktop {
+            env,
+            input: Some(over(connection, Some(journal))),
+            clipboard: None,
+        };
+
+        let refused = desktop.ready_to_hold().expect_err("not writable");
+
+        let named = dir.join(journal::DIR).display().to_string();
+        assert!(refused.contains(&named), "{refused}");
+        std::fs::remove_dir_all(&dir).expect("cleaned up");
     }
 
     #[test]

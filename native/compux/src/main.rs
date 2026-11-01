@@ -3206,6 +3206,9 @@ fn click_seq<P: held::Platform>(
     mods: &[Key],
 ) -> Result<(), String> {
     held::guarded(platform, |input| {
+        if !mods.is_empty() {
+            input.ready_to_hold()?;
+        }
         input.move_mouse(lx, ly)?;
         input.settle(lx, ly)?;
         input.press_keys(mods)?;
@@ -3258,7 +3261,9 @@ fn drag(request: &wire::Request, gate: &Gate, worker: &mut Worker) -> Result<Val
 
 /// The drag itself, over the injected platform. Everything from the press to the
 /// drop runs under the guard, so a failed step, a failed settle or a panic ends
-/// with the left button UP — it used to end with the desktop still dragging.
+/// with the left button UP — it used to end with the desktop still dragging. A
+/// platform that could not release the button after a killed helper refuses
+/// before the pointer moves.
 fn drag_seq<P: held::Platform>(
     platform: &mut P,
     fx: i32,
@@ -3267,6 +3272,7 @@ fn drag_seq<P: held::Platform>(
     ty: i32,
 ) -> Result<(), String> {
     held::guarded(platform, |input| {
+        input.ready_to_hold()?;
         input.move_mouse(fx, fy)?;
         input.settle(fx, fy)?;
         input.press_button(Button::Left)?;
@@ -3396,6 +3402,9 @@ fn key_chord_seq<P: held::Platform>(
     main: Key,
 ) -> Result<(), String> {
     held::guarded(platform, |input| {
+        if !mods.is_empty() {
+            input.ready_to_hold()?;
+        }
         input.press_keys(mods)?;
         input.click_key(main)
     })
@@ -3749,6 +3758,7 @@ const PASTE_SETTLE_MS: u64 = 50;
 /// return with the modifier down and the user's clipboard still overwritten.
 fn paste_seq<P: held::Platform>(platform: &mut P, text: &str) -> Result<(), String> {
     held::guarded(platform, |input| {
+        input.ready_to_hold()?;
         input.take_clipboard(text)?;
         input.sleep(PASTE_SETTLE_MS)?;
         input.press_keys(&[paste_modifier()])?;
@@ -7161,6 +7171,76 @@ mod tests {
         sweep_injected_failures(None, |platform| {
             key_chord_seq(platform, &[Key::Meta, Key::Shift, Key::Alt], Key::Tab)
         });
+    }
+
+    // A key or button the platform could not release after a killed helper (on
+    // X11, one it cannot journal) is never held, and the refusal comes before the
+    // sequence's first input: a drag's pointer has not moved, a click's either,
+    // and a paste has not taken the clipboard.
+    #[test]
+    fn a_sequence_that_holds_input_sends_nothing_where_none_can_be_held() {
+        type Sequence = fn(&mut Recorder) -> Result<(), String>;
+        let sequences: [(&str, Sequence); 4] = [
+            ("drag", |platform| drag_seq(platform, 10, 20, 50, 60)),
+            ("click with a modifier", |platform| {
+                click_seq(platform, 12, 34, Button::Left, 1, &[Key::Shift])
+            }),
+            ("chord with a modifier", |platform| {
+                key_chord_seq(platform, &[Key::Control], Key::Unicode('c'))
+            }),
+            ("paste", |platform| paste_seq(platform, "pasted")),
+        ];
+        for (name, sequence) in sequences {
+            let mut platform = Recorder::new(Some("the user's own text"));
+            platform.cannot_hold = Some("no journal".to_string());
+
+            let refused = sequence(&mut platform);
+
+            assert_eq!(refused, Err("no journal".to_string()), "{name}");
+            assert!(platform.calls.is_empty(), "{name}: {:?}", platform.calls);
+        }
+    }
+
+    // A click or a key with no modifier holds nothing, so it goes as it always has.
+    #[test]
+    fn a_sequence_that_holds_nothing_goes_where_nothing_can_be_held() {
+        let mut platform = Recorder::new(None);
+        platform.cannot_hold = Some("no journal".to_string());
+
+        click_seq(&mut platform, 12, 34, Button::Left, 1, &[]).expect("a plain click");
+        key_chord_seq(&mut platform, &[], Key::Return).expect("a plain key");
+
+        assert_eq!(
+            platform.calls,
+            vec![
+                Call::MoveMouse(12, 34),
+                Call::Settle(12, 34),
+                Call::Button(Button::Left, Direction::Click),
+                Call::Key(Key::Return, Direction::Click),
+            ]
+        );
+    }
+
+    // Through the gate, as an action runs it: the check is not input, and it is
+    // not lost on the way to the platform.
+    #[test]
+    fn a_drag_through_the_gate_sends_nothing_where_its_button_cannot_be_held() {
+        let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
+        gate.admit(&running("left_click_drag", Some(1))).unwrap();
+        let mut recorder = Recorder::new(None);
+        recorder.cannot_hold = Some("no journal".to_string());
+
+        let mut platform = Gated::new(&gate, recorder);
+        let refused = drag_seq(&mut platform, 10, 20, 50, 60);
+        let done = gate.finish();
+
+        assert_eq!(refused, Err("no journal".to_string()));
+        assert!(
+            platform.inner().calls.is_empty(),
+            "{:?}",
+            platform.inner().calls
+        );
+        assert!(!done.posted, "input reached the screen");
     }
 
     // --- cancellation: a pause that lands INSIDE a running sequence -----------

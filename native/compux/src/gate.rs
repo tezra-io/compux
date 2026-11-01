@@ -793,6 +793,11 @@ impl<P: Platform> Platform for Gated<'_, P> {
     fn set_clipboard_text(&mut self, text: &str) -> Result<(), String> {
         self.inner.set_clipboard_text(text)
     }
+
+    /// Not input: it goes straight through, like the clipboard.
+    fn ready_to_hold(&mut self) -> Result<(), String> {
+        self.inner.ready_to_hold()
+    }
 }
 
 fn gated(outcome: Result<Result<(), String>, Refusal>) -> Result<(), String> {
@@ -1199,6 +1204,9 @@ mod tests {
             Ok(None)
         }
         fn set_clipboard_text(&mut self, _text: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn ready_to_hold(&mut self) -> Result<(), String> {
             Ok(())
         }
     }

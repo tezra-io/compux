@@ -66,13 +66,13 @@ they are as protocol 11 had them.
   held, Caps Lock on (`keyboard_not_neutral`). Keys go only into a window that reads `ACTIVE` on the accessibility
   bus (`no_active_window`). A key or button held across an action is written to a journal under
   `$XDG_RUNTIME_DIR/compux-held` before it is pressed and cleared after its release, so the next helper on that
-  display releases what a killed one left held. A drag and a chord with modifiers hold input, so on X11 they need
-  `$XDG_RUNTIME_DIR`: without it nothing is pressed, and the action fails at its first press with an error that
-  names the missing directory (a drag's pointer has already moved to its start). `scroll` turns at most 50 notches,
-  one press and release of a wheel button each. `paste` puts the text on the `CLIPBOARD`, which compux owns for the
-  helper's life (answering `TARGETS` and `UTF8_STRING`, INCR for text past one property, 4 MiB at most) and
-  releases at exit. The person's own text is read before a paste and put back after it; a text of theirs past
-  4 MiB is not read at all, never cut, so it is not put back.
+  display releases what a killed one left held. A drag, a click or chord with modifiers, and `paste` hold input, so
+  on X11 they need a journal they can write under `$XDG_RUNTIME_DIR`: without one they are refused before their
+  first input, with an error that names the directory. Nothing is sent, not even the pointer's move to a drag's
+  start. `scroll` turns at most 50 notches, one press and release of a wheel button each. `paste` puts the text on
+  the `CLIPBOARD`, which compux owns for the helper's life (answering `TARGETS` and `UTF8_STRING`, INCR for text
+  past one property, 4 MiB at most) and releases at exit. The person's own text is read before a paste and put back
+  after it; a text of theirs past 4 MiB is not read at all, never cut, so it is not put back.
 - **GNOME Wayland.** Nothing is asked of the portal before the first pixel action. The first one starts the session
   (keyboard and pointer, `persist_mode` 2, one monitor), which shows the portal's dialog unless the restore token
   kept in `$XDG_STATE_HOME/compux/portal.json` still serves; each token is offered once and replaced by the one the
