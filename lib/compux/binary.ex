@@ -9,8 +9,9 @@ defmodule Compux.Binary do
     2. **Cached download** — otherwise a per-target release artifact, downloaded once
        from the GitHub release and verified against the committed sha256 in
        `checksum-compux.exs`: a zipped, signed `Fermix.app` on macOS (extracted with
-       `ditto` so its code signature survives) or a bare-binary tarball on Linux. The
-       resolved path is the executable inside it.
+       `ditto` so its code signature survives) or, on Linux, a tarball of the bare
+       helper and its X11 badge (`compux-indicator-x11`), which the helper spawns
+       from its own directory. The resolved path is the helper.
 
   This is the standalone-consumer path. An embedder that manages its own signed
   install (verifying provenance itself) should skip this and pass an explicit
@@ -23,6 +24,8 @@ defmodule Compux.Binary do
   """
 
   @command "compux"
+  # The badge a Linux helper shows over a bound window, from its own directory.
+  @indicator "compux-indicator-x11"
   @release_base "https://github.com/tezra-io/compux/releases/download"
 
   # Bound the release download so a hung/slow fetch can't block the caller forever
@@ -191,27 +194,39 @@ defmodule Compux.Binary do
     end
   end
 
-  # Linux ships a bare-binary tarball — no signature to preserve, so `:erl_tar` is fine.
+  # Linux ships a tarball of bare binaries — no signature to preserve, so `:erl_tar`
+  # is fine. Both are found before either is written, and the helper is written
+  # last: the cache is judged by the helper alone, so it must never stand without
+  # its badge beside it.
   defp extract(_target, archive, dest_dir) do
-    File.mkdir_p!(dest_dir)
+    with {:ok, entries} <- untar(archive),
+         {:ok, badge} <- archive_entry(entries, @indicator),
+         {:ok, helper} <- archive_entry(entries, @command) do
+      File.mkdir_p!(dest_dir)
+      write_executable(dest_dir, @indicator, badge)
+      write_executable(dest_dir, @command, helper)
+    end
+  end
 
+  defp untar(archive) do
     case :erl_tar.extract({:binary, archive}, [:memory, :compressed]) do
-      {:ok, entries} -> write_binary_entry(entries, dest_dir)
+      {:ok, entries} -> {:ok, entries}
       {:error, reason} -> {:error, {:untar, reason}}
     end
   end
 
-  defp write_binary_entry(entries, dest_dir) do
-    case Enum.find(entries, fn {name, _bin} -> Path.basename(to_string(name)) == @command end) do
-      {_name, binary} ->
-        exec = Path.join(dest_dir, @command)
-        File.write!(exec, binary)
-        File.chmod!(exec, 0o755)
-        :ok
-
-      nil ->
-        {:error, {:binary_not_in_archive, @command}}
+  defp archive_entry(entries, name) do
+    case Enum.find(entries, fn {entry, _bin} -> Path.basename(to_string(entry)) == name end) do
+      {_entry, binary} -> {:ok, binary}
+      nil -> {:error, {:binary_not_in_archive, name}}
     end
+  end
+
+  defp write_executable(dest_dir, name, binary) do
+    exec = Path.join(dest_dir, name)
+    File.write!(exec, binary)
+    File.chmod!(exec, 0o755)
+    :ok
   end
 
   defp ditto_extract(zip, dest_dir) do
@@ -280,7 +295,7 @@ defmodule Compux.Binary do
 
   @doc """
   Release artifact filename for a target: a zipped signed `.app` on macOS (its code
-  signature must survive extraction), a bare-binary tarball elsewhere. Public so the
+  signature must survive extraction), a tarball of bare binaries elsewhere. Public so the
   `compux.checksum` task names artifacts identically.
   """
   @spec artifact_name(String.t(), String.t()) :: String.t()
