@@ -514,21 +514,19 @@ struct Watch {
 
 impl Watch {
     /// The listed window, watched from here on: a window destroyed after this
-    /// is caught by the watch, and one replaced before it by its process and
-    /// title, read again on the watch's own connection.
+    /// is caught by the watch, and one replaced before it by its process, read
+    /// again on the watch's own connection.
     fn open(env: &Env, listed: &StreamWindow) -> Result<Watch, FrameError> {
         let client = listed.id;
         let (connection, _) = super::connect(env).map_err(unavailable)?;
         versions(&connection)?;
         let top = top_level(&connection, client)?;
         watch_structure(&connection, client, top)?;
-        let (pid, title) =
-            super::windows::owner_and_title(&connection, client).map_err(unavailable)?;
-        if !super::windows::still_named(listed.pid, &listed.title, pid, &title) {
+        let pid = super::windows::owner(&connection, client).map_err(unavailable)?;
+        if !super::windows::still_named(listed.pid, pid) {
             return Err(FrameError::Replaced(
-                "the window with that id is no longer the one `windows` listed (its process or \
-                 its title changed since), so nothing was bound; take `windows` again and \
-                 select it"
+                "the window with that id is no longer the one `windows` listed (another process \
+                 holds it now), so nothing was bound; take `windows` again and select it"
                     .to_string(),
             ));
         }

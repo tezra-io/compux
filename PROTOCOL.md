@@ -108,12 +108,12 @@ they are as protocol 11 had them.
   around it (`_NET_FRAME_EXTENTS`). Its process is its `_NET_WM_PID`.
 - **The binding** is the window's X id, the X connection that watches it from the moment it is bound, and its
   process with that process's start time. A window that names no process (no `_NET_WM_PID`, as a Qt popup) is
-  refused `target_binding_unavailable`, and so is one whose process or title, read again once the watch holds
-  it, is not what `windows` listed (its id was given to another window in between, or it was retitled since;
-  take `windows` again). A window destroyed after it was bound is `target_unavailable` for the rest
-  of the binding, even when the X server has given its id to a new window of the same process: each request first
-  has the watch read everything the server sent it, so a window closed before the request is never answered with
-  its last picture.
+  refused `target_binding_unavailable`, and so is one whose process, read again once the watch holds it, is not
+  what `windows` listed (its id was given to another window in between; take `windows` again). Its title is not
+  compared, since windows retitle themselves. A window destroyed after it was bound is `target_unavailable` for
+  the rest of the binding, even when the X server has given its id to a new window of the same process: each
+  request first has the watch read everything the server sent it, so a window closed before the request is never
+  answered with its last picture.
 - **Frames** come from Composite: the window is redirected (Automatic) unless a compositing manager (GNOME
   Shell's Mutter) already redirects it, and its pixmap is named and read, so a window another one covers is
   still seen. A redirect fills the new pixmap with what the screen showed there, another window's pixels where

@@ -471,7 +471,6 @@ pub fn select(
             width: surface_pixels(window.bounds.w, selecting.facts.scale_factor),
             height: surface_pixels(window.bounds.h, selecting.facts.scale_factor),
             pid: window.pid,
-            title: window.title.clone(),
         })
         .map_err(as_failure)?;
 
@@ -1027,7 +1026,6 @@ mod tests {
             width: 1600,
             height: 1200,
             pid: 200,
-            title: "Window 20".to_string(),
         }
     }
 

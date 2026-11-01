@@ -310,9 +310,9 @@ pub enum FrameError {
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     Gone(String),
     /// The window under the bound id is not the one the listing named: its
-    /// process or its title changed between the listing and the stream's own
-    /// look, as when the id was given to another window. Only the X11 stream
-    /// looks again this way; macOS binds the window server's own window.
+    /// process changed between the listing and the stream's own look, as when
+    /// the id was given to another window. Only the X11 stream looks again this
+    /// way; macOS binds the window server's own window.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     Replaced(String),
 }
@@ -376,14 +376,11 @@ pub struct StreamWindow {
     pub id: u32,
     pub width: u32,
     pub height: u32,
-    /// The process and title the listing gave the window. Where the window
-    /// server binds nothing by itself (X11), the stream reads both again once it
-    /// watches the window, so an id given to another window in between binds
-    /// nothing.
+    /// The process the listing gave the window. Where the window server binds
+    /// nothing by itself (X11), the stream reads it again once it watches the
+    /// window, so an id given to another window in between binds nothing.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub pid: i32,
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    pub title: String,
 }
 
 /// One window's frames.
@@ -1314,7 +1311,6 @@ mod tests {
             width: 8,
             height: 4,
             pid: 200,
-            title: "Window".to_string(),
         }
     }
 
