@@ -16,8 +16,11 @@ name: release
 #     needs no grant of its own. Signing is MANDATORY: the build fails loud if the
 #     Apple secrets are absent (never ships an ad-hoc bundle, whose per-build identity
 #     would re-prompt every upgrade).
-#   * Linux  — a bare `compux` binary tarball: `compux-<ver>-linux-x86_64.tar.gz`
-#     (no TCC on X11; nothing to sign).
+#   * Linux  — a tarball of bare binaries: `compux-<ver>-linux-x86_64.tar.gz` holding
+#     the helper, `compux`, and the X11 ownership badge it spawns beside itself,
+#     `compux-indicator-x11` (Compux.Binary extracts both or refuses the archive),
+#     plus `NotoSans-OFL.txt`, the licence of the font compiled into the badge (no
+#     TCC on X11; nothing to sign).
 #
 # Who holds what. The build jobs run third-party crate build code, so they hold
 # no credential and may only read. The helper is signed in its own job,
@@ -89,14 +92,6 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Linux — install system libs (xcap/enigo/arboard link deps)
-        if: matrix.target == 'linux-x86_64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libxcb1-dev libxcb-render0-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
-            libxkbcommon-x11-dev libdbus-1-dev libxdo-dev
-
       - name: Build (release, locked)
         working-directory: native/compux
         run: cargo build --release --locked
@@ -111,13 +106,16 @@ jobs:
           path: native/compux/target/release/compux
           if-no-files-found: error
 
-      - name: Linux — package the binary
+      - name: Linux — package the helper and its badge
         if: matrix.target == 'linux-x86_64'
         env:
           BIN_DIR: native/compux/target/release
         run: |
           set -euo pipefail
-          tar -czf "compux-${REF_NAME#v}-${TARGET}.tar.gz" -C "$BIN_DIR" compux
+          # The badge's font is under the SIL Open Font License, which travels with it.
+          cp native/compux/fonts/OFL.txt "$BIN_DIR/NotoSans-OFL.txt"
+          tar -czf "compux-${REF_NAME#v}-${TARGET}.tar.gz" -C "$BIN_DIR" \
+            compux compux-indicator-x11 NotoSans-OFL.txt
 
       - name: Linux — upload the artifact
         if: matrix.target == 'linux-x86_64'

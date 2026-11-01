@@ -21,24 +21,30 @@ repository = "https://github.com/tezra-io/compux"
 name = "compux"
 path = "src/main.rs"
 
+# The ownership badge on an X11 desktop, spawned by the helper beside it. Built on
+# every platform so one `cargo build` stays one command; it draws only on Linux.
+[[bin]]
+name = "compux-indicator-x11"
+path = "src/bin/compux-indicator-x11/main.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Cross-platform synthetic input (macOS CGEvent, Linux XTEST/uinput).
-enigo = "0.3"
-# Cross-platform screen capture (macOS ScreenCaptureKit/CG, Linux X11).
-xcap = "0.4"
 # PNG encoding + downscale of the captured frame.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 base64 = "0.22"
-# Clipboard access for the `paste` action (macOS NSPasteboard, Linux X11/Wayland).
-arboard = "3"
 
 # macOS Accessibility query (`inspect`) + the non-prompting permission probe +
 # the Accessibility grant PROMPT (`request_permissions`). core-foundation handles
 # CFString/CFType/CFDictionary memory safety for the AX FFI. Already in the tree
 # transitively via xcap, so this adds no new compilation.
 [target.'cfg(target_os = "macos")'.dependencies]
+# Synthetic input (CGEvent), screen capture (ScreenCaptureKit/CG) and the
+# clipboard for `paste` (NSPasteboard). macOS only: Linux posts, captures and
+# owns the clipboard through x11rb or the portal (M86 L2), with no C library.
+enigo = "0.3"
+xcap = "0.4"
+arboard = "3"
 core-foundation = "0.10"
 dispatch2 = "0.3"
 # posix_spawn + dlsym for the TCC responsibility self-disclaim re-exec (see
@@ -58,6 +64,32 @@ objc2-core-foundation = "0.3"
 objc2-core-media = "0.3"
 objc2-core-video = "0.3"
 objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = ["std", "SCStream", "SCShareableContent", "SCError", "block2", "dispatch2", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-media"] }
+
+# Linux accessibility (M86 L1): AT-SPI over D-Bus, pure Rust (no libdbus), driven
+# with `async_io::block_on` (the executor zbus itself runs on) from the one action
+# worker — no tokio, no runtime of our own. `futures-util` only for running a node's
+# reads concurrently and bounding how many nodes are in flight.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["async-io"] }
+async-io = "2"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+# Linux pixels (M86 L2): the X protocol in pure Rust, handed its display and its
+# authority as values. XTEST posts input, RandR names the monitors, XKB says
+# which group and modifiers the keyboard is in; capture is the core GetImage.
+# A bound window (M86 L3) is read through Composite, watched through Damage, and
+# its badge takes clicks only where Shape says.
+x11rb = { version = "0.13", default-features = false, features = ["xtest", "randr", "xkb", "composite", "damage", "shape"] }
+# What character an X keysym types, for every keysym a layout can name (the
+# legacy Cyrillic, Greek and other tables as well as Unicode's).
+xkeysym = "0.2"
+# The X11 badge's text: glyphs outlined and rasterised in pure Rust from
+# the unmodified Noto Sans in fonts/, whose SIL Open Font License sits beside it.
+ab_glyph = "0.2"
+
+# The reader's unit tests answer it from fake AT-SPI servers over a peer-to-peer
+# connection: no bus daemon, no desktop.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zbus = { version = "5", default-features = false, features = ["async-io", "p2p"] }
 
 [profile.release]
 strip = true

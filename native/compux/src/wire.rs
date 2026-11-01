@@ -29,6 +29,8 @@
 
 use serde_json::{json, Map, Value};
 
+use crate::semantic::Until;
+
 /// The fields reserved for a later slice. A request carrying one is refused, never
 /// silently run without the targeting it asked for. `observation_id` left this list
 /// at protocol 8, where it became the way every coordinate names its image;
@@ -56,7 +58,7 @@ const RETIRED_FIELDS: [(&str, &str); 1] = [(
 /// listed. Each names that observation with `observation_id`; none takes a
 /// `region`, because the rectangle belongs to the image, not to the action. Drag
 /// names one image for both of its points.
-const ADDRESSED_ACTIONS: [&str; 9] = [
+const ADDRESSED_ACTIONS: [&str; 15] = [
     "left_click",
     "right_click",
     "double_click",
@@ -66,12 +68,27 @@ const ADDRESSED_ACTIONS: [&str; 9] = [
     "inspect",
     "press",
     "set_value",
+    "focus",
+    "select",
+    "toggle",
+    "expand",
+    "collapse",
+    "scroll_to",
 ];
 
 /// Addressed by a CONTROL and never by a point. Their whole promise is that they
 /// cannot miss, so a coordinate on one of them is a contradiction rather than a
-/// hint at what was meant.
-const ELEMENT_ACTIONS: [&str; 2] = ["press", "set_value"];
+/// hint at what was meant. Protocol 12 adds the verbs on a reference.
+const ELEMENT_ACTIONS: [&str; 8] = [
+    "press",
+    "set_value",
+    "focus",
+    "select",
+    "toggle",
+    "expand",
+    "collapse",
+    "scroll_to",
+];
 
 /// Addressed by a point OR by a control. With a reference the helper re-reads the
 /// control's bounds at the moment it acts and clicks its centre, so a control that
@@ -89,7 +106,9 @@ const POINT_OR_ELEMENT_ACTIONS: [&str; 5] = [
 /// `observation_id` beside it says which image the rectangle was read in; with
 /// none it is read in a full-display image, which is the space `windows` answers
 /// in. Two spaces, both exact — not a recovery path.
-const VIEWING_ACTIONS: [&str; 3] = ["screenshot", "elements", "wait_for_change"];
+/// `wait_for` (protocol 12) lists what it waited for, with references, as
+/// `elements` does.
+const VIEWING_ACTIONS: [&str; 4] = ["screenshot", "elements", "wait_for_change", "wait_for"];
 
 /// Does this action address a target inside an observation it must name?
 pub fn addresses_an_image(action: &str) -> bool {
@@ -111,7 +130,7 @@ pub fn takes_an_observation(action: &str) -> bool {
 /// is how a target is found in the first place; `wait`, `wait_for_change` and the
 /// two target verbs have no window to name. Mirrors `Compux.Protocol`'s
 /// `@targetable` exactly; a test pins the two lists together.
-const TARGETABLE_ACTIONS: [&str; 14] = [
+const TARGETABLE_ACTIONS: [&str; 21] = [
     "screenshot",
     "elements",
     "inspect",
@@ -126,6 +145,13 @@ const TARGETABLE_ACTIONS: [&str; 14] = [
     "paste",
     "press",
     "set_value",
+    "focus",
+    "select",
+    "toggle",
+    "expand",
+    "collapse",
+    "scroll_to",
+    "wait_for",
 ];
 
 /// May this action act inside a bound window?
@@ -151,7 +177,7 @@ const MAX_REQUEST_ID_BYTES: usize = 64;
 /// pointer, but they act on the machine in front of the person, and a pause that
 /// stopped the clicks and let the accessibility actions through would be a pause
 /// in name only.
-const INPUT_ACTIONS: [&str; 11] = [
+const INPUT_ACTIONS: [&str; 17] = [
     "mouse_move",
     "left_click",
     "right_click",
@@ -163,12 +189,18 @@ const INPUT_ACTIONS: [&str; 11] = [
     "paste",
     "press",
     "set_value",
+    "focus",
+    "select",
+    "toggle",
+    "expand",
+    "collapse",
+    "scroll_to",
 ];
 
 /// Read-only actions, mirroring `Compux.Protocol`'s `@read_only` exactly. The
 /// complement carries a `mutation_seq` and earns a receipt. A test pins the two
 /// lists together; they may not drift.
-const READ_ONLY_ACTIONS: [&str; 13] = [
+const READ_ONLY_ACTIONS: [&str; 14] = [
     "screenshot",
     "mouse_move",
     "wait",
@@ -176,6 +208,8 @@ const READ_ONLY_ACTIONS: [&str; 13] = [
     "wait_for_change",
     "elements",
     "windows",
+    // Protocol 12: it waits on the tree and sends nothing.
+    "wait_for",
     // Binding and releasing a window dispatch nothing: no pointer moves, no key
     // goes down, nothing on the screen is touched. A sequence number and a receipt
     // on either would claim input where there was none.
@@ -296,6 +330,10 @@ pub struct Request {
     /// `parse` on every action that has no window to name, so no action function
     /// can run against the display while its caller believes it named a window.
     pub target_id: Option<String>,
+    /// What the tree is waited on for (protocol 12): `wait_for`'s condition, or the
+    /// `until` of an action's semantic check. Checked in `parse`. Boxed: most
+    /// requests carry none, and every frame is moved through a channel.
+    pub until: Option<Box<Until>>,
 }
 
 /// What an action is asked to show for itself afterwards.
@@ -345,6 +383,38 @@ impl Settle {
     }
 }
 
+/// What a semantic check's `until` came to (protocol 12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UntilOutcome {
+    /// It did not hold before the input, and held after it within its timeout.
+    Met,
+    /// It did not hold before, and still did not at the deadline.
+    NotMet,
+    /// It held before the input, so it shows nothing about the action.
+    HeldBefore,
+}
+
+impl UntilOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            UntilOutcome::Met => "met",
+            UntilOutcome::NotMet => "not_met",
+            UntilOutcome::HeldBefore => "held_before",
+        }
+    }
+}
+
+/// A wait's outcome, and what it cost to reach it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UntilSeen {
+    pub outcome: UntilOutcome,
+    pub looks: u64,
+    pub waited_ms: u64,
+    /// The request's own deadline left less than the condition's timeout, and the
+    /// wait ended there without the condition holding.
+    pub deadline_cut: bool,
+}
+
 /// The evidence an action really came back with, as the receipt reports it.
 ///
 /// Recorded only once a check has RUN, so its presence on a reply means evidence
@@ -357,6 +427,8 @@ pub struct Checked {
     pub kind: Check,
     pub settle: Option<Settle>,
     pub changed: Option<bool>,
+    /// What the check's `until` came to, on a semantic check that waited.
+    pub until: Option<UntilSeen>,
 }
 
 impl Checked {
@@ -375,6 +447,14 @@ impl Checked {
             }
             if let Some(changed) = self.changed {
                 object.insert("changed".to_string(), json!(changed));
+            }
+            if let Some(until) = self.until {
+                object.insert("until".to_string(), json!(until.outcome.as_str()));
+                object.insert("looks".to_string(), json!(until.looks));
+                object.insert("waited_ms".to_string(), json!(until.waited_ms));
+                if until.deadline_cut {
+                    object.insert("deadline_cut".to_string(), json!(true));
+                }
             }
         }
 
@@ -507,70 +587,38 @@ fn parse_request(value: &Value) -> Result<Inbound, ParseFailure> {
     };
     let action = action.to_string();
 
-    if let Some(field) = RESERVED_FIELDS.iter().find(|f| value.get(*f).is_some()) {
-        return Err(ParseFailure {
-            error: "unknown_field",
-            detail: format!("{field} is reserved for a later slice"),
+    // Every refusal from here on is answered under the request's id and action.
+    checked_request(value, request_id.clone(), action.clone())
+        .map(Inbound::Request)
+        .map_err(|(error, detail)| ParseFailure {
+            error,
+            detail,
             reply: Reply::Response(request_id),
             action: Some(action),
-        });
-    }
+        })
+}
 
-    if let Some((_, detail)) = RETIRED_FIELDS
-        .iter()
-        .find(|(field, _)| value.get(*field).is_some())
-    {
-        return Err(ParseFailure {
-            error: "unknown_field",
-            detail: detail.to_string(),
-            reply: Reply::Response(request_id),
-            action: Some(action),
-        });
-    }
+/// A request whose id and action were read, checked field by field in the order
+/// its refusals are reported: fields it may not carry, its addressing, its bound
+/// window, then its check and the condition it waits on.
+fn checked_request(value: &Value, request_id: String, action: String) -> Result<Request, Refused> {
+    refused_fields(value)?;
+    let (observation_id, element_ref) = addressing(value, &action)?;
+    let target_id = binding(value, &action).map_err(|detail| ("unknown_field", detail))?;
 
-    let (observation_id, element_ref) = match addressing(value, &action) {
-        Ok(addressed) => addressed,
-        Err((error, detail)) => {
-            return Err(ParseFailure {
-                error,
-                detail,
-                reply: Reply::Response(request_id),
-                action: Some(action),
-            })
-        }
-    };
+    let addressed = (element_ref.is_some(), observation_id.is_some());
+    let (check, until) = evidence(value, &action, addressed).and_then(|(check, until)| {
+        waited_on(value, &action, observation_id.is_some()).map(|waited| (check, waited.or(until)))
+    })?;
 
-    let target_id = match binding(value, &action) {
-        Ok(target) => target,
-        Err(detail) => {
-            return Err(ParseFailure {
-                error: "unknown_field",
-                detail,
-                reply: Reply::Response(request_id),
-                action: Some(action),
-            })
-        }
-    };
-
-    let check = match evidence(value, &action, element_ref.is_some()) {
-        Ok(check) => check,
-        Err(detail) => {
-            return Err(ParseFailure {
-                error: "check_unsupported",
-                detail,
-                reply: Reply::Response(request_id),
-                action: Some(action),
-            })
-        }
-    };
-
-    Ok(Inbound::Request(Request {
+    Ok(Request {
         request_id,
         action,
         observation_id,
         element_ref,
         check,
         target_id,
+        until,
         sidecar_generation: value
             .get("sidecar_generation")
             .and_then(Value::as_str)
@@ -581,7 +629,24 @@ fn parse_request(value: &Value) -> Result<Inbound, ParseFailure> {
             .and_then(Value::as_u64),
         mutation_seq: value.get("mutation_seq").and_then(Value::as_u64),
         body: value.clone(),
-    }))
+    })
+}
+
+/// Fields no request may carry: reserved for a later slice, or retired.
+fn refused_fields(value: &Value) -> Result<(), Refused> {
+    if let Some(field) = RESERVED_FIELDS.iter().find(|f| value.get(*f).is_some()) {
+        return Err((
+            "unknown_field",
+            format!("{field} is reserved for a later slice"),
+        ));
+    }
+    if let Some((_, detail)) = RETIRED_FIELDS
+        .iter()
+        .find(|(field, _)| value.get(*field).is_some())
+    {
+        return Err(("unknown_field", detail.to_string()));
+    }
+    Ok(())
 }
 
 /// The bound window this request acts inside, decided before the action runs.
@@ -604,6 +669,12 @@ fn binding(value: &Value, action: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// The check a request asks for, and the condition it waits on when it waits.
+type Evidence = (Check, Option<Box<Until>>);
+
+/// A refusal decided in `parse`: its wire code and the sentence beside it.
+type Refused = (&'static str, String);
+
 /// The evidence this request asks for, decided before the action runs.
 ///
 /// Two refusals, one code, because the fix for both is the same kind of thing — a
@@ -615,27 +686,75 @@ fn binding(value: &Value, action: &str) -> Result<Option<String>, String> {
 ///   * a `semantic` check re-reads the control the action named, so an action that
 ///     named a POINT has nothing to re-read. Falling back to an image there would
 ///     be this build choosing the evidence, which is the caller's decision.
-fn evidence(value: &Value, action: &str, addressed_at_element: bool) -> Result<Check, String> {
+///
+/// The object form (protocol 12) is a semantic check that also waits on the tree:
+/// `{"kind": "semantic", "until": …}`, on any action that takes a check. `addressed`
+/// is whether the request names a control, and whether it names a listing.
+fn evidence(value: &Value, action: &str, addressed: (bool, bool)) -> Result<Evidence, Refused> {
     let Some(asked) = value.get("check") else {
-        return Ok(Check::None);
+        return Ok((Check::None, None));
     };
+    let unsupported = |detail: String| ("check_unsupported", detail);
 
     if !takes_a_check(action) {
-        return Err(format!(
+        return Err(unsupported(format!(
             "{action} takes no check: it dispatches no input, so it has no evidence to bring back"
-        ));
+        )));
     }
 
     match asked.as_str() {
-        Some("image") => Ok(Check::Image),
-        Some("none") => Ok(Check::None),
-        Some("semantic") if addressed_at_element => Ok(Check::Semantic),
-        Some("semantic") => Err(format!(
+        Some("image") => Ok((Check::Image, None)),
+        Some("none") => Ok((Check::None, None)),
+        Some("semantic") if addressed.0 => Ok((Check::Semantic, None)),
+        Some("semantic") => Err(unsupported(format!(
             "a semantic check re-reads the control the action named, and this {action} names a \
              point: address it by element_ref, or ask for an image check"
+        ))),
+        None if asked.is_object() => waiting_check(asked, addressed.1),
+        _ => Err(unsupported(format!(
+            "check must be one of image, semantic, none, or {{\"kind\": \"semantic\", \"until\": …}}; \
+             {asked} is not a kind this build has"
+        ))),
+    }
+}
+
+/// The object form of a check: `kind` semantic and an `until`, nothing else.
+fn waiting_check(asked: &Value, listed: bool) -> Result<Evidence, Refused> {
+    let shape = "a check object is {\"kind\": \"semantic\", \"until\": …} and nothing else";
+    let fields_ok = asked
+        .as_object()
+        .is_some_and(|object| object.keys().all(|key| key == "kind" || key == "until"));
+    let (Some("semantic"), Some(until), true) = (
+        asked.get("kind").and_then(Value::as_str),
+        asked.get("until"),
+        fields_ok,
+    ) else {
+        return Err(("check_unsupported", format!("{shape}, not {asked}")));
+    };
+
+    let until =
+        crate::semantic::parse_until(until, listed).map_err(|why| ("invalid_argument", why))?;
+    Ok((Check::Semantic, Some(Box::new(until))))
+}
+
+/// `wait_for`'s condition, which it needs. Any other action waits by its check,
+/// so an `until` beside one is refused rather than ignored.
+fn waited_on(value: &Value, action: &str, listed: bool) -> Result<Option<Box<Until>>, Refused> {
+    match (action == "wait_for", value.get("until")) {
+        (true, None) => Err((
+            "invalid_argument",
+            "wait_for needs until: the condition to wait for".to_string(),
         )),
-        _ => Err(format!(
-            "check must be one of image, semantic, none; {asked} is not a kind this build has"
+        (true, Some(until)) => crate::semantic::parse_until(until, listed)
+            .map(|until| Some(Box::new(until)))
+            .map_err(|why| ("invalid_argument", why)),
+        (false, None) => Ok(None),
+        (false, Some(_)) => Err((
+            "unknown_field",
+            format!(
+                "{action} takes no until: a wait after an action rides its check, \
+                 {{\"kind\": \"semantic\", \"until\": …}}"
+            ),
         )),
     }
 }
@@ -659,24 +778,11 @@ fn evidence(value: &Value, action: &str, addressed_at_element: bool) -> Result<C
 type Addressed = (Option<String>, Option<String>);
 
 fn addressing(value: &Value, action: &str) -> Result<Addressed, (&'static str, String)> {
-    let named = non_empty(value, "observation_id").map_err(|field| {
-        (
-            "observation_required",
-            format!(
-                "{field} must be a non-empty string naming the reply this request's target was \
-                 read from"
-            ),
-        )
-    })?;
-    let reference = non_empty(value, "element_ref").map_err(|field| {
-        (
-            "element_required",
-            format!(
-                "{field} must be a non-empty string naming a control, as an elements reply \
-                     spelled it"
-            ),
-        )
-    })?;
+    let (named, reference) = addressed_by(value)?;
+
+    if action == "type" {
+        return typed_into(value, named, reference);
+    }
 
     if !takes_an_observation(action) {
         return match (named, reference) {
@@ -720,6 +826,66 @@ fn addressing(value: &Value, action: &str) -> Result<Addressed, (&'static str, S
     };
 
     target(value, action, reference).map(|reference| (Some(id), reference))
+}
+
+/// The `observation_id` and `element_ref` a request names, each a non-empty
+/// string where it is present at all.
+fn addressed_by(value: &Value) -> Result<Addressed, (&'static str, String)> {
+    let named = non_empty(value, "observation_id").map_err(|field| {
+        (
+            "observation_required",
+            format!(
+                "{field} must be a non-empty string naming the reply this request's target was \
+                 read from"
+            ),
+        )
+    })?;
+    let reference = non_empty(value, "element_ref").map_err(|field| {
+        (
+            "element_required",
+            format!(
+                "{field} must be a non-empty string naming a control, as an elements reply \
+                 spelled it"
+            ),
+        )
+    })?;
+    Ok((named, reference))
+}
+
+/// `type` types at the focus, or (protocol 12) into a control by reference beside
+/// the listing that named it — never at a point.
+fn typed_into(
+    value: &Value,
+    named: Option<String>,
+    reference: Option<String>,
+) -> Result<Addressed, (&'static str, String)> {
+    match (named, reference) {
+        (None, None) => Ok((None, None)),
+        (Some(_), None) => Err((
+            "unknown_field",
+            "type takes observation_id only beside element_ref: at the focus it reads no \
+             coordinates"
+                .to_string(),
+        )),
+        (None, Some(_)) => Err((
+            "observation_required",
+            "type with element_ref needs observation_id: the id of the listing that named the \
+             control"
+                .to_string(),
+        )),
+        (Some(_), Some(_))
+            if ["x", "y", "region"]
+                .iter()
+                .any(|field| value.get(*field).is_some()) =>
+        {
+            Err((
+                "addressing_conflict",
+                "type into a control is addressed by element_ref alone, never by a point"
+                    .to_string(),
+            ))
+        }
+        (Some(id), Some(reference)) => Ok((Some(id), Some(reference))),
+    }
 }
 
 /// A point, a control, or the refusal that says the request named both or neither.
@@ -822,6 +988,33 @@ fn request_id(value: &Value) -> Result<String, ParseFailure> {
     }
 }
 
+// --- verb arguments ------------------------------------------------------------
+
+/// The most wheel notches one `scroll` turns. A notch is a press and a release of
+/// a wheel button on X11, and one step on the portal and on macOS; more than this
+/// in one request is a mistake, not a page, so it is refused, never turned down.
+pub const MAX_SCROLL_NOTCHES: i32 = 50;
+
+/// `scroll`'s `amount`: 3 when it is absent, else a whole number from 1 to
+/// [`MAX_SCROLL_NOTCHES`]. Anything else is `invalid_argument`, before any input.
+pub fn scroll_notches(body: &Value) -> Result<i32, Failure> {
+    let Some(amount) = body.get("amount") else {
+        return Ok(3);
+    };
+    amount
+        .as_i64()
+        .filter(|notches| (1..=i64::from(MAX_SCROLL_NOTCHES)).contains(notches))
+        .and_then(|notches| i32::try_from(notches).ok())
+        .ok_or_else(|| {
+            Failure::new(
+                "invalid_argument",
+                format!(
+                    "a scroll turns 1 to {MAX_SCROLL_NOTCHES} notches, and {amount} is not one                      of them; nothing was sent"
+                ),
+            )
+        })
+}
+
 // --- failures ----------------------------------------------------------------
 
 /// What an action failed with: the wire's `error` code, and the sentence that goes
@@ -901,6 +1094,8 @@ impl Dispatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effect {
     Verified,
+    /// Protocol 12: a verb's read-back shows what was asked, and it did not before.
+    Changed,
     NotObserved,
     Unknown,
 }
@@ -909,6 +1104,7 @@ impl Effect {
     fn as_str(self) -> &'static str {
         match self {
             Effect::Verified => "verified",
+            Effect::Changed => "changed",
             Effect::NotObserved => "not_observed",
             Effect::Unknown => "unknown",
         }
@@ -962,6 +1158,47 @@ pub struct Timings {
     pub encode_ms: u64,
 }
 
+/// What a state-reading verb read before and after (protocol 12), and whether the
+/// state already held so nothing was sent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StateChange {
+    pub already: bool,
+    pub before: Option<&'static str>,
+    pub after: Option<&'static str>,
+}
+
+impl StateChange {
+    /// `already` only when it held; each state only when it read.
+    fn insert_into(self, object: &mut Map<String, Value>) {
+        if self.already {
+            object.insert("already".to_string(), json!(true));
+        }
+        for (key, state) in [("state_before", self.before), ("state_after", self.after)] {
+            if let Some(state) = state {
+                object.insert(key.to_string(), json!(state));
+            }
+        }
+    }
+}
+
+/// A dialog, alert, menu or popup open once an action has run (protocol 12).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Surface {
+    pub kind: &'static str,
+    pub native_kind: String,
+    pub label: Option<String>,
+}
+
+impl Surface {
+    fn into_value(self) -> Value {
+        let mut surface = json!({ "kind": self.kind, "native_kind": self.native_kind });
+        if let (Some(object), Some(label)) = (surface.as_object_mut(), self.label) {
+            object.insert("label".to_string(), json!(label));
+        }
+        surface
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Receipt {
     pub dispatch: Dispatch,
@@ -981,6 +1218,11 @@ pub struct Receipt {
     /// nothing was dispatched, or the check never ran — and it is left off the wire
     /// rather than published as an empty one.
     pub check: Option<Checked>,
+    /// A state-reading verb's states, and whether it found them as asked.
+    pub state: Option<StateChange>,
+    /// What was open once the action ran. `None` is "not looked", never "nothing
+    /// open": an action that sent nothing, or a build with no accessibility API.
+    pub surfaces: Option<Vec<Surface>>,
 }
 
 impl Receipt {
@@ -1015,6 +1257,8 @@ impl Receipt {
             observation_id_after: None,
             foreground_changed: None,
             check: checked,
+            state: None,
+            surfaces: None,
         }
     }
 
@@ -1041,6 +1285,18 @@ impl Receipt {
             self.effect = effect;
         }
         self.foreground_changed = foreground_changed;
+        self
+    }
+
+    /// What only protocol 12 reports: a verb's states, and the surfaces open once
+    /// the action ran.
+    pub fn reported(
+        mut self,
+        state: Option<StateChange>,
+        surfaces: Option<Vec<Surface>>,
+    ) -> Receipt {
+        self.state = state;
+        self.surfaces = surfaces;
         self
     }
 
@@ -1071,6 +1327,13 @@ impl Receipt {
             }
             if let Some(checked) = self.check {
                 object.insert("check".to_string(), checked.into_value());
+            }
+            if let Some(state) = self.state {
+                state.insert_into(object);
+            }
+            if let Some(surfaces) = self.surfaces {
+                let listed: Vec<Value> = surfaces.into_iter().map(Surface::into_value).collect();
+                object.insert("surfaces".to_string(), Value::Array(listed));
             }
         }
 
@@ -1199,6 +1462,31 @@ pub fn session_event(
 mod tests {
     use super::*;
 
+    // An amount is turned in full or refused: never wrapped into another number,
+    // never cut down to the cap without saying so.
+    #[test]
+    fn a_scroll_turns_one_to_fifty_notches_and_any_other_amount_is_refused_naming_the_cap() {
+        assert_eq!(scroll_notches(&json!({})), Ok(3));
+        assert_eq!(scroll_notches(&json!({"amount": 1})), Ok(1));
+        assert_eq!(scroll_notches(&json!({"amount": 50})), Ok(50));
+        let wrong = [
+            json!(51),
+            json!(0),
+            json!(-3),
+            json!(4_294_967_297_i64),
+            json!(2.5),
+            json!("3"),
+            Value::Null,
+        ];
+        for amount in wrong {
+            let refused = scroll_notches(&json!({ "amount": amount }))
+                .expect_err(&format!("{amount} is no amount"));
+            assert_eq!(refused.code, "invalid_argument", "{amount}");
+            let detail = refused.detail.unwrap_or_default();
+            assert!(detail.contains("50"), "{amount}: {detail}");
+        }
+    }
+
     fn envelope() -> Envelope {
         Envelope {
             sidecar_generation: "boot-1".to_string(),
@@ -1213,6 +1501,7 @@ mod tests {
             kind: Check::Image,
             settle: Some(Settle::Stable),
             changed: Some(true),
+            until: None,
         }
     }
 
@@ -1221,6 +1510,7 @@ mod tests {
             kind: Check::None,
             settle: None,
             changed: None,
+            until: None,
         }
     }
 
@@ -1287,8 +1577,14 @@ mod tests {
     #[test]
     fn a_viewing_action_takes_a_region_with_or_without_an_image() {
         for action in VIEWING_ACTIONS {
+            // `wait_for` needs its condition, whatever it is addressed by.
+            let until = if action == "wait_for" {
+                r#","until":{"kind":"menu_open"}"#
+            } else {
+                ""
+            };
             let with = format!(
-                r#"{{"type":"request","request_id":"r1","action":"{action}",
+                r#"{{"type":"request","request_id":"r1","action":"{action}"{until},
                    "observation_id":"7c1e-1","region":{{"x":0,"y":0,"w":10,"h":10}}}}"#
             );
             let Ok(Inbound::Request(request)) = parse(&with) else {
@@ -1296,7 +1592,8 @@ mod tests {
             };
             assert_eq!(request.observation_id.as_deref(), Some("7c1e-1"));
 
-            let without = format!(r#"{{"type":"request","request_id":"r1","action":"{action}"}}"#);
+            let without =
+                format!(r#"{{"type":"request","request_id":"r1","action":"{action}"{until}}}"#);
             let Ok(Inbound::Request(request)) = parse(&without) else {
                 panic!("{action} must take neither");
             };
@@ -1381,6 +1678,10 @@ mod tests {
                 "press" | "set_value" => {
                     r#","observation_id":"7c1e-1","element_ref":"e3","value":"v","target_id":"t1""#
                 }
+                "focus" | "select" | "toggle" | "expand" | "collapse" | "scroll_to" => {
+                    r#","observation_id":"7c1e-1","element_ref":"e3","on":true,"target_id":"t1""#
+                }
+                "wait_for" => r#","until":{"kind":"menu_open"},"target_id":"t1""#,
                 "inspect" | "left_click_drag" => r#","observation_id":"7c1e-1","target_id":"t1""#,
                 "screenshot" | "elements" | "type" | "key" | "paste" => r#","target_id":"t1""#,
                 _pointer => r#","observation_id":"7c1e-1","x":4,"y":9,"target_id":"t1""#,
@@ -1532,7 +1833,7 @@ mod tests {
             ("elements", ""),
             ("screenshot", ""),
             ("windows", ""),
-            ("type", ""),
+            ("wait", ""),
             ("key", ""),
         ];
 
@@ -1974,6 +2275,7 @@ mod tests {
             kind: Check::Semantic,
             settle: None,
             changed: None,
+            until: None,
         }));
         assert_eq!(semantic["receipt"]["check"]["kind"], json!("semantic"));
         assert!(semantic["receipt"]["check"].get("settle").is_none());
@@ -1983,6 +2285,7 @@ mod tests {
             kind: Check::Image,
             settle: Some(Settle::Timeout),
             changed: None,
+            until: None,
         }));
         assert_eq!(unlisted["receipt"]["check"]["settle"], json!("timeout"));
         assert!(
@@ -2006,5 +2309,311 @@ mod tests {
         } else {
             ""
         }
+    }
+
+    // --- protocol 12 ----------------------------------------------------------------
+
+    const VERBS: [&str; 6] = [
+        "focus",
+        "select",
+        "toggle",
+        "expand",
+        "collapse",
+        "scroll_to",
+    ];
+
+    /// The parse failure for one line, or a panic naming what came back instead.
+    fn refused(line: &str) -> ParseFailure {
+        parse(line).expect_err(line)
+    }
+
+    // The library and the helper read one list each, and they are the same list.
+    #[test]
+    fn the_action_lists_are_the_librarys() {
+        let sorted = |mut list: Vec<String>| {
+            list.sort();
+            list
+        };
+        let ours = |list: &[&str]| sorted(list.iter().map(|name| name.to_string()).collect());
+        let theirs = |attribute: &str| sorted(crate::roles::elixir_list(attribute));
+
+        assert_eq!(ours(&READ_ONLY_ACTIONS), theirs("@read_only"));
+        assert_eq!(ours(&TARGETABLE_ACTIONS), theirs("@targetable"));
+        assert_eq!(ours(&ADDRESSED_ACTIONS), theirs("@addressed"));
+        assert_eq!(ours(&ELEMENT_ACTIONS), theirs("@element"));
+        assert_eq!(ours(&VIEWING_ACTIONS), theirs("@viewing"));
+    }
+
+    // Each verb on a reference is input addressed at a control: it names the
+    // listing and the control, never a point, may name a window, is stopped by a
+    // pause, carries a sequence number and takes a check.
+    #[test]
+    fn every_verb_on_a_reference_is_input_addressed_at_a_control() {
+        for verb in VERBS {
+            assert!(addresses_an_element(verb), "{verb}");
+            assert!(takes_a_target(verb), "{verb}");
+            assert!(barred_by_a_pause(verb), "{verb}");
+            assert!(carries_mutation_seq(verb), "{verb}");
+            assert!(takes_a_check(verb), "{verb}");
+
+            let named = request(&format!(
+                r#"{{"type":"request","request_id":"r1","action":"{verb}",
+                   "observation_id":"o-1","element_ref":"e3","on":true,"mutation_seq":1}}"#
+            ));
+            assert_eq!(named.element_ref.as_deref(), Some("e3"), "{verb}");
+
+            let bare = refused(&format!(
+                r#"{{"type":"request","request_id":"r1","action":"{verb}","observation_id":"o-1"}}"#
+            ));
+            assert_eq!(bare.error, "element_required", "{verb}");
+
+            let both = refused(&format!(
+                r#"{{"type":"request","request_id":"r1","action":"{verb}","observation_id":"o-1",
+                   "element_ref":"e3","x":4,"y":9}}"#
+            ));
+            assert_eq!(both.error, "addressing_conflict", "{verb}");
+
+            let unnamed = refused(&format!(
+                r#"{{"type":"request","request_id":"r1","action":"{verb}","element_ref":"e3"}}"#
+            ));
+            assert_eq!(unnamed.error, "observation_required", "{verb}");
+        }
+    }
+
+    // `wait_for` waits on the tree and sends nothing: read-only, no sequence and no
+    // check, and it needs its condition.
+    #[test]
+    fn wait_for_is_read_only_and_needs_its_condition() {
+        assert!(!carries_mutation_seq("wait_for"));
+        assert!(!touches_input("wait_for"));
+        assert!(takes_a_target("wait_for"));
+        assert!(takes_an_observation("wait_for"));
+
+        let waiting = request(
+            r#"{"type":"request","request_id":"r1","action":"wait_for","observation_id":"o-1",
+               "until":{"kind":"enabled","element_ref":"e7","timeout_ms":2000}}"#,
+        );
+        let until = waiting.until.expect("its condition");
+        assert_eq!(
+            until.condition,
+            crate::semantic::Condition::Enabled("e7".to_string())
+        );
+        assert_eq!(until.timeout_ms, 2000);
+
+        let missing = refused(r#"{"type":"request","request_id":"r1","action":"wait_for"}"#);
+        assert_eq!(missing.error, "invalid_argument");
+        assert!(missing.detail.contains("until"), "{}", missing.detail);
+
+        let bad = refused(
+            r#"{"type":"request","request_id":"r1","action":"wait_for","until":{"kind":"flashes"}}"#,
+        );
+        assert_eq!(bad.error, "invalid_argument");
+
+        let unlisted = refused(
+            r#"{"type":"request","request_id":"r1","action":"wait_for",
+               "until":{"kind":"enabled","element_ref":"e7"}}"#,
+        );
+        assert_eq!(unlisted.error, "invalid_argument");
+        assert!(
+            unlisted.detail.contains("observation_id"),
+            "{}",
+            unlisted.detail
+        );
+
+        let checked = refused(
+            r#"{"type":"request","request_id":"r1","action":"wait_for","check":"none",
+               "until":{"kind":"menu_open"}}"#,
+        );
+        assert_eq!(checked.error, "check_unsupported");
+
+        let elsewhere = refused(
+            r#"{"type":"request","request_id":"r1","action":"key","chord":"a",
+               "until":{"kind":"menu_open"}}"#,
+        );
+        assert_eq!(
+            elsewhere.error, "unknown_field",
+            "until rides a check, not an action"
+        );
+    }
+
+    // `type` types at the focus as before, or into a control by reference beside the
+    // listing that named it.
+    #[test]
+    fn type_takes_a_reference_only_beside_its_listing() {
+        let focus = request(r#"{"type":"request","request_id":"r1","action":"type","text":"hi"}"#);
+        assert_eq!(focus.element_ref, None);
+        assert_eq!(focus.observation_id, None);
+
+        let named = request(
+            r#"{"type":"request","request_id":"r1","action":"type","text":"hi",
+               "observation_id":"o-1","element_ref":"e2","check":"semantic"}"#,
+        );
+        assert_eq!(named.element_ref.as_deref(), Some("e2"));
+        assert_eq!(named.observation_id.as_deref(), Some("o-1"));
+        assert_eq!(named.check, Check::Semantic);
+
+        let unlisted = refused(
+            r#"{"type":"request","request_id":"r1","action":"type","text":"hi","element_ref":"e2"}"#,
+        );
+        assert_eq!(unlisted.error, "observation_required");
+
+        let image = refused(
+            r#"{"type":"request","request_id":"r1","action":"type","text":"hi","observation_id":"o-1"}"#,
+        );
+        assert_eq!(image.error, "unknown_field");
+
+        let both = refused(
+            r#"{"type":"request","request_id":"r1","action":"type","text":"hi",
+               "observation_id":"o-1","element_ref":"e2","x":4,"y":9}"#,
+        );
+        assert_eq!(both.error, "addressing_conflict");
+    }
+
+    // The object form of a check waits on the tree after the input, on any action
+    // that takes a check, in the same request.
+    #[test]
+    fn a_semantic_check_may_wait_on_the_tree_after_any_input() {
+        let saved = request(
+            r#"{"type":"request","request_id":"r1","action":"key","chord":"cmd+s","mutation_seq":3,
+               "check":{"kind":"semantic","until":{"kind":"appears","role":"dialog"}}}"#,
+        );
+        assert_eq!(saved.check, Check::Semantic);
+        assert!(matches!(
+            saved.until.map(|until| until.condition),
+            Some(crate::semantic::Condition::Appears { .. })
+        ));
+
+        let pressed = request(
+            r#"{"type":"request","request_id":"r1","action":"press","observation_id":"o-1",
+               "element_ref":"e3","mutation_seq":4,
+               "check":{"kind":"semantic","until":{"kind":"disappears","element_ref":"e3"}}}"#,
+        );
+        assert_eq!(pressed.check, Check::Semantic);
+        assert!(pressed.until.is_some());
+
+        for (check, error) in [
+            (
+                r#"{"kind":"image","until":{"kind":"menu_open"}}"#,
+                "check_unsupported",
+            ),
+            (r#"{"kind":"semantic"}"#, "check_unsupported"),
+            (
+                r#"{"kind":"semantic","until":{"kind":"menu_open"},"extra":1}"#,
+                "check_unsupported",
+            ),
+            (
+                r#"{"kind":"semantic","until":{"kind":"flashes"}}"#,
+                "invalid_argument",
+            ),
+            (
+                r#"{"kind":"semantic","until":{"kind":"enabled","element_ref":"e1"}}"#,
+                "invalid_argument",
+            ),
+        ] {
+            let line = format!(
+                r#"{{"type":"request","request_id":"r1","action":"key","chord":"a","check":{check}}}"#
+            );
+            assert_eq!(refused(&line).error, error, "{check}");
+        }
+    }
+
+    // A verb's states, the surfaces open after it, the new effect and a wait's
+    // outcome, each spelled as the contract spells it.
+    #[test]
+    fn a_protocol_twelve_receipt_says_what_its_verb_read_and_what_opened() {
+        let waited = Checked {
+            kind: Check::Semantic,
+            settle: None,
+            changed: None,
+            until: Some(UntilSeen {
+                outcome: UntilOutcome::Met,
+                looks: 3,
+                waited_ms: 212,
+                deadline_cut: false,
+            }),
+        };
+        let receipt = Receipt::derive(true, true, Some(waited), Timings::default())
+            .noted(InputMethod::Ax, Some(Effect::Changed), Some(false))
+            .reported(
+                Some(StateChange {
+                    already: false,
+                    before: Some("off"),
+                    after: Some("on"),
+                }),
+                Some(vec![Surface {
+                    kind: "dialog",
+                    native_kind: "AXSheet".to_string(),
+                    label: Some("Clear all items?".to_string()),
+                }]),
+            );
+        let value = response(&envelope(), "r1", json!({}), Some(receipt));
+
+        assert_eq!(value["receipt"]["effect"], json!("changed"));
+        assert_eq!(value["receipt"]["state_before"], json!("off"));
+        assert_eq!(value["receipt"]["state_after"], json!("on"));
+        assert!(
+            value["receipt"].get("already").is_none(),
+            "said only when it held"
+        );
+        assert_eq!(
+            value["receipt"]["check"],
+            json!({"kind": "semantic", "until": "met", "looks": 3, "waited_ms": 212})
+        );
+        assert_eq!(
+            value["receipt"]["surfaces"],
+            json!([{"kind": "dialog", "native_kind": "AXSheet", "label": "Clear all items?"}])
+        );
+
+        let held = Receipt::derive(false, false, None, Timings::default())
+            .noted(InputMethod::Ax, Some(Effect::NotObserved), None)
+            .reported(
+                Some(StateChange {
+                    already: true,
+                    before: Some("on"),
+                    after: Some("on"),
+                }),
+                None,
+            );
+        let value = response(&envelope(), "r2", json!({}), Some(held));
+        assert_eq!(value["receipt"]["already"], json!(true));
+        assert_eq!(value["receipt"]["dispatch"], json!("not_sent"));
+        assert!(
+            value["receipt"].get("surfaces").is_none(),
+            "not looked is absent"
+        );
+
+        let none_open =
+            Receipt::derive(true, true, None, Timings::default()).reported(None, Some(Vec::new()));
+        let value = response(&envelope(), "r3", json!({}), Some(none_open));
+        assert_eq!(
+            value["receipt"]["surfaces"],
+            json!([]),
+            "looked, and nothing open"
+        );
+    }
+
+    // A wait the request's own deadline cut short says so beside its outcome, and
+    // one that ran its whole timeout says nothing extra.
+    #[test]
+    fn a_wait_cut_short_by_the_deadline_says_so() {
+        let cut = Checked {
+            kind: Check::Semantic,
+            settle: None,
+            changed: None,
+            until: Some(UntilSeen {
+                outcome: UntilOutcome::NotMet,
+                looks: 4,
+                waited_ms: 300,
+                deadline_cut: true,
+            }),
+        };
+        let receipt = Receipt::derive(true, true, Some(cut), Timings::default());
+        let value = response(&envelope(), "r1", json!({}), Some(receipt));
+
+        assert_eq!(
+            value["receipt"]["check"],
+            json!({"kind": "semantic", "until": "not_met", "looks": 4, "waited_ms": 300,
+                   "deadline_cut": true})
+        );
     }
 }

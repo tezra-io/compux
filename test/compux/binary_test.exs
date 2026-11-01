@@ -77,6 +77,18 @@ defmodule Compux.BinaryTest do
       assert executable?(cached)
       assert Path.basename(cached) == "compux"
 
+      # On Linux the X11 badge comes out beside it: the helper spawns it from its
+      # own directory when a window is bound.
+      case Binary.target() do
+        {:ok, "linux-" <> _} ->
+          badge = Path.join(Path.dirname(cached), "compux-indicator-x11")
+          assert File.read!(badge) == "badge-binary-bytes"
+          assert executable?(badge)
+
+        _macos ->
+          :ok
+      end
+
       # a second resolve is a pure cache hit (fetcher would crash if called)
       assert {:ok, ^cached} =
                Binary.path(
@@ -96,6 +108,61 @@ defmodule Compux.BinaryTest do
                  checksums: %{target => String.duplicate("0", 64)},
                  fetcher: fn _url -> {:ok, artifact} end
                )
+    end
+
+    # A helper with no badge beside it refuses every bound-window action, so an
+    # archive without one is refused whole, and nothing is cached for a later
+    # resolve to trust.
+    test "a Linux archive without the X11 badge is refused and caches nothing", %{tmp: tmp} do
+      case Binary.target() do
+        {:ok, "linux-" <> _ = target} ->
+          {artifact, sha} = fake_tarball([{~c"compux", "compux-binary-bytes"}])
+
+          assert {:error, {:binary_not_in_archive, "compux-indicator-x11"}} =
+                   Binary.path(
+                     cache_dir: tmp,
+                     checksums: %{target => sha},
+                     fetcher: fn _url -> {:ok, artifact} end
+                   )
+
+          assert {:error, :not_cached} = Binary.cached_path(cache_dir: tmp)
+
+        _macos ->
+          :ok
+      end
+    end
+
+    # Each binary is written under another name beside its own and renamed into
+    # place, so a resolve never sees half of one, and the helper's arrival, which
+    # is what the cache is judged by, is one step. A stale badge left from an
+    # earlier extraction is replaced, never written through, and nothing is left
+    # behind but the two binaries.
+    test "a Linux binary is renamed into place, never written where it will run", %{tmp: tmp} do
+      case Binary.target() do
+        {:ok, "linux-" <> _ = target} ->
+          {artifact, sha} = fake_artifact()
+          dir = Path.join([tmp, to_string(Application.spec(:compux, :vsn)), target])
+          File.mkdir_p!(dir)
+          stale = Path.join(dir, "compux-indicator-x11")
+          File.write!(stale, "stale-badge")
+          %File.Stat{inode: stale_inode} = File.stat!(stale)
+
+          assert {:ok, cached} =
+                   Binary.path(
+                     cache_dir: tmp,
+                     checksums: %{target => sha},
+                     fetcher: fn _url -> {:ok, artifact} end
+                   )
+
+          assert File.read!(stale) == "badge-binary-bytes"
+          assert %File.Stat{inode: new_inode} = File.stat!(stale)
+          assert new_inode != stale_inode, "the badge was written through, not renamed into place"
+          assert File.ls!(dir) |> Enum.sort() == ["compux", "compux-indicator-x11"]
+          assert executable?(cached)
+
+        _macos ->
+          :ok
+      end
     end
 
     test "fails loud when no checksum is pinned for the target", %{tmp: tmp} do
@@ -192,19 +259,25 @@ defmodule Compux.BinaryTest do
 
   # A release artifact matching the host target: a real ad-hoc-signed Fermix.app
   # (zipped with ditto) on macOS so the ditto-extract + codesign-verify path is
-  # actually exercised; a bare-binary tarball on Linux.
+  # actually exercised; a tarball of the helper and its X11 badge on Linux.
   defp fake_artifact do
     case Binary.target() do
-      {:ok, "macos-" <> _} -> fake_app_zip()
-      _ -> fake_tarball("compux-binary-bytes")
+      {:ok, "macos-" <> _} ->
+        fake_app_zip()
+
+      _ ->
+        fake_tarball([
+          {~c"compux", "compux-binary-bytes"},
+          {~c"compux-indicator-x11", "badge-binary-bytes"}
+        ])
     end
   end
 
-  defp fake_tarball(contents) do
+  defp fake_tarball(entries) do
     tar = Path.join(System.tmp_dir!(), "compux-src-#{System.unique_integer([:positive])}.tar.gz")
     # Reclaim on every path (incl. a mid-fixture raise), not just the happy path.
     on_exit(fn -> File.rm_rf(tar) end)
-    :ok = :erl_tar.create(String.to_charlist(tar), [{~c"compux", contents}], [:compressed])
+    :ok = :erl_tar.create(String.to_charlist(tar), entries, [:compressed])
     bytes = File.read!(tar)
     sha = :sha256 |> :crypto.hash(bytes) |> Base.encode16(case: :lower)
     {bytes, sha}

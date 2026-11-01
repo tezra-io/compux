@@ -48,6 +48,25 @@
 //   * TWO GROUPS, each with a button labelled "Save" — the same label twice, so
 //                           the `path` of ancestor labels is the only thing that
 //                           tells them apart.
+//
+// And, in the AppKit half only, the controls the Linux fixtures
+// (`fixtures/linux/`) also carry, so the desktop corpus asks the same things of
+// every fixture. They record under the same names with `appkit.` in front:
+//
+//   * a SEARCH FIELD      — typing into a field, and `focus`: it records when it
+//                           becomes the window's first responder;
+//   * a FRUIT LIST        — `select` on a table row;
+//   * a FOLDERS OUTLINE   — `expand` and `collapse` on disclosure rows (Projects
+//                           starts expanded, so collapse has a target), and
+//                           `select` on any row;
+//   * TABS                — `select` on a tab;
+//   * a VOLUME SLIDER     — `set_value` on a range;
+//   * a HISTORY LIST      — two hundred rows whose last one starts far out of
+//                           view: `scroll_to`, recorded as `scroll` / `bottom`
+//                           when the list reaches its end, then `select`;
+//   * CLEAR ALL…          — a SHEET with OK and Cancel: a modal dialog;
+//   * an ACTIONS MENU     — in the menu bar, with Export Report and Print
+//                           Preview: a menu item.
 
 import AppKit
 import SwiftUI
@@ -132,6 +151,14 @@ enum Control: String, CaseIterable {
     case appkitSecureField = "appkit.secure_field"
     case appkitDisabledButton = "appkit.disabled_button"
     case appkitPopUp = "appkit.popup"
+    case appkitSearch = "appkit.search"
+    case appkitList = "appkit.list"
+    case appkitOutline = "appkit.outline"
+    case appkitTabs = "appkit.tabs"
+    case appkitSlider = "appkit.slider"
+    case appkitFarList = "appkit.far_list"
+    case appkitDialog = "appkit.dialog"
+    case appkitMenu = "appkit.menu"
 
     case swiftuiButton = "swiftui.button"
     case swiftuiCheckbox = "swiftui.checkbox"
@@ -200,6 +227,41 @@ struct Handlers {
         recorder.record(control.rawValue, "select", value: title)
     }
 
+    func focused(_ control: Control) {
+        recorder.record(control.rawValue, "focus")
+    }
+
+    /// A range's value, recorded as the text of a whole number.
+    func moved(_ control: Control, to value: String) {
+        recorder.record(control.rawValue, "set_value", value: value)
+    }
+
+    func expanded(_ control: Control, row: String) {
+        recorder.record(control.rawValue, "expand", value: row)
+    }
+
+    func collapsed(_ control: Control, row: String) {
+        recorder.record(control.rawValue, "collapse", value: row)
+    }
+
+    /// A long list reached its end, however it was scrolled there.
+    func scrolledToBottom(_ control: Control) {
+        recorder.record(control.rawValue, "scroll", value: "bottom")
+    }
+
+    func opened(_ control: Control) {
+        recorder.record(control.rawValue, "open")
+    }
+
+    /// OK accepts; Cancel and Escape decline.
+    func answered(_ control: Control, accepted: Bool) {
+        recorder.record(control.rawValue, accepted ? "accept" : "cancel")
+    }
+
+    func activated(_ control: Control, title: String) {
+        recorder.record(control.rawValue, "activate", value: title)
+    }
+
     /// Drive every control once, in the order they are declared. This is what
     /// `--self-test` runs and what the window's controls call one at a time, so a
     /// change to a handler is proved by the test that needs no screen.
@@ -208,12 +270,26 @@ struct Handlers {
             switch control {
             case .appkitCheckbox, .swiftuiCheckbox:
                 toggled(control, on: true)
-            case .appkitTextField, .swiftuiTextField:
+            case .appkitTextField, .swiftuiTextField, .appkitSearch:
                 typed(control, text: "self-test")
             case .appkitSecureField, .swiftuiSecureField:
                 typedSecurely(control, text: "hunter2")
             case .appkitPopUp, .swiftuiPopUp:
                 selected(control, title: "Second")
+            case .appkitList:
+                selected(control, title: "Cherry")
+            case .appkitOutline:
+                expanded(control, row: "Documents")
+            case .appkitTabs:
+                selected(control, title: "Advanced")
+            case .appkitSlider:
+                moved(control, to: "75")
+            case .appkitFarList:
+                scrolledToBottom(control)
+            case .appkitDialog:
+                opened(control)
+            case .appkitMenu:
+                activated(control, title: "Export Report")
             default:
                 pressed(control)
             }
@@ -266,7 +342,18 @@ final class AppKitGroup: NSViewController {
         popUp.addItems(withTitles: ["First", "Second", "Third"])
         popUp.setAccessibilityLabel("AppKit pop-up button")
 
-        for control in [button, checkbox, field, secure, disabled, popUp] as [NSView] {
+        let search = NSSearchField(string: "")
+        search.placeholderString = "Search"
+        search.setAccessibilityLabel("Search")
+
+        let slider = NSSlider(value: 50, minValue: 0, maxValue: 100, target: nil, action: nil)
+        slider.setAccessibilityLabel("Volume")
+
+        let clearAll = NSButton(title: "Clear All…", target: self, action: #selector(askToClearAll))
+
+        for control in [button, checkbox, field, secure, disabled, popUp, search, slider, clearAll]
+            as [NSView]
+        {
             stack.addArrangedSubview(control)
         }
 
@@ -284,6 +371,18 @@ final class AppKitGroup: NSViewController {
             ValueWatcher(initial: "First", read: { popUp.titleOfSelectedItem ?? "" }) { value in
                 handlers.selected(.appkitPopUp, title: value)
             },
+            ValueWatcher(initial: "", read: { search.stringValue }) { value in
+                handlers.typed(.appkitSearch, text: value)
+            },
+            // Focus is the window's first responder, which for a text field is the
+            // shared field editor whose delegate is that field. Only gaining focus
+            // is an event; losing it is the next control's business.
+            ValueWatcher(initial: "", read: { isEditing(search) ? "focused" : "" }) { value in
+                if value == "focused" { handlers.focused(.appkitSearch) }
+            },
+            ValueWatcher(initial: "50", read: { String(slider.integerValue) }) { value in
+                handlers.moved(.appkitSlider, to: value)
+            },
         ]
 
         view = boxed(title: "AppKit", content: stack)
@@ -292,11 +391,225 @@ final class AppKitGroup: NSViewController {
     @objc private func press() { handlers.pressed(.appkitButton) }
     @objc private func pressDisabled() { handlers.pressed(.appkitDisabledButton) }
 
+    /// A sheet on the fixture window with OK and Cancel. A sheet is modal for its
+    /// window, and compux names it a `dialog` surface.
+    @objc private func askToClearAll() {
+        guard let window = view.window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Clear all fields?"
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        let handlers = self.handlers
+        handlers.opened(.appkitDialog)
+        alert.beginSheetModal(for: window) { response in
+            handlers.answered(.appkitDialog, accepted: response == .alertFirstButtonReturn)
+        }
+    }
+
     // The checkbox's own action is deliberately not wired: its state is watched,
     // so one change is recorded once whether it arrived by `AXPress`, by a click
     // or by a value set.
     @objc private func toggle(_ sender: NSButton) {
         _ = sender
+    }
+}
+
+/// The rows of a one-column table, read through the classic (cell-based) data
+/// source, so the table publishes plain rows with no views of its own.
+final class Rows: NSObject, NSTableViewDataSource {
+    let names: [String]
+
+    init(_ names: [String]) { self.names = names }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { names.count }
+
+    func tableView(_ tableView: NSTableView, objectValueFor tableColumn: NSTableColumn?, row: Int)
+        -> Any?
+    {
+        names[row]
+    }
+
+    /// The selected row's name, or "" when nothing is selected.
+    func selection(of tableView: NSTableView) -> String {
+        tableView.selectedRow >= 0 ? names[tableView.selectedRow] : ""
+    }
+}
+
+/// One row of the outline. An object, not a string: the outline view tells rows
+/// apart by identity, and a bridged string is a new object every time.
+final class Folder: NSObject {
+    let name: String
+    let children: [Folder]
+
+    init(_ name: String, _ children: [String] = []) {
+        self.name = name
+        self.children = children.map { Folder($0) }
+    }
+}
+
+final class Folders: NSObject, NSOutlineViewDataSource {
+    let roots = [
+        Folder("Documents", ["Invoices", "Letters"]),
+        Folder("Pictures", ["Holidays", "Family"]),
+        Folder("Projects", ["Alpha", "Beta"]),
+        Folder("Music"),
+    ]
+
+    private func children(of item: Any?) -> [Folder] { (item as? Folder)?.children ?? roots }
+
+    func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+        children(of: item).count
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        children(of: item)[index]
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
+        !((item as? Folder)?.children.isEmpty ?? true)
+    }
+
+    func outlineView(
+        _ outlineView: NSOutlineView, objectValueFor tableColumn: NSTableColumn?, byItem item: Any?
+    ) -> Any? {
+        (item as? Folder)?.name
+    }
+
+    func folder(named name: String) -> Folder? { roots.first { $0.name == name } }
+}
+
+/// A one-column table or outline in a scroll view of a fixed height, so a long
+/// one keeps most of its rows out of view.
+private func scrolled(_ table: NSTableView, label: String) -> NSScrollView {
+    let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(label))
+    column.width = 180
+    table.addTableColumn(column)
+    table.headerView = nil
+    table.setAccessibilityLabel(label)
+    let scroll = NSScrollView()
+    scroll.documentView = table
+    scroll.hasVerticalScroller = true
+    scroll.translatesAutoresizingMaskIntoConstraints = false
+    scroll.widthAnchor.constraint(equalToConstant: 200).isActive = true
+    scroll.heightAnchor.constraint(equalToConstant: 180).isActive = true
+    return scroll
+}
+
+/// Whether a scroll view shows the very end of what it scrolls.
+private func atBottom(_ scroll: NSScrollView) -> Bool {
+    guard let document = scroll.documentView else { return false }
+    let visible = scroll.contentView.documentVisibleRect
+    return document.bounds.height > visible.height && visible.maxY >= document.bounds.height - 1
+}
+
+/// The AppKit collections: the fruit list, the folders outline, the history
+/// list and the tabs. Selections, the tab and the scroll position are WATCHED,
+/// like the AppKit fields, so a change that arrived through the accessibility
+/// API is recorded as surely as a click. Expanding and collapsing post their own
+/// notifications, whoever caused them, so those are observed instead.
+final class AppKitCollections: NSViewController {
+    private let handlers: Handlers
+    private let fruit = Rows(["Apple", "Banana", "Cherry", "Damson", "Elderberry"])
+    private let history = Rows((1...200).map { "Entry \($0)" })
+    private let folders = Folders()
+    private(set) var watchers: [ValueWatcher] = []
+    private var observers: [NSObjectProtocol] = []
+
+    init(handlers: Handlers) {
+        self.handlers = handlers
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("not loaded from a nib") }
+
+    deinit { observers.forEach { NotificationCenter.default.removeObserver($0) } }
+
+    override func loadView() {
+        let fruitTable = NSTableView()
+        fruitTable.dataSource = fruit
+        let historyTable = NSTableView()
+        historyTable.dataSource = history
+        let historyScroll = scrolled(historyTable, label: "History")
+
+        let tabs = NSTabView()
+        for title in ["General", "Advanced", "About"] {
+            let item = NSTabViewItem(identifier: title)
+            item.label = title
+            item.view = NSTextField(labelWithString: "\(title) settings")
+            tabs.addTabViewItem(item)
+        }
+        tabs.setAccessibilityLabel("Tabs")
+        tabs.translatesAutoresizingMaskIntoConstraints = false
+        tabs.widthAnchor.constraint(equalToConstant: 260).isActive = true
+        tabs.heightAnchor.constraint(equalToConstant: 120).isActive = true
+
+        let row = NSStackView(views: [
+            boxed(title: "Fruit", content: scrolled(fruitTable, label: "Fruit")),
+            boxed(title: "Folders", content: foldersOutline()),
+            boxed(title: "History", content: historyScroll),
+            boxed(title: "Tabs", content: tabs),
+        ])
+        row.orientation = .horizontal
+        row.alignment = .top
+        row.spacing = 16
+
+        let handlers = self.handlers
+        let fruit = self.fruit
+        let history = self.history
+        let tabTitle = { tabs.selectedTabViewItem?.label ?? "" }
+        watchers += [
+            ValueWatcher(initial: "", read: { fruit.selection(of: fruitTable) }) { value in
+                if !value.isEmpty { handlers.selected(.appkitList, title: value) }
+            },
+            ValueWatcher(initial: "", read: { history.selection(of: historyTable) }) { value in
+                if !value.isEmpty { handlers.selected(.appkitFarList, title: value) }
+            },
+            // One event per ARRIVAL at the end, not one per step of the way there.
+            ValueWatcher(initial: "", read: { atBottom(historyScroll) ? "bottom" : "" }) { value in
+                if value == "bottom" { handlers.scrolledToBottom(.appkitFarList) }
+            },
+            ValueWatcher(initial: "General", read: tabTitle) { value in
+                handlers.selected(.appkitTabs, title: value)
+            },
+        ]
+        view = row
+    }
+
+    /// The outline, with Projects expanded BEFORE anything observes it, so the
+    /// window opens with something to collapse and records nothing for it.
+    private func foldersOutline() -> NSScrollView {
+        let outline = NSOutlineView()
+        let scroll = scrolled(outline, label: "Folders")
+        outline.outlineTableColumn = outline.tableColumns.first
+        outline.dataSource = folders
+        outline.reloadData()
+        outline.expandItem(folders.folder(named: "Projects"))
+
+        let handlers = self.handlers
+        let center = NotificationCenter.default
+        observers = [
+            center.addObserver(
+                forName: NSOutlineView.itemDidExpandNotification, object: outline, queue: .main
+            ) { note in
+                guard let folder = note.userInfo?["NSObject"] as? Folder else { return }
+                handlers.expanded(.appkitOutline, row: folder.name)
+            },
+            center.addObserver(
+                forName: NSOutlineView.itemDidCollapseNotification, object: outline, queue: .main
+            ) { note in
+                guard let folder = note.userInfo?["NSObject"] as? Folder else { return }
+                handlers.collapsed(.appkitOutline, row: folder.name)
+            },
+        ]
+        watchers.append(
+            ValueWatcher(
+                initial: "",
+                read: { (outline.item(atRow: outline.selectedRow) as? Folder)?.name ?? "" }
+            ) { value in
+                if !value.isEmpty { handlers.selected(.appkitOutline, title: value) }
+            })
+        return scroll
     }
 }
 
@@ -375,6 +688,13 @@ struct SwiftUISave: View {
     }
 }
 
+/// Whether a text field is the one being edited: its window's first responder is
+/// the shared field editor, and the editor's delegate is that field.
+private func isEditing(_ field: NSTextField) -> Bool {
+    guard let editor = field.window?.firstResponder as? NSText else { return false }
+    return editor.delegate === field
+}
+
 /// A titled box, which is what gives an element inside it an ancestor LABEL —
 /// the thing that tells the two "Save" buttons apart.
 private func boxed(title: String, content: NSView) -> NSView {
@@ -390,13 +710,17 @@ final class FixtureWindow: NSObject, NSApplicationDelegate {
     private let handlers: Handlers
     private var window: NSWindow?
     private var appKit: AppKitGroup?
+    private var collections: AppKitCollections?
     private var sampler: Timer?
 
     init(handlers: Handlers) { self.handlers = handlers }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.mainMenu = mainMenu()
         let appKit = AppKitGroup(handlers: handlers)
         self.appKit = appKit
+        let collections = AppKitCollections(handlers: handlers)
+        self.collections = collections
 
         // The hosting view goes INSIDE a titled box, like the AppKit half. Without
         // one it publishes no group of its own, so every SwiftUI control's `path`
@@ -428,14 +752,14 @@ final class FixtureWindow: NSObject, NSApplicationDelegate {
         saves.orientation = .horizontal
         saves.spacing = 16
 
-        let root = NSStackView(views: [columns, saves])
+        let root = NSStackView(views: [columns, collections.view, saves])
         root.orientation = .vertical
         root.alignment = .leading
         root.spacing = 16
         root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 520),
+            contentRect: NSRect(x: 0, y: 0, width: 1040, height: 880),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false)
@@ -453,10 +777,43 @@ final class FixtureWindow: NSObject, NSApplicationDelegate {
         // a `set_value` visible at all — the accessibility setter sends no action.
         sampler = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.appKit?.watchers.forEach { $0.sample() }
+            self?.collections?.watchers.forEach { $0.sample() }
         }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    /// The application menu (Quit) and an Actions menu whose items record their
+    /// own titles. A menu item is the one control family that lives outside the
+    /// window, in the menu bar.
+    private func mainMenu() -> NSMenu {
+        let appMenu = NSMenu(title: "Compux Fixture")
+        appMenu.addItem(
+            NSMenuItem(
+                title: "Quit Compux Fixture", action: #selector(NSApplication.terminate(_:)),
+                keyEquivalent: "q"))
+        let appItem = NSMenuItem(title: "Compux Fixture", action: nil, keyEquivalent: "")
+        appItem.submenu = appMenu
+
+        let actions = NSMenu(title: "Actions")
+        for title in ["Export Report", "Print Preview"] {
+            let item = NSMenuItem(
+                title: title, action: #selector(chooseMenuItem(_:)), keyEquivalent: "")
+            item.target = self
+            actions.addItem(item)
+        }
+        let actionsItem = NSMenuItem(title: "Actions", action: nil, keyEquivalent: "")
+        actionsItem.submenu = actions
+
+        let menu = NSMenu()
+        menu.addItem(appItem)
+        menu.addItem(actionsItem)
+        return menu
+    }
+
+    @objc private func chooseMenuItem(_ sender: NSMenuItem) {
+        handlers.activated(.appkitMenu, title: sender.title)
+    }
 
     private func saveButton(_ control: Control) -> NSView {
         let button = NSButton(title: "Save", target: self, action: #selector(save(_:)))

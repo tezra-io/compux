@@ -27,8 +27,72 @@
 //! Every OS call goes through [`Platform`], so the sequences above it are unit
 //! tested with no OS call at all — the same injected-sink seam `capture::Emitter`'s
 //! buffer already uses for the event wire.
+//!
+//! The keys, buttons and directions are compux's own names. macOS hands them to
+//! enigo; Linux to XTEST or the portal (`linux::pixels`), which links no input
+//! library at all.
 
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse};
+#[cfg(target_os = "macos")]
+use enigo::{Coordinate, Enigo, Keyboard, Mouse};
+
+/// A key a sequence presses: a character, or one of the named keys a chord or a
+/// paste uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    Unicode(char),
+    Return,
+    Tab,
+    Escape,
+    Space,
+    Backspace,
+    Delete,
+    UpArrow,
+    DownArrow,
+    LeftArrow,
+    RightArrow,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+    Meta,
+    Control,
+    Alt,
+    Shift,
+}
+
+/// A pointer button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Button {
+    Left,
+    Right,
+}
+
+/// Which way a scroll goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Axis {
+    Horizontal,
+    Vertical,
+}
+
+/// A down event, an up event, or both in one call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Press,
+    Release,
+    Click,
+}
 
 /// Dwell before putting the user's clipboard back, so the restore does not race the
 /// target application's read of the paste we just triggered.
@@ -72,19 +136,74 @@ pub trait Platform {
 
     /// Replace the clipboard's text.
     fn set_clipboard_text(&mut self, text: &str) -> Result<(), String>;
+
+    /// Whether a key or button pressed now could be released by the next helper
+    /// if this one were killed holding it. A sequence that holds one asks before
+    /// its first input, so a refusal sends nothing.
+    fn ready_to_hold(&mut self) -> Result<(), String>;
 }
 
-/// The real desktop: enigo for key/button/motion, the `pointer` FFI for the warp
-/// and the drag event, arboard for the clipboard.
+/// Any platform, borrowed: what lets a sequence run over a desktop the worker
+/// keeps for the session (Linux) as well as one an action builds (macOS).
+impl<P: Platform + ?Sized> Platform for &mut P {
+    fn key(&mut self, key: Key, direction: Direction) -> Result<(), String> {
+        (**self).key(key, direction)
+    }
+
+    fn button(&mut self, button: Button, direction: Direction) -> Result<(), String> {
+        (**self).button(button, direction)
+    }
+
+    fn move_mouse(&mut self, x: i32, y: i32) -> Result<(), String> {
+        (**self).move_mouse(x, y)
+    }
+
+    fn settle(&mut self, x: i32, y: i32) -> Result<(), String> {
+        (**self).settle(x, y)
+    }
+
+    fn drag_step(&mut self, x: i32, y: i32) -> Result<(), String> {
+        (**self).drag_step(x, y)
+    }
+
+    fn scroll(&mut self, length: i32, axis: Axis) -> Result<(), String> {
+        (**self).scroll(length, axis)
+    }
+
+    fn text(&mut self, text: &str) -> Result<(), String> {
+        (**self).text(text)
+    }
+
+    fn sleep(&mut self, ms: u64) -> Result<(), String> {
+        (**self).sleep(ms)
+    }
+
+    fn clipboard_text(&mut self) -> Result<Option<String>, String> {
+        (**self).clipboard_text()
+    }
+
+    fn set_clipboard_text(&mut self, text: &str) -> Result<(), String> {
+        (**self).set_clipboard_text(text)
+    }
+
+    fn ready_to_hold(&mut self) -> Result<(), String> {
+        (**self).ready_to_hold()
+    }
+}
+
+/// The real macOS desktop: enigo for key/button/motion, the `pointer` FFI for the
+/// warp and the drag event, arboard for the clipboard.
 ///
 /// Both handles are built on first use, so an `init input:` or a `clipboard:`
 /// failure still surfaces at exactly the point in the sequence it did before.
+#[cfg(target_os = "macos")]
 #[derive(Default)]
 pub struct Real {
     input: Option<Enigo>,
     clipboard: Option<arboard::Clipboard>,
 }
 
+#[cfg(target_os = "macos")]
 impl Real {
     fn input(&mut self) -> Result<&mut Enigo, String> {
         if self.input.is_none() {
@@ -108,6 +227,7 @@ impl Real {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Platform for Real {
     /// The wording each direction had at its old call site, so what reaches Fermix
     /// as `error` is unchanged: a press is only ever a modifier here, a click is the
@@ -115,7 +235,7 @@ impl Platform for Real {
     /// names the item it could not lift.
     fn key(&mut self, key: Key, direction: Direction) -> Result<(), String> {
         self.input()?
-            .key(key, direction)
+            .key(enigo_key(key), enigo_direction(direction))
             .map_err(|e| match direction {
                 Direction::Press => format!("modifier: {e}"),
                 Direction::Click => format!("key: {e}"),
@@ -125,7 +245,7 @@ impl Platform for Real {
 
     fn button(&mut self, button: Button, direction: Direction) -> Result<(), String> {
         self.input()?
-            .button(button, direction)
+            .button(enigo_button(button), enigo_direction(direction))
             .map_err(|e| match direction {
                 Direction::Press => format!("press: {e}"),
                 Direction::Click => format!("click: {e}"),
@@ -146,21 +266,15 @@ impl Platform for Real {
     /// macOS posts each step as an EXPLICIT `LeftMouseDragged` (enigo's `move_mouse`
     /// derives its event type from a live `pressedMouseButtons()` read that races
     /// the just-posted mouse-down and then emits `MouseMoved` — a hover mid-press).
-    #[cfg(target_os = "macos")]
     fn drag_step(&mut self, x: i32, y: i32) -> Result<(), String> {
         crate::pointer::drag_step(x, y)
     }
 
-    /// X11 motion while the button is pressed IS the drag — no distinct event type —
-    /// so enigo's own motion injection is correct here.
-    #[cfg(not(target_os = "macos"))]
-    fn drag_step(&mut self, x: i32, y: i32) -> Result<(), String> {
-        self.input()?
-            .move_mouse(x, y, Coordinate::Abs)
-            .map_err(|e| format!("drag: {e}"))
-    }
-
     fn scroll(&mut self, length: i32, axis: Axis) -> Result<(), String> {
+        let axis = match axis {
+            Axis::Horizontal => enigo::Axis::Horizontal,
+            Axis::Vertical => enigo::Axis::Vertical,
+        };
         self.input()?
             .scroll(length, axis)
             .map_err(|e| format!("scroll: {e}"))
@@ -185,6 +299,67 @@ impl Platform for Real {
         self.clipboard()?
             .set_text(text)
             .map_err(|e| format!("clipboard set: {e}"))
+    }
+
+    /// macOS keeps no journal of held input, so nothing refuses a hold here.
+    fn ready_to_hold(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn enigo_direction(direction: Direction) -> enigo::Direction {
+    match direction {
+        Direction::Press => enigo::Direction::Press,
+        Direction::Release => enigo::Direction::Release,
+        Direction::Click => enigo::Direction::Click,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn enigo_button(button: Button) -> enigo::Button {
+    match button {
+        Button::Left => enigo::Button::Left,
+        Button::Right => enigo::Button::Right,
+    }
+}
+
+/// The same key by enigo's name.
+#[cfg(target_os = "macos")]
+fn enigo_key(key: Key) -> enigo::Key {
+    use enigo::Key as E;
+    match key {
+        Key::Unicode(c) => E::Unicode(c),
+        Key::Return => E::Return,
+        Key::Tab => E::Tab,
+        Key::Escape => E::Escape,
+        Key::Space => E::Space,
+        Key::Backspace => E::Backspace,
+        Key::Delete => E::Delete,
+        Key::UpArrow => E::UpArrow,
+        Key::DownArrow => E::DownArrow,
+        Key::LeftArrow => E::LeftArrow,
+        Key::RightArrow => E::RightArrow,
+        Key::Home => E::Home,
+        Key::End => E::End,
+        Key::PageUp => E::PageUp,
+        Key::PageDown => E::PageDown,
+        Key::F1 => E::F1,
+        Key::F2 => E::F2,
+        Key::F3 => E::F3,
+        Key::F4 => E::F4,
+        Key::F5 => E::F5,
+        Key::F6 => E::F6,
+        Key::F7 => E::F7,
+        Key::F8 => E::F8,
+        Key::F9 => E::F9,
+        Key::F10 => E::F10,
+        Key::F11 => E::F11,
+        Key::F12 => E::F12,
+        Key::Meta => E::Meta,
+        Key::Control => E::Control,
+        Key::Alt => E::Alt,
+        Key::Shift => E::Shift,
     }
 }
 
@@ -238,6 +413,12 @@ impl<'a, P: Platform> Guard<'a, P> {
             self.press(Item::Key(*key))?;
         }
         Ok(())
+    }
+
+    /// Refuse, before the sequence's first input, a sequence whose held key or
+    /// button the platform could not release after a killed helper.
+    pub fn ready_to_hold(&mut self) -> Result<(), String> {
+        self.platform.ready_to_hold()
     }
 
     /// Press a mouse button.
@@ -414,6 +595,8 @@ pub struct Recorder {
     pub calls: Vec<Call>,
     pub down: Vec<Item>,
     pub clipboard: Option<String>,
+    /// Why nothing can be held here, as a platform with no journal says.
+    pub cannot_hold: Option<String>,
     fail_at: Vec<usize>,
 }
 
@@ -424,6 +607,7 @@ impl Recorder {
             calls: Vec::new(),
             down: Vec::new(),
             clipboard: clipboard.map(str::to_string),
+            cannot_hold: None,
             fail_at: Vec::new(),
         }
     }
@@ -500,6 +684,12 @@ impl Platform for Recorder {
         self.step(Call::ClipboardWrite(text.to_string()))?;
         self.clipboard = Some(text.to_string());
         Ok(())
+    }
+
+    /// Not a call: it sends nothing, and the sequences' recorded order stays
+    /// what it always was.
+    fn ready_to_hold(&mut self) -> Result<(), String> {
+        self.cannot_hold.clone().map_or(Ok(()), Err)
     }
 }
 

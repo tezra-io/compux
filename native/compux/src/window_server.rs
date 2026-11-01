@@ -79,6 +79,10 @@ pub struct WindowFacts {
     pub app: String,
     pub title: String,
     pub bounds: Bounds,
+    /// The window's own area without the frame its window manager draws around
+    /// it, where the window server tells the two apart (X11). An accessibility
+    /// frame may be placed at either, depending on the toolkit.
+    pub content: Option<Bounds>,
     /// The window server's own layer. Zero is "a window a person works in"; the
     /// Dock, the menu bar and floating panels live above it.
     pub layer: i64,
@@ -97,6 +101,15 @@ pub trait Windows: Send + Sync {
     /// refuses the listing, which is a different fact from an empty desktop and
     /// must never be flattened into one.
     fn list(&self) -> Result<Vec<WindowFacts>, String>;
+
+    /// What takes a click at (`x`, `y`) in front of window `target_id` among the
+    /// windows [`Windows::list`] does not hold, named; `None` where nothing does.
+    /// An X11 window manager lists only the windows it manages, so menus,
+    /// tooltips and a desktop shell's own windows are read here. The macOS
+    /// listing holds every window, so nothing is left to read there.
+    fn unlisted_cover(&self, _target_id: u32, _x: i32, _y: i32) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 }
 
 /// The window a given id names, out of one listing.
@@ -331,6 +344,7 @@ pub mod mac {
             app: read_text(dict, &keys.owner),
             title: read_text(dict, &keys.name),
             bounds,
+            content: None,
             layer: read_i64(dict, &keys.layer).unwrap_or(0),
             on_screen: read_bool(dict, &keys.on_screen),
         })
@@ -412,31 +426,29 @@ pub use mac::Real;
 
 // --- everywhere else ----------------------------------------------------------
 
-/// Linux has no window server this build reads, and saying so is not the same as
-/// answering an empty desktop: a caller that cannot tell them apart writes the
-/// wrong sentence about both.
+/// A session whose window server this build does not read, and why. Saying so is
+/// not the same as answering an empty desktop: a caller that cannot tell them
+/// apart writes the wrong sentence about both.
 #[cfg(not(target_os = "macos"))]
-mod stub {
-    use super::{WindowFacts, Windows};
+pub struct Unlisted {
+    why: String,
+}
 
-    #[derive(Default)]
-    pub struct Real;
-
-    impl Real {
-        pub fn new() -> Real {
-            Real
-        }
-    }
-
-    impl Windows for Real {
-        fn list(&self) -> Result<Vec<WindowFacts>, String> {
-            Err("window targeting is only supported on macOS".to_string())
+#[cfg(not(target_os = "macos"))]
+impl Unlisted {
+    pub fn new(why: &str) -> Unlisted {
+        Unlisted {
+            why: why.to_string(),
         }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-pub use stub::Real;
+impl Windows for Unlisted {
+    fn list(&self) -> Result<Vec<WindowFacts>, String> {
+        Err(self.why.clone())
+    }
+}
 
 // --- the recording window server (tests only) ---------------------------------
 
@@ -445,6 +457,7 @@ pub use stub::Real;
 #[cfg(test)]
 pub struct Recorder {
     listed: std::sync::Mutex<Result<Vec<WindowFacts>, String>>,
+    unlisted: std::sync::Mutex<Result<Option<String>, String>>,
     calls: std::sync::atomic::AtomicUsize,
 }
 
@@ -454,8 +467,15 @@ impl Recorder {
     pub fn new(listed: Vec<WindowFacts>) -> std::sync::Arc<Recorder> {
         std::sync::Arc::new(Recorder {
             listed: std::sync::Mutex::new(Ok(listed)),
+            unlisted: std::sync::Mutex::new(Ok(None)),
             calls: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// What a window the listing does not hold (a menu, a popup) answers from
+    /// now on: its name over every point, nothing, or a refusal.
+    pub fn unlisted(&self, answer: Result<Option<String>, String>) {
+        *self.unlisted.lock().unwrap_or_else(|e| e.into_inner()) = answer;
     }
 
     /// The OS refuses the listing from now on.
@@ -495,6 +515,13 @@ impl Windows for Recorder {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.state().clone()
     }
+
+    fn unlisted_cover(&self, _target_id: u32, _x: i32, _y: i32) -> Result<Option<String>, String> {
+        self.unlisted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
 /// One ordinary window, for a test that cares about two of its facts and not the
@@ -507,6 +534,7 @@ pub fn window(id: u32, pid: i32, bounds: Bounds) -> WindowFacts {
         app: format!("App{pid}"),
         title: format!("Window {id}"),
         bounds,
+        content: None,
         layer: 0,
         on_screen: true,
     }

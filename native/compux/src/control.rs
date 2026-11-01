@@ -261,6 +261,7 @@ mod tests {
             element_ref: None,
             check: wire::Check::None,
             target_id: None,
+            until: None,
         };
         gate.admit(&running).unwrap();
 
@@ -429,6 +430,7 @@ mod tests {
             element_ref: None,
             check: wire::Check::None,
             target_id: None,
+            until: None,
         };
         gate.admit(&request).unwrap();
 

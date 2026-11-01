@@ -12,19 +12,26 @@
 //! [`Ax`] is the boundary, the pattern `held.rs` set with its `Platform`: one
 //! trait, a macOS implementation where every `unsafe` in this module lives, a
 //! typed-unsupported implementation everywhere else, and — under `cfg(test)` — a
-//! [`Recorder`] that answers from a script and counts its retains and releases.
-//! The tree walk, the revalidation before an action, the budgets and the wire
-//! shapes above it are therefore unit-tested on a host with no Accessibility
-//! grant and no window server, which is every machine this is written on.
+//! [`Recorder`] that answers from a scripted tree and counts its retains and
+//! releases.
+//!
+//! The trait answers per NODE: one node's facts in one call, its value and whether
+//! that may be written as reads of their own, how many children it has, one page
+//! of them. The walk itself — its budgets, which nodes it lists and so which nodes
+//! are worth a value read, the ancestor path — lives above the seam in `tree.rs`
+//! (M86 P1), so it runs under test on any machine and a second platform answers the
+//! same questions rather than repeating it. The revalidation before an action reads
+//! the same one call.
 //!
 //! ## References, and the one release
 //!
-//! A walk RETAINS the elements it collects: the native reference is registered
+//! A walk RETAINS every element it passes: the native reference is registered
 //! with the platform and answered as an opaque [`Handle`]. [`Retained`] owns that
 //! handle and releases it on `Drop` — the ONLY place a release happens, so the
 //! count is balanced by construction rather than by a rule at each call site. A
-//! node the view filter dropped, a node past the badge cap, a whole settle poll
-//! nobody kept: each releases as it falls out of scope.
+//! node the walk did not list, a node the view filter dropped, a node past the
+//! badge cap, a whole settle poll nobody kept: each releases as it falls out of
+//! scope.
 //!
 //! ## What a reference is not
 //!
@@ -36,26 +43,57 @@
 
 use std::rc::Rc;
 
-use crate::gate::Clock;
-
-/// Wall-clock budget for ONE traversal, checked between nodes.
-///
-/// The node, visit and depth caps bound the SHAPE of a tree and say nothing about
-/// how slowly an application answers: a wedged app with twelve nodes can hold the
-/// walk for as long as the messaging timeout allows, once per node. This is the
-/// bound on the walk itself, and a reply that hit it says `truncated: "time"`
-/// rather than passing off a partial tree as the whole one.
-pub const WALK_BUDGET_MS: u64 = 1_500;
-
 /// The AX action this build can perform. One name, because `actions` on the wire
 /// lists only what is really implemented — a caller that reads `press` there and
 /// gets a refusal has been lied to.
 pub const PRESS: &str = "AXPress";
 
+/// The action that brings an element into view (protocol 12, `scroll_to`). Every
+/// container answers it, so it never makes a node a control on its own.
+pub const SCROLL_TO_VISIBLE: &str = "AXScrollToVisible";
+
 /// A label or a value is carried so a caller can name a control and read the
 /// state of one it is about to change; neither is a way to read a document.
 /// Longer than this is cut and says so with a final ellipsis.
 const MAX_TEXT_CHARS: usize = 80;
+
+/// The per-message timeout for a READ of a node, set on every element before it is
+/// read (M2). One slow application then costs a quarter of a second per message
+/// rather than a whole walk, and the walk's own wall-clock budget is checked between
+/// nodes, so no read can hold it for long. Reads outside a node — an application's
+/// windows, the application in front, the element under a point — keep the timeouts
+/// they had before M86.
+pub const READ_TIMEOUT_MS: u64 = 250;
+
+/// What one accessibility action may spend on its messages, counted from the read
+/// that revalidates the control. Half of what is left goes to the write itself
+/// ([`write_timeout_ms`]); the rest stays for reading back what it did.
+pub const WRITE_BUDGET_MS: u64 = 2_000;
+
+/// The messaging timeout for one write: the larger of a read's and half of what is
+/// left of the budget (M2).
+///
+/// A write is not cut as short as a read. Cutting it short cannot undo what the
+/// application already started, and it turns a button that merely takes a moment
+/// into `kAXErrorCannotComplete` — a receipt that says `sent, unknown` about a
+/// press that worked. Never less than a read gets, because a budget spent by a
+/// slow revalidation must not leave the write itself no time at all.
+pub fn write_timeout_ms(remaining_ms: u64) -> u64 {
+    (remaining_ms / 2).max(READ_TIMEOUT_MS)
+}
+
+/// Which application's window reads active, where the platform reads that state
+/// (AT-SPI on Linux): keys go into it only when exactly one does.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Active {
+    /// One application's window reads active: its process.
+    One(i32),
+    /// No application's window does.
+    None,
+    /// This many applications' windows do, so none of them is the one in front.
+    Many(usize),
+}
 
 /// One native element this process is holding a reference to.
 ///
@@ -91,9 +129,14 @@ impl Frame {
 /// `dispatch: sent, effect: unknown` — while everything else is a refusal of a
 /// message that was received and is safe to reason about. The text is the
 /// platform's own words, so a bug report carries the AXError number.
+///
+/// A reader that stops before sending, on something the contract names apart
+/// (a range it cannot move in, a value no control takes), names that refusal's
+/// code; every other refusal is the message failing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal {
     sent: bool,
+    code: Option<&'static str>,
     detail: String,
 }
 
@@ -102,6 +145,18 @@ impl Refusal {
     pub fn new(sent: bool, detail: impl Into<String>) -> Refusal {
         Refusal {
             sent,
+            code: None,
+            detail: detail.into(),
+        }
+    }
+
+    /// Nothing was sent, for the reason the contract's `code` names.
+    // The Linux reader makes these; the macOS one has no such stop.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn unsent(code: &'static str, detail: impl Into<String>) -> Refusal {
+        Refusal {
+            sent: false,
+            code: Some(code),
             detail: detail.into(),
         }
     }
@@ -110,76 +165,192 @@ impl Refusal {
         self.sent
     }
 
+    pub fn code(&self) -> Option<&'static str> {
+        self.code
+    }
+
     pub fn detail(&self) -> String {
         self.detail.clone()
     }
 }
 
-/// An interactive element, as one walk found it. Everything the wire publishes
-/// about a control is read once, here, so a reply is one traversal rather than a
-/// second round of queries per element.
-#[derive(Debug)]
-pub struct Node {
-    pub role: String,
-    /// Title, else description. NOT the value: a field's contents are its own
-    /// field now, and using them as a name made a text box look like its text.
+/// Why a read of one node answered nothing: three different facts, and the walk
+/// does something different with each.
+///
+/// The split [`Refusal`] makes for a write, applied to a read. Reading all three as
+/// "nothing here" dropped a slow container's whole subtree from a listing that
+/// still said it was complete — and with a quarter-second timeout on every read
+/// (M2), a slow container is the ordinary case, not the odd one.
+// The macOS and Linux readers and the recording platform produce these; a build for
+// anywhere else has no reader, holds nothing, and so only ever answers `Gone`.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unread {
+    /// The message went out and no answer came within its timeout
+    /// (`kAXErrorCannotComplete`, the code a `sent` refusal carries). The node is
+    /// still there; the application is slow.
+    NoAnswer,
+    /// The reference names nothing any more.
+    Gone,
+    /// The element answered, and would not answer this.
+    Refused,
+}
+
+/// Why a reference could not be found again before an action: a read that
+/// answered nothing, or — on Linux, where a reference is also a place in the tree —
+/// two candidates, or one that stayed unreadable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Identity {
+    Unread(Unread),
+    /// Two nodes answer for the reference: it moved, and another of its role took
+    /// its place.
+    // Only the Linux reader finds two candidates.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Ambiguous,
+    /// A candidate did not answer in time, three times.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Unknown,
+}
+
+/// Everything one node answers, in one call (M1).
+///
+/// Each fact is optional where a platform may not have it. Its value and whether
+/// that may be written are NOT here: each costs a message of its own
+/// ([`Ax::value`], [`Ax::settable`]), so the walk asks them only of a node it lists,
+/// and the decision which node that is stays above the seam.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Facts {
+    pub role: Option<String>,
+    pub subrole: Option<String>,
+    /// Title, else description, flattened and bounded at the source ([`label`]).
+    /// NOT the value: a field's contents are its own fact, and using them as a name
+    /// made a text box look like its text.
     pub label: Option<String>,
-    /// Bounded, and absent for a secure field.
-    pub value: Option<String>,
-    pub secure: bool,
+    /// An element that publishes no enabled state is enabled: it did not say
+    /// otherwise, and greying out every link and cell would hide real controls.
     pub enabled: bool,
-    /// Its OWN action list contains `AXPress`. Never inferred from the role: a
-    /// control that looks pressable and is not would be a refusal the caller was
-    /// invited to expect.
-    pub press: bool,
-    /// `AXUIElementIsAttributeSettable(AXValue)` said so.
-    pub settable: bool,
-    pub frame: Frame,
-    /// Up to three ancestor labels, nearest last.
-    pub path: Vec<String>,
-    pub element: Retained,
+    /// Its value must never be read ([`secure`]).
+    pub secure: bool,
+    /// The action names the control advertises for ITSELF. Nothing is inferred
+    /// from what its role suggests it ought to support.
+    pub actions: Vec<String>,
+    /// Some of its actions could not be named, so `actions` is not all of them.
+    /// AT-SPI names each action by index, and an index that errors is left out
+    /// rather than guessed; macOS names them in one call and never sets this.
+    pub actions_partial: bool,
+    /// Where it is now, in global logical points.
+    pub frame: Option<Frame>,
+    /// It is on screen, and the platform gives no position for it at all (GTK 4,
+    /// any Wayland session): it is listed without one. A node with no frame on a
+    /// platform that places its nodes is not on screen, and is not listed. Only the
+    /// Linux reader sets this.
+    pub placeless: bool,
+    /// The platform says it is not on screen: an AT-SPI node that does not read
+    /// SHOWING. A menu a toolkit keeps after it closed is still in the tree, and
+    /// this is how it is told from an open one. Only the Linux reader sets this.
+    pub hidden: bool,
 }
 
-/// What one traversal answered.
-#[derive(Debug)]
-pub struct Walk {
-    pub nodes: Vec<Node>,
-    /// Why it stopped before it had seen everything, as the wire spells it:
-    /// `"nodes"` (it collected or traversed as many as it may), `"depth"` (a
-    /// subtree was deeper than the walk goes) or `"time"` (it ran out of its
-    /// wall-clock budget). `None` means it saw the whole tree.
-    pub truncated: Option<&'static str>,
+/// Which attributes of one element may be written (protocol 12): the routes the
+/// verbs on a reference take. Each is the platform's own answer for THIS element;
+/// nothing is inferred from its role.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Routes {
+    /// `AXValue`: `set_value`.
+    pub value: bool,
+    /// `AXFocused`: `focus`.
+    pub focus: bool,
+    /// `AXSelected` on the element itself: `select`.
+    pub select: bool,
+    /// The attribute that expands it, when one may be written: `expand`, `collapse`.
+    pub expand: Option<Expander>,
+    /// `AXSelectedText`: `type` by reference.
+    pub text: bool,
 }
 
-impl Walk {
-    fn empty() -> Walk {
-        Walk {
-            nodes: Vec::new(),
-            truncated: None,
-        }
-    }
+/// How an expandable element is expanded: one of the two attributes a macOS
+/// element may answer its state on, or on Linux its own toggle-style action.
+// Each reader produces its own, and the recording platform all three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expander {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Expanded,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Disclosing,
+    /// AT-SPI has no expanded attribute to write: the node's own toggle-style action
+    /// is sent, and only when its EXPANDED state differs from the one asked for.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Action,
+}
+
+/// One write route, asked on its own: a verb takes one route, and asking for all
+/// of them costs a message each on macOS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    Focus,
+    Select,
+    Expand,
+    Text,
+}
+
+/// What one element's states read as, each `None` where it has no such state or
+/// would not say.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct States {
+    pub focused: Option<bool>,
+    pub selected: Option<bool>,
+    /// `AXExpanded`, else `AXDisclosing`.
+    pub expanded: Option<bool>,
+    /// `AXValue` read as a check state (0 or 1). Only asked for when the caller says
+    /// the element has one: a field's value is text, and a secure one is never read.
+    pub on: Option<bool>,
+}
+
+/// Which focus an application is asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    /// `AXFocusedWindow`.
+    Window,
+    /// `AXFocusedUIElement`.
+    Element,
+}
+
+/// One attribute write a verb sends. Each is read back by its caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Write<'a> {
+    /// `AXFocused = true`.
+    Focused,
+    /// `AXSelected = true`.
+    Selected,
+    /// `AXExpanded` or `AXDisclosing` set to this.
+    Expand(Expander, bool),
+    /// `AXSelectedText = text`: replaces the selection, or inserts at the caret.
+    SelectedText(&'a str),
+    /// On a container: `AXSelectedChildren = [item]`.
+    SelectedChildren(Handle),
 }
 
 /// A native reference this process is holding, and the platform to give it back
 /// to.
 ///
 /// **This type's `Drop` is the only release in the crate.** Every path that can
-/// let go of a reference — a node filtered out of the view, a settle poll that
-/// found nothing, an observation evicted by a newer one, one that expired, the
-/// table cleared by a `release` control, the worker shutting down — lets go of it
-/// by dropping this, so the retain and the release cannot drift apart.
+/// let go of a reference — a node the walk did not list, a node filtered out of
+/// the view, a settle poll that found nothing, an observation evicted by a newer
+/// one, one that expired, the table cleared by a `release` control, the worker
+/// shutting down — lets go of it by dropping this, so the retain and the release
+/// cannot drift apart.
 pub struct Retained {
     handle: Handle,
     ax: Rc<dyn Ax>,
 }
 
 impl Retained {
-    /// Take ownership of a reference the platform has already retained. Private
-    /// on purpose: only the platform may say a reference exists — which is exactly
-    /// the two places this is gated to: the macOS walk, and the recording platform
-    /// the tests drive on every target.
-    #[cfg(any(target_os = "macos", test))]
-    fn new(handle: Handle, ax: Rc<dyn Ax>) -> Retained {
+    /// Take ownership of a reference the platform has already retained. Only the
+    /// platform may say a reference exists — which is exactly the places this is
+    /// gated to: the macOS reader, the Linux reader (`linux::atspi`), and the
+    /// recording platform the tests drive on every target.
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    pub(crate) fn new(handle: Handle, ax: Rc<dyn Ax>) -> Retained {
         Retained { handle, ax }
     }
 
@@ -211,47 +382,72 @@ impl PartialEq for Retained {
 /// Object-safe on purpose: the observations that hold references hold an
 /// `Rc<dyn Ax>` with them, so a reference released long after the walk that made
 /// it goes back to the platform that made it.
+///
+/// Every method that hands out a reference takes `owner`: this same platform, as
+/// the handle each reference is released through. A trait object cannot recover
+/// its own `Rc`, so the caller passes it.
 pub trait Ax {
-    /// Walk ONE application's tree from its own application element — never from
-    /// `AXFocusedApplication`, a query that proved flaky from this spawned
-    /// process — and collect its interactive elements.
-    ///
-    /// `owner` is this same platform, as the handle every reference the walk
-    /// retains will be released through. A trait object cannot recover its own
-    /// `Rc`, so the caller passes it; [`walk`] is the one call site and hides it.
-    fn walk(&self, owner: &Rc<dyn Ax>, pid: i32, clock: &dyn Clock, deadline_ms: u64) -> Walk;
+    /// ONE application's own element, retained: the root its tree is walked from —
+    /// never `AXFocusedApplication`, a query that proved flaky from this spawned
+    /// process. `None` when there is no such application to address.
+    fn application(&self, owner: &Rc<dyn Ax>, pid: i32) -> Option<Retained>;
 
-    /// The element's role, or `None` when it no longer answers at all. The
-    /// revalidation before an action reads this first: a reference that answers a
-    /// DIFFERENT role now points at something the caller never saw.
-    fn role(&self, handle: Handle) -> Option<String>;
+    /// One application's own windows, retained.
+    fn windows(&self, owner: &Rc<dyn Ax>, pid: i32) -> Vec<Retained>;
 
-    /// What the control calls itself — its title, else its description — bounded
-    /// and collapsed to one line exactly as a listing publishes it, so a caller
-    /// re-reading a control can say WHICH one without keeping its own copy. `None`
-    /// when it publishes neither, or when the element is gone.
-    fn label(&self, handle: Handle) -> Option<String>;
+    /// Everything the element answers, in one call, or why it answered nothing.
+    fn facts(&self, handle: Handle) -> Result<Facts, Unread>;
 
-    /// Whether the control will accept input. An element that publishes no
-    /// `AXEnabled` at all is enabled: it did not say otherwise.
-    fn enabled(&self, handle: Handle) -> bool;
+    /// What the element answers now, read to prove it is still the control the
+    /// caller was shown: the revalidation before an action reads this first, and a
+    /// reference that names nothing, or answers a DIFFERENT role now, points at
+    /// something the caller never saw. A macOS reference is the object itself, so
+    /// this is [`Ax::facts`]; the Linux reader also finds it again by its place in
+    /// the tree.
+    fn identify(&self, handle: Handle) -> Result<Facts, Identity> {
+        self.facts(handle).map_err(Identity::Unread)
+    }
 
-    /// The control's value as text, bounded. `None` when it has none, when it is
-    /// not text-shaped, or when the element is gone.
+    /// The element's value, bounded; `None` when it has none that is text, or will
+    /// not say. Withheld at the SOURCE for a secure field, which answers `None`
+    /// before its value is ever asked for. Callers still check [`Facts::secure`]
+    /// first — not asking is a stronger guarantee than asking and throwing the
+    /// answer away — and this is what holds when a field turned secure after the
+    /// read they checked.
     fn value(&self, handle: Handle) -> Option<String>;
 
-    /// The action names the control itself advertises.
-    fn action_names(&self, handle: Handle) -> Vec<String>;
-
-    /// Whether `AXValue` may be written.
+    /// Whether the element's value may be written.
     fn settable(&self, handle: Handle) -> bool;
 
-    /// Where the control is NOW, in global logical points.
-    fn bounds(&self, handle: Handle) -> Option<Frame>;
+    /// How many children the element says it has. An element that has no children
+    /// attribute at all has none (`Ok(0)`); an error is why it would not say.
+    fn child_count(&self, handle: Handle) -> Result<usize, Unread>;
 
-    fn perform(&self, handle: Handle, action: &str) -> Result<(), Refusal>;
+    /// At most `count` of its children from index `start`, in order, retained.
+    /// Fewer when the element answered fewer; an error is why this page could not
+    /// be read, which is not the end of the list.
+    fn children(
+        &self,
+        owner: &Rc<dyn Ax>,
+        handle: Handle,
+        start: usize,
+        count: usize,
+    ) -> Result<Vec<Retained>, Unread>;
 
-    fn set_value(&self, handle: Handle, value: &str) -> Result<(), Refusal>;
+    /// Its children in ONE copy of the whole list, the first `limit` retained — for
+    /// an element that refused to count them. Xcode answers `AXWindows` and refuses
+    /// to count it, and the count is only how a long list is read in pages.
+    fn children_uncounted(
+        &self,
+        owner: &Rc<dyn Ax>,
+        handle: Handle,
+        limit: usize,
+    ) -> Result<Vec<Retained>, Unread>;
+
+    /// `timeout_ms` is this one message's messaging timeout ([`write_timeout_ms`]).
+    fn perform(&self, handle: Handle, action: &str, timeout_ms: u64) -> Result<(), Refusal>;
+
+    fn set_value(&self, handle: Handle, value: &str, timeout_ms: u64) -> Result<(), Refusal>;
 
     /// Let go of one reference. Called from exactly one place — `Retained::drop`.
     fn release(&self, handle: Handle);
@@ -265,42 +461,66 @@ pub trait Ax {
     /// case an action reports no foreground change rather than inventing one.
     fn frontmost_pid(&self) -> Option<i32>;
 
-    /// One application's own `AXWindow`s, retained.
-    ///
-    /// `owner` is this same platform, for the same reason [`Ax::walk`] takes it: a
-    /// trait object cannot recover its own `Rc`, and every reference handed back
-    /// here is released through the platform that made it. [`application_windows`]
-    /// is the one call site and hides it.
-    fn windows(&self, owner: &Rc<dyn Ax>, pid: i32) -> Vec<Retained>;
+    /// Which application's window reads active: one, none, or several. Where the
+    /// platform reads no such state (macOS), the application in front.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn active(&self) -> Active {
+        self.frontmost_pid().map_or(Active::None, Active::One)
+    }
 
-    /// The same walk, from a root this process is already holding — the window a
-    /// target is bound to. Same collection, same bounds, same truncation reasons;
-    /// only where it starts differs, which is what keeps a bound window's controls
-    /// the window's rather than the whole application's.
-    fn walk_from(
-        &self,
-        owner: &Rc<dyn Ax>,
-        root: Handle,
-        clock: &dyn Clock,
-        deadline_ms: u64,
-    ) -> Walk;
-}
+    /// How many messages this platform has sent to applications since it was made
+    /// (M7). A reply reports the difference across its own reads, which is the
+    /// number the macOS reader's batching is measured by.
+    fn messages(&self) -> u64;
 
-/// Walk `pid`'s tree through `ax`, which is also what every reference the walk
-/// retains is released through.
-pub fn walk(ax: &Rc<dyn Ax>, pid: i32, clock: &dyn Clock, deadline_ms: u64) -> Walk {
-    ax.walk(ax, pid, clock, deadline_ms)
+    /// What makes the application with this pid publish its tree, where its
+    /// toolkit publishes none until it is asked: the words of the switch. A macOS
+    /// application is asked by the reader itself (`AXManualAccessibility`).
+    fn tree_switch(&self, _pid: i32) -> Option<&'static str> {
+        None
+    }
+
+    /// Whether this session places controls on a screen at all. A Linux session on
+    /// Wayland, or with no display in reach, places none: its controls are listed
+    /// without bounds, and a listing there needs no display.
+    fn places(&self) -> bool {
+        true
+    }
+
+    /// Which of the element's attributes may be written (protocol 12).
+    fn routes(&self, handle: Handle) -> Routes;
+
+    /// One of those routes, asked alone: only its field of the answer is read, and
+    /// the others are their defaults.
+    fn route(&self, handle: Handle, route: Route) -> Routes;
+
+    /// The element's states, in one read. `on` reads `AXValue` as a check state and
+    /// is asked only when `on` is true: never of a field, whose value is text.
+    fn states(&self, handle: Handle, on: bool) -> Result<States, Unread>;
+
+    /// Whether this container's `AXSelectedChildren` may be written: the route
+    /// `select` takes for an item that cannot select itself.
+    fn selects_children(&self, container: Handle) -> bool;
+
+    /// The element's parent, retained.
+    fn parent(&self, owner: &Rc<dyn Ax>, handle: Handle) -> Option<Retained>;
+
+    /// One attribute write. `timeout_ms` as [`Ax::perform`].
+    fn write(&self, handle: Handle, write: Write<'_>, timeout_ms: u64) -> Result<(), Refusal>;
+
+    /// Whether the element's window is its application's focused window. `None`
+    /// when either would not say, which is never read as yes.
+    fn in_focused_window(&self, handle: Handle) -> Option<bool>;
+
+    /// The application's focused window or focused element, retained; `None` when
+    /// it has none or will not say.
+    fn focused(&self, owner: &Rc<dyn Ax>, pid: i32, what: Focus) -> Option<Retained>;
 }
 
 /// One application's windows, retained through the platform that made them — which
 /// is how a bound target holds on to the one it matched.
 pub fn application_windows(ax: &Rc<dyn Ax>, pid: i32) -> Vec<Retained> {
     ax.windows(ax, pid)
-}
-
-/// Walk from one window this process holds, rather than from an application.
-pub fn walk_from(ax: &Rc<dyn Ax>, root: Handle, clock: &dyn Clock, deadline_ms: u64) -> Walk {
-    ax.walk_from(ax, root, clock, deadline_ms)
 }
 
 // --- the references one reply handed out --------------------------------------
@@ -316,6 +536,9 @@ pub struct Entry {
     /// than acted on.
     pub role: String,
     pub secure: bool,
+    /// The reference of the nearest listed control it sits inside, when there is
+    /// one: how a drill knows which of a listing's references it replaces.
+    pub under: Option<String>,
     pub element: Retained,
 }
 
@@ -329,11 +552,17 @@ pub struct Elements {
     /// The application the tree was read from, and when that process started.
     pub pid: i32,
     pub started_at: u64,
-    entries: Vec<Entry>,
+    /// Shared, so a drill's observation holds the references it keeps from the
+    /// listing it named without that listing letting go of them.
+    entries: Vec<Rc<Entry>>,
 }
 
 impl Elements {
     pub fn new(pid: i32, started_at: u64, entries: Vec<Entry>) -> Elements {
+        Elements::shared(pid, started_at, entries.into_iter().map(Rc::new).collect())
+    }
+
+    pub fn shared(pid: i32, started_at: u64, entries: Vec<Rc<Entry>>) -> Elements {
         Elements {
             pid,
             started_at,
@@ -345,6 +574,23 @@ impl Elements {
         self.entries
             .iter()
             .find(|entry| entry.reference == reference)
+            .map(|entry| entry.as_ref())
+    }
+
+    /// Every entry, shared.
+    pub fn entries(&self) -> &[Rc<Entry>] {
+        &self.entries
+    }
+
+    /// The index the next reference is numbered from: the highest reference number
+    /// this table holds (`e5` is index 4, so `e6` is next), so a drill never mints
+    /// a name its listing already used.
+    pub fn next_index(&self) -> usize {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.reference.strip_prefix('e')?.parse::<usize>().ok())
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn len(&self) -> usize {
@@ -405,6 +651,155 @@ pub fn bounded_value(value: String) -> String {
     one_line(&value, MAX_TEXT_CHARS)
 }
 
+/// What a control calls itself: its title, else its description, as one bounded
+/// line — and nothing at all when that line would be empty. One rule for every
+/// platform and every caller, so a listing, a re-read after an action and a window
+/// match name a control the same way, and application text is flattened before
+/// anything above the seam can see it.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub fn label(title: Option<String>, description: Option<String>) -> Option<String> {
+    title
+        .or(description)
+        .map(|text| one_line(&text, MAX_TEXT_CHARS))
+        .filter(|text| !text.is_empty())
+}
+
+/// What macOS publishes for a password field. It is a **SUBROLE**:
+/// `AXRoleConstants.h` defines `kAXSecureTextFieldSubrole` only, and such a field
+/// answers `kAXTextFieldRole` ("AXTextField") when asked for its role. Comparing
+/// it against the role alone published every password field's value once.
+#[cfg(any(target_os = "macos", test))]
+pub const SECURE_TEXT_FIELD: &str = "AXSecureTextField";
+
+/// Whether a control's value must never be read. The subrole decides, where macOS
+/// puts it; a ROLE with the same spelling, which some applications answer, counts
+/// too, because a password field that names itself oddly is still one.
+#[cfg(any(target_os = "macos", test))]
+pub fn secure(role: Option<&str>, subrole: Option<&str>) -> bool {
+    subrole == Some(SECURE_TEXT_FIELD) || role == Some(SECURE_TEXT_FIELD)
+}
+
+// --- what an AXError means, apart from the FFI --------------------------------
+
+/// AXError `kAXErrorCannotComplete` — what a messaging timeout answers, and the one
+/// code that means "the message went out and the answer never came".
+#[cfg(any(target_os = "macos", test))]
+const CANNOT_COMPLETE: i32 = -25204;
+
+/// AXError `kAXErrorInvalidUIElement` — the reference names nothing any more.
+#[cfg(any(target_os = "macos", test))]
+const INVALID_UI_ELEMENT: i32 = -25202;
+
+/// AXError `kAXErrorAttributeUnsupported`.
+#[cfg(any(target_os = "macos", test))]
+const ATTRIBUTE_UNSUPPORTED: i32 = -25205;
+
+/// AXError `kAXErrorNoValue` — the attribute exists and holds nothing.
+#[cfg(any(target_os = "macos", test))]
+const NO_VALUE: i32 = -25212;
+
+/// What one failed read of a node means ([`Unread`]).
+#[cfg(any(target_os = "macos", test))]
+pub fn unread(code: i32) -> Unread {
+    match code {
+        CANNOT_COMPLETE => Unread::NoAnswer,
+        INVALID_UI_ELEMENT => Unread::Gone,
+        _ => Unread::Refused,
+    }
+}
+
+/// What a child count answered. An element with no children attribute, or one that
+/// holds nothing, HAS no children: that is an answer, not a refusal, and copying the
+/// list again would only be refused the same way. Every other error is why it would
+/// not count them.
+#[cfg(any(target_os = "macos", test))]
+pub fn child_count_answer(code: i32, count: isize) -> Result<usize, Unread> {
+    match code {
+        0 => usize::try_from(count).map_err(|_| Unread::Refused),
+        ATTRIBUTE_UNSUPPORTED | NO_VALUE => Ok(0),
+        other => Err(unread(other)),
+    }
+}
+
+// --- accessibility activation: the decision, apart from the FFI ----------------
+
+/// AXError `kAXErrorNotImplemented` — what a process that does not implement the
+/// attribute's setter answers (observed live from Chrome and from non-Chromium
+/// apps).
+#[cfg(any(target_os = "macos", test))]
+const NOT_IMPLEMENTED: i32 = -25208;
+
+/// The typed rejections that mean "this attribute is not a thing here" — the
+/// deterministic criterion for trying the second attribute.
+#[cfg(any(target_os = "macos", test))]
+pub fn attribute_rejected(code: i32) -> bool {
+    code == ATTRIBUTE_UNSUPPORTED || code == NOT_IMPLEMENTED
+}
+
+/// What one attempt to switch an application's accessibility on came to.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Switched {
+    /// It is on now, and this process turned it on: record it, so it is turned
+    /// off again on the way out.
+    On,
+    /// It was on before this process asked — a screen reader, another assistive
+    /// client. Nothing is written and nothing is recorded, so nothing turns it off
+    /// under the client that turned it on.
+    AlreadyOn,
+    /// Not a thing here: try the next attribute.
+    Rejected,
+    /// The application answered something else. Terminal.
+    Failed(i32),
+}
+
+/// One activation, in order: read the switch, and if it is already on leave it
+/// alone; otherwise check it may be written, write it, and decide by reading it
+/// back ([`switched`]).
+///
+/// The read FIRST is what keeps a screen reader's switch its own. Chrome under
+/// VoiceOver already has `AXEnhancedUserInterface` on; written again it reads back
+/// true, was recorded as this process's, and the exit teardown turned it off while
+/// VoiceOver was still running. Whether a prior value counts as on is the capture
+/// engine's rule, used here too, so the two activations cannot disagree.
+#[cfg(any(target_os = "macos", test))]
+pub fn switch_on(
+    read: impl Fn() -> Option<bool>,
+    settable: impl FnOnce() -> bool,
+    write: impl FnOnce() -> i32,
+) -> Switched {
+    if !crate::capture::should_record_activation(read()) {
+        return Switched::AlreadyOn;
+    }
+    if !settable() {
+        return Switched::Rejected;
+    }
+    let code = write();
+    switched(code, read())
+}
+
+/// Decide one activation from what the setter said and what the attribute READS
+/// BACK afterwards (M5).
+///
+/// The read-back wins. Chrome applies `AXEnhancedUserInterface` and still answers
+/// `kAXErrorNotImplemented`, because it handles the attribute before forwarding
+/// the setter to its superclass — so a decision on the setter's code alone took a
+/// switch that worked for one that failed, and never recorded or restored it. A
+/// clean setter return still counts with no read-back: Electron's
+/// `AXManualAccessibility` getter compares for exactly the complete mode, so an
+/// applied write can read back false.
+#[cfg(any(target_os = "macos", test))]
+pub fn switched(code: i32, read_back: Option<bool>) -> Switched {
+    if read_back == Some(true) || code == 0 {
+        return Switched::On;
+    }
+    if attribute_rejected(code) {
+        Switched::Rejected
+    } else {
+        Switched::Failed(code)
+    }
+}
+
 // --- macOS: the only place `unsafe` lives -------------------------------------
 
 /// The macOS Accessibility API.
@@ -416,77 +811,27 @@ pub fn bounded_value(value: String) -> String {
 /// exist to make irrelevant.
 #[cfg(target_os = "macos")]
 mod mac {
-    use super::{Ax, Frame, Handle, Node, Refusal, Retained, Walk, PRESS};
-    use crate::gate::Clock;
+    use super::{
+        Ax, Expander, Facts, Focus, Frame, Handle, Refusal, Retained, Route, Routes, States,
+        Switched, Unread, Write, CANNOT_COMPLETE, INVALID_UI_ELEMENT, READ_TIMEOUT_MS,
+    };
+    use core_foundation::array::CFArray;
     use core_foundation::base::{CFType, CFTypeRef, TCFType};
     use core_foundation::boolean::CFBoolean;
+    use core_foundation::number::CFNumber;
     use core_foundation::string::{CFString, CFStringRef};
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
 
-    /// Depth of the tree walk, elements COLLECTED, and nodes TRAVERSED. A large
-    /// sparse subtree has few interactive nodes and many to walk, which is why
-    /// the last two are separate numbers.
-    const MAX_DEPTH: usize = 14;
-    const MAX_NODES: usize = 250;
-    const MAX_VISITED: usize = 3000;
     /// A control's own action list is a handful of names; anything longer is a
     /// broken accessibility implementation, not a control with opinions.
     const MAX_ACTION_NAMES: usize = 32;
 
-    /// How much of an element's ancestry is worth carrying: enough to tell two
-    /// "Save" buttons apart, not enough to be a second tree.
-    const MAX_PATH_LABELS: usize = 3;
-    const MAX_PATH_CHARS: usize = 60;
-
-    /// The three reasons a walk stops early, in the words the wire uses.
-    const TRUNCATED_NODES: &str = "nodes";
-    const TRUNCATED_DEPTH: &str = "depth";
-    const TRUNCATED_TIME: &str = "time";
-
-    /// Per-message timeout for the accessibility connection to one application.
-    ///
-    /// Without it a single unresponsive application holds the action worker until
-    /// the caller's whole deadline runs out; with it, one slow application costs
-    /// one bounded call. Set on the application element at the top of a walk
-    /// (where it covers every message to that application) and again on the
-    /// element an action is about to act through.
-    const MESSAGING_TIMEOUT_S: f32 = 1.0;
-
-    /// What macOS publishes for a password field, and it is a **SUBROLE**, not a
-    /// role: `AXRoleConstants.h` defines `kAXSecureTextFieldSubrole` only, and such
-    /// a field answers `kAXTextFieldRole` ("AXTextField") when asked for its role.
-    ///
-    /// Comparing it against the ROLE is therefore never true, which is exactly the
-    /// defect this constant is now named to prevent: `secure` stayed false for
-    /// every password field on the desktop, and their values went out on the wire.
-    /// Nothing else in this module compares a subrole against a role.
-    const SECURE_TEXT_FIELD_SUBROLE: &str = "AXSecureTextField";
-
-    /// Roles worth surfacing as targets. A password field is an `AXTextField`
-    /// here and is told apart by its subrole, so it is listed like any other
-    /// field — a control the caller cannot see at all is one it invents a reason
-    /// for missing — and its value is withheld instead.
-    const INTERACTIVE: &[&str] = &[
-        "AXButton",
-        "AXMenuItem",
-        "AXMenuButton",
-        "AXPopUpButton",
-        "AXCheckBox",
-        "AXRadioButton",
-        "AXTextField",
-        "AXTextArea",
-        "AXComboBox",
-        "AXLink",
-        "AXTabButton",
-        "AXSlider",
-        "AXDisclosureTriangle",
-        "AXCell",
-    ];
-
     type AXUIElementRef = CFTypeRef;
+    type CFIndex = isize;
 
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
@@ -504,6 +849,28 @@ mod mac {
             attribute: CFStringRef,
             value: *mut CFTypeRef,
         ) -> i32;
+        // Several attributes in ONE message (M1). With options 0 an attribute that
+        // fails does not fail the read: its slot holds an AXValue of
+        // `kAXValueAXErrorType` instead.
+        fn AXUIElementCopyMultipleAttributeValues(
+            element: AXUIElementRef,
+            attributes: CFTypeRef,
+            options: u32,
+            values: *mut CFTypeRef,
+        ) -> i32;
+        // How many values an array attribute holds, and one page of them (M3).
+        fn AXUIElementGetAttributeValueCount(
+            element: AXUIElementRef,
+            attribute: CFStringRef,
+            count: *mut CFIndex,
+        ) -> i32;
+        fn AXUIElementCopyAttributeValues(
+            element: AXUIElementRef,
+            attribute: CFStringRef,
+            index: CFIndex,
+            max_values: CFIndex,
+            values: *mut CFTypeRef,
+        ) -> i32;
         fn AXUIElementSetAttributeValue(
             element: AXUIElementRef,
             attribute: CFStringRef,
@@ -517,13 +884,15 @@ mod mac {
         ) -> i32;
         fn AXUIElementCopyActionNames(element: AXUIElementRef, names: *mut CFTypeRef) -> i32;
         fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> i32;
-        // The per-message timeout for every message to this element (or, on an
-        // application element, to that whole application).
+        // The per-message timeout for every message to this element. Client-side:
+        // setting it sends nothing (M2).
         fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, seconds: f32) -> i32;
         fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> i32;
         // Extract the concrete value (CGPoint/CGSize) an AXValue wraps; false if the
         // requested type doesn't match.
         fn AXValueGetValue(value: CFTypeRef, the_type: u32, out: *mut c_void) -> bool;
+        fn AXValueGetType(value: CFTypeRef) -> u32;
+        fn AXValueGetTypeID() -> usize;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -532,6 +901,7 @@ mod mac {
         fn CFArrayGetValueAtIndex(array: CFTypeRef, index: isize) -> CFTypeRef;
         fn CFGetTypeID(cf: CFTypeRef) -> usize;
         fn CFArrayGetTypeID() -> usize;
+        fn CFEqual(cf1: CFTypeRef, cf2: CFTypeRef) -> u8;
     }
 
     // The AX attribute-name constants (`kAXRoleAttribute`, …) are header `extern
@@ -548,6 +918,35 @@ mod mac {
     const ENABLED: &str = "AXEnabled";
     const FOCUSED_APPLICATION: &str = "AXFocusedApplication";
     const WINDOWS: &str = "AXWindows";
+    // Protocol 12: the attributes the verbs on a reference read and write.
+    const FOCUSED: &str = "AXFocused";
+    const SELECTED: &str = "AXSelected";
+    const EXPANDED: &str = "AXExpanded";
+    const DISCLOSING: &str = "AXDisclosing";
+    const SELECTED_TEXT: &str = "AXSelectedText";
+    const SELECTED_CHILDREN: &str = "AXSelectedChildren";
+    const PARENT: &str = "AXParent";
+    const WINDOW: &str = "AXWindow";
+    const FOCUSED_WINDOW: &str = "AXFocusedWindow";
+    const FOCUSED_ELEMENT: &str = "AXFocusedUIElement";
+
+    /// What one batched read of an element's states asks for, in slot order;
+    /// [`STATES_ON`] adds the value as a check state, asked only of an element
+    /// that has one.
+    const STATES: [&str; 4] = [FOCUSED, SELECTED, EXPANDED, DISCLOSING];
+    const STATES_ON: [&str; 5] = [FOCUSED, SELECTED, EXPANDED, DISCLOSING, VALUE];
+
+    /// What one batched read asks every node for (M1), in slot order. `AXValue` is
+    /// NOT among them: a secure field's value is never read, and which fields are
+    /// secure is only known once this read has answered.
+    const SHAPE: [&str; 7] = [ROLE, SUBROLE, TITLE, DESCRIPTION, ENABLED, POSITION, SIZE];
+    const AT_ROLE: usize = 0;
+    const AT_SUBROLE: usize = 1;
+    const AT_TITLE: usize = 2;
+    const AT_DESCRIPTION: usize = 3;
+    const AT_ENABLED: usize = 4;
+    const AT_POSITION: usize = 5;
+    const AT_SIZE: usize = 6;
 
     /// How many of an application's windows are worth retaining to match one
     /// against. A desktop application with more than this many open windows is not
@@ -555,15 +954,18 @@ mod mac {
     /// of them for the life of a target.
     const MAX_APPLICATION_WINDOWS: usize = 64;
 
-    // AXValueType tags for AXValueGetValue.
+    /// The timeout of a read that is not a node of a walk — an application's
+    /// windows, the application in front, an activation's read of its own switch:
+    /// the one second every message had before M86. Target binding reads a slow
+    /// application's windows through this, and a quarter of a second is a walk's
+    /// budget per node, not a lookup's.
+    const LOOKUP_TIMEOUT_MS: u64 = 1_000;
+
+    // AXValueType tags for AXValueGetValue / AXValueGetType.
     const AXVALUE_CGPOINT: u32 = 1;
     const AXVALUE_CGSIZE: u32 = 2;
-
-    /// `kAXErrorCannotComplete` — what a messaging timeout answers, and the one
-    /// code that means "the message went out and the answer never came".
-    const CANNOT_COMPLETE: i32 = -25204;
-    /// `kAXErrorInvalidUIElement` — the reference names nothing any more.
-    const INVALID_UI_ELEMENT: i32 = -25202;
+    /// `kAXValueAXErrorType`: the slot of a batched read whose attribute failed.
+    const AXVALUE_AXERROR: u32 = 5;
 
     #[repr(C)]
     struct CGPoint {
@@ -590,14 +992,33 @@ mod mac {
     }
 
     /// The real desktop's accessibility API.
-    #[derive(Default)]
     pub struct Real {
         registry: Mutex<Registry>,
+        /// Every message this reader has sent to an application (M7).
+        messages: AtomicU64,
+        /// [`SHAPE`] as the attribute array one batched read sends, built once
+        /// rather than seven strings and an array per node.
+        shape: CFArray<CFString>,
+        /// [`STATES`] and [`STATES_ON`], built once for the same reason.
+        states: CFArray<CFString>,
+        states_on: CFArray<CFString>,
+    }
+
+    /// An attribute list as the array a batched read sends.
+    fn names(attributes: &[&str]) -> CFArray<CFString> {
+        let names: Vec<CFString> = attributes.iter().map(|name| CFString::new(name)).collect();
+        CFArray::from_CFTypes(&names)
     }
 
     impl Real {
         pub fn new() -> Real {
-            Real::default()
+            Real {
+                registry: Mutex::default(),
+                messages: AtomicU64::new(0),
+                shape: names(&SHAPE),
+                states: names(&STATES),
+                states_on: names(&STATES_ON),
+            }
         }
 
         // A poisoned registry means a thread panicked holding it. Recovering the
@@ -623,137 +1044,180 @@ mod mac {
             self.registry().held.get(&handle.0).cloned()
         }
 
-        /// One traversal from one root. Both entry points come through here, so a
-        /// window's controls are collected by exactly the code an application's are.
-        unsafe fn walk_element(
-            &self,
-            owner: &Rc<dyn Ax>,
-            root: &CFType,
-            clock: &dyn Clock,
-            deadline_ms: u64,
-        ) -> Walk {
-            let mut walker = Walker {
-                platform: self,
-                owner,
-                clock,
-                deadline_ms,
-                visited: 0,
-                truncated: None,
-                nodes: Vec::new(),
-                ancestors: Vec::new(),
-            };
-            unsafe { walker.visit(root, 0) };
+        /// One message is about to go out. Counted before it is sent, so a message
+        /// that timed out is counted too: it cost what it cost.
+        fn sent(&self) {
+            self.messages.fetch_add(1, Ordering::Relaxed);
+        }
 
-            Walk {
-                nodes: walker.nodes,
-                truncated: walker.truncated,
-            }
+        /// Everything one node answers: one batched read for its shape and one for
+        /// its own action names.
+        unsafe fn read_facts(&self, element: &CFType) -> Result<Facts, Unread> {
+            prepare(element, READ_TIMEOUT_MS);
+            self.sent();
+            let slots = copy_shape(element, &self.shape)?;
+
+            let role = text(&slots[AT_ROLE]);
+            let subrole = text(&slots[AT_SUBROLE]);
+            self.sent();
+            let actions = action_names(element);
+
+            Ok(Facts {
+                secure: super::secure(role.as_deref(), subrole.as_deref()),
+                label: super::label(text(&slots[AT_TITLE]), text(&slots[AT_DESCRIPTION])),
+                enabled: flag(&slots[AT_ENABLED]).unwrap_or(true),
+                frame: frame(&slots[AT_POSITION], &slots[AT_SIZE]),
+                role,
+                subrole,
+                actions,
+                // One call names every action, or none are named.
+                actions_partial: false,
+                // macOS places every node it can see, and lists none it cannot.
+                placeless: false,
+                hidden: false,
+            })
         }
     }
 
     impl Ax for Real {
-        fn walk(&self, owner: &Rc<dyn Ax>, pid: i32, clock: &dyn Clock, deadline_ms: u64) -> Walk {
-            unsafe {
-                let app_ref = AXUIElementCreateApplication(pid);
-                if app_ref.is_null() {
-                    return Walk::empty();
-                }
-                let root = CFType::wrap_under_create_rule(app_ref);
-                // On an application element this bounds every message to that
-                // application, so one wedged app costs one bounded call per node
-                // rather than the caller's whole deadline.
-                AXUIElementSetMessagingTimeout(root.as_CFTypeRef(), MESSAGING_TIMEOUT_S);
-
-                self.walk_element(owner, &root, clock, deadline_ms)
-            }
+        fn application(&self, owner: &Rc<dyn Ax>, pid: i32) -> Option<Retained> {
+            let app = application_element(pid)?;
+            Some(Retained::new(self.hold(&app), owner.clone()))
         }
 
-        /// The same traversal from a window this process holds. The messaging
-        /// timeout is set on the element itself, exactly as `perform` does, because
-        /// there is no application element in the path to carry it.
-        fn walk_from(
-            &self,
-            owner: &Rc<dyn Ax>,
-            root: Handle,
-            clock: &dyn Clock,
-            deadline_ms: u64,
-        ) -> Walk {
-            let Some(element) = self.element(root) else {
-                return Walk::empty();
+        /// The application's own `AXWindows`, retained one by one. A window a
+        /// target is bound to has to outlive the reply that bound it, and a
+        /// borrowed child of a temporary application element would not.
+        fn windows(&self, owner: &Rc<dyn Ax>, pid: i32) -> Vec<Retained> {
+            let Some(app) = application_element(pid) else {
+                return Vec::new();
             };
             unsafe {
-                AXUIElementSetMessagingTimeout(element.as_CFTypeRef(), MESSAGING_TIMEOUT_S);
-                self.walk_element(owner, &element, clock, deadline_ms)
+                prepare(&app, LOOKUP_TIMEOUT_MS);
+                self.sent();
+
+                let Some(windows) = copy_element_attr(&app, WINDOWS) else {
+                    return Vec::new();
+                };
+                self.retain_array(owner, &windows, MAX_APPLICATION_WINDOWS)
             }
         }
 
-        fn role(&self, handle: Handle) -> Option<String> {
-            let element = self.element(handle)?;
-            unsafe { copy_string_attr(&element, ROLE) }
-        }
-
-        /// Title, else description — the same two attributes in the same order a
-        /// walk reads them, bounded and collapsed here so application text cannot
-        /// forge a line wherever this is published.
-        fn label(&self, handle: Handle) -> Option<String> {
-            let element = self.element(handle)?;
-            unsafe {
-                copy_string_attr(&element, TITLE)
-                    .or_else(|| copy_string_attr(&element, DESCRIPTION))
-                    .map(|label| super::one_line(&label, super::MAX_TEXT_CHARS))
-            }
-        }
-
-        fn enabled(&self, handle: Handle) -> bool {
-            match self.element(handle) {
-                // A reference we no longer hold is not "disabled": it is gone, and
-                // the role check ahead of this one is what reports that.
-                None => true,
-                Some(element) => unsafe { is_enabled(&element) },
-            }
+        fn facts(&self, handle: Handle) -> Result<Facts, Unread> {
+            let element = self.element(handle).ok_or(Unread::Gone)?;
+            unsafe { self.read_facts(&element) }
         }
 
         /// Withheld at the SOURCE for a secure field, so nothing above this seam
         /// can see a password field's contents even to decide not to publish
         /// them. macOS answers bullets rather than the text, but this method is
-        /// on the trait and anything may call it; one subrole read is a cheaper
-        /// guarantee than remembering the rule at every future call site.
+        /// on the trait and anything may call it; reading the role and subrole
+        /// first is a cheaper guarantee than remembering the rule at every future
+        /// call site.
         fn value(&self, handle: Handle) -> Option<String> {
             let element = self.element(handle)?;
             unsafe {
-                if copy_string_attr(&element, SUBROLE).as_deref() == Some(SECURE_TEXT_FIELD_SUBROLE)
-                {
+                prepare(&element, READ_TIMEOUT_MS);
+                self.sent();
+                let role = copy_string_attr(&element, ROLE);
+                self.sent();
+                let subrole = copy_string_attr(&element, SUBROLE);
+                if super::secure(role.as_deref(), subrole.as_deref()) {
                     return None;
                 }
+                self.sent();
                 copy_string_attr(&element, VALUE).map(super::bounded_value)
             }
         }
 
-        fn action_names(&self, handle: Handle) -> Vec<String> {
-            match self.element(handle) {
-                None => Vec::new(),
-                Some(element) => unsafe { action_names(&element) },
-            }
-        }
-
         fn settable(&self, handle: Handle) -> bool {
-            match self.element(handle) {
-                None => false,
-                Some(element) => unsafe { is_settable(&element, VALUE) },
+            let Some(element) = self.element(handle) else {
+                return false;
+            };
+            unsafe {
+                prepare(&element, READ_TIMEOUT_MS);
+                self.sent();
+                is_settable(&element, VALUE)
             }
         }
 
-        fn bounds(&self, handle: Handle) -> Option<Frame> {
-            let element = self.element(handle)?;
-            unsafe { element_frame(&element) }
+        /// By count, so a table with thousands of rows is never copied whole to
+        /// keep a few hundred of them (M3).
+        fn child_count(&self, handle: Handle) -> Result<usize, Unread> {
+            let element = self.element(handle).ok_or(Unread::Gone)?;
+            let attribute = CFString::new(CHILDREN);
+            let mut count: CFIndex = 0;
+
+            unsafe {
+                prepare(&element, READ_TIMEOUT_MS);
+                self.sent();
+                let err = AXUIElementGetAttributeValueCount(
+                    element.as_CFTypeRef(),
+                    attribute.as_concrete_TypeRef(),
+                    &mut count,
+                );
+                super::child_count_answer(err, count)
+            }
         }
 
-        fn perform(&self, handle: Handle, action: &str) -> Result<(), Refusal> {
+        fn children_uncounted(
+            &self,
+            owner: &Rc<dyn Ax>,
+            handle: Handle,
+            limit: usize,
+        ) -> Result<Vec<Retained>, Unread> {
+            let element = self.element(handle).ok_or(Unread::Gone)?;
+            unsafe {
+                prepare(&element, READ_TIMEOUT_MS);
+                self.sent();
+                let children = copy_attr(&element, CHILDREN)?;
+                Ok(self.retain_array(owner, &children, limit))
+            }
+        }
+
+        fn children(
+            &self,
+            owner: &Rc<dyn Ax>,
+            handle: Handle,
+            start: usize,
+            count: usize,
+        ) -> Result<Vec<Retained>, Unread> {
+            let element = self.element(handle).ok_or(Unread::Gone)?;
+            let (Ok(index), Ok(max_values)) = (CFIndex::try_from(start), CFIndex::try_from(count))
+            else {
+                return Err(Unread::Refused);
+            };
+            let attribute = CFString::new(CHILDREN);
+            let mut page_ref: CFTypeRef = std::ptr::null();
+
+            unsafe {
+                prepare(&element, READ_TIMEOUT_MS);
+                self.sent();
+                let err = AXUIElementCopyAttributeValues(
+                    element.as_CFTypeRef(),
+                    attribute.as_concrete_TypeRef(),
+                    index,
+                    max_values,
+                    &mut page_ref,
+                );
+                if err != 0 {
+                    return Err(super::unread(err));
+                }
+                if page_ref.is_null() {
+                    return Err(Unread::Refused);
+                }
+                let page = CFType::wrap_under_create_rule(page_ref);
+                Ok(self.retain_array(owner, &page, count))
+            }
+        }
+
+        fn perform(&self, handle: Handle, action: &str, timeout_ms: u64) -> Result<(), Refusal> {
             let element = self.element(handle).ok_or_else(gone)?;
             let name = CFString::new(action);
 
             unsafe {
-                AXUIElementSetMessagingTimeout(element.as_CFTypeRef(), MESSAGING_TIMEOUT_S);
+                prepare(&element, timeout_ms);
+                self.sent();
                 answered(AXUIElementPerformAction(
                     element.as_CFTypeRef(),
                     name.as_concrete_TypeRef(),
@@ -761,13 +1225,14 @@ mod mac {
             }
         }
 
-        fn set_value(&self, handle: Handle, value: &str) -> Result<(), Refusal> {
+        fn set_value(&self, handle: Handle, value: &str, timeout_ms: u64) -> Result<(), Refusal> {
             let element = self.element(handle).ok_or_else(gone)?;
             let attribute = CFString::new(VALUE);
             let text = CFString::new(value);
 
             unsafe {
-                AXUIElementSetMessagingTimeout(element.as_CFTypeRef(), MESSAGING_TIMEOUT_S);
+                prepare(&element, timeout_ms);
+                self.sent();
                 answered(AXUIElementSetAttributeValue(
                     element.as_CFTypeRef(),
                     attribute.as_concrete_TypeRef(),
@@ -805,41 +1270,6 @@ mod mac {
             }
         }
 
-        /// The application's own `AXWindows`, retained one by one. A window a
-        /// target is bound to has to outlive the reply that bound it, and a
-        /// borrowed child of a temporary application element would not.
-        fn windows(&self, owner: &Rc<dyn Ax>, pid: i32) -> Vec<Retained> {
-            unsafe {
-                let app_ref = AXUIElementCreateApplication(pid);
-                if app_ref.is_null() {
-                    return Vec::new();
-                }
-                let app = CFType::wrap_under_create_rule(app_ref);
-                AXUIElementSetMessagingTimeout(app.as_CFTypeRef(), MESSAGING_TIMEOUT_S);
-
-                let Some(windows) = copy_element_attr(&app, WINDOWS) else {
-                    return Vec::new();
-                };
-                let array = windows.as_CFTypeRef();
-                if CFGetTypeID(array) != CFArrayGetTypeID() {
-                    return Vec::new();
-                }
-
-                let count = CFArrayGetCount(array);
-                let mut out = Vec::new();
-                let mut index = 0;
-                while index < count && out.len() < MAX_APPLICATION_WINDOWS {
-                    let window_ref = CFArrayGetValueAtIndex(array, index);
-                    if !window_ref.is_null() {
-                        let window = CFType::wrap_under_get_rule(window_ref);
-                        out.push(Retained::new(self.hold(&window), owner.clone()));
-                    }
-                    index += 1;
-                }
-                out
-            }
-        }
-
         fn frontmost_pid(&self) -> Option<i32> {
             unsafe {
                 let system_ref = AXUIElementCreateSystemWide();
@@ -848,9 +1278,10 @@ mod mac {
                 }
                 let system = CFType::wrap_under_create_rule(system_ref);
                 // The system-wide element reaches whatever is in front, which may
-                // be the very application that is not answering. Bound it like
-                // every other message this module sends.
-                AXUIElementSetMessagingTimeout(system.as_CFTypeRef(), MESSAGING_TIMEOUT_S);
+                // be the very application that is not answering. Bound it as it
+                // was bounded before M86.
+                prepare(&system, LOOKUP_TIMEOUT_MS);
+                self.sent();
                 let front = copy_element_attr(&system, FOCUSED_APPLICATION)?;
 
                 let mut pid: i32 = 0;
@@ -861,6 +1292,215 @@ mod mac {
                 }
             }
         }
+
+        fn messages(&self) -> u64 {
+            self.messages.load(Ordering::Relaxed)
+        }
+
+        /// One `AXUIElementIsAttributeSettable` per route: there is no batched form.
+        fn routes(&self, handle: Handle) -> Routes {
+            let Some(element) = self.element(handle) else {
+                return Routes::default();
+            };
+            let settable = |attribute: &str| unsafe {
+                self.sent();
+                is_settable(&element, attribute)
+            };
+            unsafe { prepare(&element, READ_TIMEOUT_MS) };
+
+            Routes {
+                expand: expander(&settable),
+                value: settable(VALUE),
+                focus: settable(FOCUSED),
+                select: settable(SELECTED),
+                text: settable(SELECTED_TEXT),
+            }
+        }
+
+        /// One `AXUIElementIsAttributeSettable`; two for `expand` on an element
+        /// with no `AXExpanded` to write.
+        fn route(&self, handle: Handle, route: Route) -> Routes {
+            let Some(element) = self.element(handle) else {
+                return Routes::default();
+            };
+            let settable = |attribute: &str| unsafe {
+                self.sent();
+                is_settable(&element, attribute)
+            };
+            unsafe { prepare(&element, READ_TIMEOUT_MS) };
+
+            let none = Routes::default();
+            match route {
+                Route::Focus => Routes {
+                    focus: settable(FOCUSED),
+                    ..none
+                },
+                Route::Select => Routes {
+                    select: settable(SELECTED),
+                    ..none
+                },
+                Route::Expand => Routes {
+                    expand: expander(&settable),
+                    ..none
+                },
+                Route::Text => Routes {
+                    text: settable(SELECTED_TEXT),
+                    ..none
+                },
+            }
+        }
+
+        fn states(&self, handle: Handle, on: bool) -> Result<States, Unread> {
+            let element = self.element(handle).ok_or(Unread::Gone)?;
+            let (attributes, count) = if on {
+                (&self.states_on, STATES_ON.len())
+            } else {
+                (&self.states, STATES.len())
+            };
+            unsafe {
+                prepare(&element, READ_TIMEOUT_MS);
+                self.sent();
+                let slots = copy_batch(&element, attributes, count)?;
+                Ok(States {
+                    focused: flag(&slots[0]),
+                    selected: flag(&slots[1]),
+                    expanded: flag(&slots[2]).or_else(|| flag(&slots[3])),
+                    on: slots.get(4).and_then(check_state),
+                })
+            }
+        }
+
+        fn selects_children(&self, container: Handle) -> bool {
+            let Some(element) = self.element(container) else {
+                return false;
+            };
+            unsafe {
+                prepare(&element, READ_TIMEOUT_MS);
+                self.sent();
+                is_settable(&element, SELECTED_CHILDREN)
+            }
+        }
+
+        fn parent(&self, owner: &Rc<dyn Ax>, handle: Handle) -> Option<Retained> {
+            let element = self.element(handle)?;
+            unsafe {
+                prepare(&element, READ_TIMEOUT_MS);
+                self.sent();
+                let parent = copy_element_attr(&element, PARENT)?;
+                Some(Retained::new(self.hold(&parent), owner.clone()))
+            }
+        }
+
+        fn write(&self, handle: Handle, write: Write<'_>, timeout_ms: u64) -> Result<(), Refusal> {
+            let element = self.element(handle).ok_or_else(gone)?;
+            let (attribute, value): (&str, CFType) = match write {
+                Write::Focused => (FOCUSED, CFBoolean::true_value().as_CFType()),
+                Write::Selected => (SELECTED, CFBoolean::true_value().as_CFType()),
+                Write::Expand(Expander::Expanded, to) => (EXPANDED, boolean(to)),
+                Write::Expand(Expander::Disclosing, to) => (DISCLOSING, boolean(to)),
+                // This reader never offers it: a macOS element answers an attribute.
+                Write::Expand(Expander::Action, _) => {
+                    return Err(Refusal::new(
+                        false,
+                        "a macOS element is expanded through an attribute, not an action",
+                    ))
+                }
+                Write::SelectedText(text) => (SELECTED_TEXT, CFString::new(text).as_CFType()),
+                Write::SelectedChildren(item) => {
+                    let item = self.element(item).ok_or_else(gone)?;
+                    (
+                        SELECTED_CHILDREN,
+                        CFArray::from_CFTypes(&[item]).as_CFType(),
+                    )
+                }
+            };
+            let attribute = CFString::new(attribute);
+
+            unsafe {
+                prepare(&element, timeout_ms);
+                self.sent();
+                answered(AXUIElementSetAttributeValue(
+                    element.as_CFTypeRef(),
+                    attribute.as_concrete_TypeRef(),
+                    value.as_CFTypeRef(),
+                ))
+            }
+        }
+
+        fn in_focused_window(&self, handle: Handle) -> Option<bool> {
+            let element = self.element(handle)?;
+            unsafe {
+                prepare(&element, READ_TIMEOUT_MS);
+                self.sent();
+                let window = copy_element_attr(&element, WINDOW)?;
+                let mut pid: i32 = 0;
+                if AXUIElementGetPid(element.as_CFTypeRef(), &mut pid) != 0 || pid <= 0 {
+                    return None;
+                }
+                let app = application_element(pid)?;
+                prepare(&app, LOOKUP_TIMEOUT_MS);
+                self.sent();
+                let focused = copy_element_attr(&app, FOCUSED_WINDOW)?;
+                Some(CFEqual(window.as_CFTypeRef(), focused.as_CFTypeRef()) != 0)
+            }
+        }
+
+        fn focused(&self, owner: &Rc<dyn Ax>, pid: i32, what: Focus) -> Option<Retained> {
+            let app = application_element(pid)?;
+            let attribute = match what {
+                Focus::Window => FOCUSED_WINDOW,
+                Focus::Element => FOCUSED_ELEMENT,
+            };
+            unsafe {
+                prepare(&app, LOOKUP_TIMEOUT_MS);
+                self.sent();
+                let focused = copy_element_attr(&app, attribute)?;
+                Some(Retained::new(self.hold(&focused), owner.clone()))
+            }
+        }
+    }
+
+    impl Real {
+        /// Retain up to `limit` elements of an array an application answered.
+        ///
+        /// The array SHOULD be a CFArray, but an app with a custom or broken AX
+        /// implementation can return another CFType, and the CFArray getters would
+        /// then type-confuse and read garbage — so the concrete type is checked
+        /// before anything is read out of it.
+        unsafe fn retain_array(
+            &self,
+            owner: &Rc<dyn Ax>,
+            array: &CFType,
+            limit: usize,
+        ) -> Vec<Retained> {
+            let array = array.as_CFTypeRef();
+            if CFGetTypeID(array) != CFArrayGetTypeID() {
+                return Vec::new();
+            }
+
+            let count = CFArrayGetCount(array);
+            let mut out = Vec::new();
+            let mut index = 0;
+            while index < count && out.len() < limit {
+                let element_ref = CFArrayGetValueAtIndex(array, index);
+                if !element_ref.is_null() {
+                    let element = CFType::wrap_under_get_rule(element_ref);
+                    out.push(Retained::new(self.hold(&element), owner.clone()));
+                }
+                index += 1;
+            }
+            out
+        }
+    }
+
+    /// One application's own element. Creating it is local: nothing is sent until
+    /// it is read.
+    fn application_element(pid: i32) -> Option<CFType> {
+        let app_ref = unsafe { AXUIElementCreateApplication(pid) };
+        if app_ref.is_null() {
+            return None;
+        }
+        Some(unsafe { CFType::wrap_under_create_rule(app_ref) })
     }
 
     /// A reference this process is no longer holding. Nothing was sent.
@@ -887,136 +1527,164 @@ mod mac {
         }
     }
 
-    /// The tree walk. One pass reads everything the wire publishes about a
-    /// control, so a reply is one traversal and not a second round per element.
-    struct Walker<'a> {
-        platform: &'a Real,
-        owner: &'a Rc<dyn Ax>,
-        clock: &'a dyn Clock,
-        deadline_ms: u64,
-        visited: usize,
-        truncated: Option<&'static str>,
-        nodes: Vec<Node>,
-        /// The labels of the nodes above the one being visited, outermost first.
-        ancestors: Vec<String>,
+    /// Bound every following message to this element (M2). Set on EVERY element
+    /// before it is read or written — not only on the application, which left
+    /// whether that bounded its descendants' messages an open question.
+    unsafe fn prepare(element: &CFType, timeout_ms: u64) {
+        AXUIElementSetMessagingTimeout(element.as_CFTypeRef(), timeout_ms as f32 / 1_000.0);
     }
 
-    impl Walker<'_> {
-        unsafe fn visit(&mut self, element: &CFType, depth: usize) {
-            if self.stop(depth) {
-                return;
-            }
-            self.visited += 1;
+    /// One batched read of [`SHAPE`] (`attributes`, built once by [`Real::new`]): a
+    /// slot per attribute, `None` where the element had no such attribute or
+    /// answered an error for it. An error overall is why the read itself failed.
+    unsafe fn copy_shape(
+        element: &CFType,
+        attributes: &CFArray<CFString>,
+    ) -> Result<Vec<Option<CFType>>, Unread> {
+        let mut values_ref: CFTypeRef = std::ptr::null();
 
-            let role = copy_string_attr(element, ROLE);
-            let label = copy_string_attr(element, TITLE)
-                .or_else(|| copy_string_attr(element, DESCRIPTION))
-                .filter(|label| !label.trim().is_empty());
-
-            if let Some(role) = role.filter(|role| INTERACTIVE.contains(&role.as_str())) {
-                if let Some(node) = self.collect(element, role, label.clone()) {
-                    self.nodes.push(node);
-                }
-            }
-
-            // This node's own label is an ancestor label for everything below it.
-            let named = label.is_some();
-            if let Some(label) = label {
-                self.ancestors.push(label);
-            }
-            for child in copy_children(element) {
-                self.visit(&child, depth + 1);
-            }
-            if named {
-                self.ancestors.pop();
-            }
+        let err = AXUIElementCopyMultipleAttributeValues(
+            element.as_CFTypeRef(),
+            attributes.as_CFTypeRef(),
+            0,
+            &mut values_ref,
+        );
+        if err != 0 {
+            return Err(super::unread(err));
+        }
+        if values_ref.is_null() {
+            return Err(Unread::Refused);
+        }
+        let values = CFType::wrap_under_create_rule(values_ref);
+        let array = values.as_CFTypeRef();
+        // One slot per attribute asked for, or the slots cannot be told apart.
+        if CFGetTypeID(array) != CFArrayGetTypeID()
+            || CFArrayGetCount(array) != SHAPE.len() as isize
+        {
+            return Err(Unread::Refused);
         }
 
-        /// Every bound the walk has, in one place. Time is checked first and wins
-        /// whenever it fires: once the clock is past the deadline every later
-        /// check would stop too, and "we ran out of time" is the useful answer.
-        fn stop(&mut self, depth: usize) -> bool {
-            if self.clock.now_ms() >= self.deadline_ms {
-                self.truncated = Some(TRUNCATED_TIME);
-                return true;
-            }
-            if self.nodes.len() >= MAX_NODES || self.visited >= MAX_VISITED {
-                self.note(TRUNCATED_NODES);
-                return true;
-            }
-            if depth > MAX_DEPTH {
-                self.note(TRUNCATED_DEPTH);
-                return true;
-            }
-            false
+        Ok((0..SHAPE.len()).map(|index| slot(array, index)).collect())
+    }
+
+    /// One batched read of `count` attributes, each slot as [`slot`] reads it.
+    unsafe fn copy_batch(
+        element: &CFType,
+        attributes: &CFArray<CFString>,
+        count: usize,
+    ) -> Result<Vec<Option<CFType>>, Unread> {
+        let mut values_ref: CFTypeRef = std::ptr::null();
+
+        let err = AXUIElementCopyMultipleAttributeValues(
+            element.as_CFTypeRef(),
+            attributes.as_CFTypeRef(),
+            0,
+            &mut values_ref,
+        );
+        if err != 0 {
+            return Err(super::unread(err));
+        }
+        if values_ref.is_null() {
+            return Err(Unread::Refused);
+        }
+        let values = CFType::wrap_under_create_rule(values_ref);
+        let array = values.as_CFTypeRef();
+        if CFGetTypeID(array) != CFArrayGetTypeID() || CFArrayGetCount(array) != count as isize {
+            return Err(Unread::Refused);
         }
 
-        fn note(&mut self, reason: &'static str) {
-            if self.truncated.is_none() {
-                self.truncated = Some(reason);
-            }
+        Ok((0..count).map(|index| slot(array, index)).collect())
+    }
+
+    /// A check state: a number that is 0 or 1, or a boolean. Anything else is not
+    /// one.
+    fn check_state(value: &Option<CFType>) -> Option<bool> {
+        let value = value.as_ref()?;
+        if let Some(flag) = value.downcast::<CFBoolean>() {
+            return Some(bool::from(flag));
+        }
+        match value.downcast::<CFNumber>()?.to_i64()? {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    fn boolean(value: bool) -> CFType {
+        if value {
+            CFBoolean::true_value().as_CFType()
+        } else {
+            CFBoolean::false_value().as_CFType()
+        }
+    }
+
+    /// One slot of a batched read. An attribute that failed is not a failure of the
+    /// read: it comes back as an AXValue of `kAXValueAXErrorType`, and it means the
+    /// same as an attribute the element does not have.
+    unsafe fn slot(array: CFTypeRef, index: usize) -> Option<CFType> {
+        let value_ref = CFArrayGetValueAtIndex(array, index as isize);
+        if value_ref.is_null() {
+            return None;
+        }
+        if CFGetTypeID(value_ref) == AXValueGetTypeID()
+            && AXValueGetType(value_ref) == AXVALUE_AXERROR
+        {
+            return None;
+        }
+        Some(CFType::wrap_under_get_rule(value_ref))
+    }
+
+    // A string-valued slot. Non-string values (e.g. a slider's number) are None —
+    // we only surface text.
+    fn text(value: &Option<CFType>) -> Option<String> {
+        value
+            .as_ref()?
+            .downcast::<CFString>()
+            .map(|text| text.to_string())
+    }
+
+    fn flag(value: &Option<CFType>) -> Option<bool> {
+        value.as_ref()?.downcast::<CFBoolean>().map(bool::from)
+    }
+
+    /// Position and size as one frame, from the two AXValues that carry them. Only
+    /// a real AXValue is unwrapped: anything else an application answered there is
+    /// no frame.
+    unsafe fn frame(position: &Option<CFType>, size: &Option<CFType>) -> Option<Frame> {
+        let (position, size) = (
+            position.as_ref()?.as_CFTypeRef(),
+            size.as_ref()?.as_CFTypeRef(),
+        );
+        if CFGetTypeID(position) != AXValueGetTypeID() || CFGetTypeID(size) != AXValueGetTypeID() {
+            return None;
         }
 
-        /// The ancestor labels worth carrying: the nearest three, nearest LAST,
-        /// trimmed to a total that stays readable beside the control itself.
-        fn path(&self) -> Vec<String> {
-            let nearest: Vec<&String> = self
-                .ancestors
-                .iter()
-                .rev()
-                .take(MAX_PATH_LABELS)
-                .rev()
-                .collect();
-
-            let mut total = 0;
-            let mut kept = Vec::new();
-            // Nearest last, so a path that has to be cut loses the OUTERMOST label
-            // first: "Toolbar" tells two Save buttons apart where the window's own
-            // name does not.
-            for label in nearest.into_iter().rev() {
-                total += label.chars().count();
-                if total > MAX_PATH_CHARS {
-                    break;
-                }
-                kept.push(label.clone());
-            }
-            kept.reverse();
-            kept
-        }
-
-        unsafe fn collect(
-            &self,
-            element: &CFType,
-            role: String,
-            label: Option<String>,
-        ) -> Option<Node> {
-            let frame = element_frame(element)?;
-            // The SUBROLE, because that is where macOS puts it. A password field's
-            // role is "AXTextField" like any other.
-            let secure =
-                copy_string_attr(element, SUBROLE).as_deref() == Some(SECURE_TEXT_FIELD_SUBROLE);
-
-            Some(Node {
-                value: if secure {
-                    None
-                } else {
-                    copy_string_attr(element, VALUE).map(super::bounded_value)
-                },
-                secure,
-                enabled: is_enabled(element),
-                press: action_names(element).iter().any(|name| name == PRESS),
-                settable: is_settable(element, VALUE),
-                frame,
-                path: self.path(),
-                element: Retained::new(self.platform.hold(element), self.owner.clone()),
-                role,
-                label,
+        let mut point = CGPoint { x: 0.0, y: 0.0 };
+        let mut dims = CGSize {
+            width: 0.0,
+            height: 0.0,
+        };
+        let got_point = AXValueGetValue(
+            position,
+            AXVALUE_CGPOINT,
+            &mut point as *mut _ as *mut c_void,
+        );
+        let got_size = AXValueGetValue(size, AXVALUE_CGSIZE, &mut dims as *mut _ as *mut c_void);
+        if got_point && got_size && dims.width > 0.0 && dims.height > 0.0 {
+            Some(Frame {
+                x: point.x,
+                y: point.y,
+                w: dims.width,
+                h: dims.height,
             })
+        } else {
+            None
         }
     }
 
-    // Read any CFType-valued AX attribute (a +1 Copy-rule ref, released on drop).
-    unsafe fn copy_element_attr(element: &CFType, attribute: &str) -> Option<CFType> {
+    // Read any CFType-valued AX attribute (a +1 Copy-rule ref, released on drop),
+    // or why it could not be read.
+    unsafe fn copy_attr(element: &CFType, attribute: &str) -> Result<CFType, Unread> {
         let attr = CFString::new(attribute);
         let mut value_ref: CFTypeRef = std::ptr::null();
         let err = AXUIElementCopyAttributeValue(
@@ -1024,10 +1692,19 @@ mod mac {
             attr.as_concrete_TypeRef(),
             &mut value_ref,
         );
-        if err != 0 || value_ref.is_null() {
-            return None;
+        if err != 0 {
+            return Err(super::unread(err));
         }
-        Some(CFType::wrap_under_create_rule(value_ref))
+        if value_ref.is_null() {
+            return Err(Unread::Refused);
+        }
+        Ok(CFType::wrap_under_create_rule(value_ref))
+    }
+
+    // The same read, where why it failed changes nothing: the attribute is simply
+    // not there to use.
+    unsafe fn copy_element_attr(element: &CFType, attribute: &str) -> Option<CFType> {
+        copy_attr(element, attribute).ok()
     }
 
     // Read a string-valued AX attribute. Non-string values (e.g. a slider's number)
@@ -1036,15 +1713,6 @@ mod mac {
         copy_element_attr(element, attribute)?
             .downcast::<CFString>()
             .map(|s| s.to_string())
-    }
-
-    /// An element that publishes no `AXEnabled` is enabled: it did not say
-    /// otherwise, and greying out every link and cell would hide real controls.
-    unsafe fn is_enabled(element: &CFType) -> bool {
-        match copy_element_attr(element, ENABLED).and_then(|value| value.downcast::<CFBoolean>()) {
-            Some(flag) => flag.into(),
-            None => true,
-        }
     }
 
     unsafe fn is_settable(element: &CFType, attribute: &str) -> bool {
@@ -1058,6 +1726,18 @@ mod mac {
         err == 0 && settable != 0
     }
 
+    /// The attribute that expands an element, when one may be written: `AXExpanded`,
+    /// else `AXDisclosing`, which is only asked when the first is not.
+    fn expander(settable: &dyn Fn(&str) -> bool) -> Option<Expander> {
+        if settable(EXPANDED) {
+            Some(Expander::Expanded)
+        } else if settable(DISCLOSING) {
+            Some(Expander::Disclosing)
+        } else {
+            None
+        }
+    }
+
     /// The action names the control advertises for ITSELF. An element with no
     /// action list has none — nothing is assumed from what it looks like.
     unsafe fn action_names(element: &CFType) -> Vec<String> {
@@ -1068,9 +1748,9 @@ mod mac {
         }
         let names = CFType::wrap_under_create_rule(names_ref);
         let array = names.as_CFTypeRef();
-        // Same guard as the children: a custom accessibility implementation can
-        // answer something that is not a CFArray, and the array getters would then
-        // type-confuse and read garbage.
+        // Same guard as every other array: a custom accessibility implementation
+        // can answer something that is not a CFArray, and the array getters would
+        // then type-confuse and read garbage.
         if CFGetTypeID(array) != CFArrayGetTypeID() {
             return Vec::new();
         }
@@ -1088,60 +1768,6 @@ mod mac {
             index += 1;
         }
         out
-    }
-
-    unsafe fn copy_children(element: &CFType) -> Vec<CFType> {
-        let Some(children) = copy_element_attr(element, CHILDREN) else {
-            return Vec::new();
-        };
-        let array = children.as_CFTypeRef();
-        // AXChildren SHOULD be a CFArray, but an app with a custom/broken AX impl can
-        // return another CFType; the CFArray getters would then type-confuse and read
-        // garbage. Verify the concrete type before treating it as an array.
-        if CFGetTypeID(array) != CFArrayGetTypeID() {
-            return Vec::new();
-        }
-        let count = CFArrayGetCount(array);
-        let mut out = Vec::new();
-        let mut index = 0;
-        while index < count && out.len() < MAX_NODES {
-            let child_ref = CFArrayGetValueAtIndex(array, index);
-            if !child_ref.is_null() {
-                out.push(CFType::wrap_under_get_rule(child_ref));
-            }
-            index += 1;
-        }
-        out
-    }
-
-    unsafe fn element_frame(element: &CFType) -> Option<Frame> {
-        let position = copy_element_attr(element, POSITION)?;
-        let size = copy_element_attr(element, SIZE)?;
-        let mut point = CGPoint { x: 0.0, y: 0.0 };
-        let mut dims = CGSize {
-            width: 0.0,
-            height: 0.0,
-        };
-        let got_point = AXValueGetValue(
-            position.as_CFTypeRef(),
-            AXVALUE_CGPOINT,
-            &mut point as *mut _ as *mut c_void,
-        );
-        let got_size = AXValueGetValue(
-            size.as_CFTypeRef(),
-            AXVALUE_CGSIZE,
-            &mut dims as *mut _ as *mut c_void,
-        );
-        if got_point && got_size && dims.width > 0.0 && dims.height > 0.0 {
-            Some(Frame {
-                x: point.x,
-                y: point.y,
-                w: dims.width,
-                h: dims.height,
-            })
-        } else {
-            None
-        }
     }
 
     // --- inspect (the element under a point) ---------------------------------
@@ -1180,7 +1806,7 @@ mod mac {
         }
     }
 
-    // --- accessibility activation (M28 B4) -----------------------------------
+    // --- accessibility activation (M28 B4, M86 M5) ---------------------------
 
     /// Chromium/Electron's opt-in switch: the family builds its AX tree only for
     /// detected assistive clients, and this per-app attribute is the documented
@@ -1191,51 +1817,53 @@ mod mac {
     /// enhanced-UI mode window managers react to (layout side effects), which
     /// is why it is never tried first.
     pub const ENHANCED_UI: &str = "AXEnhancedUserInterface";
-    /// AXError `kAXErrorAttributeUnsupported`.
-    const ATTRIBUTE_UNSUPPORTED: i32 = -25205;
-    /// AXError `kAXErrorNotImplemented` — what a process that does not
-    /// implement the attribute's setter answers (observed live from Chrome and
-    /// from non-Chromium apps).
-    const NOT_IMPLEMENTED: i32 = -25208;
-
-    /// The typed rejections that mean "this attribute is not a thing here" —
-    /// the deterministic criterion for trying the second attribute.
-    pub fn attribute_rejected(code: i32) -> bool {
-        code == ATTRIBUTE_UNSUPPORTED || code == NOT_IMPLEMENTED
-    }
 
     /// `(pid, attribute)` pairs this process switched ON — cleared on the exit
     /// paths so one enumeration never leaves an app in an altered AX mode.
     static ACTIVATED: Mutex<Vec<(i32, &'static str)>> = Mutex::new(Vec::new());
 
     /// Ask ONE application — the pid the caller resolved off the window list —
-    /// to expose its accessibility tree. Returns the attribute that activated,
-    /// or a typed reason. Setting the attribute on an app that does not gate
-    /// its tree is a harmless typed error — callers attempt unconditionally on
-    /// an empty enumeration, no app-family sniffing.
-    pub fn activate_accessibility(pid: i32) -> Result<&'static str, String> {
-        unsafe {
-            let app_ref = AXUIElementCreateApplication(pid);
-            if app_ref.is_null() {
-                return Err(format!("no accessibility connection to pid {pid}"));
-            }
-            let app = CFType::wrap_under_create_rule(app_ref);
+    /// to expose its accessibility tree. Returns what it did, in words for the
+    /// listing's note, or a typed reason. Setting the attribute on an app that does
+    /// not gate its tree is a harmless typed error — callers attempt
+    /// unconditionally on an empty enumeration, no app-family sniffing.
+    pub fn activate_accessibility(pid: i32) -> Result<String, String> {
+        let app = application_element(pid)
+            .ok_or_else(|| format!("no accessibility connection to pid {pid}"))?;
 
-            match set_bool_attr(&app, MANUAL_ACCESSIBILITY, true) {
-                0 => {
-                    record(pid, MANUAL_ACCESSIBILITY);
-                    Ok(MANUAL_ACCESSIBILITY)
+        for attribute in [MANUAL_ACCESSIBILITY, ENHANCED_UI] {
+            match unsafe { switch_attribute(&app, attribute) } {
+                Switched::On => {
+                    record(pid, attribute);
+                    return Ok(format!("{attribute} activated"));
                 }
-                code if attribute_rejected(code) => match set_bool_attr(&app, ENHANCED_UI, true) {
-                    0 => {
-                        record(pid, ENHANCED_UI);
-                        Ok(ENHANCED_UI)
-                    }
-                    code => Err(format!("AXError {code}")),
-                },
-                code => Err(format!("AXError {code}")),
+                Switched::AlreadyOn => {
+                    return Ok(format!("{attribute} already on, left as it was"))
+                }
+                Switched::Rejected => continue,
+                Switched::Failed(code) => return Err(format!("AXError {code}")),
             }
         }
+        Err(format!(
+            "neither {MANUAL_ACCESSIBILITY} nor {ENHANCED_UI} could be switched on"
+        ))
+    }
+
+    /// One attribute, in the order [`super::switch_on`] decides: read it, leave it
+    /// alone if it is already on, check it may be written, write it, READ IT BACK
+    /// (M5).
+    unsafe fn switch_attribute(app: &CFType, attribute: &'static str) -> Switched {
+        let read = || {
+            prepare(app, LOOKUP_TIMEOUT_MS);
+            copy_element_attr(app, attribute)
+                .and_then(|value| value.downcast::<CFBoolean>())
+                .map(bool::from)
+        };
+        super::switch_on(
+            read,
+            || is_settable(app, attribute),
+            || set_bool_attr(app, attribute, true),
+        )
     }
 
     /// Best-effort teardown: switch OFF every attribute this process switched on.
@@ -1315,6 +1943,7 @@ mod mac {
         }
     }
 
+    /// A write, so it is bounded like one: the whole write budget is its own.
     unsafe fn set_bool_attr(element: &CFType, attribute: &str, value: bool) -> i32 {
         let attr = CFString::new(attribute);
         let flag = if value {
@@ -1322,6 +1951,7 @@ mod mac {
         } else {
             CFBoolean::false_value()
         };
+        prepare(element, super::write_timeout_ms(super::WRITE_BUDGET_MS));
         AXUIElementSetAttributeValue(
             element.as_CFTypeRef(),
             attr.as_concrete_TypeRef(),
@@ -1363,54 +1993,19 @@ mod mac {
             );
         }
 
-        /// A walker with a known ancestry and nothing else, so the path rule is
-        /// asserted without a tree.
-        fn walker_at(ancestors: &[&str]) -> Vec<String> {
-            let owner: Rc<dyn Ax> = Rc::new(Real::new());
-            let clock = crate::gate::SystemClock::new();
-            let platform = Real::new();
-            let walker = Walker {
-                platform: &platform,
-                owner: &owner,
-                clock: &clock,
-                deadline_ms: 0,
-                visited: 0,
-                truncated: None,
-                nodes: Vec::new(),
-                ancestors: ancestors.iter().map(|label| label.to_string()).collect(),
-            };
-            walker.path()
-        }
-
-        // The path exists to tell two "Save" buttons apart, so when it has to be
-        // cut it loses the OUTERMOST label: the nearest one is what distinguishes.
+        // The batched read asks for exactly what a node's facts are built from, and
+        // never for the value: a secure field's value must not be read even to be
+        // thrown away.
         #[test]
-        fn a_path_keeps_the_nearest_ancestors() {
-            assert_eq!(
-                walker_at(&["Window", "Split", "Sidebar", "Toolbar"]),
-                vec!["Split", "Sidebar", "Toolbar"]
-            );
-            assert!(walker_at(&[]).is_empty());
-
-            let long = "x".repeat(50);
-            assert_eq!(
-                walker_at(&[&long, &long, "Toolbar"]),
-                vec![long, "Toolbar".to_string()],
-                "the outermost label goes first when the total is too long"
-            );
-        }
-
-        // The subrole the tests script is the one the walk really compares, and it
-        // is a SUBROLE: `AXRoleConstants.h` defines `kAXSecureTextFieldSubrole`
-        // only, and a password field answers `kAXTextFieldRole` for its role.
-        #[test]
-        fn the_secure_spelling_is_one_string_and_it_is_a_subrole() {
-            assert_eq!(SECURE_TEXT_FIELD_SUBROLE, crate::ax::SECURE_SUBROLE);
-            assert!(
-                !INTERACTIVE.contains(&SECURE_TEXT_FIELD_SUBROLE),
-                "a subrole must never be listed as a role"
-            );
-            assert!(INTERACTIVE.contains(&"AXTextField"), "which is its role");
+        fn the_batched_read_never_asks_for_a_value() {
+            assert!(!SHAPE.contains(&VALUE));
+            assert_eq!(SHAPE[AT_ROLE], ROLE);
+            assert_eq!(SHAPE[AT_SUBROLE], SUBROLE);
+            assert_eq!(SHAPE[AT_TITLE], TITLE);
+            assert_eq!(SHAPE[AT_DESCRIPTION], DESCRIPTION);
+            assert_eq!(SHAPE[AT_ENABLED], ENABLED);
+            assert_eq!(SHAPE[AT_POSITION], POSITION);
+            assert_eq!(SHAPE[AT_SIZE], SIZE);
         }
 
         // The process's own start time must read, and read the same twice: it is
@@ -1429,19 +2024,25 @@ mod mac {
 
 #[cfg(target_os = "macos")]
 pub use mac::{
-    activate_accessibility, attribute_rejected, clear_activation, clear_activations, element_at,
-    record_activation, Real, ENHANCED_UI, MANUAL_ACCESSIBILITY,
+    activate_accessibility, clear_activation, clear_activations, element_at, record_activation,
+    Real, ENHANCED_UI, MANUAL_ACCESSIBILITY,
 };
+
+// --- Linux: the AT-SPI reader -------------------------------------------------
+
+#[cfg(target_os = "linux")]
+pub use crate::linux::atspi::Real;
 
 // --- everywhere else: typed unsupported ---------------------------------------
 
-/// Linux has no accessibility API this build speaks, so every call answers the
+/// A system with no accessibility API this build speaks, so every call answers the
 /// same typed refusal. Deliberately not an empty success: a caller that cannot
 /// tell "nothing there" from "not supported here" writes the wrong sentence.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod stub {
-    use super::{Ax, Frame, Handle, Refusal, Retained, Walk};
-    use crate::gate::Clock;
+    use super::{
+        Ax, Facts, Focus, Handle, Refusal, Retained, Route, Routes, States, Unread, Write,
+    };
     use std::rc::Rc;
 
     #[derive(Default)]
@@ -1459,49 +2060,60 @@ mod stub {
     }
 
     impl Ax for Real {
-        fn walk(
-            &self,
-            _owner: &Rc<dyn Ax>,
-            _pid: i32,
-            _clock: &dyn Clock,
-            _deadline_ms: u64,
-        ) -> Walk {
-            Walk::empty()
-        }
-
-        fn role(&self, _handle: Handle) -> Option<String> {
+        fn application(&self, _owner: &Rc<dyn Ax>, _pid: i32) -> Option<Retained> {
             None
         }
 
-        fn label(&self, _handle: Handle) -> Option<String> {
-            None
+        fn windows(&self, _owner: &Rc<dyn Ax>, _pid: i32) -> Vec<Retained> {
+            Vec::new()
         }
 
-        fn enabled(&self, _handle: Handle) -> bool {
-            false
+        // Nothing here hands out a reference, so a handle names nothing.
+        fn facts(&self, _handle: Handle) -> Result<Facts, Unread> {
+            Err(Unread::Gone)
         }
 
         fn value(&self, _handle: Handle) -> Option<String> {
             None
         }
 
-        fn action_names(&self, _handle: Handle) -> Vec<String> {
-            Vec::new()
-        }
-
         fn settable(&self, _handle: Handle) -> bool {
             false
         }
 
-        fn bounds(&self, _handle: Handle) -> Option<Frame> {
-            None
+        fn child_count(&self, _handle: Handle) -> Result<usize, Unread> {
+            Err(Unread::Gone)
         }
 
-        fn perform(&self, _handle: Handle, _action: &str) -> Result<(), Refusal> {
+        fn children(
+            &self,
+            _owner: &Rc<dyn Ax>,
+            _handle: Handle,
+            _start: usize,
+            _count: usize,
+        ) -> Result<Vec<Retained>, Unread> {
+            Err(Unread::Gone)
+        }
+
+        fn children_uncounted(
+            &self,
+            _owner: &Rc<dyn Ax>,
+            _handle: Handle,
+            _limit: usize,
+        ) -> Result<Vec<Retained>, Unread> {
+            Err(Unread::Gone)
+        }
+
+        fn perform(&self, _handle: Handle, _action: &str, _timeout_ms: u64) -> Result<(), Refusal> {
             Err(unsupported())
         }
 
-        fn set_value(&self, _handle: Handle, _value: &str) -> Result<(), Refusal> {
+        fn set_value(
+            &self,
+            _handle: Handle,
+            _value: &str,
+            _timeout_ms: u64,
+        ) -> Result<(), Refusal> {
             Err(unsupported())
         }
 
@@ -1515,39 +2127,61 @@ mod stub {
             None
         }
 
-        fn windows(&self, _owner: &Rc<dyn Ax>, _pid: i32) -> Vec<Retained> {
-            Vec::new()
+        fn messages(&self) -> u64 {
+            0
         }
 
-        fn walk_from(
+        fn routes(&self, _handle: Handle) -> Routes {
+            Routes::default()
+        }
+
+        fn route(&self, _handle: Handle, _route: Route) -> Routes {
+            Routes::default()
+        }
+
+        fn states(&self, _handle: Handle, _on: bool) -> Result<States, Unread> {
+            Err(Unread::Gone)
+        }
+
+        fn selects_children(&self, _container: Handle) -> bool {
+            false
+        }
+
+        fn parent(&self, _owner: &Rc<dyn Ax>, _handle: Handle) -> Option<Retained> {
+            None
+        }
+
+        fn write(
             &self,
-            _owner: &Rc<dyn Ax>,
-            _root: Handle,
-            _clock: &dyn Clock,
-            _deadline_ms: u64,
-        ) -> Walk {
-            Walk::empty()
+            _handle: Handle,
+            _write: Write<'_>,
+            _timeout_ms: u64,
+        ) -> Result<(), Refusal> {
+            Err(unsupported())
+        }
+
+        fn in_focused_window(&self, _handle: Handle) -> Option<bool> {
+            None
+        }
+
+        fn focused(&self, _owner: &Rc<dyn Ax>, _pid: i32, _what: Focus) -> Option<Retained> {
+            None
         }
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub use stub::Real;
 
 // --- the recording platform (tests only) --------------------------------------
 
-/// The subrole macOS publishes for a password field, spelled once for the tests
-/// that need it. `mac`'s own copy is pinned equal to this.
-#[cfg(test)]
-pub const SECURE_SUBROLE: &str = "AXSecureTextField";
-
-/// A scripted control, for a test that needs a tree without a desktop.
+/// A scripted node, for a test that needs a tree without a desktop.
 ///
-/// It carries a `subrole` and derives `secure` from it exactly as the walk does,
+/// It carries a `subrole` and derives `secure` from it exactly as the reader does,
 /// rather than taking "this one is secure" as a given: treating the secure
-/// spelling as a ROLE is the mistake that published every password field's value,
-/// and a recording platform that was simply told the answer could not have caught
-/// it.
+/// spelling as a ROLE only is the mistake that published every password field's
+/// value, and a recording platform that was simply told the answer could not have
+/// caught it.
 #[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct Scripted {
@@ -1556,10 +2190,30 @@ pub struct Scripted {
     pub label: Option<String>,
     pub value: Option<String>,
     pub enabled: bool,
-    pub press: bool,
+    /// The action names it advertises for ITSELF.
+    pub actions: Vec<String>,
+    /// Some of its actions could not be named.
+    pub actions_partial: bool,
     pub settable: bool,
-    pub frame: Frame,
-    pub path: Vec<String>,
+    /// `None` is a node that will not say where it is.
+    pub frame: Option<Frame>,
+    /// On screen where the platform places nothing.
+    pub placeless: bool,
+    /// Its children, as indices into the same script, in order. A node no other
+    /// node lists as a child is a child of the application.
+    pub children: Vec<usize>,
+    /// What reading it costs on the recorder's clock, so a walk runs into its
+    /// wall-clock budget without anything sleeping.
+    pub cost_ms: u64,
+    /// Its writable attributes apart from `AXValue`, which `settable` answers.
+    pub routes: Routes,
+    /// Its states, as a read answers them; a write the recorder honours changes
+    /// them, and a press flips `on`.
+    pub states: States,
+    /// Whether it is a container whose `AXSelectedChildren` may be written.
+    pub selects_children: bool,
+    /// What it answers when asked whether its window is the focused one.
+    pub in_focused_window: Option<bool>,
 }
 
 #[cfg(test)]
@@ -1567,39 +2221,65 @@ impl Scripted {
     /// Whether this control's value must never be read, derived where macOS
     /// really puts it.
     pub fn secure(&self) -> bool {
-        self.subrole.as_deref() == Some(SECURE_SUBROLE)
+        secure(Some(&self.role), self.subrole.as_deref())
     }
-}
 
-#[cfg(test)]
-impl Scripted {
+    /// What the reader would answer for it.
+    fn facts(&self) -> Facts {
+        Facts {
+            role: Some(self.role.clone()),
+            subrole: self.subrole.clone(),
+            label: label(self.label.clone(), None),
+            enabled: self.enabled,
+            secure: self.secure(),
+            actions: self.actions.clone(),
+            actions_partial: self.actions_partial,
+            frame: self.frame,
+            placeless: self.placeless,
+            hidden: false,
+        }
+    }
+
+    /// A node of this role and nothing else: no label, no actions, nowhere.
+    pub fn of(role: &str) -> Scripted {
+        Scripted {
+            role: role.to_string(),
+            subrole: None,
+            label: None,
+            value: None,
+            enabled: true,
+            actions: Vec::new(),
+            actions_partial: false,
+            settable: false,
+            frame: None,
+            placeless: false,
+            children: Vec::new(),
+            cost_ms: 0,
+            routes: Routes::default(),
+            states: States::default(),
+            selects_children: false,
+            in_focused_window: Some(true),
+        }
+    }
+
     /// A pressable button at a known frame — the shape most tests need.
     pub fn button(label: &str, frame: Frame) -> Scripted {
         Scripted {
-            role: "AXButton".to_string(),
-            subrole: None,
             label: Some(label.to_string()),
-            value: None,
-            enabled: true,
-            press: true,
-            settable: false,
-            frame,
-            path: Vec::new(),
+            actions: vec![PRESS.to_string()],
+            frame: Some(frame),
+            ..Scripted::of("AXButton")
         }
     }
 
     /// A settable text field carrying `value`.
     pub fn field(label: &str, value: &str, frame: Frame) -> Scripted {
         Scripted {
-            role: "AXTextField".to_string(),
-            subrole: None,
             label: Some(label.to_string()),
             value: Some(value.to_string()),
-            enabled: true,
-            press: false,
             settable: true,
-            frame,
-            path: Vec::new(),
+            frame: Some(frame),
+            ..Scripted::of("AXTextField")
         }
     }
 
@@ -1607,10 +2287,50 @@ impl Scripted {
     /// subrole — which is the whole point.
     pub fn secure_field(label: &str, value: &str, frame: Frame) -> Scripted {
         Scripted {
-            subrole: Some(SECURE_SUBROLE.to_string()),
+            subrole: Some(SECURE_TEXT_FIELD.to_string()),
             ..Scripted::field(label, value, frame)
         }
     }
+
+    /// A named container holding the nodes at these indices.
+    pub fn group(label: &str, children: &[usize]) -> Scripted {
+        Scripted {
+            label: Some(label.to_string()),
+            children: children.to_vec(),
+            ..Scripted::of("AXGroup")
+        }
+    }
+
+    /// A checkbox that is pressed to toggle, reading `on` as its check state.
+    pub fn checkbox(label: &str, on: bool, frame: Frame) -> Scripted {
+        Scripted {
+            states: States {
+                on: Some(on),
+                ..States::default()
+            },
+            ..Scripted {
+                role: "AXCheckBox".to_string(),
+                ..Scripted::button(label, frame)
+            }
+        }
+    }
+}
+
+/// What a handle the recorder minted names: the application itself, or one of the
+/// scripted nodes.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slot {
+    Application,
+    Node(usize),
+}
+
+/// A write the field shows only after this many more reads of it.
+#[cfg(test)]
+struct Lagging {
+    index: usize,
+    value: String,
+    reads_left: usize,
 }
 
 /// What one scripted application answers, and what was asked of it.
@@ -1618,29 +2338,65 @@ impl Scripted {
 #[derive(Default)]
 struct Recorded {
     elements: Vec<Scripted>,
-    /// Handle to index into `elements`, for the handles still held.
-    held: std::collections::HashMap<u64, usize>,
+    held: std::collections::HashMap<u64, Slot>,
     next: u64,
     retains: usize,
     releases: usize,
-    performed: Vec<(Handle, String)>,
+    /// Every action and write, with the messaging timeout it was sent with.
+    performed: Vec<(Handle, String, u64)>,
     /// What a `set_value` will WRITE, when a test wants the read-back to differ
     /// from what was asked for (a formatter, a mask, a field that rejects it).
     writes: Option<String>,
+    /// How many reads after a `set_value` still answer the old value.
+    lag: usize,
+    lagging: Option<Lagging>,
     fail_next: Option<Refusal>,
     started_at: Option<u64>,
     frontmost: Option<i32>,
+    /// How many applications claim an active window, where a test says more than
+    /// one does.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    active_many: Option<usize>,
     /// What the front application becomes WHILE the next action runs, so a
     /// foreground change is observed between the two readings rather than set up
     /// before either of them.
     frontmost_after: Option<Option<i32>>,
-    /// Milliseconds the clock is advanced per visited node, so a walk can be
-    /// driven into its wall-clock budget without sleeping.
-    ms_per_node: u64,
+    /// What each node's `cost_ms` is charged to.
+    clock: Option<std::sync::Arc<dyn crate::gate::Clock>>,
     walks: usize,
     /// Indices into `elements` that answer as the application's WINDOWS, for a test
     /// that binds a target to one of them.
     windows: Vec<usize>,
+    /// Every page of children asked for, as `(start, count)`.
+    pages: Vec<(usize, usize)>,
+    /// How many uncounted copies of a child list were asked for.
+    copies: usize,
+    /// The nodes whose value was asked for, in order.
+    values_read: Vec<usize>,
+    /// The write routes asked of each node, in order: all of them for a listing.
+    routes_asked: Vec<(usize, Route)>,
+    /// Nodes whose facts, child count or uncounted copy answer this instead.
+    facts_fail: std::collections::HashMap<usize, Unread>,
+    /// Nodes that cannot be found again before an action, and why.
+    identity_fail: std::collections::HashMap<usize, Identity>,
+    count_fail: std::collections::HashMap<usize, Unread>,
+    copy_fail: std::collections::HashMap<usize, Unread>,
+    /// A node's page of children, by the index it starts at, that answers this.
+    page_fail: std::collections::HashMap<(usize, usize), Unread>,
+    /// Nodes that count a different number of children than they list.
+    miscounted: std::collections::HashMap<usize, usize>,
+    /// How many walks find the application with nothing in it yet: a tree that is
+    /// still being built.
+    empty_walks: usize,
+    messages: u64,
+    /// The application's focused window and focused element, by index.
+    focused_window: Option<usize>,
+    focused_element: Option<usize>,
+    /// Writes and presses are taken and change nothing, so a read-back finds the
+    /// state as it was.
+    ignores_writes: bool,
+    /// Where a scroll into view moves a node to.
+    scrolls_to: Option<(usize, Frame)>,
 }
 
 /// A [`Ax`] that answers from a script, records what was asked of it, and counts
@@ -1693,6 +2449,21 @@ impl Recorder {
         self.state().frontmost = pid;
     }
 
+    /// What the accessibility bus says is active: one application, none, or
+    /// several, none of which is then in front.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn set_active(&self, active: Active) {
+        let mut state = self.state();
+        state.frontmost = match active {
+            Active::One(pid) => Some(pid),
+            Active::None | Active::Many(_) => None,
+        };
+        state.active_many = match active {
+            Active::Many(count) => Some(count),
+            Active::One(_) | Active::None => None,
+        };
+    }
+
     /// The next action takes the foreground for this application.
     pub fn takes_foreground(&self, pid: Option<i32>) {
         self.state().frontmost_after = Some(pid);
@@ -1704,7 +2475,7 @@ impl Recorder {
         }
     }
 
-    /// Change what the Nth scripted control answers from now on.
+    /// Change what the Nth scripted node answers from now on.
     pub fn change(&self, index: usize, edit: impl FnOnce(&mut Scripted)) {
         edit(&mut self.state().elements[index]);
     }
@@ -1712,7 +2483,9 @@ impl Recorder {
     /// The control went away. Its references still exist and answer nothing, which
     /// is what a dialog that closed or a row that was removed looks like to one.
     pub fn vanish(&self, index: usize) {
-        self.state().held.retain(|_, held| *held != index);
+        self.state()
+            .held
+            .retain(|_, held| *held != Slot::Node(index));
     }
 
     /// The next `perform` or `set_value` answers this refusal.
@@ -1726,16 +2499,82 @@ impl Recorder {
         self.state().writes = Some(value.to_string());
     }
 
-    pub fn performed(&self) -> Vec<(Handle, String)> {
+    /// A field that commits a moment late: after a `set_value`, this many reads
+    /// still answer what it held before.
+    pub fn commits_after(&self, reads: usize) {
+        self.state().lag = reads;
+    }
+
+    /// Every action and write, as `(handle, what, timeout_ms)`.
+    pub fn performed(&self) -> Vec<(Handle, String, u64)> {
         self.state().performed.clone()
     }
 
-    /// Advance the injected clock by `ms` for every node a walk visits, so a walk
-    /// runs into its wall-clock budget without anything sleeping.
-    pub fn costs_per_node(&self, ms: u64) {
-        self.state().ms_per_node = ms;
+    /// The Nth node's facts answer this instead of its facts.
+    /// The node cannot be found again before an action, for this reason.
+    pub fn identifies_as(&self, index: usize, why: Identity) {
+        self.state().identity_fail.insert(index, why);
     }
 
+    pub fn fails_facts_for(&self, index: usize, why: Unread) {
+        self.state().facts_fail.insert(index, why);
+    }
+
+    /// The Nth node's child count answers this instead of a count.
+    pub fn fails_count_for(&self, index: usize, why: Unread) {
+        self.state().count_fail.insert(index, why);
+    }
+
+    /// One uncounted copy of the Nth node's children answers this instead.
+    pub fn fails_copy_for(&self, index: usize, why: Unread) {
+        self.state().copy_fail.insert(index, why);
+    }
+
+    /// The page of the Nth node's children that starts at `start` answers this
+    /// instead: a page that failed after its count answered.
+    pub fn fails_page_for(&self, index: usize, start: usize, why: Unread) {
+        self.state().page_fail.insert((index, start), why);
+    }
+
+    /// The Nth node counts `count` children, whatever its list holds: a list that
+    /// changed between the count and the read, or an application that miscounts.
+    pub fn counts_children(&self, index: usize, count: usize) {
+        self.state().miscounted.insert(index, count);
+    }
+
+    /// How many uncounted copies of a child list were asked for.
+    pub fn copies(&self) -> usize {
+        self.state().copies
+    }
+
+    /// The nodes whose value was asked for, in order.
+    pub fn values_read(&self) -> Vec<usize> {
+        self.state().values_read.clone()
+    }
+
+    /// Every write route asked, by node, in order.
+    pub fn routes_asked(&self) -> Vec<(usize, Route)> {
+        self.state().routes_asked.clone()
+    }
+
+    /// The first `walks` walks find the application with nothing in it, as a
+    /// tree that is still being built answers.
+    pub fn empty_for(&self, walks: usize) {
+        self.state().empty_walks = walks;
+    }
+
+    /// Every scripted node costs `ms` on `clock` each time it is read, so a walk
+    /// runs into its wall-clock budget without anything sleeping.
+    pub fn costs_per_node(&self, ms: u64, clock: std::sync::Arc<dyn crate::gate::Clock>) {
+        let mut state = self.state();
+        state.clock = Some(clock);
+        for element in state.elements.iter_mut() {
+            element.cost_ms = ms;
+        }
+    }
+
+    /// How many walks of the application have begun: each one starts by retaining
+    /// its root.
     pub fn walks(&self) -> usize {
         self.state().walks
     }
@@ -1745,111 +2584,296 @@ impl Recorder {
         self.state().windows = indices.to_vec();
     }
 
-    fn scripted(&self, handle: Handle) -> Option<Scripted> {
-        let state = self.state();
-        let index = *state.held.get(&handle.0)?;
-        state.elements.get(index).cloned()
+    /// Every page of children asked for, as `(start, count)`.
+    pub fn pages(&self) -> Vec<(usize, usize)> {
+        self.state().pages.clone()
+    }
+
+    /// The application's focused window and focused element, by index.
+    pub fn focuses(&self, window: Option<usize>, element: Option<usize>) {
+        let mut state = self.state();
+        state.focused_window = window;
+        state.focused_element = element;
+    }
+
+    /// Writes and presses from now on are taken and change nothing.
+    pub fn ignores_writes(&self) {
+        self.state().ignores_writes = true;
+    }
+
+    /// A scroll into view of the Nth node moves it to `frame`.
+    pub fn scrolls_to(&self, index: usize, frame: Frame) {
+        self.state().scrolls_to = Some((index, frame));
+    }
+
+    /// The node a handle names, when it names a scripted node.
+    fn node(state: &Recorded, handle: Handle) -> Option<usize> {
+        match state.held.get(&handle.0) {
+            Some(Slot::Node(index)) => Some(*index),
+            _ => None,
+        }
+    }
+
+    /// What a write does to the scripted tree, unless writes are ignored.
+    fn apply(state: &mut Recorded, index: usize, write: Write<'_>) {
+        if state.ignores_writes {
+            return;
+        }
+        let states = &mut state.elements[index].states;
+        match write {
+            Write::Focused => states.focused = Some(true),
+            Write::Selected => states.selected = Some(true),
+            Write::Expand(_, to) => states.expanded = Some(to),
+            Write::SelectedText(text) => {
+                let value = state.elements[index].value.clone().unwrap_or_default();
+                state.elements[index].value = Some(format!("{value}{text}"));
+            }
+            Write::SelectedChildren(item) => {
+                if let Some(item) = Recorder::node(state, item) {
+                    state.elements[item].states.selected = Some(true);
+                }
+            }
+        }
+    }
+
+    /// What a performed action does to the scripted tree: a press flips a check
+    /// state, a scroll into view moves the node it was scripted to move.
+    fn act(state: &mut Recorded, index: usize, action: &str) {
+        if state.ignores_writes {
+            return;
+        }
+        if action == PRESS {
+            let on = &mut state.elements[index].states.on;
+            *on = on.map(|on| !on);
+        }
+        if action == SCROLL_TO_VISIBLE {
+            if let Some((_, frame)) = state.scrolls_to.filter(|(node, _)| *node == index) {
+                state.elements[index].frame = Some(frame);
+            }
+        }
+    }
+
+    /// The node that lists this one as a child; `None` is the application.
+    fn parent_of(state: &Recorded, index: usize) -> Option<usize> {
+        state
+            .elements
+            .iter()
+            .position(|node| node.children.contains(&index))
+    }
+
+    fn retain(state: &mut Recorded, slot: Slot, owner: &Rc<dyn Ax>) -> Retained {
+        state.next += 1;
+        let handle = Handle(state.next);
+        state.held.insert(handle.0, slot);
+        state.retains += 1;
+        Retained::new(handle, owner.clone())
+    }
+
+    /// The application's own children: every node no other node lists, in order.
+    fn top_level(elements: &[Scripted]) -> Vec<usize> {
+        (0..elements.len())
+            .filter(|index| !elements.iter().any(|node| node.children.contains(index)))
+            .collect()
+    }
+
+    fn children_of(state: &Recorded, handle: Handle) -> Vec<usize> {
+        match state.held.get(&handle.0) {
+            Some(Slot::Application) if state.walks <= state.empty_walks => Vec::new(),
+            Some(Slot::Application) => Recorder::top_level(&state.elements),
+            Some(Slot::Node(index)) => state.elements[*index].children.clone(),
+            None => Vec::new(),
+        }
+    }
+
+    /// What a node's child count answers: a scripted failure, a scripted miscount,
+    /// or how many it lists.
+    fn count(state: &Recorded, handle: Handle) -> Result<usize, Unread> {
+        let Some(slot) = state.held.get(&handle.0) else {
+            return Err(Unread::Gone);
+        };
+        let listed = Recorder::children_of(state, handle).len();
+        let Slot::Node(index) = slot else {
+            return Ok(listed);
+        };
+        match (state.count_fail.get(index), state.miscounted.get(index)) {
+            (Some(why), _) => Err(*why),
+            (None, Some(count)) => Ok(*count),
+            (None, None) => Ok(listed),
+        }
+    }
+
+    /// One read of a node's facts, charged to the clock.
+    fn read(state: &mut Recorded, index: usize) -> Result<Facts, Unread> {
+        if let Some(clock) = state.clock.clone() {
+            clock.sleep(state.elements[index].cost_ms);
+        }
+        match state.facts_fail.get(&index) {
+            Some(why) => Err(*why),
+            None => Ok(state.elements[index].facts()),
+        }
+    }
+
+    /// A lagging write shows on the first value read after its stale ones run out.
+    fn land(state: &mut Recorded, index: usize) {
+        let Some(lagging) = state.lagging.as_mut().filter(|lag| lag.index == index) else {
+            return;
+        };
+        if lagging.reads_left > 0 {
+            lagging.reads_left -= 1;
+            return;
+        }
+        let value = lagging.value.clone();
+        state.lagging = None;
+        state.elements[index].value = Some(value);
     }
 }
 
 #[cfg(test)]
 impl Ax for Recorder {
-    fn walk(&self, owner: &Rc<dyn Ax>, pid: i32, clock: &dyn Clock, deadline_ms: u64) -> Walk {
-        let mut state = self.state();
-        state.walks += 1;
+    fn application(&self, owner: &Rc<dyn Ax>, pid: i32) -> Option<Retained> {
         if pid != self.pid {
-            return Walk::empty();
-        }
-
-        let (elements, cost) = (state.elements.clone(), state.ms_per_node);
-        let mut nodes = Vec::new();
-        let mut truncated = None;
-
-        for (index, scripted) in elements.into_iter().enumerate() {
-            clock.sleep(cost);
-            if clock.now_ms() >= deadline_ms {
-                truncated = Some("time");
-                break;
-            }
-
-            state.next += 1;
-            let handle = Handle(state.next);
-            state.held.insert(handle.0, index);
-            state.retains += 1;
-
-            // Exactly what the walk does: derive from the subrole, sanitise every
-            // piece of the application's own text, and never read a secure value.
-            let secure = scripted.secure();
-            nodes.push(Node {
-                role: scripted.role,
-                label: scripted.label.map(|label| one_line(&label, MAX_TEXT_CHARS)),
-                value: if secure {
-                    None
-                } else {
-                    scripted.value.map(bounded_value)
-                },
-                secure,
-                enabled: scripted.enabled,
-                press: scripted.press,
-                settable: scripted.settable,
-                frame: scripted.frame,
-                path: scripted
-                    .path
-                    .into_iter()
-                    .map(|label| one_line(&label, MAX_TEXT_CHARS))
-                    .collect(),
-                element: Retained::new(handle, owner.clone()),
-            });
-        }
-
-        Walk { nodes, truncated }
-    }
-
-    fn role(&self, handle: Handle) -> Option<String> {
-        self.scripted(handle).map(|element| element.role)
-    }
-
-    fn label(&self, handle: Handle) -> Option<String> {
-        self.scripted(handle)
-            .and_then(|element| element.label)
-            .map(|label| one_line(&label, MAX_TEXT_CHARS))
-    }
-
-    fn enabled(&self, handle: Handle) -> bool {
-        self.scripted(handle)
-            .map(|element| element.enabled)
-            .unwrap_or(true)
-    }
-
-    fn value(&self, handle: Handle) -> Option<String> {
-        let element = self.scripted(handle)?;
-        // Withheld at the source, as the real platform withholds it: nothing above
-        // this may see a secure field's contents even to decide not to publish it.
-        if element.secure() {
             return None;
         }
-        element.value.map(bounded_value)
+        let mut state = self.state();
+        state.walks += 1;
+        Some(Recorder::retain(&mut state, Slot::Application, owner))
     }
 
-    fn action_names(&self, handle: Handle) -> Vec<String> {
-        match self.scripted(handle) {
-            Some(element) if element.press => vec![PRESS.to_string()],
-            _other => Vec::new(),
+    /// The scripted application's windows, retained like anything else — so a test
+    /// that binds a target proves the retain and the release too.
+    fn windows(&self, owner: &Rc<dyn Ax>, pid: i32) -> Vec<Retained> {
+        if pid != self.pid {
+            return Vec::new();
         }
+
+        let mut state = self.state();
+        state.messages += 1;
+        let windows = state.windows.clone();
+        windows
+            .into_iter()
+            .map(|index| Recorder::retain(&mut state, Slot::Node(index), owner))
+            .collect()
+    }
+
+    fn facts(&self, handle: Handle) -> Result<Facts, Unread> {
+        let mut state = self.state();
+        state.messages += 1;
+        match *state.held.get(&handle.0).ok_or(Unread::Gone)? {
+            Slot::Application => Ok(Facts {
+                role: Some("AXApplication".to_string()),
+                enabled: true,
+                ..Facts::default()
+            }),
+            Slot::Node(index) => Recorder::read(&mut state, index),
+        }
+    }
+
+    /// As a reader that finds a reference again by its place: what the test says
+    /// the search found, else the facts.
+    fn identify(&self, handle: Handle) -> Result<Facts, Identity> {
+        let found = {
+            let state = self.state();
+            match state.held.get(&handle.0) {
+                Some(Slot::Node(index)) => state.identity_fail.get(index).copied(),
+                _ => None,
+            }
+        };
+        match found {
+            Some(why) => Err(why),
+            None => self.facts(handle).map_err(Identity::Unread),
+        }
+    }
+
+    /// Whatever the node holds, except a secure field's: withheld at the source as
+    /// the platform reader withholds it, and never counted as read.
+    fn value(&self, handle: Handle) -> Option<String> {
+        let mut state = self.state();
+        state.messages += 1;
+        let Some(&Slot::Node(index)) = state.held.get(&handle.0) else {
+            return None;
+        };
+        if state.elements[index].secure() {
+            return None;
+        }
+        state.values_read.push(index);
+        Recorder::land(&mut state, index);
+        state.elements[index].value.clone().map(bounded_value)
     }
 
     fn settable(&self, handle: Handle) -> bool {
-        self.scripted(handle)
-            .map(|element| element.settable)
-            .unwrap_or(false)
-    }
-
-    fn bounds(&self, handle: Handle) -> Option<Frame> {
-        self.scripted(handle).map(|element| element.frame)
-    }
-
-    fn perform(&self, handle: Handle, action: &str) -> Result<(), Refusal> {
         let mut state = self.state();
+        state.messages += 1;
+        match state.held.get(&handle.0) {
+            Some(&Slot::Node(index)) => state.elements[index].settable,
+            _ => false,
+        }
+    }
+
+    fn child_count(&self, handle: Handle) -> Result<usize, Unread> {
+        let mut state = self.state();
+        state.messages += 1;
+        Recorder::count(&state, handle)
+    }
+
+    fn children_uncounted(
+        &self,
+        owner: &Rc<dyn Ax>,
+        handle: Handle,
+        limit: usize,
+    ) -> Result<Vec<Retained>, Unread> {
+        let mut state = self.state();
+        state.messages += 1;
+        state.copies += 1;
+        let failed = match state.held.get(&handle.0) {
+            None => Some(Unread::Gone),
+            Some(Slot::Node(index)) => state.copy_fail.get(index).copied(),
+            Some(Slot::Application) => None,
+        };
+        if let Some(why) = failed {
+            return Err(why);
+        }
+        let listed: Vec<usize> = Recorder::children_of(&state, handle)
+            .into_iter()
+            .take(limit)
+            .collect();
+        Ok(listed
+            .into_iter()
+            .map(|index| Recorder::retain(&mut state, Slot::Node(index), owner))
+            .collect())
+    }
+
+    fn children(
+        &self,
+        owner: &Rc<dyn Ax>,
+        handle: Handle,
+        start: usize,
+        count: usize,
+    ) -> Result<Vec<Retained>, Unread> {
+        let mut state = self.state();
+        state.messages += 1;
+        state.pages.push((start, count));
+        let failed = match state.held.get(&handle.0) {
+            None => Some(Unread::Gone),
+            Some(Slot::Node(index)) => state.page_fail.get(&(*index, start)).copied(),
+            Some(Slot::Application) => None,
+        };
+        if let Some(why) = failed {
+            return Err(why);
+        }
+        let page: Vec<usize> = Recorder::children_of(&state, handle)
+            .into_iter()
+            .skip(start)
+            .take(count)
+            .collect();
+        Ok(page
+            .into_iter()
+            .map(|index| Recorder::retain(&mut state, Slot::Node(index), owner))
+            .collect())
+    }
+
+    fn perform(&self, handle: Handle, action: &str, timeout_ms: u64) -> Result<(), Refusal> {
+        let mut state = self.state();
+        state.messages += 1;
         if let Some(refusal) = state.fail_next.take() {
             return Err(refusal);
         }
@@ -1859,33 +2883,49 @@ impl Ax for Recorder {
                 "the recorder no longer holds that reference",
             ));
         }
-        state.performed.push((handle, action.to_string()));
+        state
+            .performed
+            .push((handle, action.to_string(), timeout_ms));
         Recorder::acted(&mut state);
+        if let Some(index) = Recorder::node(&state, handle) {
+            Recorder::act(&mut state, index, action);
+        }
         Ok(())
     }
 
-    fn set_value(&self, handle: Handle, value: &str) -> Result<(), Refusal> {
+    fn set_value(&self, handle: Handle, value: &str, timeout_ms: u64) -> Result<(), Refusal> {
         let mut state = self.state();
+        state.messages += 1;
         if let Some(refusal) = state.fail_next.take() {
             return Err(refusal);
         }
-        let Some(&index) = state.held.get(&handle.0) else {
+        let Some(&Slot::Node(index)) = state.held.get(&handle.0) else {
             return Err(Refusal::new(
                 false,
                 "the recorder no longer holds that reference",
             ));
         };
 
-        state.performed.push((handle, format!("set:{value}")));
+        state
+            .performed
+            .push((handle, format!("set:{value}"), timeout_ms));
         Recorder::acted(&mut state);
         let written = state.writes.clone().unwrap_or_else(|| value.to_string());
         // A secure field reads back masked, whatever was written into it.
-        let secure = state.elements[index].secure();
-        state.elements[index].value = Some(if secure {
+        let shown = if state.elements[index].secure() {
             "••••".to_string()
         } else {
             written
-        });
+        };
+        if state.lag == 0 {
+            state.elements[index].value = Some(shown);
+        } else {
+            state.lagging = Some(Lagging {
+                index,
+                value: shown,
+                reads_left: state.lag,
+            });
+        }
         Ok(())
     }
 
@@ -1905,82 +2945,144 @@ impl Ax for Recorder {
     }
 
     fn frontmost_pid(&self) -> Option<i32> {
-        self.state().frontmost
-    }
-
-    /// A walk from a window this recorder holds answers the same scripted controls
-    /// an application walk does: a recording platform cannot model a real subtree,
-    /// and what the tests above it are about is WHERE the walk starts, which the
-    /// held-handle check proves.
-    fn walk_from(
-        &self,
-        owner: &Rc<dyn Ax>,
-        root: Handle,
-        clock: &dyn Clock,
-        deadline_ms: u64,
-    ) -> Walk {
-        if !self.state().held.contains_key(&root.0) {
-            return Walk::empty();
-        }
-        self.walk(owner, self.pid, clock, deadline_ms)
-    }
-
-    /// The scripted application's windows, retained like anything else — so a test
-    /// that binds a target proves the retain and the release too.
-    fn windows(&self, owner: &Rc<dyn Ax>, pid: i32) -> Vec<Retained> {
-        if pid != self.pid {
-            return Vec::new();
-        }
-
         let mut state = self.state();
-        let windows = state.windows.clone();
-        let mut out = Vec::new();
-        for index in windows {
-            state.next += 1;
-            let handle = Handle(state.next);
-            state.held.insert(handle.0, index);
-            state.retains += 1;
-            out.push(Retained::new(handle, owner.clone()));
+        state.messages += 1;
+        state.frontmost
+    }
+
+    fn active(&self) -> Active {
+        let mut state = self.state();
+        state.messages += 1;
+        match (state.active_many, state.frontmost) {
+            (Some(count), _) => Active::Many(count),
+            (None, Some(pid)) => Active::One(pid),
+            (None, None) => Active::None,
         }
-        out
+    }
+
+    fn messages(&self) -> u64 {
+        self.state().messages
+    }
+
+    fn routes(&self, handle: Handle) -> Routes {
+        let mut state = self.state();
+        state.messages += 1;
+        let Some(index) = Recorder::node(&state, handle) else {
+            return Routes::default();
+        };
+        for route in [Route::Focus, Route::Select, Route::Expand, Route::Text] {
+            state.routes_asked.push((index, route));
+        }
+        Routes {
+            value: state.elements[index].settable,
+            ..state.elements[index].routes
+        }
+    }
+
+    fn route(&self, handle: Handle, route: Route) -> Routes {
+        let mut state = self.state();
+        state.messages += 1;
+        let Some(index) = Recorder::node(&state, handle) else {
+            return Routes::default();
+        };
+        state.routes_asked.push((index, route));
+        let all = state.elements[index].routes;
+        let none = Routes::default();
+        match route {
+            Route::Focus => Routes {
+                focus: all.focus,
+                ..none
+            },
+            Route::Select => Routes {
+                select: all.select,
+                ..none
+            },
+            Route::Expand => Routes {
+                expand: all.expand,
+                ..none
+            },
+            Route::Text => Routes {
+                text: all.text,
+                ..none
+            },
+        }
+    }
+
+    fn states(&self, handle: Handle, on: bool) -> Result<States, Unread> {
+        let mut state = self.state();
+        state.messages += 1;
+        let index = Recorder::node(&state, handle).ok_or(Unread::Gone)?;
+        if let Some(why) = state.facts_fail.get(&index) {
+            return Err(*why);
+        }
+        let states = state.elements[index].states;
+        Ok(States {
+            on: states.on.filter(|_| on),
+            ..states
+        })
+    }
+
+    fn selects_children(&self, container: Handle) -> bool {
+        let mut state = self.state();
+        state.messages += 1;
+        Recorder::node(&state, container)
+            .is_some_and(|index| state.elements[index].selects_children)
+    }
+
+    fn parent(&self, owner: &Rc<dyn Ax>, handle: Handle) -> Option<Retained> {
+        let mut state = self.state();
+        state.messages += 1;
+        let index = Recorder::node(&state, handle)?;
+        let slot = match Recorder::parent_of(&state, index) {
+            Some(parent) => Slot::Node(parent),
+            None => Slot::Application,
+        };
+        Some(Recorder::retain(&mut state, slot, owner))
+    }
+
+    fn write(&self, handle: Handle, write: Write<'_>, timeout_ms: u64) -> Result<(), Refusal> {
+        let mut state = self.state();
+        state.messages += 1;
+        if let Some(refusal) = state.fail_next.take() {
+            return Err(refusal);
+        }
+        let Some(index) = Recorder::node(&state, handle) else {
+            return Err(Refusal::new(
+                false,
+                "the recorder no longer holds that reference",
+            ));
+        };
+        state
+            .performed
+            .push((handle, format!("write:{write:?}"), timeout_ms));
+        Recorder::acted(&mut state);
+        Recorder::apply(&mut state, index, write);
+        Ok(())
+    }
+
+    fn in_focused_window(&self, handle: Handle) -> Option<bool> {
+        let mut state = self.state();
+        state.messages += 1;
+        Recorder::node(&state, handle).and_then(|index| state.elements[index].in_focused_window)
+    }
+
+    fn focused(&self, owner: &Rc<dyn Ax>, pid: i32, what: Focus) -> Option<Retained> {
+        if pid != self.pid {
+            return None;
+        }
+        let mut state = self.state();
+        state.messages += 1;
+        let index = match what {
+            Focus::Window => state.focused_window,
+            Focus::Element => state.focused_element,
+        }?;
+        Some(Recorder::retain(&mut state, Slot::Node(index), owner))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gate::SystemClock;
-    use std::sync::Mutex;
-
-    /// A clock a test moves by hand, so a wall-clock budget is asserted rather
-    /// than waited for.
-    struct TestClock {
-        ms: Mutex<u64>,
-    }
-
-    impl TestClock {
-        fn new() -> TestClock {
-            TestClock { ms: Mutex::new(0) }
-        }
-    }
-
-    impl Clock for TestClock {
-        fn now_ms(&self) -> u64 {
-            *self.ms.lock().unwrap()
-        }
-
-        fn now_ns(&self) -> u128 {
-            self.now_ms() as u128 * 1_000_000
-        }
-
-        fn now_mach(&self) -> u64 {
-            self.now_ms() * 1_000_000
-        }
-
-        fn sleep(&self, ms: u64) {
-            *self.ms.lock().unwrap() += ms;
-        }
-    }
 
     fn frame(x: f64, y: f64) -> Frame {
         Frame {
@@ -1997,118 +3099,174 @@ mod tests {
         (recorder, ax)
     }
 
-    // The invariant the whole design exists for: a walk retains, and every node it
-    // produced releases when it is dropped — the filtered-out ones, the ones past a
-    // cap, a whole poll nobody kept.
-    #[test]
-    fn every_reference_a_walk_retains_is_released_when_its_nodes_are_dropped() {
-        let (recorder, ax) = platform(vec![
-            Scripted::button("Save", frame(10.0, 10.0)),
-            Scripted::button("Cancel", frame(100.0, 10.0)),
-            Scripted::field("Name", "ada", frame(10.0, 50.0)),
-        ]);
-        let clock = SystemClock::new();
-
-        let found = walk(&ax, 4711, &clock, u64::MAX);
-        assert_eq!(found.nodes.len(), 3);
-        assert_eq!(recorder.counts(), (3, 0, 3));
-
-        drop(found);
-        assert_eq!(
-            recorder.counts(),
-            (3, 3, 0),
-            "a walk nobody kept holds nothing"
-        );
-    }
-
-    // Half of a walk kept and half dropped is the ordinary case — the view filter
-    // and the badge cap both do it — and the two halves must account separately.
-    #[test]
-    fn keeping_some_nodes_releases_only_the_others() {
-        let (recorder, ax) = platform(vec![
-            Scripted::button("One", frame(0.0, 0.0)),
-            Scripted::button("Two", frame(0.0, 40.0)),
-            Scripted::button("Three", frame(0.0, 80.0)),
-        ]);
-        let clock = SystemClock::new();
-
-        let mut found = walk(&ax, 4711, &clock, u64::MAX);
-        let kept = found.nodes.remove(0);
-        drop(found);
-
-        assert_eq!(recorder.counts(), (3, 2, 1), "one reference is still held");
-        drop(kept);
-        assert_eq!(recorder.counts(), (3, 3, 0));
-    }
-
-    // The bound the caps could not give: an application slow enough that the walk
-    // runs out of wall clock rather than out of nodes. It stops and SAYS it
-    // stopped, because a partial tree passed off as the whole one is how a caller
-    // concludes a control is not there.
-    #[test]
-    fn a_walk_stops_on_its_wall_clock_budget_and_names_the_reason() {
-        let (recorder, ax) = platform(vec![
-            Scripted::button("One", frame(0.0, 0.0)),
-            Scripted::button("Two", frame(0.0, 40.0)),
-            Scripted::button("Three", frame(0.0, 80.0)),
-        ]);
-        recorder.costs_per_node(700);
-        let clock = TestClock::new();
-
-        let found = walk(&ax, 4711, &clock, WALK_BUDGET_MS);
-
-        assert_eq!(found.truncated, Some("time"));
-        assert_eq!(
-            found.nodes.len(),
-            2,
-            "it stopped part way, not at the start"
-        );
-
-        drop(found);
-        assert_eq!(
-            recorder.counts().2,
-            0,
-            "a truncated walk still releases everything it retained"
-        );
-    }
-
-    #[test]
-    fn a_walk_of_another_application_finds_nothing() {
-        let (recorder, ax) = platform(vec![Scripted::button("Save", frame(0.0, 0.0))]);
-        let clock = SystemClock::new();
-
-        assert!(walk(&ax, 9999, &clock, u64::MAX).nodes.is_empty());
-        assert_eq!(recorder.counts(), (0, 0, 0));
-    }
-
     // The privacy blocker, stated as the thing that was wrong: a password field
     // has the ORDINARY text-field role and is told apart by its SUBROLE, so a
-    // check against the role is never true and every one of those values went out
-    // on the wire. Here the walk must withhold it while listing the control.
+    // check against the role alone is never true and every one of those values
+    // went out on the wire. A role with that spelling counts as well.
     #[test]
-    fn a_password_field_is_told_apart_by_its_subrole_and_never_carries_its_value() {
-        let (_recorder, ax) = platform(vec![
-            Scripted::field("Name", "ada", frame(0.0, 0.0)),
-            Scripted::secure_field("Password", "hunter2", frame(0.0, 40.0)),
+    fn a_secure_field_is_told_apart_by_its_subrole_or_its_role() {
+        assert!(secure(Some("AXTextField"), Some(SECURE_TEXT_FIELD)));
+        assert!(secure(Some(SECURE_TEXT_FIELD), None));
+        assert!(!secure(Some("AXTextField"), None));
+        assert!(!secure(None, None));
+    }
+
+    // The value is withheld at the source: a caller that asks a secure field gets
+    // nothing, whatever it decided from an older read, and nothing is counted as
+    // read.
+    #[test]
+    fn a_secure_field_answers_no_value_through_the_seam() {
+        let (recorder, ax) = platform(vec![
+            Scripted::secure_field("Password", "hunter2", frame(0.0, 0.0)),
+            Scripted::field("Name", "ada", frame(0.0, 40.0)),
         ]);
-        let clock = SystemClock::new();
+        let root = ax.application(&ax, 4711).expect("the application");
+        let page = ax.children(&ax, root.handle(), 0, 2).expect("two fields");
 
-        let found = walk(&ax, 4711, &clock, u64::MAX);
-        let (plain, secret) = (&found.nodes[0], &found.nodes[1]);
+        assert_eq!(ax.value(page[0].handle()), None);
+        assert_eq!(ax.value(page[1].handle()), Some("ada".to_string()));
+        assert_eq!(recorder.values_read(), vec![1]);
+    }
 
+    // A read that answered nothing is one of three facts, told apart by its code:
+    // a timeout is a slow application whose subtree is still there, an invalid
+    // element is gone, and anything else is a refusal of that one question.
+    #[test]
+    fn a_read_error_is_told_apart_by_its_code() {
+        assert_eq!(unread(-25204), Unread::NoAnswer);
+        assert_eq!(unread(-25202), Unread::Gone);
+        assert_eq!(unread(-25200), Unread::Refused);
+        assert_eq!(unread(-25211), Unread::Refused, "the API disabled");
+        assert_eq!(unread(ATTRIBUTE_UNSUPPORTED), Unread::Refused);
+    }
+
+    // An element with no children attribute, or one that holds nothing, has no
+    // children: an answer, not a refusal to count — copying the list again would
+    // be refused the same way.
+    #[test]
+    fn a_child_count_with_no_children_attribute_has_none() {
+        assert_eq!(child_count_answer(0, 7), Ok(7));
+        assert_eq!(child_count_answer(ATTRIBUTE_UNSUPPORTED, 0), Ok(0));
+        assert_eq!(child_count_answer(NO_VALUE, 0), Ok(0));
+        assert_eq!(child_count_answer(-25204, 0), Err(Unread::NoAnswer));
+        assert_eq!(child_count_answer(-25202, 0), Err(Unread::Gone));
+        assert_eq!(child_count_answer(-25200, 0), Err(Unread::Refused));
+        assert_eq!(child_count_answer(NOT_IMPLEMENTED, 0), Err(Unread::Refused));
+    }
+
+    // One naming rule for every reader of a control: title, else description,
+    // flattened and bounded, and an empty name is no name.
+    #[test]
+    fn a_label_is_the_title_else_the_description_on_one_bounded_line() {
         assert_eq!(
-            secret.role, "AXTextField",
-            "the same role as the plain field"
+            label(Some("Save".to_string()), Some("Saves".to_string())).as_deref(),
+            Some("Save")
         );
-        assert!(secret.secure, "and told apart by its subrole");
-        assert_eq!(secret.value, None, "its value never leaves the platform");
+        assert_eq!(
+            label(None, Some("Close\nwindow".to_string())).as_deref(),
+            Some("Close window")
+        );
+        assert_eq!(label(Some("  \n ".to_string()), None), None);
+        assert_eq!(label(None, None), None);
+        assert_eq!(
+            label(Some("x".repeat(200)), None).map(|text| text.chars().count()),
+            Some(80)
+        );
+    }
 
-        assert!(!plain.secure);
-        assert_eq!(plain.value.as_deref(), Some("ada"));
+    // M2: a write gets half of what is left of its budget, never less than a read
+    // gets — so a slow revalidation cannot leave the write no time at all.
+    #[test]
+    fn a_write_timeout_is_half_the_remaining_budget_and_never_less_than_a_read() {
+        assert_eq!(write_timeout_ms(WRITE_BUDGET_MS), 1_000);
+        assert_eq!(write_timeout_ms(1_200), 600);
+        assert_eq!(write_timeout_ms(400), READ_TIMEOUT_MS);
+        assert_eq!(write_timeout_ms(0), READ_TIMEOUT_MS);
+    }
 
-        // Nor can it be read back afterwards, by any route above this seam.
-        assert_eq!(ax.value(secret.element.handle()), None);
-        assert_eq!(ax.value(plain.element.handle()).as_deref(), Some("ada"));
+    // M5: Chrome applies AXEnhancedUserInterface and still answers
+    // kAXErrorNotImplemented, so the setter's code alone took a switch that worked
+    // for one that failed — and it was never recorded, so never restored.
+    #[test]
+    fn an_activation_is_decided_by_reading_the_attribute_back() {
+        assert_eq!(switched(NOT_IMPLEMENTED, Some(true)), Switched::On);
+        assert_eq!(switched(0, Some(true)), Switched::On);
+        // An applied Electron write can read back false.
+        assert_eq!(switched(0, Some(false)), Switched::On);
+        assert_eq!(switched(0, None), Switched::On);
+
+        assert_eq!(switched(NOT_IMPLEMENTED, Some(false)), Switched::Rejected);
+        assert_eq!(switched(ATTRIBUTE_UNSUPPORTED, None), Switched::Rejected);
+        assert_eq!(switched(-25204, None), Switched::Failed(-25204));
+
+        // The whole sequence, against a scripted switch. Chrome under VoiceOver
+        // already has it on: it is read, left alone, and never written — so it is
+        // never recorded, and the exit teardown never turns it off under VoiceOver.
+        assert_eq!(
+            activation(Some(true), true, NOT_IMPLEMENTED, Some(true)),
+            (Switched::AlreadyOn, vec!["read"])
+        );
+        // Off, or never set: checked, written, and read back.
+        let written = vec!["read", "settable", "write", "read"];
+        assert_eq!(
+            activation(Some(false), true, NOT_IMPLEMENTED, Some(true)),
+            (Switched::On, written.clone())
+        );
+        assert_eq!(
+            activation(None, true, 0, None),
+            (Switched::On, written.clone())
+        );
+        assert_eq!(
+            activation(None, true, NOT_IMPLEMENTED, Some(false)),
+            (Switched::Rejected, written)
+        );
+        // Not writable here: the next attribute is tried, and nothing is written.
+        assert_eq!(
+            activation(None, false, 0, Some(true)),
+            (Switched::Rejected, vec!["read", "settable"])
+        );
+    }
+
+    /// One activation against a scripted switch: what it reads before and after
+    /// the write, whether it may be written, and what the setter answers. Returns
+    /// the decision and every call made, in order.
+    fn activation(
+        before: Option<bool>,
+        writable: bool,
+        code: i32,
+        after: Option<bool>,
+    ) -> (Switched, Vec<&'static str>) {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let decided = switch_on(
+            || {
+                let written = calls.borrow().contains(&"write");
+                calls.borrow_mut().push("read");
+                if written {
+                    after
+                } else {
+                    before
+                }
+            },
+            || {
+                calls.borrow_mut().push("settable");
+                writable
+            },
+            || {
+                calls.borrow_mut().push("write");
+                code
+            },
+        );
+        (decided, calls.into_inner())
+    }
+
+    // The two typed rejections fall through to the second attribute; every other
+    // AXError is terminal.
+    #[test]
+    fn attribute_rejection_codes() {
+        assert!(attribute_rejected(-25205));
+        assert!(attribute_rejected(-25208));
+        assert!(!attribute_rejected(-25204));
+        assert!(!attribute_rejected(0));
     }
 
     // The text belongs to the application, and a consumer renders it into a list
@@ -2141,22 +3299,6 @@ mod tests {
         assert!(wide.ends_with('…'));
     }
 
-    // A walk sanitises at the source, so nothing above it has to remember to.
-    #[test]
-    fn a_walk_flattens_every_piece_of_text_it_collects() {
-        let mut scripted = Scripted::field("Name", "first\nsecond", frame(0.0, 0.0));
-        scripted.label = Some("Full\nname".to_string());
-        scripted.path = vec!["Doc\nument".to_string()];
-
-        let (_recorder, ax) = platform(vec![scripted]);
-        let found = walk(&ax, 4711, &SystemClock::new(), u64::MAX);
-        let node = &found.nodes[0];
-
-        assert_eq!(node.label.as_deref(), Some("Full name"));
-        assert_eq!(node.value.as_deref(), Some("first second"));
-        assert_eq!(node.path, vec!["Doc ument".to_string()]);
-    }
-
     // A value is a hint about the control's state, not a way to read a document,
     // and a cut value must not read as a whole one.
     #[test]
@@ -2187,20 +3329,26 @@ mod tests {
             Scripted::button("Save", frame(0.0, 0.0)),
             Scripted::field("Name", "ada", frame(0.0, 40.0)),
         ]);
-        let clock = SystemClock::new();
 
-        let found = walk(&ax, 4711, &clock, u64::MAX);
-        let entries: Vec<Entry> = found
-            .nodes
+        let root = ax.application(&ax, 4711).expect("the scripted application");
+        let entries: Vec<Entry> = ax
+            .children(&ax, root.handle(), 0, 2)
+            .expect("one page of the scripted application")
             .into_iter()
             .enumerate()
-            .map(|(index, node)| Entry {
+            .map(|(index, element)| Entry {
                 reference: reference_for(index),
-                role: node.role,
-                secure: node.secure,
-                element: node.element,
+                role: ax
+                    .facts(element.handle())
+                    .ok()
+                    .and_then(|facts| facts.role)
+                    .expect("a scripted role"),
+                secure: false,
+                under: None,
+                element,
             })
             .collect();
+        drop(root);
 
         let elements = Elements::new(4711, recorder.started_at(), entries);
         assert_eq!(elements.len(), 2);
@@ -2209,9 +3357,9 @@ mod tests {
             Some("AXTextField")
         );
         assert!(elements.get("e9").is_none(), "a reference nobody minted");
-        assert_eq!(recorder.counts(), (2, 0, 2));
+        assert_eq!(recorder.counts(), (3, 1, 2));
 
         drop(elements);
-        assert_eq!(recorder.counts(), (2, 2, 0));
+        assert_eq!(recorder.counts(), (3, 3, 0));
     }
 }
