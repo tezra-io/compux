@@ -386,6 +386,8 @@ mod tests {
         assert!(inked(&canvas, inside, BUTTON) > 20, "Stop is written on it");
     }
 
+    // Its value is that hostile text does not panic the painter: the canvas
+    // comes back at its own size, and nothing here looks at what was drawn.
     #[test]
     fn hostile_text_is_drawn_inside_the_canvas_whatever_it_holds() {
         let (_, canvas) = painted(Activity::Working, "ÅÉÎ̈g̃ 漢字 \u{10FFFD} ﷽ ꧅ 𒐫𒐫𒐫");

@@ -195,9 +195,9 @@ defmodule Compux.Binary do
   end
 
   # Linux ships a tarball of bare binaries — no signature to preserve, so `:erl_tar`
-  # is fine. Both are found before either is written, and the helper is written
-  # last: the cache is judged by the helper alone, so it must never stand without
-  # its badge beside it.
+  # is fine. Both are found before either is written, and the helper is renamed
+  # into place last: the cache is judged by the helper alone, so it must never
+  # stand without its badge beside it.
   defp extract(_target, archive, dest_dir) do
     with {:ok, entries} <- untar(archive),
          {:ok, badge} <- archive_entry(entries, @indicator),
@@ -222,11 +222,22 @@ defmodule Compux.Binary do
     end
   end
 
+  # Written under another name beside its own, then renamed into place: a resolve
+  # never sees half a binary, and the helper's arrival, the last write, is one
+  # step. A failed write leaves no partial file behind.
   defp write_executable(dest_dir, name, binary) do
     exec = Path.join(dest_dir, name)
-    File.write!(exec, binary)
-    File.chmod!(exec, 0o755)
-    :ok
+    partial = Path.join(dest_dir, ".#{name}.partial")
+
+    try do
+      File.write!(partial, binary)
+      File.chmod!(partial, 0o755)
+      File.rename!(partial, exec)
+    rescue
+      error ->
+        File.rm(partial)
+        reraise error, __STACKTRACE__
+    end
   end
 
   defp ditto_extract(zip, dest_dir) do

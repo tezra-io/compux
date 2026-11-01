@@ -132,6 +132,39 @@ defmodule Compux.BinaryTest do
       end
     end
 
+    # Each binary is written under another name beside its own and renamed into
+    # place, so a resolve never sees half of one, and the helper's arrival, which
+    # is what the cache is judged by, is one step. A stale badge left from an
+    # earlier extraction is replaced, never written through, and nothing is left
+    # behind but the two binaries.
+    test "a Linux binary is renamed into place, never written where it will run", %{tmp: tmp} do
+      case Binary.target() do
+        {:ok, "linux-" <> _ = target} ->
+          {artifact, sha} = fake_artifact()
+          dir = Path.join([tmp, to_string(Application.spec(:compux, :vsn)), target])
+          File.mkdir_p!(dir)
+          stale = Path.join(dir, "compux-indicator-x11")
+          File.write!(stale, "stale-badge")
+          %File.Stat{inode: stale_inode} = File.stat!(stale)
+
+          assert {:ok, cached} =
+                   Binary.path(
+                     cache_dir: tmp,
+                     checksums: %{target => sha},
+                     fetcher: fn _url -> {:ok, artifact} end
+                   )
+
+          assert File.read!(stale) == "badge-binary-bytes"
+          assert %File.Stat{inode: new_inode} = File.stat!(stale)
+          assert new_inode != stale_inode, "the badge was written through, not renamed into place"
+          assert File.ls!(dir) |> Enum.sort() == ["compux", "compux-indicator-x11"]
+          assert executable?(cached)
+
+        _macos ->
+          :ok
+      end
+    end
+
     test "fails loud when no checksum is pinned for the target", %{tmp: tmp} do
       assert {:error, {:no_checksum_for_target, _target}} =
                Binary.path(cache_dir: tmp, checksums: %{}, fetcher: fn _url -> {:ok, ""} end)
