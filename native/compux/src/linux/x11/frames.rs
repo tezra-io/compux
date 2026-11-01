@@ -291,12 +291,16 @@ pub fn inside(crop: Rect, width: u16, height: u16) -> bool {
 
 /// Where `crop`, in the window's own pixels, lies in the window's Composite
 /// pixmap. The pixmap holds the window's X border as well, so the window's own
-/// first pixel is `border` pixels in from the pixmap's corner. `None` past
+/// first pixel is `border` pixels in from the pixmap's corner. Refused past
 /// any coordinate a pixmap can have.
-pub fn in_pixmap(crop: Rect, border: u16) -> Option<Rect> {
-    Some(Rect {
-        x: crop.x.checked_add(i32::from(border))?,
-        y: crop.y.checked_add(i32::from(border))?,
+pub fn in_pixmap(crop: Rect, border: u16) -> Result<Rect, FrameError> {
+    let moved = |at: i32| {
+        at.checked_add(i32::from(border))
+            .ok_or_else(|| off_the_pixmap(crop, border))
+    };
+    Ok(Rect {
+        x: moved(crop.x)?,
+        y: moved(crop.y)?,
         ..crop
     })
 }
@@ -934,7 +938,7 @@ impl Watch {
             .map_err(lost)?;
         self.damaged = false;
         let (crop, border) = self.places()?;
-        let mut pixels = self.grab(in_pixmap(crop, border).ok_or_else(|| too_wide(crop))?)?;
+        let mut pixels = self.grab(in_pixmap(crop, border)?)?;
         // The frame extents can move the picture within the window without a new
         // pixmap; whatever of it the proof did not reach is not sent.
         black_out(&mut pixels, crop, self.proven);
@@ -1288,6 +1292,14 @@ fn drowned() -> FrameError {
     ))
 }
 
+fn off_the_pixmap(crop: Rect, border: u16) -> FrameError {
+    FrameError::Unavailable(format!(
+        "the window's picture at ({}, {}) inside a {border}-pixel border is past any pixmap \
+         coordinate",
+        crop.x, crop.y
+    ))
+}
+
 fn too_wide(crop: Rect) -> FrameError {
     FrameError::Unavailable(format!(
         "the window is {}x{} at ({}, {}), past what one X request can read",
@@ -1386,9 +1398,15 @@ mod tests {
     #[test]
     fn a_picture_is_read_from_inside_the_windows_border() {
         let crop = rect(6, 30, 800, 600);
-        assert_eq!(in_pixmap(crop, 0), Some(crop));
-        assert_eq!(in_pixmap(crop, 8), Some(rect(14, 38, 800, 600)));
-        assert_eq!(in_pixmap(rect(i32::MAX, 0, 1, 1), 1), None);
+        assert_eq!(in_pixmap(crop, 0).ok(), Some(crop));
+        assert_eq!(in_pixmap(crop, 8).ok(), Some(rect(14, 38, 800, 600)));
+        // An offset no pixmap coordinate can hold says so, in its own words.
+        let refused = in_pixmap(rect(i32::MAX, 0, 1, 1), 1).expect_err("past any coordinate");
+        assert!(
+            refused.detail().contains("past any pixmap coordinate"),
+            "{}",
+            refused.detail()
+        );
     }
 
     fn frame() -> WindowFrame {
