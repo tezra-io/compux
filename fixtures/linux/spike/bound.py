@@ -92,6 +92,10 @@ POPUP_MARGIN = 20
 # badge, stacked over it, and is moved onto it.
 UNDER, UNDER_COLOUR = "Compux Under", 0x6080A0
 MOVER, MOVER_COLOUR, MOVER_FROM, MOVER_TO = "Compux Mover", 0xA06040, (300, 600), (250, 0)
+# Also at the top, for a window that holds the badge under and never unmaps.
+STAGED, STAGED_COLOUR = "Compux Staged", 0x8080C0
+# How long the badge may take to look again once such a window's input leaves it.
+HELD_LOOK_WAIT_S = 2.0
 # A window resized again and again while it is captured, the way a drag at its
 # corner resizes it: sizes grow and shrink by these steps.
 RESIZED, RESIZED_COLOUR, RESIZED_AT = "Compux Resized", 0x50A050, (200, 200)
@@ -845,6 +849,7 @@ def bare_steps(binary, out):
                     badge_restack_check(helper, display, oracle),
                     badge_held_check(helper, display, oracle),
                     badge_sibling_check(helper, display, oracle),
+                    badge_stage_check(helper, display, oracle),
                     resize_while_captured_check(helper, display)]
     finally:
         if helper is not None:
@@ -1020,6 +1025,62 @@ def badge_sibling_check(helper, display, oracle):
         popup.destroy()
         mover.destroy()
         under.destroy()
+
+
+def badge_stage_check(helper, display, oracle):
+    """A desktop shell's stage, as the server knows one: an override-redirect
+    window over the badge that takes input there while a panel of its is open, and
+    is never unmapped. The bound window raised over the badge leaves the badge
+    under both. Once the window's input region leaves the badge (the panel closed),
+    the badge is back over the bound window within the badge's own looking again,
+    though nothing was unmapped. Judged by the server's stacking order."""
+    flow = "the badge is back on top once a window over it that never unmaps no longer takes input there"
+    staged = Victim(STAGED, STAGED_COLOUR, place=HELD_AT, display=display)
+    staged.create()
+    staged.listed_on_root()
+    stage = None
+    try:
+        window = wait_listed(helper, STAGED)
+        _, bound = helper.ask("select_target", window_id=window["id"]) if window else (None, {})
+        shown = wait_for(lambda: len(badges(display=display)) == 1)
+        if not bound.get("ok") or not shown:
+            return {"flow": flow, "passed": False,
+                    "why": f"select {bound.get('error') or 'ok'} {bound.get('detail')}; badge {shown}"}
+        badge = int(badges(display=display)[0])
+        x, y, _, _ = geometry(badge, display)
+        stage = Victim(POPUP, POPUP_COLOUR, place=(x - POPUP_MARGIN, y - POPUP_MARGIN),
+                       display=display, override=True)
+        stage.create()
+        time.sleep(QUIET_S)
+        staged.raise_to_top()
+        time.sleep(QUIET_S)
+        held = oracle.stacking()
+        # The panel closes: the stage takes input only in a corner clear of the badge.
+        oracle.shape_input(stage.id, [(0, 0, 1, 1)])
+        back = wait_for_s(lambda: oracle.stacking().index(badge) > oracle.stacking().index(staged.id),
+                          HELD_LOOK_WAIT_S)
+        after = oracle.stacking()
+        helper.ask("release_target")
+        under = held.index(badge) < held.index(staged.id) and held.index(badge) < held.index(stage.id)
+        mapped = stage.id in after
+        return {"flow": flow, "passed": under and back and mapped,
+                "why": f"badge {badge:#x} under the window and the stage while the stage takes input "
+                       f"over it {under} ({[hex(w) for w in held]}); once its input left, over the "
+                       f"window within {HELD_LOOK_WAIT_S} s {back}, the stage still mapped {mapped} "
+                       f"({[hex(w) for w in after]})"}
+    finally:
+        if stage is not None:
+            stage.destroy()
+        staged.destroy()
+
+
+def wait_for_s(predicate, wait_s):
+    """Whether `predicate` holds within `wait_s`, looked at every WAIT_STEP_S."""
+    for _ in range(max(1, round(wait_s / WAIT_STEP_S))):
+        if predicate():
+            return True
+        time.sleep(WAIT_STEP_S)
+    return predicate()
 
 
 def resize_while_captured_check(helper, display):
