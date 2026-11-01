@@ -2413,11 +2413,10 @@ it (read only: it reads two names from the user manager, sets nothing):
 env -u DISPLAY -u WAYLAND_DISPLAY -u XAUTHORITY python3 /tmp/cx.py "$CX" '{"action":"probe"}' </dev/null
 ```
 
-Its stderr says `took ["DISPLAY"] from the user manager, for controls` (the
+Its stderr says `took ["DISPLAY", "XAUTHORITY"] from the user manager` (the
 names only, never a value). The probe says `x11` again, `"display_adopted":
-true`, and capture and input `false`: such a helper works by control only. Its
-`hello` lists no pixel verb and `input_methods` is `["ax"]`; a `screenshot` is
-refused `pixels_unavailable`; `elements` lists the controls without positions.
+true`, and since M86 L2 capture and input `true`: the helper reaches the adopted
+display with its authority as its own (the M86 L2 section checks its pixels).
 `systemctl --user show-environment | grep -c DISPLAY` should be at least 1 for
 this to hold; if it is 0, GNOME did not import the display into the user
 manager, and the probe answers `none`: write that down.
@@ -2566,3 +2565,215 @@ arrives; a stopwatch is enough):
   `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`, a GTK 4 one started before the bus) leaves
   no window reading ACTIVE there: `elements` says so and names the switches, but
   cannot name the application until the window list arrives (L3).
+
+# Live check — Linux pixels on x11rb and the GNOME portal (M86 L2)
+
+**What this is for.** The Linux build no longer captures, clicks, types or pastes
+through xcap, enigo and arboard. On X11 it speaks to the X server itself (x11rb):
+XTEST with the server's own keymap, the core `GetImage` in strips, RandR, EWMH, and
+a `CLIPBOARD` it owns. On GNOME Wayland it goes through the XDG desktop portal under
+the app id `io.tezra.fermix.ComputerUse`. In private containers (Xvfb, openbox, the
+GTK 3 fixture; `fixtures/linux/spike/spike.sh`, stage `pixels`) a click, typing, a
+paste, a refused character and a frame against a known pattern all pass, and a
+button a killed helper held is released by the next one. The portal route is
+tested against a fake portal only: nothing here has met a real GNOME Shell.
+
+Expected outcome in one line: on your X11 desktop compux's frame is GNOME's picture,
+and its clicks, keys and paste land where they are aimed; on the Wayland VM one
+dialog grants the session, and a restarted helper is not asked again.
+
+> **Steps A3, A4, B3, B4, B5 and B6 POST REAL INPUT**: clicks, typed text and a paste,
+> into the GTK 3 fixture (A) or Text Editor (B). The other steps read only. Nothing
+> here may be run by an agent. Run it yourself, at the machine, with nothing
+> confidential on screen.
+
+## A. Your X11 desktop (Pop!_OS 22.04, GNOME 42)
+
+### A0. Preconditions
+
+* The build, from the branch with L2 on it, and `cx.py` from the slice-2 section
+  with `"protocol_version": 12` in its `hello`:
+
+  ```sh
+  cd ~/src/compux && git switch feat/m86
+  (cd native/compux && cargo build --release)
+  CX=$PWD/native/compux/target/release/compux
+  ```
+
+* The GTK 3 fixture in its own terminal: `python3 fixtures/linux/fixture_gtk3.py
+  --state-file /tmp/gtk3.json`. To read what it recorded: `python3 -m json.tool
+  /tmp/gtk3.json | tail -20`.
+
+### A1. Is the frame honest? (Q2, read only, fails fastest)
+
+The L0 question, now on the code that ships. Put something GPU-drawn in view (a
+playing video in Firefox, or `glxgears`), then:
+
+```sh
+python3 fixtures/linux/spike/owner/owner_capture.py --binary "$CX" --out ~/l2-q2
+gnome-screenshot -f ~/l2-q2/gnome.png          # straight after, same scene
+```
+
+* `~/l2-q2/compux.png` and `~/l2-q2/gnome.png` show the same scene: the video or GL
+  window and the top bar drawn in both, not black or stale in compux's. If they are
+  not, stop here: the X11 frame needs Composite capture (L3), and nothing below
+  changes that.
+* `~/l2-q2/compux.json`'s `physical` size is your monitor's size in pixels, as
+  `xrandr | grep '*'` prints it: compux now works in root pixels at a scale of 1,
+  whatever GNOME's text scaling says.
+
+### A2. The handshake and the probe (read only)
+
+```sh
+python3 /tmp/cx.py "$CX" '{"action":"probe"}' </dev/null
+```
+
+* `hello` lists `screenshot`, the clicks, `mouse_move`, `left_click_drag`, `scroll`,
+  `key`, `wait_for_change`, `paste` and `windows`, and `input_methods` is
+  `["foreground_hid","ax"]`.
+* The probe says `"x11_pixels": {"xtest": true, "keymap": true}` and `"portal":
+  {"version": "1.14.4-…", "registry": false, "screenshot_permission": …}`: 22.04's
+  portal has no Registry. Write down the stored answer it shows.
+
+Then the helper with no display of its own (read only):
+
+```sh
+env -u DISPLAY -u WAYLAND_DISPLAY -u XAUTHORITY python3 /tmp/cx.py "$CX" \
+  '{"action":"probe"}' '{"action":"screenshot"}' </dev/null
+```
+
+Its stderr names what it took from the user manager (expect `DISPLAY` and
+`XAUTHORITY`); the probe says `"display_adopted": true` and capture and input
+`true`; the screenshot answers `ok` with the same size as A1's. If it is refused,
+write down the refusal and whether `systemctl --user show-environment | grep -c
+XAUTHORITY` is 0.
+
+### A3. Clicks, keys and a paste into the GTK 3 fixture (POSTS INPUT)
+
+Copy some text of your own first (select a word anywhere, Ctrl+C): the paste puts it
+back afterwards. With **Compux Fixture GTK3** in front, one `cx.py` session
+(`python3 /tmp/cx.py "$CX"`, then one line at a time):
+
+* **`{"action":"left_click","element_ref":"<GTK3 button>"}`** (take the reference
+  from a `{"action":"elements","scope":"window"}` line): the pointer moves to the
+  button and clicks it; the fixture records `gtk3.button press`, and the receipt's
+  `input_method` is `foreground_hid`.
+* **`left_click` on `GTK3 text field`, then `{"action":"type","text":"hello"}`**:
+  the field shows `hello`; the fixture records `set_value hello`.
+* `{"action":"type","text":"é"}` (with your layout's `é` not on a key; a US layout
+  has none): `text_outside_layout`, the detail names `é` and `paste`, and nothing is
+  typed.
+* Turn **Caps Lock on**, then `{"action":"type","text":"abc"}`:
+  `keyboard_not_neutral`, the detail says Caps Lock, nothing typed. Turn it off.
+* **`{"action":"paste","text":" and ✓ pasted"}`**: the field shows `hello and ✓
+  pasted`.
+* End the session (Ctrl-D). In any text field, press Ctrl+V: your own text from
+  before the step comes back. compux kept it on the clipboard until it exited; write
+  down if it came back empty (no clipboard manager took it over at exit).
+
+### A4. The pointer by point, and a drag (POSTS INPUT)
+
+* **`{"action":"left_click","x":X,"y":Y}`** at the GTK3 button's centre read off the
+  `image` line's picture (the script prints the screenshot it aimed through): the
+  fixture records the press. This is the root-pixel scale on your display.
+* **`{"action":"left_click_drag","from":{"x":A,"y":B},"to":{"x":C,"y":D}}`** on the
+  GTK3 slider's knob to its far end: the slider moves; then `ls
+  "$XDG_RUNTIME_DIR/compux-held"` lists nothing (the journal is gone once the button
+  is up). A helper killed mid-drag was released by the next start in the
+  containers; it is not repeated here.
+
+### A5. What A cannot prove
+
+* XTEST and `GetImage` under GNOME Shell's compositor at a scale other than 1, and
+  a keyboard with a second layout group: write down your scale and layouts.
+* `no_active_window` needs a desktop where no window reads ACTIVE; on GNOME one
+  always does.
+
+## B. The GNOME Wayland VM (Ubuntu 24.04, logged in for real)
+
+### B1. The portal itself (L0(d), fails fastest)
+
+Run L0(d)'s steps from the M86 L0 findings (§7) first, in this order: `apt policy
+xdg-desktop-portal` is 1.18 or later; the desktop file for the app id; the
+`owner_portal_probe.py` screenshot twice (a dialog the first time, none the
+second); `remote --type-after 5 --hold 15`, then `remote --token …` in a new process
+(no dialog means a restore token survives a restart). The desktop file, which
+compux needs too, is `~/.local/share/applications/io.tezra.fermix.ComputerUse.desktop`:
+
+```
+[Desktop Entry]
+Type=Application
+Name=Fermix Computer Use
+Exec=/bin/false
+NoDisplay=true
+```
+
+If no dialog ever names the app, or the token does not survive, stop: compux's
+portal route rests on both.
+
+### B2. The handshake and the probe (read only)
+
+Build and copy `cx.py` into the VM as in A0, then
+`python3 /tmp/cx.py "$CX" '{"action":"probe"}' </dev/null`:
+
+* `hello` lists `screenshot`, the clicks, `scroll`, `key` and `type`, and **no**
+  `paste` and **no** `windows`; `input_methods` is `["foreground_hid","ax"]`.
+* The probe says `"display_server": "wayland"`, `"portal": {"version": "1.18.…",
+  "registry": true, "screenshot_permission": "unset"}` (or `"yes"` after B1), and
+  no dialog appears. `rm -f ~/.local/state/compux/portal.json` before B3, so B3
+  starts with no restore token.
+
+### B3. The first session (POSTS INPUT)
+
+Open Text Editor, then in one `cx.py` session:
+
+* `{"action":"screenshot"}`: GNOME asks to share the screen and allow remote
+  control, naming **Fermix Computer Use**. Pick the monitor and allow. Then the
+  screenshot itself: no second dialog if B1 already allowed screenshots. Note the
+  image's `width` and `height` beside the monitor's size.
+* **`left_click` on Text Editor's page, then `{"action":"type","text":"abc"}`**:
+  `abc` arrives, all three (the session's first key is not dropped).
+* `{"action":"type","text":"é"}`: write down whether it arrives. The compositor
+  drops a character its layout cannot type without saying so, so compux does not
+  refuse it on Wayland.
+* `cat ~/.local/state/compux/portal.json` holds a `restore_token`.
+
+### B4. A restarted helper is not asked again (POSTS INPUT)
+
+End the session (Ctrl-D) and start a new one: **`{"action":"screenshot"}` then a
+`left_click` on Text Editor**. No dialog appears, and the click lands. The state
+file's token has changed (each is used once).
+
+### B5. The person ends it, and a refusal (POSTS INPUT)
+
+* In a session, stop the sharing from the shell's indicator (top bar). The next
+  `screenshot` asks again (the dialog shows); allow it.
+* `rm -f ~/.local/state/compux/portal.json`, reset the stored answer, then
+  `{"action":"screenshot"}` and **Deny** the dialog: `consent_refused`, the detail
+  points at `fermix doctor`. The probe now says `"screenshot_permission": "no"`.
+  Reset it again; the probe says `"unset"`. The reset (compux itself never writes
+  the store):
+
+  ```sh
+  gdbus call --session --dest org.freedesktop.impl.portal.PermissionStore \
+    --object-path /org/freedesktop/impl/portal/PermissionStore \
+    --method org.freedesktop.impl.portal.PermissionStore.DeletePermission \
+    screenshot screenshot io.tezra.fermix.ComputerUse
+  ```
+
+* Once more, and leave the dialog unanswered: at 25 s `consent_timeout`. Write down
+  whether the dialog closes then.
+
+### B6. At scale 200% (POSTS INPUT: one click)
+
+Settings → Displays → Scale 200%. Repeat B3's screenshot and **one `left_click` on
+Text Editor's page**: the image's size is the monitor's logical size times 2, and
+the click lands where it was aimed.
+
+### B7. What B cannot prove
+
+* KDE Plasma, COSMIC and wlroots compositors: pixels are refused there by design,
+  and the controls (L1) still work; nothing here runs one.
+* A desktop of more than one monitor on Wayland: the portal's screenshot is the
+  whole desktop and says nothing of where the others lie, so compux refuses it
+  (`capture_unavailable`). Write down what a second monitor does.

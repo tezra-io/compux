@@ -379,35 +379,54 @@ embedder that manages its own signed install passes an explicit `:binary_path` t
 
 macOS-first. **Apple-Silicon macOS** is the primary, fully-featured target
 (capture, input, accessibility `inspect` + `elements`, non-prompting permission
-probe, idle detection). **Linux/X11** supports capture + input + `wait_for_change`
-+ `paste` (the paste chord is Ctrl+V), and `elements`, the verbs on a reference and
-`wait_for` through AT-SPI (see "Controls have names"). `inspect` is macOS-only;
-the Linux build's `hello` does not list it, and a request for it is
-`unknown_action` (see "The version handshake"). The permission `probe` works on
-both: on Linux it reports which display server answered its socket (`x11`,
-`wayland`, `none`) and whether an X endpoint answers (`x11_endpoint`, XWayland
-beside Wayland), whether the accessibility bus answers and how many applications
-its registry lists (or why it is unavailable), the at-spi2-core and ATK bridge
-versions dpkg records, and the toolkit notes known without reading any
-application, all read-only (PROTOCOL.md §8). A helper started with no display of its own (a daemon a systemd
-user unit started before login) reads `DISPLAY` and `WAYLAND_DISPLAY`, and
-nothing else, from the user manager over the session bus, and carries them as
-values: it never writes its own environment. Its screen capture and input
-(xcap, enigo) read a display only from that environment, so such a helper works
-by control only: its handshake offers no pixel verb, its listings carry no
-positions, and a pixel request is refused `pixels_unavailable`. **Wayland** pixels and **Windows** are not
-supported yet; on Wayland the controls are listed without positions and act by
-reference.
+probe, idle detection). **Linux** answers `elements`, the verbs on a reference and
+`wait_for` through AT-SPI (see "Controls have names") on any session, and its
+pixels by one route per session, decided once at start (PROTOCOL.md §1.1):
+
+- **X11:** capture, input, `wait_for_change`, `windows` and `paste` (the paste
+  chord is Ctrl+V), in pure Rust over x11rb: XTEST with the server's own keymap
+  (never remapped), the core `GetImage` in strips, RandR, EWMH, and the
+  `CLIPBOARD` selection compux owns for the helper's life. `type` is refused
+  before a key is sent for a character the layout cannot type
+  (`text_outside_layout`, use `paste`) or while a modifier, Caps Lock or a second
+  layout group is on (`keyboard_not_neutral`). A key or button held across an
+  action is journalled under `$XDG_RUNTIME_DIR`, and the next helper releases what
+  a killed one left held.
+- **GNOME Wayland:** capture and input through the XDG desktop portal
+  (xdg-desktop-portal 1.18 or later, which registers compux as
+  `io.tezra.fermix.ComputerUse`): the portal asks the person once, and a restore
+  token kept in `$XDG_STATE_HOME/compux/portal.json` lets later sessions start
+  without asking. One monitor per session; no `paste` and no `windows`.
+- **KDE Plasma, COSMIC, wlroots compositors, and GNOME with an older portal:**
+  controls only; every pixel request is refused `pixels_unavailable` with the
+  reason.
+
+On both, keys go only into a window that reads `ACTIVE` on the accessibility bus
+(`no_active_window`). `inspect` is macOS-only; the Linux build's `hello` does not
+list it, and a request for it is `unknown_action` (see "The version handshake").
+The permission `probe` works on both: on Linux it reports which display server
+answered its socket (`x11`, `wayland`, `none`) and whether an X endpoint answers
+(`x11_endpoint`, XWayland beside Wayland), whether the accessibility bus answers
+and how many applications its registry lists (or why it is unavailable), the
+at-spi2-core and ATK bridge versions dpkg records, the toolkit notes known
+without reading any application, whether XTEST and the keymap answer
+(`x11_pixels`), and the portal's version, its Registry and any stored Screenshot
+answer for compux (`portal`), all read-only and raising no dialog
+(PROTOCOL.md §8). A helper started with no display of its own (a daemon a
+systemd user unit started before login) reads `DISPLAY`, `WAYLAND_DISPLAY` and
+`XAUTHORITY`, and nothing else, from the user manager over the session bus, and
+carries them as values: it never writes its own environment, and reaches that
+display as its own. **Windows** is not supported.
 
 `idle_ms` / `wait_for_idle` (operational, not model actions) report how long the
 human has been idle — a coexistence signal so a policy layer can yield the seat to
 a present human. macOS only (typed error elsewhere). They count synthetic input too,
 so a caller that also drives input disambiguates its own actions.
 
-Building the Linux target needs the X11/input system headers the crates link
-via pkg-config: `libxcb1-dev libxcb-render0-dev libxcb-shape0-dev
-libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev`
-(mirrored in `ci.yml`'s `rust-linux` job and the release workflow).
+Building the Linux target needs no C library but the C runtime: no X, XKB, xdo
+or D-Bus development package and no pkg-config
+(`fixtures/linux/spike/no_c_deps.sh` proves it in a plain Ubuntu 24.04
+container, and checks the helper links nothing else).
 
 macOS requires the user to grant **Screen Recording** (capture) and **Accessibility**
 (input) in System Settings → Privacy & Security. Without Accessibility, synthetic
