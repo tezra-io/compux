@@ -3,11 +3,12 @@
 //!
 //! The directory is made `0700` and must be a directory, not a link to one, that
 //! this user owns. One an earlier build made wider is tightened to `0700`, and
-//! that is said; one another user owns is refused. The text goes to a scratch
-//! file beside the target, created new with mode `0600`
-//! (a stale scratch, or a link planted under its name, is removed first, and
-//! never followed), then renamed over the target, which replaces whatever entry
-//! held that name rather than writing through it.
+//! that is said; one another user owns is refused. It is opened once, and the
+//! checks and the chmod go through that handle, so both are about one directory.
+//! The text goes to a scratch file beside the target, created new with mode
+//! `0600` (a stale scratch, or a link planted under its name, is removed first,
+//! and never followed), then renamed over the target, which replaces whatever
+//! entry held that name rather than writing through it.
 
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -42,11 +43,29 @@ pub fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// The directory as `uid`'s alone: a directory, not a link to one, owned by
 /// `uid`, and `0700`, tightened to that if it is wider.
+///
+/// Opened once, and every check and the chmod go through that one handle, so the
+/// directory tightened is the directory checked.
 fn private_directory(dir: &Path, uid: u32) -> std::io::Result<()> {
-    let metadata = std::fs::symlink_metadata(dir)?;
-    if !metadata.is_dir() {
+    let handle = std::fs::File::open(dir)?;
+    private_directory_at(&handle, dir, uid)
+}
+
+/// The checks on an opened directory: the path must still name it, as itself
+/// and not through a link, before its owner and mode are read through the
+/// handle and any chmod is made through it.
+fn private_directory_at(handle: &std::fs::File, dir: &Path, uid: u32) -> std::io::Result<()> {
+    let named = std::fs::symlink_metadata(dir)?;
+    if named.is_symlink() {
         return Err(std::io::Error::other(format!(
             "{} is a link, not a directory of compux's own",
+            dir.display()
+        )));
+    }
+    let metadata = handle.metadata()?;
+    if !metadata.is_dir() || (named.dev(), named.ino()) != (metadata.dev(), metadata.ino()) {
+        return Err(std::io::Error::other(format!(
+            "{} is not the directory compux opened there a moment ago; nothing was written",
             dir.display()
         )));
     }
@@ -61,7 +80,7 @@ fn private_directory(dir: &Path, uid: u32) -> std::io::Result<()> {
     if mode & 0o077 == 0 {
         return Ok(());
     }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    handle.set_permissions(std::fs::Permissions::from_mode(0o700))?;
     eprintln!(
         "compux: {} was open to others ({mode:o}); it is 0700 now",
         dir.display()
@@ -130,6 +149,30 @@ mod tests {
 
         assert!(refused.to_string().contains("belongs to user"), "{refused}");
         assert_eq!(mode(&dir), 0o755);
+        std::fs::remove_dir_all(&dir).expect("cleaned up");
+    }
+
+    // The directory checked is the directory tightened: a path that names
+    // another directory by the time it would be tightened is refused, and that
+    // other directory is left as it was.
+    #[test]
+    fn a_directory_swapped_after_it_was_opened_is_refused_and_left_alone() {
+        let dir = scratch("swapped");
+        let ours = dir.join("compux");
+        std::fs::create_dir(&ours).expect("the directory first opened");
+        let handle = std::fs::File::open(&ours).expect("opened");
+        std::fs::rename(&ours, dir.join("moved")).expect("moved away");
+        std::fs::create_dir(&ours).expect("another directory under the name");
+        std::fs::set_permissions(&ours, std::fs::Permissions::from_mode(0o755)).expect("open");
+        let uid = std::fs::metadata(&ours).expect("it is there").uid();
+
+        let refused = private_directory_at(&handle, &ours, uid).expect_err("not the one opened");
+
+        assert!(
+            refused.to_string().contains("not the directory"),
+            "{refused}"
+        );
+        assert_eq!(mode(&ours), 0o755);
         std::fs::remove_dir_all(&dir).expect("cleaned up");
     }
 

@@ -7,9 +7,11 @@
 //!   press is posted and forgotten after their release (`journal`), so a helper
 //!   killed in between has them released by the next one. An action that would
 //!   hold one is refused before its first input where no journal can be written.
-//!   A tap, a click and a wheel notch hold nothing past themselves: each goes
-//!   whole in one write and is checked once after it, so a helper killed while
-//!   it waits has sent all of one or none.
+//!   A tap, a click and a wheel notch hold nothing past themselves: each is one
+//!   batch, with no reply awaited between its events, flushed together and
+//!   checked once after it, so nothing of it is down while compux waits on the
+//!   server. Whether the flush is a single `write` is x11rb's buffering, not
+//!   something compux promises.
 //! - **Text** is typed only once every character is known to be on the layout,
 //!   and only while the keyboard is neutral; the caller refuses otherwise before
 //!   anything is posted ([`Desktop::ready_to_type`]).
@@ -292,12 +294,13 @@ impl Input {
         ))
     }
 
-    /// Input that holds nothing past itself (a tap, a click, a wheel notch), sent
-    /// whole in one write, then checked with one round trip. Nothing of it is
-    /// down while compux waits, so a helper killed then has sent all of it or
-    /// none, and it needs no journal. An error the server answered for any of it
-    /// is an error here; the rest of it still went, so what it pressed it also
-    /// released.
+    /// Input that holds nothing past itself (a tap, a click, a wheel notch), as
+    /// one batch: no reply is awaited between its events, which are flushed
+    /// together and then checked with one round trip. Nothing of it is down
+    /// while compux waits, so it needs no journal; whether the flush is a single
+    /// `write` is x11rb's buffering, not a promise. An error the server answered
+    /// for any of it is an error here; the rest of it still went, so what it
+    /// pressed it also released.
     fn batch(&mut self, events: &[(u8, u8)]) -> Result<(), String> {
         let mut sent = Vec::with_capacity(events.len());
         for &(kind, detail) in events {
