@@ -535,9 +535,10 @@ fn served(
 ) -> Result<WindowFrame, FrameError> {
     match (caught, peeked) {
         (Caught::Up, peeked) => peeked,
-        (Caught::Reproving, Ok(_before)) => Err(FrameError::Unavailable(
+        (Caught::Reproving, Ok(_before)) => Err(FrameError::Reproving(
             "the window is being proved again after it changed size, was shown again or got a new \
-             border, and nothing of it is sent until that holds; retry in a moment"
+             border, or its last proof fell short, and nothing of it is sent until a proof holds; \
+             retry in a moment"
                 .to_string(),
         )),
         (Caught::Reproving, refused) => refused,

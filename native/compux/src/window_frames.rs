@@ -315,6 +315,12 @@ pub enum FrameError {
     /// way; macOS binds the window server's own window.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     Replaced(String),
+    /// The bound window is being proved again (it was resized, shown again or
+    /// given a new border, or its last proof fell short): no frame of it is
+    /// served until a proof holds, which is a frame or two away. Only the X11
+    /// stream proves a window this way.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    Reproving(String),
 }
 
 impl FrameError {
@@ -328,6 +334,7 @@ impl FrameError {
             FrameError::NotYet => "capture_unavailable",
             FrameError::Gone(_) => "target_unavailable",
             FrameError::Replaced(_) => "target_binding_unavailable",
+            FrameError::Reproving(_) => "capture_unavailable",
         }
     }
 
@@ -338,7 +345,8 @@ impl FrameError {
             | FrameError::Denied(detail)
             | FrameError::BudgetExceeded(detail)
             | FrameError::Gone(detail)
-            | FrameError::Replaced(detail) => detail.clone(),
+            | FrameError::Replaced(detail)
+            | FrameError::Reproving(detail) => detail.clone(),
             FrameError::NotYet => {
                 "no frame of that window arrived after the action was dispatched".to_string()
             }
