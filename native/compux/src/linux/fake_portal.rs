@@ -100,6 +100,8 @@ pub struct Script {
     pub forged: Option<&'static str>,
     /// The file a forged Screenshot Response names.
     pub forged_uri: String,
+    /// An error the portal answers its `Introspect` with, running or not.
+    pub introspect_error: Option<&'static str>,
 }
 
 impl Default for Script {
@@ -125,6 +127,7 @@ impl Default for Script {
             owner: PORTAL,
             forged: None,
             forged_uri: String::new(),
+            introspect_error: None,
         }
     }
 }
@@ -340,6 +343,10 @@ async fn answer_bus(
             server.reply(header, &owned).await
         }
         Some("GetNameOwner") => server.reply(header, &script.owner).await,
+        Some("Introspect") if script.introspect_error.is_some() => {
+            let error = script.introspect_error.unwrap_or_default();
+            server.reply_error(header, error, &("refused",)).await
+        }
         Some("Introspect") => {
             let xml: String = script
                 .interfaces

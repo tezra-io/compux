@@ -499,10 +499,11 @@ defmodule Compux do
     * `:portal` — `%{running:, version:, registry:, screenshot_permission:}`,
       read where a session bus answers (`nil` where none does), raising no dialog
       and starting neither the portal nor its store: whether the portal answered
-      (`false` where it is not running), the installed xdg-desktop-portal's
+      (`false` where it is not running; `nil` where it answered an error that
+      does not say whether it runs), the installed xdg-desktop-portal's
       version (`nil` where the package database does not say), whether its host
       Registry is there (1.18 or later; without it GNOME Wayland's pixels are
-      refused; `nil` where the portal is not running), and the PermissionStore's
+      refused; `nil` unless the portal answered), and the PermissionStore's
       stored Screenshot answer for `io.tezra.fermix.ComputerUse`: `"yes"`, `"no"`
       (every screenshot is refused `consent_refused` until the person resets it),
       `"unset"`, or `"not_running"` (the store is not running, so nothing was

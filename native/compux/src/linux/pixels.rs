@@ -64,9 +64,10 @@ pub enum Activation {
 pub struct Wayland {
     pub gnome: bool,
     pub kde: bool,
-    /// Whether the portal answered at all; nothing else about it is known when
-    /// it did not.
-    pub running: bool,
+    /// Whether the portal answered at all: `Some(false)` where the bus said
+    /// nobody runs it, `None` where its error said neither. Nothing else about it
+    /// is known unless it answered.
+    pub running: Option<bool>,
     pub registry: bool,
     pub screenshot: bool,
     pub remote_desktop: bool,
@@ -119,12 +120,22 @@ pub fn decide(server: Server, wayland: Option<&Wayland>) -> Decision {
             "{which} on Wayland has no pixel route compux has qualified; only GNOME's portal is"
         ));
     }
-    if !facts.running {
-        return Decision::Refused(
-            "the XDG desktop portal is not running on this session and did not start, so \
-             compux has no route to the screen or the input"
-                .to_string(),
-        );
+    match facts.running {
+        Some(true) => {}
+        Some(false) => {
+            return Decision::Refused(
+                "the XDG desktop portal is not running on this session and did not start, so \
+                 compux has no route to the screen or the input"
+                    .to_string(),
+            )
+        }
+        None => {
+            return Decision::Refused(
+                "the XDG desktop portal answered with an error that does not say whether it \
+                 runs, so compux has no route to the screen or the input"
+                    .to_string(),
+            )
+        }
     }
     if !facts.registry {
         let version = facts.version.as_deref().unwrap_or("of unknown version");
@@ -566,7 +577,14 @@ pub async fn read_wayland(
     activation: Activation,
 ) -> Wayland {
     let introspection = introspected(session, activation).await;
-    let running = introspection.is_some();
+    let running = match &introspection {
+        Ok(_) => Some(true),
+        Err(error) if not_running(error) => Some(false),
+        Err(error) => {
+            eprintln!("compux: the portal would not say whether it runs: {error}");
+            None
+        }
+    };
     let interfaces = introspection.unwrap_or_default();
     let has = |name: &str| interfaces.contains(&format!("\"{name}\""));
     Wayland {
@@ -594,21 +612,16 @@ async fn owned(session: &Connection, name: &str) -> bool {
     reply.is_ok_and(|reply| reply.body().deserialize::<bool>().unwrap_or(false))
 }
 
-/// The portal object's introspection: `None` where the portal did not answer,
-/// which with [`Activation::Never`] is a portal that is not running.
-async fn introspected(session: &Connection, activation: Activation) -> Option<String> {
+/// The portal object's introspection, or the error the portal answered.
+async fn introspected(session: &Connection, activation: Activation) -> zbus::Result<String> {
     let (destination, path, interface) = PORTAL_DESKTOP;
     match activation {
-        Activation::Allowed => {
-            let reply = session
-                .call_method(Some(destination), path, Some(interface), "Introspect", &())
-                .await
-                .ok()?;
-            reply.body().deserialize::<String>().ok()
-        }
-        Activation::Never => call_unstarted(session, PORTAL_DESKTOP, "Introspect", &())
-            .await
-            .ok(),
+        Activation::Allowed => session
+            .call_method(Some(destination), path, Some(interface), "Introspect", &())
+            .await?
+            .body()
+            .deserialize::<String>(),
+        Activation::Never => call_unstarted(session, PORTAL_DESKTOP, "Introspect", &()).await,
     }
 }
 
@@ -619,6 +632,12 @@ const NOT_RUNNING: [&str; 2] = [
     "org.freedesktop.DBus.Error.NameHasNoOwner",
     "org.freedesktop.DBus.Error.ServiceUnknown",
 ];
+
+/// Whether an error says nobody runs the service: one of [`NOT_RUNNING`]. Any
+/// other (a timeout, a refusal, a reply that would not read) says nothing of it.
+fn not_running(error: &zbus::Error) -> bool {
+    matches!(error, zbus::Error::MethodError(name, _, _) if NOT_RUNNING.contains(&name.as_str()))
+}
 
 /// A method call that never starts the service it goes to: a name nobody owns
 /// answers with one of [`NOT_RUNNING`] instead of being started to answer it.
@@ -664,10 +683,11 @@ pub async fn stored_screenshot(session: &Connection) -> Option<&'static str> {
         Err(zbus::Error::MethodError(name, _, _)) if name.as_str().ends_with(".NotFound") => {
             return Some("unset")
         }
-        Err(zbus::Error::MethodError(name, _, _)) if NOT_RUNNING.contains(&name.as_str()) => {
-            return Some("not_running")
+        Err(error) if not_running(&error) => return Some("not_running"),
+        Err(error) => {
+            eprintln!("compux: the PermissionStore would not answer: {error}");
+            return None;
         }
-        Err(_) => return None,
     };
     Some(
         match permissions
@@ -699,7 +719,7 @@ pub fn probe_fields(
         "portal".to_string(),
         portal.map_or(Value::Null, |(facts, stored)| {
             json!({"running": facts.running, "version": facts.version,
-                   "registry": facts.running.then_some(facts.registry),
+                   "registry": (facts.running == Some(true)).then_some(facts.registry),
                    "screenshot_permission": stored})
         }),
     );
@@ -740,7 +760,7 @@ mod tests {
         Wayland {
             gnome: true,
             kde: false,
-            running: true,
+            running: Some(true),
             registry: true,
             screenshot: true,
             remote_desktop: true,
@@ -842,7 +862,7 @@ mod tests {
     #[test]
     fn a_portal_that_is_not_running_is_refused_saying_so() {
         let stopped = Wayland {
-            running: false,
+            running: Some(false),
             registry: false,
             screenshot: false,
             remote_desktop: false,
@@ -853,6 +873,20 @@ mod tests {
         let why = refused(decide(Server::Wayland { x11: false }, Some(&stopped)));
 
         assert!(why.contains("not running"), "{why}");
+    }
+
+    // A portal whose error says neither that it runs nor that it does not is no
+    // route either, and the refusal does not call it stopped.
+    #[test]
+    fn a_portal_that_will_not_say_whether_it_runs_is_refused_saying_so() {
+        let unknown = Wayland {
+            running: None,
+            ..gnome()
+        };
+
+        let why = refused(decide(Server::Wayland { x11: false }, Some(&unknown)));
+
+        assert!(why.contains("does not say whether it runs"), "{why}");
     }
 
     // The route is decided by the server first: an X11 session (or none) is
@@ -1046,12 +1080,32 @@ mod tests {
         let stored = async_io::block_on(stored_screenshot(&client));
         let fields = probe_fields(None, Some((facts.clone(), stored)));
 
-        assert!(!facts.running, "{facts:?}");
+        assert_eq!(facts.running, Some(false), "{facts:?}");
         assert_eq!(stored, Some("not_running"));
         assert_eq!(
             fields["portal"],
             json!({"running": false, "version": "1.18.4", "registry": null,
                    "screenshot_permission": "not_running"})
+        );
+    }
+
+    // Only NameHasNoOwner and ServiceUnknown say the portal is not running. Any
+    // other error says nothing either way: `running` reads null, not false.
+    #[test]
+    fn a_portal_that_answers_another_error_is_not_said_to_be_stopped() {
+        let (_fake, client) = FakePortal::start(Script {
+            introspect_error: Some("org.freedesktop.DBus.Error.AccessDenied"),
+            ..Script::default()
+        });
+
+        let version = Some("1.18.4".to_string());
+        let facts = async_io::block_on(read_wayland(&client, version, Activation::Never));
+        let fields = probe_fields(None, Some((facts, Some("unset"))));
+
+        assert_eq!(
+            fields["portal"],
+            json!({"running": null, "version": "1.18.4", "registry": null,
+                   "screenshot_permission": "unset"})
         );
     }
 
@@ -1066,7 +1120,7 @@ mod tests {
 
         let facts = async_io::block_on(read_wayland(&client, None, Activation::Allowed));
 
-        assert!(facts.running, "{facts:?}");
+        assert_eq!(facts.running, Some(true), "{facts:?}");
         let calls = fake.calls();
         let asked = calls
             .iter()

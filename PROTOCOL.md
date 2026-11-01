@@ -55,7 +55,7 @@ they are as protocol 11 had them.
 | X11 (`display_server: "x11"`) | x11rb, pure Rust: XTEST for the pointer and the keys, the core `GetImage` on the root in strips for the frame, RandR for the monitors, EWMH for `windows`, the `CLIPBOARD` selection owned in-process for `paste` | all |
 | GNOME Wayland, XWayland beside it or not | the XDG desktop portal, under the app id `io.tezra.fermix.ComputerUse` registered through the host `Registry` (xdg-desktop-portal 1.18 or later): `Screenshot` for the frame, one RemoteDesktop session with a ScreenCast monitor source for the pointer and the keys | all but `paste` (no portal clipboard compux can own) and `windows` (no portal lists them) |
 | GNOME Wayland whose portal has no `Registry` (xdg-desktop-portal before 1.18) | refused, naming the portal's version: without its own app id compux would share the empty one with every host process | none |
-| GNOME Wayland whose portal is not running and does not start when asked | refused, saying so | none |
+| GNOME Wayland whose portal is not running and does not start when asked, or answers an error that does not say whether it runs | refused, saying which | none |
 | KDE Plasma, COSMIC, wlroots compositors on Wayland | refused, naming the compositor: no route is qualified there | none |
 | no display answers | refused | none |
 
@@ -664,7 +664,7 @@ Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux bu
 | `text_outside_layout` | Linux (X11): `type` text the active keymap cannot produce; the detail names the characters and `paste`. Nothing sent. |
 | `keyboard_not_neutral` | Linux (X11): `type` while the keyboard is in a group other than the first, a modifier is held, or Caps Lock is on; the detail says which. Nothing sent. |
 | `no_active_window` | Linux: `type` without `element_ref`, `key` or `paste` while no window, or more than one, reads `ACTIVE` on the accessibility bus, so the keys would go where nobody chose. The detail says which: no window, or how many applications claim one. compux never activates a window to make room. Nothing sent. |
-| `pixels_unavailable` | Linux: a pixel action (or `type` without `element_ref`, or an image check) where the session's pixel route is refused (§1.1: a compositor with no qualified route, a portal without its `Registry`, no display), or one the route does not serve (`paste` and `windows` on GNOME Wayland). The detail is the route's reason. Nothing sent; work by control. |
+| `pixels_unavailable` | Linux: a pixel action (or `type` without `element_ref`, or an image check) where the session's pixel route is refused (§1.1: a compositor with no qualified route, a portal without its `Registry`, a portal that is not running and does not start or whose error does not say whether it runs, no display), or one the route does not serve (`paste` and `windows` on GNOME Wayland). The detail is the route's reason. Nothing sent; work by control. |
 | `consent_refused` | Linux (GNOME Wayland): the portal answered no, now or by a stored answer. A stored no stays until the person resets it; `fermix doctor` prints how. compux never writes the PermissionStore. Nothing sent. |
 | `consent_timeout` | Linux (GNOME Wayland): the portal ended its dialog unanswered, or nobody answered it within 25 s; the dialog is closed. Nothing sent. |
 | `capture_unavailable` | Also Linux (GNOME Wayland): the portal's call failed or was answered by another process than the portal's owner, a session set-up step (`CreateSession`, `SelectDevices`, `SelectSources`, which show no dialog) went unanswered for 5 s (the detail names the step), its screenshot is not a regular file or would not decode (the file is left where it is), or it holds more than the session's one monitor. Nothing sent. |
@@ -700,13 +700,14 @@ read-only and raising no prompt:
 - `x11_pixels` is the X11 route's two needs, read on a connection of its own where an X endpoint answers (`null`
   where none does): `xtest`, the XTEST extension; `keymap`, the server's keyboard map answered.
 - `portal` is read where a session bus answers (`null` where none does), without raising a dialog and without
-  starting the portal or its store: `running`, whether the portal answered (false where it is not running);
-  `version`, the installed xdg-desktop-portal as the package database records it (`null` where it does not say);
-  `registry`, whether the portal offers the host `Registry` (1.18 and later; `null` where the portal is not
-  running); `screenshot_permission`, the PermissionStore's stored Screenshot answer for
-  `io.tezra.fermix.ComputerUse`: `yes`, `no` (every screenshot is refused `consent_refused` until the person resets
-  it), `unset` (no answer stored, or no table at all), or `not_running` (the store is not running, so nothing was
-  read). `null` where the store would not answer.
+  starting the portal or its store: `running`, whether the portal answered (false where the bus says nobody runs it;
+  `null` where it answered an error that says neither, which the helper prints); `version`, the installed
+  xdg-desktop-portal as the package database records it (`null` where it does not say); `registry`, whether the
+  portal offers the host `Registry` (1.18 and later; `null` unless the portal answered);
+  `screenshot_permission`, the PermissionStore's stored Screenshot answer for `io.tezra.fermix.ComputerUse`: `yes`,
+  `no` (every screenshot is refused `consent_refused` until the person resets it), `unset` (no answer stored, or no
+  table at all), or `not_running` (the store is not running, so nothing was read). `null` where the store would not
+  answer.
 - `accessibility_bus.state`:
   - `answering`: the registry answers and lists `applications` applications, one or more;
   - `empty`: the registry answers and lists none (`applications` is 0);
