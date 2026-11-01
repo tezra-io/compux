@@ -153,16 +153,17 @@ they are as protocol 11 had them.
   clicks (a Shape input region); a click anywhere else on it reaches the window under it. A button event another
   program sends to it (`SendEvent`) is dropped and logged, so no program can pause, resume or stop the session
   that way; input made through XTEST is the server's own, as the person's is, and nothing on X11 tells the two
-  apart, for the badge or any other window. It hides while the
-  window is minimized or gone, or while another window covers the area it would take. It raises itself, at most
-  ten times a second, over a window the window manager manages that moves, restacks or maps onto it (the bound
-  window raised over it among them), and never over an override-redirect one: the person's own menus and
-  tooltips stay over it. Its text is Noto Sans Regular, built in, at 13 pixels,
-  in root pixels at a scale of 1 on any screen. It draws glyphs in the order the characters come, with kerning
-  and no shaping: right-to-left text reads in the wrong order, and a character the font lacks (CJK, among
-  others) is its missing-glyph box. It is a real window, so it shows in display screenshots, never in the bound
-  window's frames. A badge that cannot show itself (no SHAPE 1.1, or a display other than 24-bit TrueColor with
-  32-bit pixels) exits, and a mutation on the window is then `control_surface_unavailable`.
+  apart, for the badge or any other window. It hides while the window is minimized or gone, or while another
+  window covers the area it would take. It raises itself, at most ten times a second, over a window the window
+  manager manages that moves, restacks or maps onto it (the bound window raised over it among them), and never
+  over an override-redirect one: the person's own menus and tooltips stay over it. While one of those is open
+  over it (above it, and taking input where the badge is), it does not raise itself at all, for a new state
+  either, and goes back on top when that window is unmapped. Its text is Noto Sans Regular, built in, at 13
+  pixels, in root pixels at a scale of 1 on any screen. It draws glyphs in the order the characters come, with
+  kerning and no shaping: right-to-left text reads in the wrong order, and a character the font lacks (CJK,
+  among others) is its missing-glyph box. It is a real window, so it shows in display screenshots, never in the
+  bound window's frames. A badge that cannot show itself (no SHAPE 1.1, or a display other than 24-bit TrueColor
+  with 32-bit pixels) exits, and a mutation on the window is then `control_surface_unavailable`.
 
 ## 2. `elements`
 

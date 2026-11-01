@@ -2933,6 +2933,9 @@ above the fixture where the badge sits. Then:
   ("a menu or popup", or Text Editor's class). The menu stays open and
   `/tmp/gtk3.json` records nothing. Close the menu (Escape) and click the same
   point again: it lands. The badge must not have jumped over the open menu.
+  Open the menu once more so it hangs over the badge too: the badge stays under
+  it while it is open, and is back over the fixture within about a second of
+  Escape.
 * If a GNOME notification is on screen over the fixture, a click at a point
   under it should be refused the same way, naming GNOME Shell. If it lands in
   the fixture instead, write it down: the shell's own windows were not seen.
@@ -3026,6 +3029,10 @@ Each with the window still bound, in the session:
   and nothing here tries.
 * A program holding a pointer grab with no window at the point takes a click
   there, and compux cannot see it.
+* A new state sent to the badge while a menu is open over it (the window moved,
+  or a pause) leaves it under the menu. A menu closes when you move the window,
+  so the containers prove it, with a popup that stays open while the bound window
+  moves and is raised.
 * *Optional:* a window manager that keeps a client's own X border on its
   top-level windows (dwm, for one). Bind a window there with `--save`: the
   picture must start at the window's first pixel, with no strip of the border's
