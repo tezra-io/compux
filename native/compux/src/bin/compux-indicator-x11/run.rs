@@ -147,6 +147,19 @@ fn next(receiver: &Receiver<Message>, look_after: Option<Duration>) -> Next {
     }
 }
 
+/// The hold once the window holding the badge under is unmapped: let go of
+/// (`None`), so the badge looks again and raises now, where the raise budget
+/// allows it; kept otherwise, so the loop's own timer looks again within
+/// [`HELD_LOOK_MS`]. A popup mapped and unmapped over the badge in a loop
+/// therefore raises it no more than the budget does.
+pub fn unmap_hold(held_by: Option<u32>, raises: &mut RaiseBudget, now_ms: u64) -> Option<u32> {
+    if raises.allow(now_ms) {
+        None
+    } else {
+        held_by
+    }
+}
+
 /// How long the loop waits before it looks again, while `held_by` holds the
 /// badge under; forever while nothing does.
 fn look_after(held_by: Option<u32>) -> Option<Duration> {
@@ -357,8 +370,11 @@ impl Badge {
             }
             // The menu or popup the badge stayed under closed.
             Event::UnmapNotify(e) if Some(e.window) == self.held_by => {
-                self.held_by = None;
-                self.back_on_top()?
+                let now_ms = self.now_ms();
+                self.held_by = unmap_hold(self.held_by, &mut self.raises, now_ms);
+                if self.held_by.is_none() {
+                    self.back_on_top()?
+                }
             }
             Event::RandrScreenChangeNotify(_) => self.render()?,
             Event::Error(e) => {
@@ -441,7 +457,7 @@ impl Badge {
         let Some(frame) = self.frame else {
             return Ok(());
         };
-        let now_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let now_ms = self.now_ms();
         if !self.raises.allow(now_ms) {
             return Ok(());
         }
@@ -455,9 +471,9 @@ impl Badge {
     }
 
     /// Back on top once the window that held the badge under is unmapped or no
-    /// longer takes input over it, unless another one does. Outside the raise
-    /// budget: it runs once for each popup that closes, and otherwise at most
-    /// every [`HELD_LOOK_MS`], so a spent budget never leaves the badge under.
+    /// longer takes input over it, unless another one does. The look itself is
+    /// not counted: an unmap reaches it only within the raise budget
+    /// ([`unmap_hold`]), and the loop's timer at most every [`HELD_LOOK_MS`].
     fn back_on_top(&mut self) -> Result<(), String> {
         let Some(frame) = self.frame else {
             return Ok(());
@@ -466,6 +482,11 @@ impl Badge {
             self.window.raise()?;
         }
         Ok(())
+    }
+
+    /// Milliseconds since the badge started, for the raise budget.
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// The windows stacked above the badge at `frame`, where nothing the person
@@ -701,6 +722,23 @@ mod tests {
             Some(Duration::from_millis(HELD_LOOK_MS))
         );
         assert_eq!(look_after(None), None);
+    }
+
+    // A popup that closes lets the badge back on top at once, within the budget.
+    // Past it the hold stays, and the loop's timer looks again on its own.
+    #[test]
+    fn an_unmap_past_the_raise_budget_leaves_the_badge_to_its_timer() {
+        let mut raises = RaiseBudget::new();
+        assert_eq!(unmap_hold(Some(7), &mut raises, 5_000), None, "looks now");
+        for _ in 1..MAX_RAISES_PER_SECOND {
+            assert!(raises.allow(5_000));
+        }
+        let held = unmap_hold(Some(7), &mut raises, 5_000);
+        assert_eq!(held, Some(7), "the budget is spent: still held");
+        let (_sender, receiver) = mpsc::channel::<Message>();
+        let started = Instant::now();
+        assert!(matches!(next(&receiver, look_after(held)), Next::LookAgain));
+        assert!(started.elapsed() >= Duration::from_millis(HELD_LOOK_MS));
     }
 
     #[test]
