@@ -4,20 +4,22 @@
 //! window another window covers still has its own pixmap, so it is still seen.
 //!
 //! **What proves the pixmap is the window's.** Redirecting a window gives it a
-//! new pixmap, and the server fills it with what the screen showed there. Where
-//! the screen showed the window, that copy is the window. Where it did not (under
-//! a window above it, or off the root), the copy is whatever was there, and the
-//! server asks the window to repaint those parts. So the windows above it are read
-//! before the redirect and again after it, and must not have moved; the damage
-//! reports are watched from before the redirect, its own report comes first and
-//! is set aside, and then the window's repaint must reach every part of its
-//! picture the screen was not showing, within [`REPAINT_WAIT_MS`], or the binding
-//! is refused. A window manager's frame around the window is painted by the
-//! server as part of the redirect (its parts are window backgrounds), so it is the
-//! client's part of the picture that is waited for. A window a compositing manager already redirected is
-//! drawn by that manager from the same pixmap, which therefore is the window as
-//! it shows. A window mapped again or resized gets a new pixmap, and is proved
-//! again the same way before anything more is published.
+//! new pixmap, and the server fills it with what the screen showed there, which
+//! under another window is that window's pixels. A pixmap a compositing manager
+//! redirected long ago may hold the same. So no pixel is sent until drawing after
+//! a cut-off has reached it: damage is reported rectangle by rectangle from
+//! before the redirect, the redirect's own report (the copy) comes first and is
+//! set aside, everything reported up to then is set aside, and then every window
+//! the picture is drawn from (the window manager's frame and its decorations, the
+//! client and the client's own windows) is cleared and sent an Expose. The
+//! server repaints what has a background, and the application and the window
+//! manager draw the rest; that drawing must reach every pixel of the picture,
+//! frame and GTK's shadow included, within [`REPAINT_WAIT_MS`], or the binding is
+//! refused. Nothing in the proof depends on which windows were over it, so a
+//! window moving meanwhile changes nothing. A window resized, hidden or shown
+//! during the proof voids it. A window mapped again or resized gets a new pixmap,
+//! and is proved again the same way before anything more is published, and any
+//! part of a picture the proof did not reach is sent black.
 //!
 //! **What a frame carries.** The window manager's frame and GTK's shadow are
 //! accounted for exactly as the window list accounts for them, so a picture is
@@ -69,9 +71,17 @@ pub const REDIRECT_WAIT_MS: u64 = 200;
 /// How long the window's repaint after a redirect is waited for.
 pub const REPAINT_WAIT_MS: u64 = 1_000;
 
-/// The most windows above a bound one that are read for the proof. Past it, all
-/// of the window's picture counts as unseen and must be repainted.
-const MAX_ABOVE: usize = 1_024;
+/// The most windows a bound window's picture may be drawn from (its frame, the
+/// frame's decorations, the client and the client's own windows) for the proof
+/// to ask each to repaint. A window holding more is refused.
+const MAX_WINDOWS: usize = 1_024;
+
+/// The deepest that tree is walked.
+const MAX_TREE_DEPTH: usize = 16;
+
+/// The most undrawn pieces a proof follows. Drawing scattered finely enough to
+/// split the picture past this is refused rather than followed.
+const MAX_PIECES: usize = 4_096;
 
 /// The pause between two looks while a proof waits.
 const PROOF_POLL_MS: u64 = 2;
@@ -106,10 +116,10 @@ pub enum Step {
 }
 
 /// The step for what the sync found.
-pub fn step(viewable: bool, was_hidden: bool, resized: bool, damaged: bool) -> Step {
+pub fn step(viewable: bool, was_hidden: bool, renewed: bool, damaged: bool) -> Step {
     if !viewable {
         Step::Hidden
-    } else if was_hidden || resized {
+    } else if was_hidden || renewed {
         Step::Prove
     } else if damaged {
         Step::Read
@@ -118,64 +128,35 @@ pub fn step(viewable: bool, was_hidden: bool, resized: bool, damaged: bool) -> S
     }
 }
 
-/// The bounding box of the damage reported so far, in the frame's pixels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Area {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
-
-impl Area {
-    pub fn of(x: i16, y: i16, width: u16, height: u16) -> Area {
-        Area {
-            left: i32::from(x),
-            top: i32::from(y),
-            right: i32::from(x) + i32::from(width),
-            bottom: i32::from(y) + i32::from(height),
-        }
-    }
-
-    pub fn merged(self, other: Area) -> Area {
-        Area {
-            left: self.left.min(other.left),
-            top: self.top.min(other.top),
-            right: self.right.max(other.right),
-            bottom: self.bottom.max(other.bottom),
-        }
-    }
-
-    /// Does the damage reach every pixel of `crop`?
-    pub fn covers(self, crop: Rect) -> bool {
-        let (right, bottom) = (
-            i64::from(crop.x) + i64::from(crop.width),
-            i64::from(crop.y) + i64::from(crop.height),
-        );
-        self.left <= crop.x
-            && self.top <= crop.y
-            && i64::from(self.right) >= right
-            && i64::from(self.bottom) >= bottom
-    }
-}
-
-/// The parts of the client's picture (`client`, root pixels) the screen was not
-/// showing when the window was redirected: off the root, or under a window above
-/// it (`above`, root rectangles). The server copies the rest from the screen, which
-/// showed the window there, and asks the client to repaint these.
-pub fn unseen(client: Rect, screen: Rect, above: &[Rect]) -> Vec<Rect> {
-    let mut pieces = outside(client, screen);
-    pieces.extend(above.iter().filter_map(|cover| overlap(client, *cover)));
+/// What of `pieces` the damage rectangle `drawn` has not reached: each piece
+/// less the rectangle, at most four pieces for one. Damage is taken rectangle by
+/// rectangle, never as a bounding box, so pixels between two drawn places stay
+/// unproven.
+pub fn undrawn(pieces: Vec<Rect>, drawn: Rect) -> Vec<Rect> {
     pieces
+        .into_iter()
+        .flat_map(|piece| outside(piece, drawn))
+        .collect()
 }
 
-/// Has the damage since the redirect's own report repainted every unseen piece?
-/// With none unseen, the screen's copy is the whole proof.
-pub fn repainted(damage: Option<Area>, unseen: &[Rect]) -> bool {
-    if unseen.is_empty() {
-        return true;
+/// Every pixel of a frame cut at `crop` that lies outside `proven` (all of them
+/// when nothing is proven) is sent black and opaque: a pixel nothing showed to be
+/// the window's own is never sent as it was read.
+pub fn black_out(pixels: &mut [u8], crop: Rect, proven: Option<Rect>) {
+    let pieces = match proven {
+        Some(proven) => outside(crop, proven),
+        None => vec![crop],
+    };
+    let width = crop.width as usize;
+    for piece in pieces {
+        let (left, top) = ((piece.x - crop.x) as usize, (piece.y - crop.y) as usize);
+        for row in top..top + piece.height as usize {
+            let start = (row * width + left) * BYTES_PER_PIXEL;
+            let end = start + piece.width as usize * BYTES_PER_PIXEL;
+            let (black, _) = pixels[start..end].as_chunks_mut::<BYTES_PER_PIXEL>();
+            black.fill([0, 0, 0, 0xff]);
+        }
     }
-    damage.is_some_and(|damage| unseen.iter().all(|piece| damage.covers(*piece)))
 }
 
 /// Where two rectangles share pixels, if anywhere.
@@ -426,15 +407,18 @@ struct Watch {
     top: XWindow,
     damage: u32,
     pixmap: u32,
-    /// Whether this watch redirected the window, rather than a compositing
-    /// manager before it.
-    ours: bool,
+    /// The part of the window, in its own pixels, that drawing after the last
+    /// proof's cut-off reached: all a frame may show. `None` while no proof
+    /// holds.
+    proven: Option<Rect>,
     format: Format,
     frame_atom: u32,
     shadow_atom: u32,
     size: (u16, u16),
     damaged: bool,
-    resized: bool,
+    /// Resized, mapped or unmapped since the last proof began: the window has,
+    /// or will have, a new pixmap that proof says nothing of.
+    renewed: bool,
     hidden: bool,
 }
 
@@ -460,13 +444,13 @@ impl Watch {
             top,
             damage: 0,
             pixmap: 0,
-            ours: false,
+            proven: None,
             format,
             frame_atom,
             shadow_atom,
             size: (geometry.width, geometry.height),
             damaged: true,
-            resized: false,
+            renewed: false,
             hidden: false,
         };
         if !watch.viewable()? {
@@ -479,147 +463,132 @@ impl Watch {
         Ok(watch)
     }
 
-    /// Damage reports first, then the redirect, then the proof, then the
-    /// pixmap's name: each step is the one before it holding.
+    /// Damage reports first, then the redirect, then the pixmap's name, then the
+    /// proof: each step is the one before it holding. A window a compositing
+    /// manager redirected before is not redirected again, and is proved all the
+    /// same.
     fn redirect(&mut self) -> Result<(), FrameError> {
         let connection = &self.connection;
         self.damage = connection.generate_id().map_err(no_id)?;
         connection
-            .damage_create(self.damage, self.top, ReportLevel::BOUNDING_BOX)
+            .damage_create(self.damage, self.top, ReportLevel::DELTA_RECTANGLES)
             .map_err(lost)?
             .check()
             .map_err(|error| reply_error(error, "damage reports on the window"))?;
-        let composited = already_redirected(connection, self.top)?;
-        let before = self.unseen_now()?;
-        let connection = &self.connection;
-        connection
-            .composite_redirect_window(self.top, Redirect::AUTOMATIC)
-            .map_err(lost)?
-            .check()
-            .map_err(|error| reply_error(error, "redirecting the window"))?;
-        self.ours = !composited;
-        if self.ours {
-            self.prove(&before)?;
+        if !already_redirected(connection, self.top)? {
+            connection
+                .composite_redirect_window(self.top, Redirect::AUTOMATIC)
+                .map_err(lost)?
+                .check()
+                .map_err(|error| reply_error(error, "redirecting the window"))?;
+            self.redirected()?;
         }
-        self.name()
+        self.name()?;
+        let proven = self.prove()?.ok_or_else(|| {
+            unproven("it was resized, hidden or shown while it was being proved".to_string())
+        })?;
+        self.proven = Some(proven);
+        Ok(())
     }
 
-    /// The redirect's own report, set aside; the windows over it where they were
-    /// before the redirect (`before`); then the window's repaint over every part of
-    /// its picture the screen was not showing.
-    fn prove(&mut self, before: &[Rect]) -> Result<(), FrameError> {
-        self.connection.flush().map_err(lost)?;
-        if !self.damage_within(REDIRECT_WAIT_MS, None)? {
-            return Err(unproven(format!(
-                "the X server reported no drawing within {REDIRECT_WAIT_MS} ms of redirecting it"
-            )));
-        }
-        self.repaired()?;
-        let after = self.unseen_now()?;
-        if after != before {
-            return Err(unproven(
-                "the windows over it moved while it was redirected".to_string(),
-            ));
-        }
-        if self.damage_within(REPAINT_WAIT_MS, Some(&after))? {
+    /// The redirect's own report: the server copied what the screen showed into
+    /// the window's new pixmap, and reports that as drawing. The copy proves
+    /// nothing of the window; the report proves its damage is being reported.
+    fn redirected(&mut self) -> Result<(), FrameError> {
+        if self.report_within(REDIRECT_WAIT_MS)? {
             return Ok(());
         }
         Err(unproven(format!(
-            "it did not repaint the {} part(s) of itself the screen was not showing within \
-             {REPAINT_WAIT_MS} ms of being redirected",
-            after.len()
+            "the X server reported no drawing within {REDIRECT_WAIT_MS} ms of redirecting it"
         )))
     }
 
-    /// The parts of the client's picture the screen is not showing now, in this
-    /// window's own pixels, where damage is reported. Past [`MAX_ABOVE`] windows
-    /// over it, all of that picture counts.
-    fn unseen_now(&self) -> Result<Vec<Rect>, FrameError> {
-        let (crop, client) = self.places()?;
-        let Some(drawn) = overlap(crop, client) else {
-            return Ok(Vec::new());
-        };
-        let connection = &self.connection;
-        let tree = connection.query_tree(self.top).map_err(lost)?;
-        let tree = tree
-            .reply()
-            .map_err(|error| reply_error(error, "the window"))?;
-        let root = connection.get_geometry(tree.root).map_err(lost)?;
-        let origin = connection.translate_coordinates(self.top, tree.root, 0, 0);
-        let siblings = connection.query_tree(tree.root).map_err(lost)?;
-        let root = root
-            .reply()
-            .map_err(|error| reply_error(error, "the screen"))?;
-        let origin = origin.map_err(lost)?.reply();
-        let origin = origin.map_err(|error| reply_error(error, "the window"))?;
-        let siblings = siblings
-            .reply()
-            .map_err(|error| reply_error(error, "the screen"))?;
-        let at = siblings
-            .children
-            .iter()
-            .position(|window| *window == self.top);
-        let above = at
-            .map(|at| &siblings.children[at + 1..])
-            .ok_or_else(reframed)?;
-
-        let (dx, dy) = (i32::from(origin.dst_x), i32::from(origin.dst_y));
-        let screen = Rect {
-            x: 0,
-            y: 0,
-            width: u32::from(root.width),
-            height: u32::from(root.height),
-        };
-        let covers = match above.len() > MAX_ABOVE {
-            true => vec![screen],
-            false => self.covering(above)?,
-        };
-        let on_root = Rect {
-            x: drawn.x + dx,
-            y: drawn.y + dy,
-            ..drawn
-        };
-        Ok(unseen(on_root, screen, &covers)
-            .into_iter()
-            .map(|piece| Rect {
-                x: piece.x - dx,
-                y: piece.y - dy,
-                ..piece
-            })
-            .collect())
+    /// That the window's picture is its own, whatever was over it: everything
+    /// reported so far is set aside, every window the picture is drawn from is
+    /// cleared and asked to repaint, and the drawing after that must reach every
+    /// pixel of the picture (the window manager's frame and GTK's shadow as much
+    /// as the client) within [`REPAINT_WAIT_MS`]. `None` when the window was
+    /// resized, hidden or shown meanwhile, which voids the proof; a picture not
+    /// wholly drawn by then is refused.
+    fn prove(&mut self) -> Result<Option<Rect>, FrameError> {
+        self.repaired()?;
+        self.renewed = false;
+        let crop = self.crop()?;
+        self.expose()?;
+        let left = self.repaint_within(REPAINT_WAIT_MS, crop)?;
+        if self.renewed {
+            return Ok(None);
+        }
+        if left.is_empty() {
+            return Ok(Some(crop));
+        }
+        Err(unproven(format!(
+            "{} part(s) of its picture were not drawn within {REPAINT_WAIT_MS} ms of asking it \
+             to repaint",
+            left.len()
+        )))
     }
 
-    /// The rectangles, borders included, of the windows in `windows` that are
-    /// viewable and draw: what they cover of whatever is under them. A window gone
-    /// since it was listed covers nothing.
-    fn covering(&self, windows: &[XWindow]) -> Result<Vec<Rect>, FrameError> {
+    /// Every window the picture is drawn from is cleared to its background and
+    /// sent an Expose for all of it: the server paints what has a background, and
+    /// the application or the window manager draws the rest, as after any
+    /// exposure. A window gone meanwhile needs nothing.
+    fn expose(&self) -> Result<(), FrameError> {
         let connection = &self.connection;
+        let windows = self.drawn_from()?;
         let mut asked = Vec::with_capacity(windows.len());
         for window in windows {
-            let attributes = connection.get_window_attributes(*window).map_err(lost)?;
-            asked.push((attributes, connection.get_geometry(*window).map_err(lost)?));
+            asked.push((
+                window,
+                connection.get_window_attributes(window).map_err(lost)?,
+            ));
         }
-        let mut covers = Vec::with_capacity(asked.len());
-        for (attributes, geometry) in asked {
-            let (Some(attributes), Some(geometry)) =
-                (still(attributes.reply())?, still(geometry.reply())?)
-            else {
+        for (window, attributes) in asked {
+            let Some(attributes) = still(attributes.reply())? else {
                 continue;
             };
-            if attributes.map_state != MapState::VIEWABLE
-                || attributes.class == WindowClass::INPUT_ONLY
-            {
+            // An input-only window has no pixels, and clearing one is an error.
+            if attributes.class == WindowClass::INPUT_ONLY {
                 continue;
             }
-            let border = 2 * u32::from(geometry.border_width);
-            covers.push(Rect {
-                x: i32::from(geometry.x),
-                y: i32::from(geometry.y),
-                width: u32::from(geometry.width) + border,
-                height: u32::from(geometry.height) + border,
-            });
+            connection
+                .clear_area(true, window, 0, 0, 0, 0)
+                .map_err(lost)?
+                .ignore_error();
         }
-        Ok(covers)
+        connection.flush().map_err(lost)
+    }
+
+    /// The top-level window and every window inside it, a level at a time.
+    fn drawn_from(&self) -> Result<Vec<XWindow>, FrameError> {
+        let mut found = vec![self.top];
+        let mut level = vec![self.top];
+        for _ in 0..MAX_TREE_DEPTH {
+            let mut asked = Vec::with_capacity(level.len());
+            for window in &level {
+                asked.push(self.connection.query_tree(*window).map_err(lost)?);
+            }
+            level = Vec::new();
+            for tree in asked {
+                level.extend(
+                    still(tree.reply())?
+                        .map(|tree| tree.children)
+                        .unwrap_or_default(),
+                );
+            }
+            found.extend(&level);
+            if found.len() > MAX_WINDOWS {
+                return Err(unproven(format!(
+                    "it is drawn from more than {MAX_WINDOWS} windows"
+                )));
+            }
+            if level.is_empty() {
+                return Ok(found);
+            }
+        }
+        Err(unproven(format!(
+            "its windows nest deeper than {MAX_TREE_DEPTH}"
+        )))
     }
 
     /// The pixmap the window is drawn into now, under a name of this watch's.
@@ -645,39 +614,52 @@ impl Watch {
         Err(drowned())
     }
 
-    /// Wait up to `wait_ms` for damage: any report at all (`None`), or enough to
-    /// repaint every one of the `unseen` pieces, which none need when there are
-    /// none.
-    fn damage_within(&mut self, wait_ms: u64, unseen: Option<&[Rect]>) -> Result<bool, FrameError> {
-        if unseen.is_some_and(|pieces| repainted(None, pieces)) {
-            return Ok(true);
-        }
+    /// Wait up to `wait_ms` for any damage report at all.
+    fn report_within(&mut self, wait_ms: u64) -> Result<bool, FrameError> {
         let deadline = Instant::now() + Duration::from_millis(wait_ms);
-        let mut seen: Option<Area> = None;
         for _ in 0..MAX_EVENTS {
-            let Some(area) = self.next_damage()? else {
-                if Instant::now() >= deadline {
-                    return Ok(false);
-                }
-                std::thread::sleep(Duration::from_millis(PROOF_POLL_MS));
-                continue;
-            };
-            seen = Some(seen.map_or(area, |earlier| earlier.merged(area)));
-            if unseen.is_none_or(|pieces| repainted(seen, pieces)) {
+            if self.next_damage()?.is_some() {
                 return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(PROOF_POLL_MS));
+        }
+        Err(drowned())
+    }
+
+    /// Wait up to `wait_ms` for drawing over every pixel of `crop`: what is still
+    /// undrawn at the deadline, or as soon as the window is renewed.
+    fn repaint_within(&mut self, wait_ms: u64, crop: Rect) -> Result<Vec<Rect>, FrameError> {
+        let deadline = Instant::now() + Duration::from_millis(wait_ms);
+        let mut left = vec![crop];
+        for _ in 0..MAX_EVENTS {
+            if left.is_empty() || self.renewed {
+                return Ok(left);
+            }
+            if left.len() > MAX_PIECES {
+                return Err(unproven(format!(
+                    "its drawing split the picture into more than {MAX_PIECES} pieces"
+                )));
+            }
+            match self.next_damage()? {
+                Some(drawn) => left = undrawn(left, drawn),
+                None if Instant::now() >= deadline => return Ok(left),
+                None => std::thread::sleep(Duration::from_millis(PROOF_POLL_MS)),
             }
         }
         Err(drowned())
     }
 
     /// The next damage report waiting, after any other events before it.
-    fn next_damage(&mut self) -> Result<Option<Area>, FrameError> {
+    fn next_damage(&mut self) -> Result<Option<Rect>, FrameError> {
         for _ in 0..MAX_EVENTS {
             let Some(event) = self.connection.poll_for_event().map_err(lost)? else {
                 return Ok(None);
             };
-            if let Some(area) = self.took(event)? {
-                return Ok(Some(area));
+            if let Some(drawn) = self.took(event)? {
+                return Ok(Some(drawn));
             }
         }
         Err(drowned())
@@ -695,22 +677,32 @@ impl Watch {
         Ok(())
     }
 
-    /// One event: a damage report on this window is returned, a change to the
-    /// window is noted, and a window gone ends the stream.
-    fn took(&mut self, event: Event) -> Result<Option<Area>, FrameError> {
+    /// One event: a damage report on this window is returned, in the window's
+    /// pixels, a change to the window is noted, and a window gone ends the
+    /// stream.
+    fn took(&mut self, event: Event) -> Result<Option<Rect>, FrameError> {
+        let ours = |window: XWindow| window == self.top || window == self.client;
         match event {
             Event::DamageNotify(report) if report.damage == self.damage => {
                 self.damaged = true;
                 let area = report.area;
-                return Ok(Some(Area::of(area.x, area.y, area.width, area.height)));
+                return Ok(Some(Rect {
+                    x: i32::from(area.x),
+                    y: i32::from(area.y),
+                    width: u32::from(area.width),
+                    height: u32::from(area.height),
+                }));
             }
             Event::DestroyNotify(gone) if gone.window == self.client => return Err(destroyed()),
             Event::DestroyNotify(gone) if gone.window == self.top => return Err(reframed()),
             Event::ReparentNotify(moved) if moved.window == self.client => return Err(reframed()),
             Event::ConfigureNotify(change) if change.window == self.top => {
-                self.resized |= (change.width, change.height) != self.size;
+                self.renewed |= (change.width, change.height) != self.size;
                 self.size = (change.width, change.height);
             }
+            // Mapped again, a window is given a new pixmap.
+            Event::MapNotify(shown) if ours(shown.window) => self.renewed = true,
+            Event::UnmapNotify(hidden) if ours(hidden.window) => self.renewed = true,
             Event::Error(error) => {
                 eprintln!("compux: the window capture: {}", super::refused(&error))
             }
@@ -737,9 +729,8 @@ impl Watch {
                     Ok(Command::CatchUp(answer)) => (self.catch_up(), Some(answer)),
                     Ok(Command::Stop) | Err(RecvTimeoutError::Disconnected) => return,
                 };
-            let fault = outcome.err();
-            let ended = fault.is_some();
-            if let Some(fault) = fault {
+            let ended = outcome.is_err();
+            if let Err(fault) = outcome {
                 slot.fault(fault);
             }
             // Nobody waiting for the answer is a request that already gave up.
@@ -766,16 +757,17 @@ impl Watch {
         let stamp = clock.now_mach();
         let viewable = self.viewable()?;
         self.drain()?;
-        match step(viewable, self.hidden, self.resized, self.damaged) {
+        match step(viewable, self.hidden, self.renewed, self.damaged) {
             Step::Hidden => {
                 self.hidden = true;
                 slot.note(sample(slot, clock, stamp, Health::Minimized));
                 Ok(())
             }
-            Step::Prove => {
-                self.prove_again()?;
-                self.read(slot, stamp, clock)
-            }
+            // A proof the window voided by changing again is retried next interval.
+            Step::Prove => match self.prove_again()? {
+                true => self.read(slot, stamp, clock),
+                false => Ok(()),
+            },
             Step::Read => self.read(slot, stamp, clock),
             Step::Idle => {
                 slot.note(sample(slot, clock, stamp, Health::Idle));
@@ -784,30 +776,14 @@ impl Watch {
         }
     }
 
-    /// A window mapped again or resized has a new pixmap. One this watch
-    /// redirected is redirected again, so the server's copy and the window's
-    /// repaint come in the order the proof reads them.
-    fn prove_again(&mut self) -> Result<(), FrameError> {
-        if self.ours {
-            self.connection
-                .composite_unredirect_window(self.top, Redirect::AUTOMATIC)
-                .map_err(lost)?
-                .check()
-                .map_err(|error| reply_error(error, "redirecting the window again"))?;
-            self.repaired()?;
-            let before = self.unseen_now()?;
-            self.connection
-                .composite_redirect_window(self.top, Redirect::AUTOMATIC)
-                .map_err(lost)?
-                .check()
-                .map_err(|error| reply_error(error, "redirecting the window again"))?;
-            self.prove(&before)?;
-        }
+    /// A window mapped again or resized has a new pixmap: it is named, and proved
+    /// as the first one was. `false` when the window changed again meanwhile.
+    fn prove_again(&mut self) -> Result<bool, FrameError> {
         self.name()?;
+        self.proven = self.prove()?;
         self.hidden = false;
-        self.resized = false;
         self.damaged = true;
-        Ok(())
+        Ok(self.proven.is_some())
     }
 
     /// Read the window as it is now, and publish it stamped `stamp`.
@@ -817,7 +793,10 @@ impl Watch {
             .map_err(lost)?;
         self.damaged = false;
         let crop = self.crop()?;
-        let pixels = self.grab(crop)?;
+        let mut pixels = self.grab(crop)?;
+        // The frame extents can move the picture within the window without a new
+        // pixmap; whatever of it the proof did not reach is not sent.
+        black_out(&mut pixels, crop, self.proven);
         let width = crop.width;
         slot.offer(WindowFrame {
             pixels,
@@ -1190,87 +1169,20 @@ mod tests {
         assert_eq!(step(true, false, false, false), Step::Idle);
     }
 
-    // The repaint must reach every pixel of the picture, edge to edge; damage
+    // The drawing must reach every pixel of the picture, edge to edge; drawing
     // short by one row proves nothing about that row.
     #[test]
-    fn damage_covers_a_picture_only_to_its_last_pixel() {
+    fn drawing_proves_a_picture_only_to_its_last_pixel() {
         let crop = rect(0, 0, 982, 795);
-        let whole = Area::of(0, 0, 982, 795);
-        assert!(whole.covers(crop));
-        assert!(!Area::of(0, 0, 982, 794).covers(crop));
-        assert!(!Area::of(1, 0, 981, 795).covers(crop));
-
-        let halves = Area::of(0, 0, 982, 400).merged(Area::of(0, 400, 982, 395));
-        assert!(halves.covers(crop));
-        assert!(Area::of(0, 0, 100, 100).covers(rect(10, 10, 90, 90)));
-    }
-
-    // Nothing over it and all of it on the root: the screen showed all of it, and
-    // nothing has to be repainted.
-    #[test]
-    fn a_window_nothing_covers_is_all_seen() {
-        let screen = rect(0, 0, 1280, 1024);
+        assert!(undrawn(vec![crop], rect(0, 0, 982, 795)).is_empty());
         assert_eq!(
-            unseen(rect(60, 180, 980, 770), screen, &[]),
-            Vec::<Rect>::new()
+            undrawn(vec![crop], rect(0, 0, 982, 794)),
+            vec![rect(0, 794, 982, 1)]
         );
-        let elsewhere = [rect(0, 0, 50, 50), rect(1100, 960, 100, 60)];
         assert_eq!(
-            unseen(rect(60, 180, 980, 770), screen, &elsewhere),
-            Vec::<Rect>::new()
+            undrawn(vec![crop], rect(1, 0, 981, 795)),
+            vec![rect(0, 0, 1, 795)]
         );
-    }
-
-    // The part a window above it covers is unseen, and only that part.
-    #[test]
-    fn the_part_under_a_window_above_is_unseen() {
-        let screen = rect(0, 0, 1280, 1024);
-        let pieces = unseen(rect(61, 180, 980, 770), screen, &[rect(580, 490, 564, 507)]);
-        assert_eq!(pieces, vec![rect(580, 490, 461, 460)]);
-    }
-
-    // A window hanging off the root was never on the screen there: the copy holds
-    // nothing of it, so that part is unseen too.
-    #[test]
-    fn the_part_off_the_root_is_unseen() {
-        let screen = rect(0, 0, 1280, 1024);
-        let pieces = unseen(rect(-40, 900, 300, 200), screen, &[]);
-        let area: u64 = pieces
-            .iter()
-            .map(|p| u64::from(p.width) * u64::from(p.height))
-            .sum();
-        assert_eq!(area, 300 * 200 - 260 * 124);
-        assert!(
-            pieces
-                .iter()
-                .all(|p| p.x < 0 || p.y + p.height as i32 > 1024),
-            "{pieces:?}"
-        );
-    }
-
-    // A window fully under another is unseen whole.
-    #[test]
-    fn a_window_under_a_bigger_one_is_unseen_whole() {
-        let screen = rect(0, 0, 1280, 1024);
-        assert_eq!(
-            unseen(rect(100, 100, 200, 100), screen, &[rect(0, 0, 1280, 1024)]),
-            vec![rect(100, 100, 200, 100)]
-        );
-    }
-
-    // Seen in full: nothing to wait for. Unseen pieces: every one repainted, to its
-    // last pixel; damage beside a piece proves nothing about it.
-    #[test]
-    fn the_proof_needs_every_unseen_piece_repainted_and_nothing_more() {
-        assert!(repainted(None, &[]));
-        assert!(repainted(Some(Area::of(0, 0, 10, 10)), &[]));
-        let piece = rect(519, 310, 461, 460);
-        assert!(!repainted(None, &[piece]));
-        assert!(repainted(Some(Area::of(519, 310, 461, 460)), &[piece]));
-        assert!(!repainted(Some(Area::of(519, 310, 461, 459)), &[piece]));
-        let two = [piece, rect(0, 0, 20, 20)];
-        assert!(!repainted(Some(Area::of(519, 310, 461, 460)), &two));
-        assert!(repainted(Some(Area::of(0, 0, 980, 770)), &two));
     }
 
     #[test]
@@ -1332,6 +1244,81 @@ mod tests {
         let refused = served(Caught::Late, Ok(frame())).expect_err("late");
         assert_eq!(refused.code(), "capture_unavailable");
         assert!(refused.detail().contains("did not"), "{refused:?}");
+    }
+
+    fn area(pieces: &[Rect]) -> u64 {
+        pieces
+            .iter()
+            .map(|piece| u64::from(piece.width) * u64::from(piece.height))
+            .sum()
+    }
+
+    // The window manager's frame and GTK's shadow are part of the picture, and the
+    // copy the redirect made of them is whatever the screen showed there: only
+    // damage after it proves them, as it proves the client's part.
+    #[test]
+    fn the_frame_around_the_client_stays_unproven_until_it_is_drawn() {
+        let crop = rect(0, 0, 982, 795);
+        let client = rect(1, 25, 980, 764);
+        let left = undrawn(vec![crop], client);
+        assert_eq!(area(&left), 982 * 795 - 980 * 764, "{left:?}");
+        assert!(left.iter().all(|piece| overlap(*piece, client).is_none()));
+        assert!(left.iter().any(|piece| piece.y == 0 && piece.height == 25));
+        assert!(undrawn(left, rect(0, 0, 982, 795)).is_empty());
+    }
+
+    // Damage is read rectangle by rectangle, never as a bounding box: two corners
+    // drawn say nothing of the pixels between them.
+    #[test]
+    fn two_corners_drawn_do_not_prove_the_middle() {
+        let crop = rect(0, 0, 100, 100);
+        let left = undrawn(
+            undrawn(vec![crop], rect(0, 0, 10, 10)),
+            rect(90, 90, 10, 10),
+        );
+        assert_eq!(area(&left), 100 * 100 - 2 * 10 * 10, "{left:?}");
+        assert!(left
+            .iter()
+            .any(|piece| overlap(*piece, rect(50, 50, 1, 1)).is_some()));
+    }
+
+    #[test]
+    fn damage_in_pieces_proves_the_whole_crop() {
+        let crop = rect(20, 14, 800, 600);
+        let left = undrawn(
+            undrawn(vec![crop], rect(0, 0, 420, 700)),
+            rect(420, 0, 500, 700),
+        );
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    fn grey(width: u32, height: u32) -> Vec<u8> {
+        vec![0x80; (width * height) as usize * BYTES_PER_PIXEL]
+    }
+
+    fn pixel(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+        let at = ((y * width + x) as usize) * BYTES_PER_PIXEL;
+        [pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]]
+    }
+
+    // A pixel nothing proved is the window's own is never sent as it was read.
+    #[test]
+    fn pixels_outside_the_proven_rectangle_are_sent_black() {
+        let crop = rect(5, 5, 4, 3);
+        let mut pixels = grey(4, 3);
+        black_out(&mut pixels, crop, Some(rect(6, 5, 10, 10)));
+        for y in 0..3 {
+            assert_eq!(pixel(&pixels, 4, 0, y), [0, 0, 0, 0xff], "row {y}");
+            assert_eq!(pixel(&pixels, 4, 1, y), [0x80; 4], "row {y}");
+        }
+
+        let mut unproven = grey(4, 3);
+        black_out(&mut unproven, crop, None);
+        assert!(unproven.chunks(4).all(|p| p == [0, 0, 0, 0xff]));
+
+        let mut proven = grey(4, 3);
+        black_out(&mut proven, crop, Some(crop));
+        assert_eq!(proven, grey(4, 3));
     }
 
     #[test]
