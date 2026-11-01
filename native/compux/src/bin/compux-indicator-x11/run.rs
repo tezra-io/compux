@@ -19,9 +19,9 @@ use x11rb::protocol::Event;
 use crate::draw::{Canvas, Painter};
 use crate::label::target_label;
 use crate::layout::{layout, Button, Layout};
-use crate::place::{badge_frame, HEIGHT};
+use crate::place::{badge_frame, Rect, HEIGHT};
 use crate::wire::{self, Activity, Line, TargetState, WireError, LINE_LIMIT};
-use crate::x11::{Delivered, Window};
+use crate::x11::{outer, Delivered, Window};
 
 /// How many times a second the badge puts itself back on top. A window that keeps
 /// raising itself over the badge gets this many answers and no more, so two such
@@ -69,6 +69,14 @@ pub fn forged(event: &Event) -> bool {
     matches!(event, Event::ButtonPress(_) | Event::ButtonRelease(_)) && event.sent_event()
 }
 
+/// Whether another window's move, resize, restack or map calls for the badge to
+/// go back on top: one the window manager manages, whose outer rectangle now
+/// meets the badge's. An override-redirect window never does: it is the
+/// person's menu or tooltip, and the badge stays under what they opened.
+pub fn comes_over(badge: Rect, window: Rect, override_redirect: bool) -> bool {
+    !override_redirect && badge.intersection(window).is_some()
+}
+
 /// Everything the loop is handed.
 enum Message {
     Input(Line),
@@ -109,6 +117,7 @@ fn serve() -> Result<(), String> {
         window,
         state: TargetState::initial(),
         canvas: None,
+        frame: None,
         pressed: None,
         ignored: 0,
         forged: 0,
@@ -133,6 +142,8 @@ struct Badge {
     row: Layout,
     /// What is on the window now, for an expose; `None` while hidden.
     canvas: Option<Canvas>,
+    /// Where the window is now; `None` while hidden.
+    frame: Option<Rect>,
     /// The button a press went down on, waiting for its release.
     pressed: Option<Button>,
     ignored: u32,
@@ -220,11 +231,13 @@ impl Badge {
         let screens = self.window.screens()?;
         let Some(frame) = badge_frame(&self.state, (self.row.width, HEIGHT), &screens) else {
             self.canvas = None;
+            self.frame = None;
             return self.window.hide();
         };
         let canvas = self.painter.render(&self.row, self.state.activity);
         self.window.show(frame, &canvas, self.row.input_region())?;
         self.canvas = Some(canvas);
+        self.frame = Some(frame);
         Ok(())
     }
 
@@ -243,11 +256,14 @@ impl Badge {
                 let released = self.row.hit(i32::from(e.event_x), i32::from(e.event_y));
                 return Ok(self.release(released));
             }
-            // A window placed directly over the badge, or a new one mapped.
-            Event::ConfigureNotify(e) if e.window != id && e.above_sibling == id => {
-                self.on_top()?
+            // Another window moved, resized, restacked or mapped where the badge is.
+            Event::ConfigureNotify(e) if e.window != id => {
+                let at = outer(e.x, e.y, e.width, e.height, e.border_width);
+                self.over(at, e.override_redirect)?
             }
-            Event::MapNotify(e) if e.window != id => self.on_top()?,
+            Event::MapNotify(e) if e.window != id && !e.override_redirect => {
+                self.mapped(e.window)?
+            }
             Event::RandrScreenChangeNotify(_) => self.render()?,
             Event::Error(e) => {
                 return Err(format!(
@@ -301,6 +317,24 @@ impl Badge {
         match send(event) {
             Ok(()) => Flow::Continue,
             Err(_helper_gone) => Flow::Finish,
+        }
+    }
+
+    /// Back on top of a window that now meets the badge, unless the window is
+    /// the person's menu or tooltip.
+    fn over(&mut self, window: Rect, override_redirect: bool) -> Result<(), String> {
+        match self.frame {
+            Some(frame) if comes_over(frame, window, override_redirect) => self.on_top(),
+            _elsewhere => Ok(()),
+        }
+    }
+
+    /// A map says nothing of where: one look at the window says it. A window
+    /// gone since needs nothing.
+    fn mapped(&mut self, window: u32) -> Result<(), String> {
+        match self.window.outer_of(window)? {
+            Some(at) => self.over(at, false),
+            None => Ok(()),
         }
     }
 
@@ -397,6 +431,37 @@ mod tests {
             count: 0,
         };
         assert!(!forged(&Event::Expose(expose)), "only buttons act");
+    }
+
+    // The badge goes back over a managed window that now meets it (the bound
+    // window raised over it, or another moved onto it), never over a menu or a
+    // tooltip the person opened, and not for a window elsewhere.
+    #[test]
+    fn the_badge_goes_back_on_top_only_of_a_managed_window_that_meets_it() {
+        let badge = Rect {
+            x: 60,
+            y: 126,
+            w: 440,
+            h: 28,
+        };
+        let over = Rect {
+            x: 0,
+            y: 120,
+            w: 982,
+            h: 795,
+        };
+        let below = Rect {
+            x: 0,
+            y: 154,
+            w: 982,
+            h: 795,
+        };
+        assert!(comes_over(badge, over, false));
+        assert!(
+            !comes_over(badge, over, true),
+            "a menu stays over the badge"
+        );
+        assert!(!comes_over(badge, below, false), "touching is not meeting");
     }
 
     #[test]

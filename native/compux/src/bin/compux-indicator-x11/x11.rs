@@ -15,13 +15,14 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use x11rb::connection::Connection;
+use x11rb::errors::ReplyError;
 use x11rb::protocol::randr::{self, ConnectionExt as _};
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     self, AtomEnum, ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux,
     EventMask, ImageFormat, ImageOrder, PropMode, StackMode, VisualClass, WindowClass,
 };
-use x11rb::protocol::Event;
+use x11rb::protocol::{ErrorKind, Event};
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
@@ -210,6 +211,20 @@ impl Window {
             self.mapped = false;
         }
         self.conn.flush().map_err(lost)
+    }
+
+    /// Another window's outer rectangle, border included, in root pixels; `None`
+    /// where it is gone.
+    pub fn outer_of(&self, window: u32) -> Result<Option<Rect>, String> {
+        match self.conn.get_geometry(window).map_err(lost)?.reply() {
+            Ok(g) => Ok(Some(outer(g.x, g.y, g.width, g.height, g.border_width))),
+            Err(ReplyError::X11Error(e))
+                if matches!(e.error_kind, ErrorKind::Window | ErrorKind::Drawable) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(lost(e)),
+        }
     }
 
     /// Back on top of every other window, after one was raised over it.
@@ -449,6 +464,18 @@ fn watch_root(conn: &RustConnection, root: u32, monitors: bool) -> Result<(), St
             .map_err(lost)?;
     }
     Ok(())
+}
+
+/// A window's outer rectangle from its corner, its size inside its border, and
+/// the border.
+pub fn outer(x: i16, y: i16, width: u16, height: u16, border: u16) -> Rect {
+    let border = i32::from(border);
+    Rect {
+        x: i32::from(x),
+        y: i32::from(y),
+        w: i32::from(width) + 2 * border,
+        h: i32::from(height) + 2 * border,
+    }
 }
 
 fn lost(error: impl std::fmt::Display) -> String {
