@@ -657,7 +657,7 @@ fn reply(
     gate: &Gate,
     outcome: Result<Value, Failure>,
     done: gate::Dispatched,
-    surfaces: Option<Vec<wire::Surface>>,
+    surfaces: Option<wire::Surfaces>,
 ) -> Value {
     // The capture verbs answer in the computer-history `ack` family, byte for byte
     // as they did at protocol 6. Their client reads that shape and nothing else.
@@ -4756,21 +4756,25 @@ fn surfaces_after(
     request: &wire::Request,
     done: &gate::Dispatched,
     worker: &Worker,
-) -> Option<Vec<wire::Surface>> {
+) -> Option<wire::Surfaces> {
     if !done.posted || !worker.accessibility || !wire::carries_mutation_seq(&request.action) {
         return None;
     }
     let (scene, _named) = scene_for(request, worker).ok()?;
-    let open = semantic::surfaces(&worker.ax, scene.pid);
-    Some(
-        open.into_iter()
-            .map(|surface| wire::Surface {
-                kind: surface.kind,
-                native_kind: surface.native_kind,
-                label: surface.label,
-            })
-            .collect(),
-    )
+    let seen = semantic::surfaces(&worker.ax, scene.pid);
+    let open = seen
+        .found
+        .into_iter()
+        .map(|surface| wire::Surface {
+            kind: surface.kind,
+            native_kind: surface.native_kind,
+            label: surface.label,
+        })
+        .collect();
+    Some(wire::Surfaces {
+        open,
+        truncated: seen.stopped,
+    })
 }
 
 /// Where a listing that answers a request is drawn: the named listing's own view
@@ -10845,7 +10849,10 @@ mod tests {
         worker.accessibility = true;
         assert_eq!(
             surfaces_after(&running("key", Some(1)), &done, &worker),
-            Some(Vec::new())
+            Some(wire::Surfaces {
+                open: Vec::new(),
+                truncated: None,
+            })
         );
         assert_eq!(
             surfaces_after(
@@ -10856,6 +10863,22 @@ mod tests {
             None,
             "nothing sent"
         );
+    }
+
+    // A receipt's surfaces scan that stopped before it finished never claims
+    // nothing is open: it lists what it found and says why it stopped.
+    #[test]
+    fn a_receipt_whose_surfaces_scan_stopped_short_says_so() {
+        let gate = boot_gate();
+        let mut nodes = vec![ax::Scripted::button("Save", frame_at(100.0, 200.0))];
+        nodes.extend((0..100).map(|index| ax::Scripted::group(&format!("W{index}"), &[])));
+        let app = ax::Recorder::new(FIXTURE_PID, nodes);
+        let (mut worker, observation) = worker_listing(&gate, &app);
+
+        let pressed = served(&at_element("press", &observation, "e1"), &gate, &mut worker);
+
+        assert_eq!(pressed["receipt"]["surfaces"], json!([]), "{pressed}");
+        assert_eq!(pressed["receipt"]["surfaces_truncated"], json!("nodes"));
     }
 
     // The controls as protocol 12 names them: a normalised role beside the native

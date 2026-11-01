@@ -1205,6 +1205,15 @@ impl Surface {
     }
 }
 
+/// What a receipt's scan for surfaces found (protocol 12), and why it stopped
+/// before it finished where it did: then `open` is what it saw, and nothing more is
+/// proven closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Surfaces {
+    pub open: Vec<Surface>,
+    pub truncated: Option<&'static str>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Receipt {
     pub dispatch: Dispatch,
@@ -1228,7 +1237,7 @@ pub struct Receipt {
     pub state: Option<StateChange>,
     /// What was open once the action ran. `None` is "not looked", never "nothing
     /// open": an action that sent nothing, or a build with no accessibility API.
-    pub surfaces: Option<Vec<Surface>>,
+    pub surfaces: Option<Surfaces>,
 }
 
 impl Receipt {
@@ -1296,11 +1305,7 @@ impl Receipt {
 
     /// What only protocol 12 reports: a verb's states, and the surfaces open once
     /// the action ran.
-    pub fn reported(
-        mut self,
-        state: Option<StateChange>,
-        surfaces: Option<Vec<Surface>>,
-    ) -> Receipt {
+    pub fn reported(mut self, state: Option<StateChange>, surfaces: Option<Surfaces>) -> Receipt {
         self.state = state;
         self.surfaces = surfaces;
         self
@@ -1338,8 +1343,12 @@ impl Receipt {
                 state.insert_into(object);
             }
             if let Some(surfaces) = self.surfaces {
-                let listed: Vec<Value> = surfaces.into_iter().map(Surface::into_value).collect();
+                let listed: Vec<Value> =
+                    surfaces.open.into_iter().map(Surface::into_value).collect();
                 object.insert("surfaces".to_string(), Value::Array(listed));
+                if let Some(truncated) = surfaces.truncated {
+                    object.insert("surfaces_truncated".to_string(), json!(truncated));
+                }
             }
         }
 
@@ -2547,11 +2556,14 @@ mod tests {
                     before: Some("off"),
                     after: Some("on"),
                 }),
-                Some(vec![Surface {
-                    kind: "dialog",
-                    native_kind: "AXSheet".to_string(),
-                    label: Some("Clear all items?".to_string()),
-                }]),
+                Some(Surfaces {
+                    open: vec![Surface {
+                        kind: "dialog",
+                        native_kind: "AXSheet".to_string(),
+                        label: Some("Clear all items?".to_string()),
+                    }],
+                    truncated: None,
+                }),
             );
         let value = response(&envelope(), "r1", json!({}), Some(receipt));
 
@@ -2569,6 +2581,10 @@ mod tests {
         assert_eq!(
             value["receipt"]["surfaces"],
             json!([{"kind": "dialog", "native_kind": "AXSheet", "label": "Clear all items?"}])
+        );
+        assert!(
+            value["receipt"].get("surfaces_truncated").is_none(),
+            "said only of a scan that stopped short"
         );
 
         let held = Receipt::derive(false, false, None, Timings::default())
@@ -2589,13 +2605,33 @@ mod tests {
             "not looked is absent"
         );
 
-        let none_open =
-            Receipt::derive(true, true, None, Timings::default()).reported(None, Some(Vec::new()));
+        let none_open = Receipt::derive(true, true, None, Timings::default()).reported(
+            None,
+            Some(Surfaces {
+                open: Vec::new(),
+                truncated: None,
+            }),
+        );
         let value = response(&envelope(), "r3", json!({}), Some(none_open));
         assert_eq!(
             value["receipt"]["surfaces"],
             json!([]),
             "looked, and nothing open"
+        );
+
+        let cut = Receipt::derive(true, true, None, Timings::default()).reported(
+            None,
+            Some(Surfaces {
+                open: Vec::new(),
+                truncated: Some("time"),
+            }),
+        );
+        let value = response(&envelope(), "r4", json!({}), Some(cut));
+        assert_eq!(value["receipt"]["surfaces"], json!([]));
+        assert_eq!(
+            value["receipt"]["surfaces_truncated"],
+            json!("time"),
+            "looked, and stopped before it finished"
         );
     }
 

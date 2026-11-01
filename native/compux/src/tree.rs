@@ -62,10 +62,11 @@ const MAX_PATH_CHARS: usize = 60;
 /// How deep a skeleton reads below its root before it cuts (protocol 12).
 pub const SKELETON_DEPTH: usize = 3;
 
-/// The three reasons a walk stops early, in the words the wire uses.
-const TRUNCATED_NODES: &str = "nodes";
+/// The three reasons a walk stops early, in the words the wire uses. A scan for
+/// surfaces stops for the first and the last.
+pub const TRUNCATED_NODES: &str = "nodes";
 const TRUNCATED_DEPTH: &str = "depth";
-const TRUNCATED_TIME: &str = "time";
+pub const TRUNCATED_TIME: &str = "time";
 
 /// Roles worth surfacing as targets, in each reader's own words: macOS's AX roles,
 /// then AT-SPI's (`linux::vocabulary`). A password field is listed like any other

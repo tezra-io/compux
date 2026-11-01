@@ -309,9 +309,10 @@ defmodule Compux do
   A condition that never held is still `{:ok, %{"met" => false}}`: the wait ran.
   The wait never outlives the request's own deadline; when that deadline is what
   ended it, the reply also says `"deadline_cut" => true`. A `disappears` wait
-  by role or name holds only on a look that saw everything; one that ended with
-  its last look cut short says `"truncated"` with the walk's word, and the
-  control may be past where that look stopped.
+  by role or name, and a `menu_closed` wait, hold only on a look that saw
+  everything; one that ended with its last look cut short says `"truncated"`
+  with the look's word, and what it waited to be gone may be past where that
+  look stopped.
   """
   @spec wait_for(t(), map(), keyword()) :: response()
   def wait_for(%__MODULE__{} = cu, until, opts \\ []) when is_map(until) do

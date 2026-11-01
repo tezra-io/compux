@@ -209,7 +209,9 @@ The scopes, on Linux (AT-SPI):
 | `dialog` | Every dialog or alert open in the application (§6.2). | no |
 
 A scope whose root does not exist (no focused window, nothing focused, no menu or dialog open) is refused
-`scope_not_found`, with a detail that names what is missing.
+`scope_not_found`, with a detail that names what is missing. A `menu` or `dialog` scope whose scan for surfaces
+(§6.2) stopped before it finished and found none is refused the same way, and its detail says the look stopped
+short, not that nothing is open: look again, or list the window and find the controls there.
 
 ### 2.2 Reply
 
@@ -313,7 +315,9 @@ turn secure after the walk that listed it, and the value is withheld at the sour
 Every receipt of an action that **dispatched input** (`dispatch` is `sent` or `partial`) carries `surfaces`: the
 dialogs, alerts, menus and popups open in the action's application once it has run (§6.2). `[]` means none is open.
 A receipt with nothing dispatched carries none, and neither does a build with no accessibility API: absent means
-"not looked", never "nothing open".
+"not looked", never "nothing open". A scan that stopped before it finished says why beside the list:
+`"surfaces_truncated": "time"` (a node did not answer in time) or `"nodes"` (it read as many nodes as it may). Then
+`surfaces` is what it saw, and a surface it did not reach may be open.
 
 ```json
 "receipt":{"dispatch":"sent","effect":"not_observed","input_method":"ax",
@@ -481,12 +485,13 @@ One object, used by `wait_for` (§5.3) and by an action's check (§5.2):
 | `enabled` | `element_ref` | That control reads enabled. |
 | `value` | `element_ref`, `value` (string) | That control's value (bounded to 80 characters) equals `value`. Refused on a secure field. |
 | `window_title` | `contains` (string) | The scope's window title contains it (case-insensitive): the bound window, else the application's focused window. |
-| `menu_open`, `menu_closed` | none | A menu is open / no menu is open in the application (§6.2). |
+| `menu_open`, `menu_closed` | none | A menu is open / no menu is open in the application (§6.2); `menu_closed` only by a scan that saw everything it looks at. |
 | `text` | `contains` (string) | Some node in the scope has that text (case-insensitive) in its label, or for a static text in its value. |
 
 - `scope` (optional): as `elements`' scope; default `window` with a target, else `app`. Not accepted on the
   `element_ref` kinds, which read their control directly. A scope that is not open is read as **empty**, never
-  refused: waiting for a dialog's button before the dialog exists is the ordinary case. `window_title` reads the
+  refused: waiting for a dialog's button before the dialog exists is the ordinary case. A `menu` or `dialog` scope
+  whose scan stopped before it finished is not proven empty (below). `window_title` reads the
   bound window, else the application's focused window, whatever its scope says.
 - The application is the bound window's when the request names one, else the listing's the request names, else
   the one in front.
@@ -506,13 +511,15 @@ deadline is what ended a wait that was not met, the reply says `"deadline_cut": 
 in the receipt's semantic `check`. A wait its own `timeout_ms` ended says nothing extra.
 
 **An absence a look cannot prove.** Each look's walk has the bounds an `elements` walk has, and one that stops at
-them says why (`truncated`, §2.2). `disappears` by `role`/`name` holds only when a look saw the whole scope and
-listed no match, or when the scope is not open. A look that stopped short and listed no match does not hold: the
-control may be past where it stopped. When a wait for an absence ends not met and its last look was cut short, the
-reply says why, in the walk's word: `"truncated": "nodes"`, `"depth"` or `"time"`, on `wait_for`'s reply and in the
-receipt's semantic `check` beside `not_met`. Then wait on the control itself (`disappears` with `element_ref`, which
-reads that one control and is exact), or on a narrower scope. The look before an action's input follows the same
-rule, so a look cut short never reads as `held_before`.
+them says why (`truncated`, §2.2), and so does the bounded scan for surfaces (§6.2). `disappears` by `role`/`name`
+holds only when a look saw the whole scope and listed no match, or when the scope is not open and the scan that
+says so saw everything; `menu_closed` only when that scan saw everything and found no menu. A look that stopped
+short and found nothing does not hold: the control or the menu may be past where it stopped. When a wait for an
+absence ends not met and its last look was cut short, the reply says why: `"truncated": "nodes"`, `"depth"` or
+`"time"` (a scan for surfaces stops for `"nodes"` or `"time"`), on `wait_for`'s reply and in the receipt's semantic
+`check` beside `not_met`. Then wait on the control itself (`disappears` with `element_ref`, which reads that one
+control and is exact), or on a narrower scope. The look before an action's input follows the same rule, so a look
+cut short never reads as `held_before`.
 
 Two reads run after the wait and are **not** held to the deadline: an action's `element_after` (one read of its
 control, §3.1) and the surfaces scan on its receipt (at most 64 nodes, §3.2; a node that does not answer within its
@@ -653,7 +660,9 @@ each state is its AT-SPI state bit: `CHECKED`, `EXPANDED` (on a node that reads 
 | `popup` | `AXPopover` | A window's child | none |
 
 The macOS build looks two levels down from the application (its windows and their children) and into the menu
-bar, and reads at most 64 nodes doing so. A dialog drawn inside web content is not a surface here.
+bar, and reads at most 64 nodes doing so. A dialog drawn inside web content is not a surface here. The scan says
+whether it saw everything it looks at: one that met a node that did not answer within its 250 ms, or read its 64
+nodes with more left to read, stopped short, and proves nothing closed (§3.2, §5.1).
 
 The Linux build looks the same two levels down, the same 64 nodes at most, and for the menu bar inside each window
 rather than on the application: directly among the window's children (Qt), or inside a box among them (GTK 3). A
@@ -743,7 +752,7 @@ Every `error` code protocol 12 answers. "Linux" marks the ones only the Linux bu
 | `focus_refused` | `focus` on a control whose window is not the active one. Nothing sent. |
 | `ax_action_failed` | The application refused the message. Nothing went out. |
 | `ax_timed_out` | The message went out and no answer came; never repeated. |
-| `scope_not_found` | An `elements` scope has no root: no focused window, nothing focused, no menu or dialog open. A condition reads such a scope as empty instead (§5.1). |
+| `scope_not_found` | An `elements` scope has no root: no focused window, nothing focused, no menu or dialog open, or the scan for a menu or dialog stopped before it finished (the detail says which). A condition reads such a scope as empty instead (§5.1), and one a scan stopped short of as unproven. |
 | `accessibility_unavailable` | A build with no accessibility API (neither macOS nor Linux) was asked to read or act on controls. |
 | `ambiguous_element` | Linux: re-validation found several candidates for one reference. |
 | `identity_unknown` | Linux: a candidate stayed unreadable after two re-reads. |

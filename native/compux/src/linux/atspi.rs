@@ -2601,6 +2601,7 @@ mod tests {
         let (_fake, ax) = reader(desktop);
 
         let found: Vec<(&str, String, Option<String>)> = crate::semantic::surfaces(&ax, PID)
+            .found
             .into_iter()
             .map(|surface| (surface.kind, surface.native_kind, surface.label))
             .collect();
@@ -2648,6 +2649,7 @@ mod tests {
         ));
         let kinds = |ax: &Rc<dyn Ax>| -> Vec<(&'static str, Option<String>)> {
             crate::semantic::surfaces(ax, PID)
+                .found
                 .into_iter()
                 .map(|surface| (surface.kind, surface.label))
                 .collect()
@@ -2696,6 +2698,7 @@ mod tests {
         ));
         let kinds = |ax: &Rc<dyn Ax>| -> Vec<(&'static str, String)> {
             crate::semantic::surfaces(ax, PID)
+                .found
                 .into_iter()
                 .map(|surface| (surface.kind, surface.native_kind))
                 .collect()

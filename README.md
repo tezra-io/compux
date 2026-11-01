@@ -308,9 +308,11 @@ that promises not to take the focus should have to say when it did.
   with `check: %{"kind" => "semantic", "until" => condition}`; the condition is
   read before the input, so a receipt says `met`, `not_met` or `held_before`. A
   wait never outlives the request's deadline, and says `deadline_cut` when that
-  is what ended it.
+  is what ended it. A wait for something to be gone holds only on a look that
+  saw everything, and says `truncated` when its last look stopped short.
 * **What opened.** Every receipt of input that went out names the dialogs,
-  alerts, menus and popups open after it in `surfaces` (`[]` when none is).
+  alerts, menus and popups open after it in `surfaces` (`[]` when none is), and
+  says `surfaces_truncated` when its scan stopped before it finished.
 
 The Linux build answers all of these through AT-SPI (M86 L1).
 
