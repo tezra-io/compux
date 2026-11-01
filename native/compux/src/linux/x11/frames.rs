@@ -4,12 +4,17 @@
 //! window another window covers still has its own pixmap, so it is still seen.
 //!
 //! **What proves the pixmap is the window's.** Redirecting a window gives it a
-//! new pixmap, and the server fills it with what the screen showed there, which
-//! may be another window. Only once the window has drawn itself over all of it
-//! is it the window's own. So the damage reports are watched from before the
-//! redirect: the redirect's own report comes first and is set aside, then the
-//! window's repaint must cover the whole picture within [`REPAINT_WAIT_MS`], or
-//! the binding is refused. A window a compositing manager already redirected is
+//! new pixmap, and the server fills it with what the screen showed there. Where
+//! the screen showed the window, that copy is the window. Where it did not (under
+//! a window above it, or off the root), the copy is whatever was there, and the
+//! server asks the window to repaint those parts. So the windows above it are read
+//! before the redirect and again after it, and must not have moved; the damage
+//! reports are watched from before the redirect, its own report comes first and
+//! is set aside, and then the window's repaint must reach every part of its
+//! picture the screen was not showing, within [`REPAINT_WAIT_MS`], or the binding
+//! is refused. A window manager's frame around the window is painted by the
+//! server as part of the redirect (its parts are window backgrounds), so it is the
+//! client's part of the picture that is waited for. A window a compositing manager already redirected is
 //! drawn by that manager from the same pixmap, which therefore is the window as
 //! it shows. A window mapped again or resized gets a new pixmap, and is proved
 //! again the same way before anything more is published.
@@ -41,7 +46,7 @@ use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
 use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, EventMask, ImageFormat, ImageOrder,
-    MapState, Window as XWindow,
+    MapState, Window as XWindow, WindowClass,
 };
 use x11rb::protocol::{ErrorKind, Event};
 use x11rb::rust_connection::RustConnection;
@@ -64,8 +69,17 @@ pub const REDIRECT_WAIT_MS: u64 = 200;
 /// How long the window's repaint after a redirect is waited for.
 pub const REPAINT_WAIT_MS: u64 = 1_000;
 
+/// The most windows above a bound one that are read for the proof. Past it, all
+/// of the window's picture counts as unseen and must be repainted.
+const MAX_ABOVE: usize = 1_024;
+
 /// The pause between two looks while a proof waits.
 const PROOF_POLL_MS: u64 = 2;
+
+/// How long a request waits for the watch to catch up with the server. A watch
+/// mid-proof answers once the proof is done, so this covers the redirect's report
+/// and the window's repaint together.
+const CATCH_UP_WAIT_MS: u64 = 2_000;
 
 /// How long `stop` waits for the watch's thread to end. It ends within one
 /// event poll; this covers a server that stopped answering mid-read.
@@ -145,6 +159,79 @@ impl Area {
     }
 }
 
+/// The parts of the client's picture (`client`, root pixels) the screen was not
+/// showing when the window was redirected: off the root, or under a window above
+/// it (`above`, root rectangles). The server copies the rest from the screen, which
+/// showed the window there, and asks the client to repaint these.
+pub fn unseen(client: Rect, screen: Rect, above: &[Rect]) -> Vec<Rect> {
+    let mut pieces = outside(client, screen);
+    pieces.extend(above.iter().filter_map(|cover| overlap(client, *cover)));
+    pieces
+}
+
+/// Has the damage since the redirect's own report repainted every unseen piece?
+/// With none unseen, the screen's copy is the whole proof.
+pub fn repainted(damage: Option<Area>, unseen: &[Rect]) -> bool {
+    if unseen.is_empty() {
+        return true;
+    }
+    damage.is_some_and(|damage| unseen.iter().all(|piece| damage.covers(*piece)))
+}
+
+/// Where two rectangles share pixels, if anywhere.
+fn overlap(a: Rect, b: Rect) -> Option<Rect> {
+    let (left, top) = (a.x.max(b.x), a.y.max(b.y));
+    let right = right_of(a).min(right_of(b));
+    let bottom = bottom_of(a).min(bottom_of(b));
+    if right <= i64::from(left) || bottom <= i64::from(top) {
+        return None;
+    }
+    Some(Rect {
+        x: left,
+        y: top,
+        width: u32::try_from(right - i64::from(left)).ok()?,
+        height: u32::try_from(bottom - i64::from(top)).ok()?,
+    })
+}
+
+/// The parts of `rect` outside `bounds`: at most four bands, above, below, left
+/// and right of the part inside.
+fn outside(rect: Rect, bounds: Rect) -> Vec<Rect> {
+    let Some(inner) = overlap(rect, bounds) else {
+        return vec![rect];
+    };
+    let band = |x: i64, y: i64, right: i64, bottom: i64| -> Option<Rect> {
+        Some(Rect {
+            x: i32::try_from(x).ok()?,
+            y: i32::try_from(y).ok()?,
+            width: u32::try_from(right - x).ok().filter(|width| *width > 0)?,
+            height: u32::try_from(bottom - y)
+                .ok()
+                .filter(|height| *height > 0)?,
+        })
+    };
+    let (left, top) = (i64::from(rect.x), i64::from(rect.y));
+    let (in_left, in_top) = (i64::from(inner.x), i64::from(inner.y));
+    let (in_right, in_bottom) = (right_of(inner), bottom_of(inner));
+    [
+        band(left, top, right_of(rect), in_top),
+        band(left, in_bottom, right_of(rect), bottom_of(rect)),
+        band(left, in_top, in_left, in_bottom),
+        band(in_right, in_top, right_of(rect), in_bottom),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn right_of(rect: Rect) -> i64 {
+    i64::from(rect.x) + i64::from(rect.width)
+}
+
+fn bottom_of(rect: Rect) -> i64 {
+    i64::from(rect.y) + i64::from(rect.height)
+}
+
 /// Is `crop` inside a drawable of this size?
 pub fn inside(crop: Rect, width: u16, height: u16) -> bool {
     let right = i64::from(crop.x) + i64::from(crop.width);
@@ -199,13 +286,19 @@ impl WindowFrames for Composite {
         Ok(())
     }
 
+    /// The window can be closed, and another made under its id, between two
+    /// intervals: the watch catches up with the server first, so a window
+    /// destroyed before this request is never answered with its last frame.
     fn latest(&self, after: Option<Fence>) -> Result<WindowFrame, FrameError> {
-        if self.lock().is_none() {
-            return Err(FrameError::Unavailable(
-                "no window capture is running".to_string(),
-            ));
-        }
-        self.slot.peek(after, self.clock.now_ns())
+        let caught = match self.lock().as_ref() {
+            Some(running) => running.catch_up(),
+            None => {
+                return Err(FrameError::Unavailable(
+                    "no window capture is running".to_string(),
+                ))
+            }
+        };
+        served(caught, self.slot.peek(after, self.clock.now_ns()))
     }
 
     fn stop(&self) {
@@ -223,21 +316,58 @@ impl Drop for Composite {
     }
 }
 
-/// The watch's thread, and the two channels that start and confirm its end.
+/// What the watch said when it was asked to catch up with the server before a
+/// frame is served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Caught {
+    /// It synced its connection and read every report sent before the sync.
+    Up,
+    /// It is not running: it ended on a fault the slot holds, or without one.
+    Ended,
+    /// It did not answer within [`CATCH_UP_WAIT_MS`].
+    Late,
+}
+
+/// What the slot holds, as far as the watch's catching up lets it be served.
+fn served(
+    caught: Caught,
+    peeked: Result<WindowFrame, FrameError>,
+) -> Result<WindowFrame, FrameError> {
+    match (caught, peeked) {
+        (Caught::Up, peeked) => peeked,
+        (Caught::Late, _) => Err(FrameError::Unavailable(format!(
+            "the window capture did not catch up with the X server within {CATCH_UP_WAIT_MS} ms"
+        ))),
+        (Caught::Ended, Err(fault)) if !matches!(fault, FrameError::NotYet) => Err(fault),
+        // Nothing it holds is known to be the window now, and nothing more will come.
+        (Caught::Ended, _) => Err(FrameError::Gone(
+            "the window capture's watch ended; select the window again".to_string(),
+        )),
+    }
+}
+
+/// What the watch's thread is asked to do between two intervals.
+enum Command {
+    /// Sync, read every report the server sent before the sync, and say so.
+    CatchUp(Sender<()>),
+    Stop,
+}
+
+/// The watch's thread, and the two channels that command it and confirm its end.
 struct Running {
-    stop: Sender<()>,
+    commands: Sender<Command>,
     ended: Receiver<()>,
     thread: std::thread::JoinHandle<()>,
 }
 
 impl Running {
     fn spawn(watch: Watch, slot: Arc<Slot>, clock: Arc<dyn Clock>) -> Result<Running, FrameError> {
-        let (stop, stopped) = mpsc::channel();
+        let (commands, commanded) = mpsc::channel();
         let (finished, ended) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("compux-window-frames".to_string())
             .spawn(move || {
-                watch.run(&slot, &*clock, &stopped);
+                watch.run(&slot, &*clock, &commanded);
                 // Nobody waiting for this is a stop that already gave up.
                 finished.send(()).ok();
             })
@@ -245,10 +375,24 @@ impl Running {
                 FrameError::Unavailable(format!("the window capture would not start: {error}"))
             })?;
         Ok(Running {
-            stop,
+            commands,
             ended,
             thread,
         })
+    }
+
+    /// Ask the watch to catch up, and wait for it, bounded. A watch that already
+    /// ended has dropped the request, which drops its answer.
+    fn catch_up(&self) -> Caught {
+        let (answer, answered) = mpsc::channel();
+        if self.commands.send(Command::CatchUp(answer)).is_err() {
+            return Caught::Ended;
+        }
+        match answered.recv_timeout(Duration::from_millis(CATCH_UP_WAIT_MS)) {
+            Ok(()) => Caught::Up,
+            Err(RecvTimeoutError::Disconnected) => Caught::Ended,
+            Err(RecvTimeoutError::Timeout) => Caught::Late,
+        }
     }
 
     /// Ask the watch to end, and wait for it, bounded. A watch stuck on a
@@ -256,7 +400,7 @@ impl Running {
     fn end(self) {
         // A watch that already ended has dropped its receiver, which is the same
         // answer as this one.
-        self.stop.send(()).ok();
+        self.commands.send(Command::Stop).ok();
         match self.ended.recv_timeout(Duration::from_millis(STOP_WAIT_MS)) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => {
                 if self.thread.join().is_err() {
@@ -346,6 +490,8 @@ impl Watch {
             .check()
             .map_err(|error| reply_error(error, "damage reports on the window"))?;
         let composited = already_redirected(connection, self.top)?;
+        let before = self.unseen_now()?;
+        let connection = &self.connection;
         connection
             .composite_redirect_window(self.top, Redirect::AUTOMATIC)
             .map_err(lost)?
@@ -353,28 +499,127 @@ impl Watch {
             .map_err(|error| reply_error(error, "redirecting the window"))?;
         self.ours = !composited;
         if self.ours {
-            self.prove()?;
+            self.prove(&before)?;
         }
         self.name()
     }
 
-    /// The redirect's own report, set aside, then the window's repaint over the
-    /// whole picture.
-    fn prove(&mut self) -> Result<(), FrameError> {
-        let crop = self.crop()?;
+    /// The redirect's own report, set aside; the windows over it where they were
+    /// before the redirect (`before`); then the window's repaint over every part of
+    /// its picture the screen was not showing.
+    fn prove(&mut self, before: &[Rect]) -> Result<(), FrameError> {
         self.connection.flush().map_err(lost)?;
-        if self.damage_within(REDIRECT_WAIT_MS, None)?.is_none() {
+        if !self.damage_within(REDIRECT_WAIT_MS, None)? {
             return Err(unproven(format!(
                 "the X server reported no drawing within {REDIRECT_WAIT_MS} ms of redirecting it"
             )));
         }
         self.repaired()?;
-        match self.damage_within(REPAINT_WAIT_MS, Some(crop))? {
-            Some(_) => Ok(()),
-            None => Err(unproven(format!(
-                "it did not repaint all of itself within {REPAINT_WAIT_MS} ms of being redirected"
-            ))),
+        let after = self.unseen_now()?;
+        if after != before {
+            return Err(unproven(
+                "the windows over it moved while it was redirected".to_string(),
+            ));
         }
+        if self.damage_within(REPAINT_WAIT_MS, Some(&after))? {
+            return Ok(());
+        }
+        Err(unproven(format!(
+            "it did not repaint the {} part(s) of itself the screen was not showing within \
+             {REPAINT_WAIT_MS} ms of being redirected",
+            after.len()
+        )))
+    }
+
+    /// The parts of the client's picture the screen is not showing now, in this
+    /// window's own pixels, where damage is reported. Past [`MAX_ABOVE`] windows
+    /// over it, all of that picture counts.
+    fn unseen_now(&self) -> Result<Vec<Rect>, FrameError> {
+        let (crop, client) = self.places()?;
+        let Some(drawn) = overlap(crop, client) else {
+            return Ok(Vec::new());
+        };
+        let connection = &self.connection;
+        let tree = connection.query_tree(self.top).map_err(lost)?;
+        let tree = tree
+            .reply()
+            .map_err(|error| reply_error(error, "the window"))?;
+        let root = connection.get_geometry(tree.root).map_err(lost)?;
+        let origin = connection.translate_coordinates(self.top, tree.root, 0, 0);
+        let siblings = connection.query_tree(tree.root).map_err(lost)?;
+        let root = root
+            .reply()
+            .map_err(|error| reply_error(error, "the screen"))?;
+        let origin = origin.map_err(lost)?.reply();
+        let origin = origin.map_err(|error| reply_error(error, "the window"))?;
+        let siblings = siblings
+            .reply()
+            .map_err(|error| reply_error(error, "the screen"))?;
+        let at = siblings
+            .children
+            .iter()
+            .position(|window| *window == self.top);
+        let above = at
+            .map(|at| &siblings.children[at + 1..])
+            .ok_or_else(reframed)?;
+
+        let (dx, dy) = (i32::from(origin.dst_x), i32::from(origin.dst_y));
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            width: u32::from(root.width),
+            height: u32::from(root.height),
+        };
+        let covers = match above.len() > MAX_ABOVE {
+            true => vec![screen],
+            false => self.covering(above)?,
+        };
+        let on_root = Rect {
+            x: drawn.x + dx,
+            y: drawn.y + dy,
+            ..drawn
+        };
+        Ok(unseen(on_root, screen, &covers)
+            .into_iter()
+            .map(|piece| Rect {
+                x: piece.x - dx,
+                y: piece.y - dy,
+                ..piece
+            })
+            .collect())
+    }
+
+    /// The rectangles, borders included, of the windows in `windows` that are
+    /// viewable and draw: what they cover of whatever is under them. A window gone
+    /// since it was listed covers nothing.
+    fn covering(&self, windows: &[XWindow]) -> Result<Vec<Rect>, FrameError> {
+        let connection = &self.connection;
+        let mut asked = Vec::with_capacity(windows.len());
+        for window in windows {
+            let attributes = connection.get_window_attributes(*window).map_err(lost)?;
+            asked.push((attributes, connection.get_geometry(*window).map_err(lost)?));
+        }
+        let mut covers = Vec::with_capacity(asked.len());
+        for (attributes, geometry) in asked {
+            let (Some(attributes), Some(geometry)) =
+                (still(attributes.reply())?, still(geometry.reply())?)
+            else {
+                continue;
+            };
+            if attributes.map_state != MapState::VIEWABLE
+                || attributes.class == WindowClass::INPUT_ONLY
+            {
+                continue;
+            }
+            let border = 2 * u32::from(geometry.border_width);
+            covers.push(Rect {
+                x: i32::from(geometry.x),
+                y: i32::from(geometry.y),
+                width: u32::from(geometry.width) + border,
+                height: u32::from(geometry.height) + border,
+            });
+        }
+        Ok(covers)
     }
 
     /// The pixmap the window is drawn into now, under a name of this watch's.
@@ -400,26 +645,26 @@ impl Watch {
         Err(drowned())
     }
 
-    /// Wait up to `wait_ms` for damage: any at all, or enough to cover `crop`.
-    fn damage_within(
-        &mut self,
-        wait_ms: u64,
-        crop: Option<Rect>,
-    ) -> Result<Option<Area>, FrameError> {
+    /// Wait up to `wait_ms` for damage: any report at all (`None`), or enough to
+    /// repaint every one of the `unseen` pieces, which none need when there are
+    /// none.
+    fn damage_within(&mut self, wait_ms: u64, unseen: Option<&[Rect]>) -> Result<bool, FrameError> {
+        if unseen.is_some_and(|pieces| repainted(None, pieces)) {
+            return Ok(true);
+        }
         let deadline = Instant::now() + Duration::from_millis(wait_ms);
         let mut seen: Option<Area> = None;
         for _ in 0..MAX_EVENTS {
             let Some(area) = self.next_damage()? else {
                 if Instant::now() >= deadline {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 std::thread::sleep(Duration::from_millis(PROOF_POLL_MS));
                 continue;
             };
-            let total = seen.map_or(area, |earlier| earlier.merged(area));
-            seen = Some(total);
-            if crop.is_none_or(|crop| total.covers(crop)) {
-                return Ok(seen);
+            seen = Some(seen.map_or(area, |earlier| earlier.merged(area)));
+            if unseen.is_none_or(|pieces| repainted(seen, pieces)) {
+                return Ok(true);
             }
         }
         Err(drowned())
@@ -474,19 +719,44 @@ impl Watch {
         Ok(None)
     }
 
-    /// One frame interval after another, until the stop arrives or a fault
-    /// ends the stream; the fault is the slot's to answer.
-    fn run(mut self, slot: &Slot, clock: &dyn Clock, stop: &Receiver<()>) {
+    /// One frame interval after another, catching up whenever a request asks,
+    /// until the stop arrives or a fault ends the stream. The fault is the
+    /// slot's to answer, and it is there before the request that found it is
+    /// answered. Requests never put an interval off: the next one is due at its
+    /// time however many arrive before it.
+    fn run(mut self, slot: &Slot, clock: &dyn Clock, commands: &Receiver<Command>) {
+        let interval = Duration::from_millis(FRAME_INTERVAL_MS);
+        let mut due = Instant::now() + interval;
         loop {
-            match stop.recv_timeout(Duration::from_millis(FRAME_INTERVAL_MS)) {
-                Err(RecvTimeoutError::Timeout) => {}
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
-            }
-            if let Err(fault) = self.tick(slot, clock) {
+            let (outcome, answer) =
+                match commands.recv_timeout(due.saturating_duration_since(Instant::now())) {
+                    Err(RecvTimeoutError::Timeout) => {
+                        due = Instant::now() + interval;
+                        (self.tick(slot, clock), None)
+                    }
+                    Ok(Command::CatchUp(answer)) => (self.catch_up(), Some(answer)),
+                    Ok(Command::Stop) | Err(RecvTimeoutError::Disconnected) => return,
+                };
+            let fault = outcome.err();
+            let ended = fault.is_some();
+            if let Some(fault) = fault {
                 slot.fault(fault);
+            }
+            // Nobody waiting for the answer is a request that already gave up.
+            if let Some(answer) = answer {
+                answer.send(()).ok();
+            }
+            if ended {
                 return;
             }
         }
+    }
+
+    /// Read everything the server sent before now: a window destroyed before
+    /// this ends the stream here, not at the next interval.
+    fn catch_up(&mut self) -> Result<(), FrameError> {
+        self.sync()?;
+        self.drain()
     }
 
     /// Sync, read what the server said before it, and take the one step that
@@ -525,12 +795,13 @@ impl Watch {
                 .check()
                 .map_err(|error| reply_error(error, "redirecting the window again"))?;
             self.repaired()?;
+            let before = self.unseen_now()?;
             self.connection
                 .composite_redirect_window(self.top, Redirect::AUTOMATIC)
                 .map_err(lost)?
                 .check()
                 .map_err(|error| reply_error(error, "redirecting the window again"))?;
-            self.prove()?;
+            self.prove(&before)?;
         }
         self.name()?;
         self.hidden = false;
@@ -563,9 +834,15 @@ impl Watch {
         Ok(())
     }
 
-    /// Where the listed window is inside the redirected one, in its pixels: the
-    /// client's place in it, less GTK's shadow, with the window manager's frame.
+    /// Where the listed window is inside the redirected one, in its pixels.
     fn crop(&self) -> Result<Rect, FrameError> {
+        Ok(self.places()?.0)
+    }
+
+    /// Where the listed window (the client's place, less GTK's shadow, with the
+    /// window manager's frame) and the client are inside the redirected one, in
+    /// its pixels.
+    fn places(&self) -> Result<(Rect, Rect), FrameError> {
         let connection = &self.connection;
         let outer = connection.get_geometry(self.top).map_err(lost)?;
         let client = connection.get_geometry(self.client).map_err(lost)?;
@@ -590,8 +867,8 @@ impl Watch {
             height: u32::from(client.height),
         };
         let crop = placed(inner, frame.reply_extents()?, shadow.reply_extents()?)
-            .map(|(seen, _)| seen)
-            .filter(|seen| inside(*seen, outer.width, outer.height));
+            .map(|(seen, _)| (seen, inner))
+            .filter(|(seen, _)| inside(*seen, outer.width, outer.height));
         crop.ok_or_else(|| {
             FrameError::Unavailable(format!(
                 "the window's frame extents put it outside the {}x{} window the window manager \
@@ -854,6 +1131,20 @@ fn reframed() -> FrameError {
     )
 }
 
+/// A reply, or `None` for a window that is gone; any other failure is the
+/// connection's.
+fn still<T>(reply: Result<T, ReplyError>) -> Result<Option<T>, FrameError> {
+    match reply {
+        Ok(reply) => Ok(Some(reply)),
+        Err(ReplyError::X11Error(error))
+            if matches!(error.error_kind, ErrorKind::Window | ErrorKind::Drawable) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(reply_error(error, "a window over it")),
+    }
+}
+
 fn unproven(why: String) -> FrameError {
     FrameError::Unavailable(format!(
         "the window's own picture could not be proved: {why}, so what compux holds of it could \
@@ -914,6 +1205,74 @@ mod tests {
         assert!(Area::of(0, 0, 100, 100).covers(rect(10, 10, 90, 90)));
     }
 
+    // Nothing over it and all of it on the root: the screen showed all of it, and
+    // nothing has to be repainted.
+    #[test]
+    fn a_window_nothing_covers_is_all_seen() {
+        let screen = rect(0, 0, 1280, 1024);
+        assert_eq!(
+            unseen(rect(60, 180, 980, 770), screen, &[]),
+            Vec::<Rect>::new()
+        );
+        let elsewhere = [rect(0, 0, 50, 50), rect(1100, 960, 100, 60)];
+        assert_eq!(
+            unseen(rect(60, 180, 980, 770), screen, &elsewhere),
+            Vec::<Rect>::new()
+        );
+    }
+
+    // The part a window above it covers is unseen, and only that part.
+    #[test]
+    fn the_part_under_a_window_above_is_unseen() {
+        let screen = rect(0, 0, 1280, 1024);
+        let pieces = unseen(rect(61, 180, 980, 770), screen, &[rect(580, 490, 564, 507)]);
+        assert_eq!(pieces, vec![rect(580, 490, 461, 460)]);
+    }
+
+    // A window hanging off the root was never on the screen there: the copy holds
+    // nothing of it, so that part is unseen too.
+    #[test]
+    fn the_part_off_the_root_is_unseen() {
+        let screen = rect(0, 0, 1280, 1024);
+        let pieces = unseen(rect(-40, 900, 300, 200), screen, &[]);
+        let area: u64 = pieces
+            .iter()
+            .map(|p| u64::from(p.width) * u64::from(p.height))
+            .sum();
+        assert_eq!(area, 300 * 200 - 260 * 124);
+        assert!(
+            pieces
+                .iter()
+                .all(|p| p.x < 0 || p.y + p.height as i32 > 1024),
+            "{pieces:?}"
+        );
+    }
+
+    // A window fully under another is unseen whole.
+    #[test]
+    fn a_window_under_a_bigger_one_is_unseen_whole() {
+        let screen = rect(0, 0, 1280, 1024);
+        assert_eq!(
+            unseen(rect(100, 100, 200, 100), screen, &[rect(0, 0, 1280, 1024)]),
+            vec![rect(100, 100, 200, 100)]
+        );
+    }
+
+    // Seen in full: nothing to wait for. Unseen pieces: every one repainted, to its
+    // last pixel; damage beside a piece proves nothing about it.
+    #[test]
+    fn the_proof_needs_every_unseen_piece_repainted_and_nothing_more() {
+        assert!(repainted(None, &[]));
+        assert!(repainted(Some(Area::of(0, 0, 10, 10)), &[]));
+        let piece = rect(519, 310, 461, 460);
+        assert!(!repainted(None, &[piece]));
+        assert!(repainted(Some(Area::of(519, 310, 461, 460)), &[piece]));
+        assert!(!repainted(Some(Area::of(519, 310, 461, 459)), &[piece]));
+        let two = [piece, rect(0, 0, 20, 20)];
+        assert!(!repainted(Some(Area::of(519, 310, 461, 460)), &two));
+        assert!(repainted(Some(Area::of(0, 0, 980, 770)), &two));
+    }
+
     #[test]
     fn a_picture_is_cut_only_from_inside_its_drawable() {
         assert!(inside(rect(0, 0, 982, 795), 982, 795));
@@ -921,6 +1280,58 @@ mod tests {
         assert!(!inside(rect(0, 0, 983, 795), 982, 795));
         assert!(!inside(rect(-1, 0, 10, 10), 982, 795));
         assert!(!inside(rect(0, 790, 10, 10), 982, 795));
+    }
+
+    fn frame() -> WindowFrame {
+        WindowFrame {
+            pixels: vec![0; 4],
+            width: 1,
+            height: 1,
+            stride: 4,
+            captured_at_ns: 1,
+            display_time_mach: Some(1),
+            seq: 1,
+            content_rect: None,
+            reported_scale: None,
+            status: Health::Live,
+        }
+    }
+
+    // The window can be closed and another made under its id between two
+    // intervals, so a frame is served only once the watch has read everything the
+    // server sent it up to the request.
+    #[test]
+    fn a_watch_that_caught_up_serves_what_the_slot_holds() {
+        assert_eq!(served(Caught::Up, Ok(frame())).expect("served").seq, 1);
+        let closed = FrameError::Gone("the window was closed after it was bound".to_string());
+        let refused = served(Caught::Up, Err(closed)).expect_err("gone");
+        assert_eq!(refused.code(), "target_unavailable");
+    }
+
+    #[test]
+    fn a_watch_that_ended_without_a_fault_never_serves_its_last_frame() {
+        let refused = served(Caught::Ended, Ok(frame())).expect_err("ended");
+        assert_eq!(refused.code(), "target_unavailable");
+        let never = served(Caught::Ended, Err(FrameError::NotYet)).expect_err("ended");
+        assert_eq!(
+            never.code(),
+            "target_unavailable",
+            "no frame will ever come"
+        );
+    }
+
+    #[test]
+    fn a_watch_that_ended_on_a_fault_answers_that_fault() {
+        let closed = FrameError::Gone("the window was closed after it was bound".to_string());
+        let refused = served(Caught::Ended, Err(closed)).expect_err("gone");
+        assert!(refused.detail().contains("closed"), "{refused:?}");
+    }
+
+    #[test]
+    fn a_watch_that_did_not_catch_up_serves_nothing() {
+        let refused = served(Caught::Late, Ok(frame())).expect_err("late");
+        assert_eq!(refused.code(), "capture_unavailable");
+        assert!(refused.detail().contains("did not"), "{refused:?}");
     }
 
     #[test]
