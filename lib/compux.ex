@@ -516,6 +516,19 @@ defmodule Compux do
       (every screenshot is refused `consent_refused` until the person resets it),
       `"unset"`, or `"not_running"` (the store is not running, so nothing was
       read).
+    * `:pixel_route` — `%{route:, cause:, desktop:, interface:}`: the pixel
+      route the session took, `"x11"`, `"portal"` or `"none"` (`"unknown"` for
+      a word this library does not know), and where it is `"none"` why:
+      `cause` is `"no_display"`, `"no_session_bus"`, `"unsupported_desktop"`
+      (`desktop`: `"kde"` or `"other"`), `"portal_not_running"`,
+      `"portal_unanswered"`, `"portal_no_registry"` or `"portal_missing"`
+      (`interface`: `"Screenshot"`, `"RemoteDesktop"` or `"ScreenCast"`); each
+      `nil` where it does not apply or is not one of these.
+
+  On Linux `:screen_capture` and `:input_control` say what the route serves as
+  far as the probe's own facts support it: capture is false under a stored
+  Screenshot `"no"`, input is false on X11 without XTEST or the keymap, and both
+  are false on X11 where the probe's own X connection did not answer.
   """
   @spec probe(t()) :: {:ok, map()} | {:error, term()}
   def probe(%__MODULE__{driver: driver, state: state}) do
@@ -684,7 +697,8 @@ defmodule Compux do
       accessibility_packages: probe_packages(Map.get(response, "accessibility_packages")),
       toolkit_notes: probe_notes(Map.get(response, "toolkit_notes")),
       x11_pixels: probe_x11_pixels(Map.get(response, "x11_pixels")),
-      portal: probe_portal(Map.get(response, "portal"))
+      portal: probe_portal(Map.get(response, "portal")),
+      pixel_route: probe_pixel_route(Map.get(response, "pixel_route"))
     }
   end
 
@@ -760,6 +774,25 @@ defmodule Compux do
   end
 
   defp probe_portal(_absent), do: nil
+
+  @pixel_routes ~w(x11 portal none)
+  @pixel_causes ~w(no_display no_session_bus unsupported_desktop portal_not_running
+                   portal_unanswered portal_no_registry portal_missing)
+  @desktops ~w(kde other)
+  @portal_interfaces ~w(Screenshot RemoteDesktop ScreenCast)
+
+  defp probe_pixel_route(%{} = route) do
+    %{
+      route: if(route["route"] in @pixel_routes, do: route["route"], else: "unknown"),
+      cause: probe_word(route["cause"], @pixel_causes),
+      desktop: probe_word(route["desktop"], @desktops),
+      interface: probe_word(route["interface"], @portal_interfaces)
+    }
+  end
+
+  defp probe_pixel_route(_absent), do: nil
+
+  defp probe_word(word, words), do: if(word in words, do: word)
 
   defp probe_count(count) when is_integer(count) and count >= 0, do: count
   defp probe_count(_absent), do: nil

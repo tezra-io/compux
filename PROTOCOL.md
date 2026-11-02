@@ -825,6 +825,7 @@ read-only and raising no prompt:
  "display_adopted":false,"screen_capture":true,"input_control":true,
  "x11_pixels":{"xtest":true,"keymap":true},
  "portal":{"running":true,"version":"1.14.4-1ubuntu2~22.04.2","registry":false,"screenshot_permission":"unset"},
+ "pixel_route":{"route":"x11"},
  "accessibility_bus":{"state":"answering","applications":7,
                       "status":{"is_enabled":false,"screen_reader_enabled":false}},
  "accessibility_packages":{"source":"dpkg","at_spi2_core":"2.44.0-3","atk_bridge":"2.38.0-3"},
@@ -836,9 +837,25 @@ read-only and raising no prompt:
   when only an X socket answers, `none` when neither does. `x11_endpoint` says whether an X endpoint answers: the
   session's own on X11, XWayland beside Wayland. `display_adopted` is true where the helper had no display of its
   own and took the session's from the user manager (§1), which it reaches as its own. `screen_capture` and
-  `input_control` say whether the session's pixel route (§1.1) serves `screenshot` and the pointer: true on X11 and
-  on GNOME Wayland with a `Registry`, false where the route is refused. They are read without a prompt, so on GNOME
-  Wayland they do not say the person will allow it.
+  `input_control` say whether the session's pixel route (§1.1) serves `screenshot` and the pointer and keys, as far
+  as the probe's own facts support it: both false where the route is refused (`pixel_route` says why). On X11,
+  `input_control` is false where `x11_pixels` says XTEST or the keymap is missing (the first input is refused
+  without XTEST, and keys are found on the keymap); capture needs neither. Both are false on X11 where the probe's
+  own X connection did not answer (`x11_pixels` is `null`). On GNOME Wayland, `screen_capture` is false where the
+  stored Screenshot answer is `no`, which refuses every screenshot; `input_control` stays true, since the portal's
+  input is its RemoteDesktop session, which never asks `Screenshot`. A pointer verb is still aimed in a screenshot
+  there (no control on a Wayland session carries a position, §2.2), so under a stored `no` it is keys, `type` and
+  the verbs on a reference that act. The two are read without a prompt, so on GNOME Wayland they do not say the
+  person will allow what the portal has not asked yet.
+- `pixel_route` is the route the helper decided at its start (§1.1); the probe reads nothing for it. `route` is
+  `x11`, `portal` or `none`. Where it is `none`, `cause` says why, in one closed word: `no_display` (neither a
+  Wayland nor an X socket answers), `no_session_bus` (a Wayland session with no session bus to reach the portal on),
+  `unsupported_desktop` (a compositor other than GNOME's on Wayland, with `desktop`: `kde` for KDE Plasma, `other`
+  for any other), `portal_not_running` (the portal is not running and did not start), `portal_unanswered` (the
+  portal answered an error that does not say whether it runs), `portal_no_registry` (the portal has no host
+  `Registry`; `portal.version` says which it is), or `portal_missing` (the portal lacks one of the interfaces the
+  route needs, with `interface`: `Screenshot`, `RemoteDesktop` or `ScreenCast`). A refused pixel action carries the
+  same reason as a sentence (`pixels_unavailable`, §7).
 - `x11_pixels` is the X11 route's two needs, read on a connection of its own where an X endpoint answers (`null`
   where none does): `xtest`, the XTEST extension; `keymap`, the server's keyboard map answered.
 - `portal` is read where a session bus answers (`null` where none does), without raising a dialog and without

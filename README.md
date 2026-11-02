@@ -432,9 +432,11 @@ answered its socket (`x11`, `wayland`, `none`) and whether an X endpoint answers
 and how many applications its registry lists (or why it is unavailable), the
 at-spi2-core and ATK bridge versions dpkg records, the toolkit notes known
 without reading any application, whether XTEST and the keymap answer
-(`x11_pixels`), and whether the portal runs, its version, its Registry and any
-stored Screenshot answer for compux (`portal`), all read-only, raising no dialog
-and starting neither the portal nor its store (PROTOCOL.md, "`probe`"). A helper
+(`x11_pixels`), whether the portal runs, its version, its Registry and any
+stored Screenshot answer for compux (`portal`), and the pixel route the session
+took or, where it took none, why (`pixel_route`), all read-only, raising no dialog
+and starting neither the portal nor its store; its capture and input say only
+what those facts support (PROTOCOL.md, "`probe`"). A helper
 started with no display of its own (a daemon a systemd user unit started before
 login) reads `DISPLAY`, `WAYLAND_DISPLAY` and `XAUTHORITY`, and nothing else,
 from the user manager over the session bus, and carries them as values: it never

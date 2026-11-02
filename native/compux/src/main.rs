@@ -1402,33 +1402,35 @@ fn indicator_presence(launcher: &Arc<dyn indicator::Launcher>) -> &'static str {
 /// posting an event — the only reliable way to detect the silent-drop state where
 /// capture works but synthetic input is discarded. On Linux it also says whether
 /// the accessibility bus answers, which packages it rests on, and the toolkit
-/// notes known without reading an application (`linux::probe`), read-only as
+/// notes known without reading an application (`linux::probe`), both pixel
+/// routes' facts and the route the session took (`linux::pixels`), read-only as
 /// well. Surfaced by the consumer's diagnostics (a doctor/setup surface); the
 /// model never calls this.
 fn probe(endpoint: &Endpoint, pixels: &Pixels) -> Result<Value, Failure> {
     probe_with(endpoint, pixels, || platform_facts(endpoint))
 }
 
-/// `probe` with the facts `platform` reads: on Linux the accessibility bus, its
-/// packages and the toolkit notes, and both pixel routes' state; none on macOS,
-/// whose grants are the two booleans.
+/// `probe` over the facts `platform` reads, read first: capture and input are
+/// said from the route and those facts, and the facts are reported beside them.
 fn probe_with(
     endpoint: &Endpoint,
     pixels: &Pixels,
-    platform: impl FnOnce() -> serde_json::Map<String, Value>,
+    platform: impl FnOnce() -> PlatformFacts,
 ) -> Result<Value, Failure> {
+    let facts = platform();
+    let (screen_capture, input_control) = grants(pixels, &facts);
     let mut reply = with_x11_endpoint(
         json!({
             "ok": true,
             "platform": std::env::consts::OS,
             "display_server": display_server(endpoint),
-            "screen_capture": screen_capture_ok(pixels),
-            "input_control": input_control_ok(pixels),
+            "screen_capture": screen_capture,
+            "input_control": input_control,
         }),
         endpoint,
     );
     if let Some(object) = reply.as_object_mut() {
-        object.extend(platform());
+        object.extend(platform_fields(pixels, facts));
     }
     Ok(reply)
 }
@@ -1454,17 +1456,52 @@ fn with_x11_endpoint(reply: Value, _endpoint: &Endpoint) -> Value {
     reply
 }
 
-/// What `probe` reports of the accessibility bus, its packages and the toolkits,
-/// and of the X11 and portal pixel routes.
+/// What `probe` reads on Linux before it says anything: the accessibility bus,
+/// its packages and the toolkit notes, as the fields they are reported in, and
+/// the X11 and portal pixel routes' facts, which capture and input are said from.
 #[cfg(target_os = "linux")]
-fn platform_facts(endpoint: &Endpoint) -> serde_json::Map<String, Value> {
-    let mut facts = linux::probe::report(Duration::from_millis(ax::READ_TIMEOUT_MS));
-    facts.extend(linux::pixels::probe(endpoint));
-    facts
+#[derive(Default)]
+struct PlatformFacts {
+    fields: serde_json::Map<String, Value>,
+    pixels: linux::pixels::Probed,
 }
 
-#[cfg(not(target_os = "linux"))]
-fn platform_facts(_endpoint: &Endpoint) -> serde_json::Map<String, Value> {
+/// What `probe` reads on macOS: the two grants, as TCC holds them.
+#[cfg(target_os = "macos")]
+struct PlatformFacts {
+    screen_capture: bool,
+    input_control: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn platform_facts(endpoint: &Endpoint) -> PlatformFacts {
+    PlatformFacts {
+        fields: linux::probe::report(Duration::from_millis(ax::READ_TIMEOUT_MS)),
+        pixels: linux::pixels::probe(endpoint),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_facts(_endpoint: &Endpoint) -> PlatformFacts {
+    PlatformFacts {
+        screen_capture: permissions::screen_capture(),
+        input_control: permissions::input_control(),
+    }
+}
+
+/// Linux: the facts as read, both pixel routes' among them, and the route the
+/// session took.
+#[cfg(target_os = "linux")]
+fn platform_fields(pixels: &Pixels, facts: PlatformFacts) -> serde_json::Map<String, Value> {
+    let mut fields = facts.fields;
+    fields.extend(linux::pixels::probe_fields(&facts.pixels));
+    fields.insert("pixel_route".to_string(), pixels.pixel_route());
+    fields
+}
+
+/// macOS reports nothing beside its two grants.
+#[cfg(target_os = "macos")]
+fn platform_fields(_pixels: &Pixels, _facts: PlatformFacts) -> serde_json::Map<String, Value> {
     serde_json::Map::new()
 }
 
@@ -1497,16 +1534,17 @@ fn request_input_control_ok(_pixels: &Pixels) -> bool {
     permissions::request_input_control()
 }
 
-// No TCC off macOS: report the same reality `probe` does (there is nothing to
-// prompt, and a portal dialog is raised by first use, never by asking).
+// No TCC off macOS: there is nothing to prompt, and a portal dialog is raised by
+// first use, never by asking. What the session's pixel route serves is reported,
+// read from nothing; `probe` qualifies it with the facts it reads.
 #[cfg(not(target_os = "macos"))]
 fn request_screen_capture_ok(pixels: &Pixels) -> bool {
-    screen_capture_ok(pixels)
+    pixels.serves("screenshot")
 }
 
 #[cfg(not(target_os = "macos"))]
 fn request_input_control_ok(pixels: &Pixels) -> bool {
-    input_control_ok(pixels)
+    pixels.serves("left_click")
 }
 
 #[cfg(target_os = "macos")]
@@ -1674,32 +1712,24 @@ fn display_server(_endpoint: &Endpoint) -> &'static str {
     "quartz"
 }
 
+/// macOS: capture and input are the two grants TCC holds.
 #[cfg(target_os = "macos")]
-fn screen_capture_ok(_pixels: &Pixels) -> bool {
-    permissions::screen_capture()
-}
-
-#[cfg(target_os = "macos")]
-fn input_control_ok(_pixels: &Pixels) -> bool {
-    permissions::input_control()
+fn grants(_pixels: &Pixels, facts: &PlatformFacts) -> (bool, bool) {
+    (facts.screen_capture, facts.input_control)
 }
 
 // Linux: the display server is decided by which socket answers, and capture and
 // input by the session's pixel route (X11 through x11rb, GNOME Wayland through the
-// portal); a real capture or input still fails loud per action.
+// portal) as far as the probe's own facts support it; a real capture or input
+// still fails loud per action.
 #[cfg(target_os = "linux")]
 fn display_server(endpoint: &Endpoint) -> &'static str {
     endpoint.server().name()
 }
 
 #[cfg(target_os = "linux")]
-fn screen_capture_ok(pixels: &Pixels) -> bool {
-    pixels.serves("screenshot")
-}
-
-#[cfg(target_os = "linux")]
-fn input_control_ok(pixels: &Pixels) -> bool {
-    pixels.serves("left_click")
+fn grants(pixels: &Pixels, facts: &PlatformFacts) -> (bool, bool) {
+    linux::pixels::grants(pixels, &facts.pixels)
 }
 
 // --- display selection ------------------------------------------------------
@@ -6773,7 +6803,7 @@ mod tests {
             adopted: false,
         };
         let shown = |endpoint: &Endpoint, pixels: &Pixels| {
-            let v = probe_with(endpoint, pixels, serde_json::Map::new).unwrap();
+            let v = probe_with(endpoint, pixels, PlatformFacts::default).unwrap();
             let keys = [
                 "display_server",
                 "x11_endpoint",
@@ -6787,7 +6817,7 @@ mod tests {
             shown(&own, &test_pixels()),
             [json!("x11"), json!(true), json!(true), json!(true)]
         );
-        let refused = Pixels::Refused("no display answers".to_string());
+        let refused = Pixels::Refused(linux::pixels::NoRoute::NoDisplay);
         assert_eq!(
             shown(&Endpoint::default(), &refused),
             [json!("none"), json!(false), json!(false), json!(false)]
@@ -6805,7 +6835,12 @@ mod tests {
             &linux::probe::Packages::default(),
         );
 
-        let v = probe_with(&Endpoint::default(), &test_pixels(), || facts.clone()).unwrap();
+        let read = || PlatformFacts {
+            fields: facts.clone(),
+            ..PlatformFacts::default()
+        };
+
+        let v = probe_with(&Endpoint::default(), &test_pixels(), read).unwrap();
 
         for key in [
             "accessibility_bus",
@@ -6817,6 +6852,66 @@ mod tests {
         assert!(v["display_server"].is_string(), "{v}");
     }
 
+    // The probe says capture and input only as far as its own facts support what
+    // the route serves, and names the route the session took: an X display with no
+    // XTEST still captures and takes no input, a stored portal "no" takes input and
+    // captures nothing, and a refused route says why in closed words.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_the_probe_says_what_its_own_facts_support_and_names_the_route() {
+        use linux::pixels::{NoRoute, Probed, Wayland};
+        let x11 = Pixels::X11(
+            Box::new(linux::x11::Desktop::new(Default::default())),
+            Default::default(),
+        );
+        let portal = Pixels::on_portal(linux::portal::Portal::with(
+            Box::new(|| panic!("the probe asked the portal")),
+            None,
+            linux::portal::Budgets::PORTAL,
+        ));
+        let refused = Pixels::Refused(NoRoute::PortalMissing {
+            interface: "ScreenCast",
+        });
+        let no_xtest = || PlatformFacts {
+            pixels: Probed {
+                x11: Some(linux::x11::Facts {
+                    xtest: false,
+                    keymap: true,
+                }),
+                portal: None,
+            },
+            ..PlatformFacts::default()
+        };
+        let stored_no = || PlatformFacts {
+            pixels: Probed {
+                x11: None,
+                portal: Some((Wayland::default(), Some("no"))),
+            },
+            ..PlatformFacts::default()
+        };
+        let shown = |pixels: &Pixels, read: fn() -> PlatformFacts| {
+            let v = probe_with(&Endpoint::default(), pixels, read).unwrap();
+            ["screen_capture", "input_control", "pixel_route"].map(|key| v[key].clone())
+        };
+
+        assert_eq!(
+            shown(&x11, no_xtest),
+            [json!(true), json!(false), json!({"route": "x11"})]
+        );
+        assert_eq!(
+            shown(&portal, stored_no),
+            [json!(false), json!(true), json!({"route": "portal"})]
+        );
+        assert_eq!(
+            shown(&refused, PlatformFacts::default),
+            [
+                json!(false),
+                json!(false),
+                json!({"route": "none", "cause": "portal_missing", "interface": "ScreenCast"})
+            ]
+        );
+    }
+
     // A session whose pixel route is refused (a compositor compux has not
     // qualified, a portal with no Registry, no display at all) serves controls only.
     // The handshake offers no pixel verb and no foreground input, the probe says it
@@ -6825,14 +6920,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn on_linux_a_session_whose_pixel_route_is_refused_serves_controls_only() {
-        let refused = || Pixels::Refused("KDE Plasma on Wayland has no pixel route".to_string());
+        let refused = || Pixels::Refused(linux::pixels::NoRoute::UnsupportedDesktop { kde: true });
         let adopted = Endpoint {
             adopted: true,
             ..Endpoint::default()
         };
 
         let v = hello(&test_launcher(), &refused()).unwrap();
-        let probed = probe_with(&adopted, &refused(), serde_json::Map::new).unwrap();
+        let probed = probe_with(&adopted, &refused(), PlatformFacts::default).unwrap();
 
         let actions = advertised(&v);
         for pixel in PIXEL_ACTIONS {
@@ -6846,6 +6941,11 @@ mod tests {
         assert_eq!(probed["display_adopted"], json!(true), "{probed}");
         assert_eq!(probed["screen_capture"], json!(false), "{probed}");
         assert_eq!(probed["input_control"], json!(false), "{probed}");
+        assert_eq!(
+            probed["pixel_route"],
+            json!({"route": "none", "cause": "unsupported_desktop", "desktop": "kde"}),
+            "{probed}"
+        );
 
         let gate = Gate::new("boot-1".to_string(), Arc::new(SystemClock::new()));
         let mut worker = Worker {
@@ -7115,11 +7215,30 @@ mod tests {
         let route = linux::pixels::route(adopted.server(), || {
             panic!("an X display's route read the portal")
         });
-        let probed = probe_with(&adopted, &test_pixels(), serde_json::Map::new).unwrap();
+        let probed = probe_with(&adopted, &test_pixels(), PlatformFacts::default).unwrap();
 
         assert_eq!(adopted.server(), own.server());
         assert_eq!(route, linux::pixels::Decision::X11);
         assert_eq!(probed["display_adopted"], json!(true), "{probed}");
+    }
+
+    // The macOS probe is its two grants and nothing beside them: no pixel route
+    // and none of the Linux facts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_macos_the_probe_is_its_two_grants_and_names_no_route() {
+        let read = || PlatformFacts {
+            screen_capture: true,
+            input_control: false,
+        };
+
+        let v = probe_with(&Endpoint::default(), &test_pixels(), read).unwrap();
+
+        assert_eq!(
+            v,
+            json!({"ok": true, "platform": "macos", "display_server": "quartz",
+                   "screen_capture": true, "input_control": false})
+        );
     }
 
     // And the macOS build offers every verb it offered before, in the same order.
