@@ -222,7 +222,8 @@ binding ties the bound one (§1.2): exactly one of the application's windows on 
 Linux these are the window manager's clients and the root's own children, where an override-redirect menu sits; a
 window server that will not list them is `target_unavailable`. The window server is asked only when the application
 has a window on screen besides the bound one that macOS does not already name as the bound window's, and at most
-once a look; a bound window that is its application's only one never asks it. Without a target nothing here changes.
+once a look; on X11 a bound window that is its application's only one never asks it. Without a target nothing here
+changes.
 
 ### 2.2 Reply
 

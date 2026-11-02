@@ -2276,7 +2276,8 @@ bound window, for the focus and for a menu of the application's) has never run. 
   `{"action":"elements","scope":"focused","target_id":"T"}` lists the field.
 * Open the sheet by hand (**Clear All…**): `{"action":"elements","scope":"dialog","target_id":"T"}`
   lists OK and Cancel; a press with `"target_id":"T"` on Clear All… names the sheet
-  in `receipt.surfaces`. With the sheet still open, send
+  in `receipt.surfaces`, once (note it if it is listed twice). With the sheet still
+  open, send
   `{"action":"elements","scope":"focused","target_id":"T"}`: a control in the sheet
   is inside the bound window, so if the sheet holds the focus this lists it. Note
   what it answers: a `scope_not_found` saying focus is in another window means the
@@ -2294,9 +2295,14 @@ bound window, for the focus and for a menu of the application's) has never run. 
   `receipt.surfaces` names the menu; pressing Second by the menu scope's
   `element_ref` with `"target_id":"T"` picks it. If it does not, the menu scope is
   `scope_not_found` saying to release the target, and the wait is not met
-  (`"met":false`). Note which answer came, and whether the window scope lists the
-  items (AppKit listing the open menu under the pop-up button): together they say
-  whether "press a pop-up, pick an item" works under a binding. Press Escape.
+  (`"met":false`). A third answer is neither: if reading the menu's `AXWindow`
+  does not answer within 250 ms, the scan stops, the menu scope is
+  `scope_not_found` saying the look stopped before it finished, and the wait is
+  not met with `"truncated":"time"`. Note which answer came (with `truncated` if
+  the not-met reply carries it, so a slow read is not recorded as macOS not naming
+  the window), and whether the window scope lists the items (AppKit listing the
+  open menu under the pop-up button): together they say whether "press a pop-up,
+  pick an item" works under a binding. Press Escape.
 * Right-click the context-menu area and send
   `{"action":"elements","scope":"menu","target_id":"T"}` while it is open. Like the
   pop-up's menu, it lists the menu's items if macOS names the bound window as the
@@ -2306,7 +2312,13 @@ bound window, for the focus and for a menu of the application's) has never run. 
 * TextEdit with two documents open: bind the first, click into the second, and
   send `{"action":"elements","scope":"focused","target_id":"T"}`: `scope_not_found`
   saying focus is in another window of the application. Nothing of the second
-  document is listed.
+  document is listed. Then, still bound to the first, right-click in the second
+  and, with its menu open, send
+  `{"action":"elements","scope":"menu","target_id":"T"}` and
+  `{"action":"wait_for","until":{"kind":"menu_open"},"timeout_ms":1000,"target_id":"T"}`:
+  `scope_not_found` saying to release the target, and `"met":false`. If the
+  menu's items are listed, macOS names the wrong window as a menu's `AXWindow`,
+  and the `AXWindow` mark must be dropped: report it. Press Escape.
 * `{"action":"screenshot","target_id":"T","marks":true}` badges the fixture
   window's controls; press one by its mark's `element_ref` with `"target_id":"T"`
   and it acts. With the context menu open over the window, the same screenshot
