@@ -16,7 +16,7 @@ they are as protocol 11 had them.
 ## 1. `hello`
 
 ```json
-{"type":"response","request_id":"h1","ok":true,"protocol_version":12,"compux_version":"0.10.1",
+{"type":"response","request_id":"h1","ok":true,"protocol_version":12,"compux_version":"0.11.0",
  "actions":["screenshot","left_click","right_click","double_click","mouse_move","left_click_drag","scroll",
             "type","key","wait","inspect","wait_for_change","paste","elements","windows","press","set_value",
             "focus","select","toggle","expand","collapse","scroll_to","wait_for","select_target","release_target"],
