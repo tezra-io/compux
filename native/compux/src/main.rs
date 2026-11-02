@@ -3046,8 +3046,8 @@ fn listed_under(marks: &MarksFrom) -> Option<u32> {
 }
 
 /// What a bound window's marks are read from: the window's own subtree and the
-/// surfaces in windows of its own that its scene sees ([`semantic::surfaces`]), in
-/// one walk, cut to this view. Nothing else of the application is read, so no
+/// surfaces outside it that its scene sees ([`semantic::surfaces`]), in one walk,
+/// cut to this view. Nothing else of the application is read, so no
 /// control of another window is marked under the binding.
 fn bound_in_view(
     ax: &Rc<dyn ax::Ax>,
@@ -9182,9 +9182,11 @@ mod tests {
     }
 
     // A bound screenshot's marks are what the bound window sees: its own controls,
-    // and those of a dialog in a window the window server says is its own. A
-    // control of another window of the same application, inside the same
-    // rectangle, is not marked, so no reference to it is listed under the binding.
+    // those of a dialog in a window the window server says is its own, and those
+    // of a menu macOS names the bound window as the window of. A control of
+    // another window of the same application, inside the same rectangle, or of a
+    // menu that names no window, is not marked, so no reference to it is listed
+    // under the binding.
     #[test]
     fn a_bound_screenshots_marks_are_what_the_bound_window_sees() {
         let gate = boot_gate();
@@ -9196,6 +9198,17 @@ mod tests {
             label: Some(label.to_string()),
             children: children.to_vec(),
             ..ax::Scripted::of("AXWindow")
+        };
+        let menu = |named: Option<usize>, item: usize| ax::Scripted {
+            window: named,
+            children: vec![item],
+            ..ax::Scripted::of("AXMenu")
+        };
+        let item = |label: &str, x: f64| ax::Scripted {
+            label: Some(label.to_string()),
+            actions: vec![ax::PRESS.to_string()],
+            frame: Some(frame_at(x, 310.0)),
+            ..ax::Scripted::of("AXMenuItem")
         };
         let app = ax::Recorder::new(
             FIXTURE_PID,
@@ -9215,6 +9228,10 @@ mod tests {
                 ax::Scripted::button("Save", frame_at(20.0, 360.0)),
                 ax::Scripted::button("Delete", frame_at(60.0, 80.0)),
                 ax::Scripted::button("Keep", frame_at(150.0, 150.0)),
+                placed(300.0, 300.0, 100.0, 40.0, menu(Some(0), 7)),
+                item("Copy", 310.0),
+                placed(420.0, 300.0, 100.0, 40.0, menu(None, 9)),
+                item("Paste", 430.0),
             ],
         );
         app.windows_are(&[0, 1]);
@@ -9256,10 +9273,10 @@ mod tests {
             .iter()
             .map(|entry| entry["label"].as_str().unwrap_or("-"))
             .collect();
-        assert_eq!(marked, vec!["Save", "Keep"]);
+        assert_eq!(marked, vec!["Save", "Keep", "Copy"]);
         let listed = info.elements.expect("references");
         assert_eq!(listed.bound, Some(10));
-        assert_eq!(listed.len(), 2);
+        assert_eq!(listed.len(), 3);
     }
 
     // A window bound without an accessibility element has no subtree of its own

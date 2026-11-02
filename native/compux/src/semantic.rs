@@ -382,8 +382,9 @@ pub struct Surface {
     pub native_kind: String,
     pub label: Option<String>,
     pub element: Retained,
-    /// It sits in a window of its own that the window server ties to the bound
-    /// window, outside the bound window's subtree.
+    /// It is the bound window's by the platform's mark and sits outside the bound
+    /// window's subtree: macOS names the bound window as its window, or it is in a
+    /// window of its own that the window server ties to the bound window.
     pub apart: bool,
 }
 
@@ -401,10 +402,13 @@ pub struct Surfaces {
 /// The surfaces a scene sees, the one answer the `menu` and `dialog` scopes, the
 /// menu conditions and a receipt all read. Unbound, those open in the application:
 /// its windows and their children, and the menu of a menu-bar item that reads
-/// selected. Bound, the bound window's own: the window and what is inside it, and
-/// what is in a window the window server says is its own, transient for it
-/// directly or through a chain ([`MAX_TRANSIENT_HOPS`]). Where the window server
-/// marks no window as another's (macOS), that is only what is inside it.
+/// selected. Bound, the bound window's own: the window and what is inside it, a
+/// surface of the application's whose window macOS names as the bound window
+/// (`AXWindow`), and what is in a window the window server says is its own,
+/// transient for it directly or through a chain ([`MAX_TRANSIENT_HOPS`]). Where
+/// neither mark is set, that is only what is inside it. The window server is asked
+/// only when the application has another window on screen that could be one, and
+/// at most once a scan.
 ///
 /// A scan reads at most [`MAX_SURFACE_NODES`] nodes. A node the platform says is
 /// off screen is no surface, and nothing below it is looked at. A node that will
@@ -420,6 +424,7 @@ pub fn surfaces(ax: &Rc<dyn Ax>, scene: &Scene) -> Result<Surfaces, Failure> {
         stopped: None,
         found: Vec::new(),
         apart: false,
+        ties: None,
     };
     match &scene.window {
         None => scan.application(scene.pid),
@@ -440,9 +445,34 @@ struct Scan<'a> {
     /// and a slow application would hold it for a timeout per node.
     stopped: Option<&'static str>,
     found: Vec<Surface>,
-    /// What is read now sits in a window of the bound window's own, outside its
+    /// What is read now is the bound window's by the platform's mark, outside its
     /// subtree.
     apart: bool,
+    /// What the window server says of the bound window's application, read the
+    /// first time a child of the application could sit in one of its windows.
+    ties: Option<Ties>,
+}
+
+/// The application's windows on screen, as the window server lists them, and the
+/// ids of those that are the bound window's own.
+struct Ties {
+    family: Vec<WindowFacts>,
+    owned: Vec<u32>,
+}
+
+/// What the window server says of a bound window's application, for one scan.
+fn read_ties(pid: i32, bound: &Bound) -> Result<Ties, Failure> {
+    let family = bound.windows.family(pid).map_err(|why| {
+        Failure::new(
+            "target_unavailable",
+            format!(
+                "the window server would not say which windows are the bound window's ({why}): \
+                 release the target to read the application's"
+            ),
+        )
+    })?;
+    let owned = owned_by(&family, bound.id);
+    Ok(Ties { family, owned })
 }
 
 impl Scan<'_> {
@@ -457,18 +487,9 @@ impl Scan<'_> {
     }
 
     /// A bound window's own surfaces: the window read as a child of the
-    /// application is, then the children of the application that sit in one of
-    /// the windows the window server says are its own.
+    /// application is, then the other children of the application that are its
+    /// own ([`Scan::owned_top`]).
     fn bound(&mut self, pid: i32, bound: &Bound) -> Result<(), Failure> {
-        let family = bound.windows.family(pid).map_err(|why| {
-            Failure::new(
-                "target_unavailable",
-                format!(
-                    "the window server would not say which windows are the bound window's \
-                     ({why}): release the target to read the application's"
-                ),
-            )
-        })?;
         let window = self
             .ax
             .retain_again(self.ax, bound.element)
@@ -479,16 +500,12 @@ impl Scan<'_> {
                 )
             })?;
         self.top(window);
-        let owned = owned_by(&family, bound.id);
-        if owned.is_empty() {
-            return Ok(());
-        }
         let Some(app) = self.ax.application(self.ax, pid) else {
             return Ok(());
         };
         self.apart = true;
         for child in self.kids(app.handle()) {
-            self.owned_top(child, &family, &owned);
+            self.owned_top(child, pid, bound)?;
         }
         Ok(())
     }
@@ -554,19 +571,52 @@ impl Scan<'_> {
         self.top_read(&facts, node);
     }
 
-    /// A child of the application read as [`Scan::top`] reads it, when its frame
-    /// ties it to one of the bound window's own windows (`owned`, out of the
-    /// application's windows `family`).
-    fn owned_top(&mut self, node: Retained, family: &[WindowFacts], owned: &[u32]) {
+    /// A child of the application other than the bound window, read as
+    /// [`Scan::top`] reads it when it is the bound window's: a surface whose window
+    /// macOS names as the bound window, or one whose frame ties it to one of the
+    /// bound window's own windows on the window server.
+    fn owned_top(&mut self, node: Retained, pid: i32, bound: &Bound) -> Result<(), Failure> {
+        if self.ax.same(node.handle(), bound.element) {
+            return Ok(());
+        }
         let Some(facts) = self.facts(node.handle()).filter(|facts| !facts.hidden) else {
-            return;
+            return Ok(());
         };
-        if facts
-            .frame
-            .is_some_and(|frame| crate::target::tied(frame, family, owned))
-        {
+        if self.named(&facts, node.handle(), bound.element) || self.tied(&facts, pid, bound)? {
             self.top_read(&facts, node);
         }
+        Ok(())
+    }
+
+    /// Whether a surface's window, as the platform names it, is `window`. A read
+    /// that does not answer in time stops the scan, as any read does.
+    fn named(&mut self, facts: &Facts, handle: Handle, window: Handle) -> bool {
+        let role = facts.role.as_deref().unwrap_or("");
+        if roles::surface(role, facts.subrole.as_deref()).is_none() {
+            return false;
+        }
+        match self.ax.in_window(handle, window) {
+            Ok(named) => named,
+            Err(why) => {
+                self.unread(why);
+                false
+            }
+        }
+    }
+
+    /// Whether a frame ties a child to one of the bound window's own windows. The
+    /// window server is asked the first time a scan needs it, and not again.
+    fn tied(&mut self, facts: &Facts, pid: i32, bound: &Bound) -> Result<bool, Failure> {
+        let Some(frame) = facts.frame else {
+            return Ok(false);
+        };
+        let ties = match self.ties.take() {
+            Some(ties) => ties,
+            None => read_ties(pid, bound)?,
+        };
+        let tied = crate::target::tied(frame, &ties.family, &ties.owned);
+        self.ties = Some(ties);
+        Ok(tied)
     }
 
     /// What [`Scan::top`] does with a child of the application once read.
@@ -2096,9 +2146,9 @@ mod tests {
         assert_eq!(labels(&found), vec!["Keep first"]);
     }
 
-    // Where the window server marks no window as another's (macOS), a bound
-    // window's surfaces are the ones inside it: a sheet of its own, never a
-    // dialog in a window of its own.
+    // Where the window server marks no window as another's (macOS) and macOS
+    // names no window for a surface, a bound window's surfaces are the ones inside
+    // it: a sheet of its own, never a menu of the application's.
     #[test]
     fn where_nothing_marks_ownership_a_bound_window_sees_only_what_is_inside_it() {
         let (recorder, ax) = platform(desktop());
@@ -2113,6 +2163,149 @@ mod tests {
             whole(&ax, &bound, Scope::Menu).is_err(),
             "the context menu is the application's, not the window's"
         );
+    }
+
+    /// [`desktop`] with a second window, Other, and its context menu naming
+    /// `window` as its window, as macOS's `AXWindow` does.
+    fn desktop_menu_naming(window: Option<usize>) -> Vec<Scripted> {
+        let mut elements = desktop();
+        elements[5].window = window;
+        elements.push(Scripted {
+            frame: Some(frame(300.0, 0.0)),
+            ..holding("AXWindow", "Other", &[])
+        });
+        elements
+    }
+
+    /// Whether `condition` holds on one look at `scene`.
+    fn seen_on(ax: &Rc<dyn Ax>, scene: &Scene, condition: Condition) -> bool {
+        let clock = SystemClock::new();
+        let at = Looking {
+            ax,
+            scene: scene.clone(),
+            named: None,
+            clock: &clock,
+        };
+        holds(look(&at, &condition, u64::MAX).expect("a look"))
+    }
+
+    // A menu of the application's own, outside every window, is the bound
+    // window's when macOS names the bound window as its window: the menu scope
+    // lists it, menu_open holds, menu_closed does not, and a receipt sees it as
+    // apart from the window's subtree. One that names no window, or another, stays
+    // the application's.
+    #[test]
+    fn a_menu_naming_the_bound_window_as_its_window_is_the_bound_windows() {
+        let other = desktop().len();
+        for (window, its_own) in [(Some(0), true), (None, false), (Some(other), false)] {
+            let (recorder, ax) = platform(desktop_menu_naming(window));
+            recorder.windows_are(&[0, other]);
+            let windows = crate::ax::application_windows(&ax, PID);
+            let bound = bound_to(&windows[0], 10, &WindowRecorder::new(Vec::new()));
+
+            assert_eq!(
+                seen_on(&ax, &bound, Condition::MenuOpen),
+                its_own,
+                "{window:?}"
+            );
+            assert_eq!(
+                seen_on(&ax, &bound, Condition::MenuClosed),
+                !its_own,
+                "{window:?}"
+            );
+            let receipt = surfaces(&ax, &bound).expect("a scan");
+            let menus: Vec<(Option<&str>, bool)> = receipt
+                .found
+                .iter()
+                .filter(|surface| surface.kind == "menu")
+                .map(|surface| (surface.label.as_deref(), surface.apart))
+                .collect();
+            let listed = whole(&ax, &bound, Scope::Menu);
+            if its_own {
+                assert_eq!(menus, vec![(Some("Context"), true)]);
+                assert_eq!(labels(&listed.expect("its menu")), vec!["Copy"]);
+                continue;
+            }
+            assert!(menus.is_empty(), "{window:?}: {menus:?}");
+            let refused = listed.expect_err("the application's menu");
+            assert_eq!(refused.code, "scope_not_found");
+            let detail = refused.detail.unwrap_or_default();
+            assert!(detail.contains("release the target"), "{detail}");
+        }
+    }
+
+    // A menu whose window does not answer in time leaves the scan unfinished, as
+    // any read that does not answer does: menu_closed is not proven.
+    #[test]
+    fn a_menu_whose_window_does_not_answer_leaves_the_scan_unfinished() {
+        let (recorder, ax) = platform(desktop_menu_naming(Some(0)));
+        recorder.windows_are(&[0]);
+        recorder.fails_window_for(5, Unread::NoAnswer);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let bound = bound_to(&windows[0], 10, &WindowRecorder::new(Vec::new()));
+
+        assert_eq!(surfaces(&ax, &bound).expect("a scan").stopped, Some("time"));
+        let clock = SystemClock::new();
+        let at = Looking {
+            ax: &ax,
+            scene: bound,
+            named: None,
+            clock: &clock,
+        };
+        assert!(matches!(
+            look(&at, &Condition::MenuClosed, u64::MAX),
+            Ok(Seen::Unproven("time"))
+        ));
+    }
+
+    // The window server is asked which windows are the bound window's only when
+    // the application has another window on screen that could be one: a wait
+    // bound to an application's only window never asks it, and one beside another
+    // window asks once a look.
+    #[test]
+    fn a_bound_wait_asks_the_window_server_only_beside_another_window() {
+        let alone = vec![
+            Scripted {
+                frame: Some(span(0.0, 400.0)),
+                ..holding("AXWindow", "Document", &[1])
+            },
+            Scripted::button("Save", frame(0.0, 120.0)),
+        ];
+        let (recorder, ax) = platform(alone);
+        recorder.windows_are(&[0]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let server = two_windows_server();
+        let clock = SystemClock::new();
+        let at = Looking {
+            ax: &ax,
+            scene: bound_to(&windows[0], 10, &server),
+            named: None,
+            clock: &clock,
+        };
+        let waited = wait(&test_gate(), 500, |deadline| {
+            look(&at, &Condition::MenuOpen, deadline)
+        })
+        .expect("a wait");
+        assert!(!waited.met && waited.looks > 1, "{}", waited.looks);
+        assert_eq!(server.calls(), 0, "nothing else could be the window's");
+
+        let (recorder, ax) = platform(two_windows());
+        recorder.windows_are(&[0, 1]);
+        let windows = crate::ax::application_windows(&ax, PID);
+        let server = two_windows_server();
+        let at = Looking {
+            ax: &ax,
+            scene: bound_to(&windows[0], 10, &server),
+            named: None,
+            clock: &clock,
+        };
+        let waited = wait(&test_gate(), 500, |deadline| {
+            look(&at, &Condition::MenuOpen, deadline)
+        })
+        .expect("a wait");
+        assert!(!waited.met, "the second window's menu is not the first's");
+        let asked = u64::try_from(server.calls()).expect("a count");
+        assert_eq!(asked, waited.looks, "once a look");
     }
 
     // A condition bound to a window reads a reference only from a listing taken

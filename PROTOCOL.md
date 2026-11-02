@@ -195,8 +195,8 @@ The scopes, on macOS:
 | `app` | The application element of the application in view (as protocol 11), or of the bound window's application. Refused with a target: a bound window's controls are the window's (release the target to list the application). | no |
 | `window` | The bound window; without a target, the application's focused window (`AXFocusedWindow`). | no |
 | `focused` | The application's focused element (`AXFocusedUIElement`), and what is inside it. With a target, only one whose `AXWindow` is the bound window. | yes |
-| `menu` | Every menu open in the application (§6.2): a context menu, a pop-up's menu, a menu-bar menu. With a target, only a menu inside the bound window: the menu bar's menus and a menu in a window of its own (a context menu, a pop-up's menu) are the application's, not the window's. | no |
-| `dialog` | Every dialog or alert open in the application (§6.2), sheets included. With a target, the bound window itself when it is one and those inside it (a sheet): a dialog in a window of its own is the application's, not the window's. | no |
+| `menu` | Every menu open in the application (§6.2): a context menu, a pop-up's menu, a menu-bar menu. With a target, a menu inside the bound window, and a menu of the application's (a context menu, a pop-up's menu) whose `AXWindow` is the bound window. The menu bar's menus, and a menu whose `AXWindow` is none or another window, are the application's, not the window's. | no |
+| `dialog` | Every dialog or alert open in the application (§6.2), sheets included. With a target, the bound window itself when it is one, those inside it (a sheet), and a dialog of the application's whose `AXWindow` is the bound window. Any other dialog in a window of its own is the application's, not the window's. | no |
 
 The scopes, on Linux (AT-SPI):
 
@@ -220,7 +220,9 @@ bound window's is refused `scope_not_found` saying so: one open in another windo
 window's, and releasing the target lists the application's. A window is tied to its accessibility element as the
 binding ties the bound one (§1.2): exactly one of the application's windows on screen sits at the element's frame. On
 Linux these are the window manager's clients and the root's own children, where an override-redirect menu sits; a
-window server that will not list them is `target_unavailable`. Without a target nothing here changes.
+window server that will not list them is `target_unavailable`. The window server is asked only when the application
+has a window on screen besides the bound one that macOS does not already name as the bound window's, and at most
+once a look; a bound window that is its application's only one never asks it. Without a target nothing here changes.
 
 ### 2.2 Reply
 
@@ -486,7 +488,7 @@ use a reference from that list. The same holds for a condition naming an `elemen
 target. A request naming no target uses any listing, as before.
 
 A screenshot with `marks` of a bound window badges what that window sees: its own controls, and those of the
-surfaces in windows of its own that its `menu` and `dialog` scopes list (§2.1), and its references are listed under
+surfaces outside it that its `menu` and `dialog` scopes list (§2.1), and its references are listed under
 the binding. Nothing else of the application is marked, however it overlaps the window. A window bound without an
 accessibility element has nothing of its own to read, so its marks are the application's in view, as a display's
 are, with their points and no `element_ref`: no reference of them could be used under the binding. Such a mark is
@@ -697,8 +699,10 @@ application, and a context menu the menu inside the window a toolkit puts up for
 menu it has made.
 
 With a target, the scan reads the bound window as it reads a child of the application, so the window itself when it
-is a surface and the surfaces inside it, and then, on X11, each child of the application whose frame ties it to a
-window `WM_TRANSIENT_FOR` the bound one (§2.1). It reads the same 64 nodes at most. What the toolkits do on X11:
+is a surface and the surfaces inside it, and then each other child of the application that is the bound window's:
+on macOS a surface whose `AXWindow` is the bound window (a read of it that does not answer within its 250 ms stops
+the scan), and on X11 one whose frame ties it to a window `WM_TRANSIENT_FOR` the bound one (§2.1). It reads the same
+64 nodes at most. What the toolkits do on X11:
 
 | Toolkit | Dialog | Menu |
 |---|---|---|

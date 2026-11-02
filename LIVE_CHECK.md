@@ -2269,7 +2269,7 @@ answered by a modal window: note what `dispatch` says). Press Cancel by hand.
 
 The unit tests prove what a binding does to `focused`, `menu` and `dialog` on a
 recording platform; the macOS reader's half (an element's `AXWindow` against the
-bound window) has never run. Bind the fixture window (`windows`, then
+bound window, for the focus and for a menu of the application's) has never run. Bind the fixture window (`windows`, then
 `select_target` with its id, `T` below), and send each with `"target_id":"T"`:
 
 * With the caret in the fixture's text field,
@@ -2283,11 +2283,26 @@ bound window) has never run. Bind the fixture window (`windows`, then
   sheet's controls name the sheet, not the window, as their `AXWindow`. Press
   Cancel by hand. The scope then answers
   `scope_not_found` saying no dialog **of the bound window** is open.
+* Press the fixture's **AppKit pop-up button** through the binding (its
+  `element_ref` from a listing taken with `"target_id":"T"`, pressed with
+  `"target_id":"T"`), and with its menu (First, Second, Third) open send
+  `{"action":"elements","scope":"menu","target_id":"T"}`,
+  `{"action":"elements","scope":"window","target_id":"T"}` and
+  `{"action":"wait_for","until":{"kind":"menu_open"},"timeout_ms":1000,"target_id":"T"}`.
+  If macOS names the bound window as the open menu's `AXWindow`, the menu scope
+  lists First, Second and Third, the wait is met (`"met":true`), and the press's
+  `receipt.surfaces` names the menu; pressing Second by the menu scope's
+  `element_ref` with `"target_id":"T"` picks it. If it does not, the menu scope is
+  `scope_not_found` saying to release the target, and the wait is not met
+  (`"met":false`). Note which answer came, and whether the window scope lists the
+  items (AppKit listing the open menu under the pop-up button): together they say
+  whether "press a pop-up, pick an item" works under a binding. Press Escape.
 * Right-click the context-menu area and send
-  `{"action":"elements","scope":"menu","target_id":"T"}` while it is open: it answers
-  `scope_not_found` (a macOS context menu is the application's, not the window's)
-  and says to release the target; the same request without `target_id` lists the
-  menu's items. Press Escape.
+  `{"action":"elements","scope":"menu","target_id":"T"}` while it is open. Like the
+  pop-up's menu, it lists the menu's items if macOS names the bound window as the
+  menu's `AXWindow`, and otherwise answers `scope_not_found` saying to release the
+  target; note which. The same request without `target_id` lists the menu's items
+  either way. Press Escape.
 * TextEdit with two documents open: bind the first, click into the second, and
   send `{"action":"elements","scope":"focused","target_id":"T"}`: `scope_not_found`
   saying focus is in another window of the application. Nothing of the second
@@ -2295,7 +2310,8 @@ bound window) has never run. Bind the fixture window (`windows`, then
 * `{"action":"screenshot","target_id":"T","marks":true}` badges the fixture
   window's controls; press one by its mark's `element_ref` with `"target_id":"T"`
   and it acts. With the context menu open over the window, the same screenshot
-  badges none of the menu's items (the menu is the application's). A window
+  badges the menu's items exactly when the step above listed them under the
+  binding, and none of them otherwise. A window
   bound without an accessibility element (`ax_binding` not `bound`) gets marks
   with points and no `element_ref`.
 * With the fixture bound again, a reference from step 2's listing (taken without

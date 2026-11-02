@@ -1547,6 +1547,11 @@ impl Ax for Real {
         })
     }
 
+    fn same(&self, one: Handle, other: Handle) -> bool {
+        let at = self.address(one);
+        at.is_some() && at == self.address(other)
+    }
+
     /// The application's window that reads ACTIVE, or the node inside it that
     /// reads FOCUSED.
     fn focused(&self, owner: &Rc<dyn Ax>, pid: i32, what: Focus) -> Option<Retained> {

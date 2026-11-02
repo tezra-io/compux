@@ -512,6 +512,18 @@ pub trait Ax {
     /// when either would not say, which is never read as yes.
     fn in_focused_window(&self, handle: Handle) -> Option<bool>;
 
+    /// Whether the platform names `window` as this element's window: macOS's
+    /// `AXWindow`, compared as [`Ax::focused_in`] compares it. `Refused` where the
+    /// platform keeps no such mark (AT-SPI has none) or the element names none,
+    /// which never counts as the window's.
+    fn in_window(&self, _handle: Handle, _window: Handle) -> Result<bool, Unread> {
+        Err(Unread::Refused)
+    }
+
+    /// Whether two handles name one element. Nothing is sent: what each holds is
+    /// compared.
+    fn same(&self, one: Handle, other: Handle) -> bool;
+
     /// The application's focused window or focused element, retained; `None` when
     /// it has none or will not say.
     fn focused(&self, owner: &Rc<dyn Ax>, pid: i32, what: Focus) -> Option<Retained>;
@@ -1466,6 +1478,24 @@ mod mac {
             }
         }
 
+        fn in_window(&self, handle: Handle, window: Handle) -> Result<bool, Unread> {
+            let element = self.element(handle).ok_or(Unread::Gone)?;
+            let window = self.element(window).ok_or(Unread::Gone)?;
+            unsafe {
+                prepare(&element, READ_TIMEOUT_MS);
+                self.sent();
+                let its_window = copy_attr(&element, WINDOW)?;
+                Ok(CFEqual(its_window.as_CFTypeRef(), window.as_CFTypeRef()) != 0)
+            }
+        }
+
+        fn same(&self, one: Handle, other: Handle) -> bool {
+            let (Some(one), Some(other)) = (self.element(one), self.element(other)) else {
+                return false;
+            };
+            unsafe { CFEqual(one.as_CFTypeRef(), other.as_CFTypeRef()) != 0 }
+        }
+
         fn focused(&self, owner: &Rc<dyn Ax>, pid: i32, what: Focus) -> Option<Retained> {
             let app = application_element(pid)?;
             let attribute = match what {
@@ -2213,6 +2243,10 @@ mod stub {
             None
         }
 
+        fn same(&self, _one: Handle, _other: Handle) -> bool {
+            false
+        }
+
         fn focused(&self, _owner: &Rc<dyn Ax>, _pid: i32, _what: Focus) -> Option<Retained> {
             None
         }
@@ -2271,6 +2305,9 @@ pub struct Scripted {
     pub selects_children: bool,
     /// What it answers when asked whether its window is the focused one.
     pub in_focused_window: Option<bool>,
+    /// The node it names as its window (macOS `AXWindow`), as an index into the
+    /// same script; `None` names none.
+    pub window: Option<usize>,
 }
 
 #[cfg(test)]
@@ -2316,6 +2353,7 @@ impl Scripted {
             states: States::default(),
             selects_children: false,
             in_focused_window: Some(true),
+            window: None,
         }
     }
 
@@ -2438,6 +2476,8 @@ struct Recorded {
     identity_fail: std::collections::HashMap<usize, Identity>,
     count_fail: std::collections::HashMap<usize, Unread>,
     copy_fail: std::collections::HashMap<usize, Unread>,
+    /// Nodes whose window (macOS `AXWindow`) answers this instead.
+    window_fail: std::collections::HashMap<usize, Unread>,
     /// A node's page of children, by the index it starts at, that answers this.
     page_fail: std::collections::HashMap<(usize, usize), Unread>,
     /// Nodes that count a different number of children than they list.
@@ -2585,6 +2625,11 @@ impl Recorder {
     /// One uncounted copy of the Nth node's children answers this instead.
     pub fn fails_copy_for(&self, index: usize, why: Unread) {
         self.state().copy_fail.insert(index, why);
+    }
+
+    /// The Nth node's window (macOS `AXWindow`) answers this instead.
+    pub fn fails_window_for(&self, index: usize, why: Unread) {
+        self.state().window_fail.insert(index, why);
     }
 
     /// The page of the Nth node's children that starts at `start` answers this
@@ -3121,6 +3166,24 @@ impl Ax for Recorder {
         let mut state = self.state();
         state.messages += 1;
         Recorder::node(&state, handle).and_then(|index| state.elements[index].in_focused_window)
+    }
+
+    fn in_window(&self, handle: Handle, window: Handle) -> Result<bool, Unread> {
+        let mut state = self.state();
+        state.messages += 1;
+        let index = Recorder::node(&state, handle).ok_or(Unread::Gone)?;
+        let window = Recorder::node(&state, window).ok_or(Unread::Gone)?;
+        if let Some(why) = state.window_fail.get(&index) {
+            return Err(*why);
+        }
+        let named = state.elements[index].window.ok_or(Unread::Refused)?;
+        Ok(named == window)
+    }
+
+    fn same(&self, one: Handle, other: Handle) -> bool {
+        let state = self.state();
+        let held = state.held.get(&one.0);
+        held.is_some() && held == state.held.get(&other.0)
     }
 
     fn focused(&self, owner: &Rc<dyn Ax>, pid: i32, what: Focus) -> Option<Retained> {
