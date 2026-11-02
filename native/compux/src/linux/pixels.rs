@@ -85,7 +85,96 @@ pub struct Wayland {
 pub enum Decision {
     X11,
     Portal,
-    Refused(String),
+    Refused(NoRoute),
+}
+
+/// Why a session has no pixel route: one value, which a refused action carries
+/// as its sentence and `probe` names as its closed cause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NoRoute {
+    /// Neither a Wayland nor an X socket answers.
+    NoDisplay,
+    /// A Wayland session with no session bus to reach the portal on.
+    NoSessionBus,
+    /// A Wayland compositor other than GNOME's: KDE Plasma, or another.
+    UnsupportedDesktop { kde: bool },
+    /// The portal is not running and did not start.
+    PortalNotRunning,
+    /// The portal answered an error that does not say whether it runs.
+    PortalUnanswered,
+    /// The portal has no host Registry; its version, where the package
+    /// database says.
+    PortalNoRegistry { version: Option<String> },
+    /// The portal lacks one of the three interfaces the route needs.
+    PortalMissing { interface: &'static str },
+}
+
+impl std::fmt::Display for NoRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NoRoute::NoDisplay => {
+                f.write_str("no display answers this session (neither a Wayland nor an X socket)")
+            }
+            NoRoute::NoSessionBus => {
+                f.write_str("this Wayland session has no session bus to reach the portal on")
+            }
+            NoRoute::UnsupportedDesktop { kde } => {
+                let which = if *kde {
+                    "KDE Plasma"
+                } else {
+                    "this compositor"
+                };
+                write!(
+                    f,
+                    "{which} on Wayland has no pixel route compux has qualified; only GNOME's \
+                     portal is"
+                )
+            }
+            NoRoute::PortalNotRunning => f.write_str(
+                "the XDG desktop portal is not running on this session and did not start, so \
+                 compux has no route to the screen or the input",
+            ),
+            NoRoute::PortalUnanswered => f.write_str(
+                "the XDG desktop portal answered with an error that does not say whether it \
+                 runs, so compux has no route to the screen or the input",
+            ),
+            NoRoute::PortalNoRegistry { version } => {
+                let version = version.as_deref().unwrap_or("of unknown version");
+                write!(
+                    f,
+                    "xdg-desktop-portal {version} has no host Registry (1.18 or later has it), so \
+                     compux cannot ask for pixels under its own app id {}",
+                    portal::APP_ID
+                )
+            }
+            NoRoute::PortalMissing { interface } => {
+                write!(f, "the portal has no {interface} on this session")
+            }
+        }
+    }
+}
+
+impl NoRoute {
+    /// `probe`'s `pixel_route` for a session refused for this: `none`, with the
+    /// closed cause and, where one says which, the desktop or the interface.
+    pub fn pixel_route(&self) -> Value {
+        match self {
+            NoRoute::NoDisplay => json!({"route": "none", "cause": "no_display"}),
+            NoRoute::NoSessionBus => json!({"route": "none", "cause": "no_session_bus"}),
+            NoRoute::UnsupportedDesktop { kde } => json!({
+                "route": "none", "cause": "unsupported_desktop",
+                "desktop": if *kde { "kde" } else { "other" },
+            }),
+            NoRoute::PortalNotRunning => json!({"route": "none", "cause": "portal_not_running"}),
+            NoRoute::PortalUnanswered => json!({"route": "none", "cause": "portal_unanswered"}),
+            NoRoute::PortalNoRegistry { .. } => {
+                json!({"route": "none", "cause": "portal_no_registry"})
+            }
+            NoRoute::PortalMissing { interface } => {
+                json!({"route": "none", "cause": "portal_missing", "interface": interface})
+            }
+        }
+    }
 }
 
 /// The route for a session's server: its portal facts are read, by `read`, on
@@ -102,60 +191,30 @@ pub fn route(server: Server, read: impl FnOnce() -> Option<Wayland>) -> Decision
 pub fn decide(server: Server, wayland: Option<&Wayland>) -> Decision {
     let facts = match (server, wayland) {
         (Server::X11, _) => return Decision::X11,
-        (Server::None, _) => {
-            return Decision::Refused(
-                "no display answers this session (neither a Wayland nor an X socket)".to_string(),
-            )
-        }
-        (Server::Wayland { .. }, None) => {
-            return Decision::Refused(
-                "this Wayland session has no session bus to reach the portal on".to_string(),
-            )
-        }
+        (Server::None, _) => return Decision::Refused(NoRoute::NoDisplay),
+        (Server::Wayland { .. }, None) => return Decision::Refused(NoRoute::NoSessionBus),
         (Server::Wayland { .. }, Some(facts)) => facts,
     };
     if !facts.gnome {
-        let which = if facts.kde {
-            "KDE Plasma"
-        } else {
-            "this compositor"
-        };
-        return Decision::Refused(format!(
-            "{which} on Wayland has no pixel route compux has qualified; only GNOME's portal is"
-        ));
+        return Decision::Refused(NoRoute::UnsupportedDesktop { kde: facts.kde });
     }
     match facts.running {
         Some(true) => {}
-        Some(false) => {
-            return Decision::Refused(
-                "the XDG desktop portal is not running on this session and did not start, so \
-                 compux has no route to the screen or the input"
-                    .to_string(),
-            )
-        }
-        None => {
-            return Decision::Refused(
-                "the XDG desktop portal answered with an error that does not say whether it \
-                 runs, so compux has no route to the screen or the input"
-                    .to_string(),
-            )
-        }
+        Some(false) => return Decision::Refused(NoRoute::PortalNotRunning),
+        None => return Decision::Refused(NoRoute::PortalUnanswered),
     }
     if !facts.registry {
-        let version = facts.version.as_deref().unwrap_or("of unknown version");
-        return Decision::Refused(format!(
-            "xdg-desktop-portal {version} has no host Registry (1.18 or later has it), so compux \
-             cannot ask for pixels under its own app id {}",
-            portal::APP_ID
-        ));
+        return Decision::Refused(NoRoute::PortalNoRegistry {
+            version: facts.version.clone(),
+        });
     }
     let missing = [
         (facts.screenshot, "Screenshot"),
         (facts.remote_desktop, "RemoteDesktop"),
         (facts.screen_cast, "ScreenCast"),
     ];
-    if let Some((_, name)) = missing.iter().find(|(present, _)| !present) {
-        return Decision::Refused(format!("the portal has no {name} on this session"));
+    if let Some((_, interface)) = missing.iter().find(|(present, _)| !present) {
+        return Decision::Refused(NoRoute::PortalMissing { interface });
     }
     Decision::Portal
 }
@@ -164,7 +223,7 @@ pub fn decide(server: Server, wayland: Option<&Wayland>) -> Decision {
 pub enum Pixels {
     X11(Box<x11::Desktop>, Env),
     Portal(Rc<RefCell<Portal>>, PortalInput),
-    Refused(String),
+    Refused(NoRoute),
     /// Serves every pixel action into a recording platform, and no screen: what a
     /// unit test's worker is given.
     #[cfg(test)]
@@ -241,7 +300,7 @@ impl Pixels {
         match self {
             Pixels::X11(_, env) => Screen::X11(env.clone()),
             Pixels::Portal(portal, _) => Screen::Portal(Rc::clone(portal)),
-            Pixels::Refused(why) => Screen::Refused(why.clone()),
+            Pixels::Refused(why) => Screen::Refused(why.to_string()),
             #[cfg(test)]
             Pixels::Recorded(_) => Screen::Refused("a unit test has no screen".to_string()),
         }
@@ -252,7 +311,7 @@ impl Pixels {
         match self {
             Pixels::X11(desktop, _) => Ok(desktop.as_mut()),
             Pixels::Portal(_, input) => Ok(input),
-            Pixels::Refused(why) => Err(why.clone()),
+            Pixels::Refused(why) => Err(why.to_string()),
             #[cfg(test)]
             Pixels::Recorded(recorder) => Ok(recorder),
         }
@@ -319,6 +378,17 @@ impl Pixels {
     /// Whether the portal's geometry applies: logical points, frames measured.
     pub fn portal(&self) -> bool {
         matches!(self, Pixels::Portal(..))
+    }
+
+    /// The route this session took, as `probe` names it in `pixel_route`.
+    pub fn pixel_route(&self) -> Value {
+        match self {
+            Pixels::X11(..) => json!({"route": "x11"}),
+            Pixels::Portal(..) => json!({"route": "portal"}),
+            Pixels::Refused(why) => why.pixel_route(),
+            #[cfg(test)]
+            Pixels::Recorded(_) => json!({"route": "recorded"}),
+        }
     }
 }
 
@@ -731,34 +801,68 @@ pub async fn stored_screenshot(session: &Connection) -> Option<&'static str> {
     )
 }
 
+/// What `probe` reads of both routes, before anything is said from it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Probed {
+    /// XTEST and the keymap, where an X endpoint answered the probe's own
+    /// connection.
+    pub x11: Option<x11::Facts>,
+    /// The portal's facts and the stored Screenshot answer, where a session bus
+    /// answered.
+    pub portal: Option<(Wayland, Option<&'static str>)>,
+}
+
 /// The `probe` fields for both routes: `x11_pixels` where an X endpoint answers,
 /// `portal` where a session bus does.
-pub fn probe_fields(
-    x11: Option<x11::Facts>,
-    portal: Option<(Wayland, Option<&'static str>)>,
-) -> Map<String, Value> {
+pub fn probe_fields(probed: &Probed) -> Map<String, Value> {
     let mut fields = Map::new();
     fields.insert(
         "x11_pixels".to_string(),
-        x11.map_or(
+        probed.x11.map_or(
             Value::Null,
             |facts| json!({"xtest": facts.xtest, "keymap": facts.keymap}),
         ),
     );
     fields.insert(
         "portal".to_string(),
-        portal.map_or(Value::Null, |(facts, stored)| {
-            json!({"running": facts.running, "version": facts.version,
-                   "registry": (facts.running == Some(true)).then_some(facts.registry),
-                   "screenshot_permission": stored})
-        }),
+        probed
+            .portal
+            .as_ref()
+            .map_or(Value::Null, |(facts, stored)| {
+                json!({"running": facts.running, "version": facts.version,
+                       "registry": (facts.running == Some(true)).then_some(facts.registry),
+                       "screenshot_permission": stored})
+            }),
     );
     fields
 }
 
-/// What `probe` reads for the two routes, now.
+/// Pure: what `probe` says of capture and input, as `(screen_capture,
+/// input_control)`: what the route serves, as far as the probe's own facts
+/// support it. On the portal a stored Screenshot "no" refuses every screenshot;
+/// its input is the RemoteDesktop session, which never asks Screenshot. On X11
+/// both go through the X endpoint, which the probe's own connection must have
+/// reached; input needs XTEST and the keymap, capture neither.
+pub fn grants(pixels: &Pixels, probed: &Probed) -> (bool, bool) {
+    let (screen, input) = (pixels.serves("screenshot"), pixels.serves("left_click"));
+    match pixels {
+        Pixels::Portal(..) => {
+            let stored = probed.portal.as_ref().and_then(|(_, stored)| *stored);
+            (screen && stored != Some("no"), input)
+        }
+        Pixels::X11(..) => match probed.x11 {
+            Some(facts) => (screen, input && facts.xtest && facts.keymap),
+            None => (false, false),
+        },
+        Pixels::Refused(_) => (screen, input),
+        #[cfg(test)]
+        Pixels::Recorded(_) => (screen, input),
+    }
+}
+
+/// What `probe` reads of the two routes, now.
 #[cfg(not(test))]
-pub fn probe(endpoint: &Endpoint) -> Map<String, Value> {
+pub fn probe(endpoint: &Endpoint) -> Probed {
     let x11 = endpoint
         .server()
         .x11_endpoint()
@@ -771,12 +875,12 @@ pub fn probe(endpoint: &Endpoint) -> Map<String, Value> {
         let stored = stored_screenshot(&session).await;
         Some((facts, stored))
     });
-    probe_fields(x11, portal)
+    Probed { x11, portal }
 }
 
 /// Under test there is no session this process may read.
 #[cfg(test)]
-pub fn probe(_endpoint: &Endpoint) -> Map<String, Value> {
+pub fn probe(_endpoint: &Endpoint) -> Probed {
     panic!("a unit test asked probe for the real session: give probe its facts instead")
 }
 
@@ -801,7 +905,7 @@ mod tests {
 
     fn refused(decision: Decision) -> String {
         match decision {
-            Decision::Refused(why) => why,
+            Decision::Refused(why) => why.to_string(),
             other => panic!("not refused: {other:?}"),
         }
     }
@@ -936,6 +1040,101 @@ mod tests {
     fn no_display_and_no_session_bus_are_refused() {
         assert!(refused(decide(Server::None, None)).contains("no display"));
         assert!(refused(decide(Server::Wayland { x11: false }, None)).contains("session bus"));
+    }
+
+    // Each refused route carries its own sentence, word for word: in the refusal
+    // of a pixel action, as the input's error, and as the screen's reason.
+    #[test]
+    fn each_refused_route_says_its_sentence_word_for_word() {
+        let wayland = Server::Wayland { x11: false };
+        let with = |change: fn(&mut Wayland)| {
+            let mut facts = gnome();
+            change(&mut facts);
+            Some(facts)
+        };
+        let cases = [
+            (
+                Server::None,
+                None,
+                "no display answers this session (neither a Wayland nor an X socket)",
+            ),
+            (
+                wayland,
+                None,
+                "this Wayland session has no session bus to reach the portal on",
+            ),
+            (
+                wayland,
+                with(|w| (w.gnome, w.kde) = (false, true)),
+                "KDE Plasma on Wayland has no pixel route compux has qualified; only GNOME's \
+                 portal is",
+            ),
+            (
+                wayland,
+                with(|w| w.gnome = false),
+                "this compositor on Wayland has no pixel route compux has qualified; only \
+                 GNOME's portal is",
+            ),
+            (
+                wayland,
+                with(|w| w.running = Some(false)),
+                "the XDG desktop portal is not running on this session and did not start, so \
+                 compux has no route to the screen or the input",
+            ),
+            (
+                wayland,
+                with(|w| w.running = None),
+                "the XDG desktop portal answered with an error that does not say whether it \
+                 runs, so compux has no route to the screen or the input",
+            ),
+            (
+                wayland,
+                with(|w| w.registry = false),
+                "xdg-desktop-portal 1.18.4 has no host Registry (1.18 or later has it), so \
+                 compux cannot ask for pixels under its own app id io.tezra.fermix.ComputerUse",
+            ),
+            (
+                wayland,
+                with(|w| (w.registry, w.version) = (false, None)),
+                "xdg-desktop-portal of unknown version has no host Registry (1.18 or later has \
+                 it), so compux cannot ask for pixels under its own app id \
+                 io.tezra.fermix.ComputerUse",
+            ),
+            (
+                wayland,
+                with(|w| w.screenshot = false),
+                "the portal has no Screenshot on this session",
+            ),
+            (
+                wayland,
+                with(|w| w.remote_desktop = false),
+                "the portal has no RemoteDesktop on this session",
+            ),
+            (
+                wayland,
+                with(|w| w.screen_cast = false),
+                "the portal has no ScreenCast on this session",
+            ),
+        ];
+        for (server, facts, sentence) in cases {
+            let mut pixels = match decide(server, facts.as_ref()) {
+                Decision::Refused(why) => Pixels::Refused(why),
+                other => panic!("not refused: {other:?}"),
+            };
+
+            assert_eq!(
+                pixels.refusal("screenshot"),
+                format!(
+                    "{sentence}; work by control (`elements` and the verbs on a reference); \
+                     nothing was sent"
+                )
+            );
+            assert_eq!(pixels.input().err().as_deref(), Some(sentence));
+            assert!(
+                matches!(pixels.screen(), Screen::Refused(why) if why == sentence),
+                "{sentence}"
+            );
+        }
     }
 
     // The portal's screenshot is the whole desktop and says nothing of where any
@@ -1108,7 +1307,10 @@ mod tests {
         let version = Some("1.18.4".to_string());
         let facts = async_io::block_on(read_wayland(&client, version, Activation::Never));
         let stored = async_io::block_on(stored_screenshot(&client));
-        let fields = probe_fields(None, Some((facts.clone(), stored)));
+        let fields = probe_fields(&Probed {
+            x11: None,
+            portal: Some((facts.clone(), stored)),
+        });
 
         assert_eq!(facts.running, Some(false), "{facts:?}");
         assert_eq!(stored, Some("not_running"));
@@ -1130,7 +1332,10 @@ mod tests {
 
         let version = Some("1.18.4".to_string());
         let facts = async_io::block_on(read_wayland(&client, version, Activation::Never));
-        let fields = probe_fields(None, Some((facts, Some("unset"))));
+        let fields = probe_fields(&Probed {
+            x11: None,
+            portal: Some((facts, Some("unset"))),
+        });
 
         assert_eq!(
             fields["portal"],
@@ -1223,19 +1428,19 @@ mod tests {
 
     #[test]
     fn a_refused_route_serves_nothing_and_every_refusal_carries_its_reason() {
-        let mut pixels = Pixels::Refused("KDE Plasma on Wayland has no pixel route".to_string());
+        let mut pixels = Pixels::Refused(NoRoute::UnsupportedDesktop { kde: true });
 
         let refusal = pixels.refusal("screenshot");
-        let input = pixels.input().err();
+        let input = pixels.input().err().unwrap_or_default();
 
         assert!(!pixels.serves("screenshot") && !pixels.serves("left_click"));
         assert!(
             refusal.starts_with("KDE Plasma") && refusal.ends_with("nothing was sent"),
             "{refusal}"
         );
-        assert_eq!(
-            input.as_deref(),
-            Some("KDE Plasma on Wayland has no pixel route")
+        assert!(
+            input.starts_with("KDE Plasma on Wayland has no pixel route"),
+            "{input}"
         );
         assert!(matches!(pixels.screen(), Screen::Refused(why) if why.starts_with("KDE Plasma")));
     }
@@ -1301,8 +1506,11 @@ mod tests {
             ..gnome()
         };
 
-        let both = probe_fields(Some(x11), Some((facts, Some("no"))));
-        let neither = probe_fields(None, None);
+        let both = probe_fields(&Probed {
+            x11: Some(x11),
+            portal: Some((facts, Some("no"))),
+        });
+        let neither = probe_fields(&Probed::default());
 
         assert_eq!(both["x11_pixels"], json!({"xtest": true, "keymap": false}));
         assert_eq!(
@@ -1312,5 +1520,168 @@ mod tests {
         );
         assert_eq!(neither["x11_pixels"], Value::Null);
         assert_eq!(neither["portal"], Value::Null);
+    }
+
+    /// A portal route that fails the test if anything asks the portal.
+    fn unasked_portal() -> Pixels {
+        Pixels::on_portal(Portal::with(
+            Box::new(|| panic!("the probe asked the portal")),
+            None,
+            portal::Budgets::PORTAL,
+        ))
+    }
+
+    fn x11_route() -> Pixels {
+        Pixels::X11(Box::new(x11::Desktop::new(Env::default())), Env::default())
+    }
+
+    fn stored(answer: Option<&'static str>) -> Probed {
+        Probed {
+            x11: None,
+            portal: Some((gnome(), answer)),
+        }
+    }
+
+    // A stored Screenshot "no" refuses every portal screenshot, so the probe does
+    // not say capture is served. The portal's input never asks Screenshot (its
+    // session is RemoteDesktop with a ScreenCast source, asked on their own), so
+    // input stays as served.
+    #[test]
+    fn on_the_portal_a_stored_no_says_no_capture_and_leaves_input_as_served() {
+        let portal = unasked_portal();
+
+        assert_eq!(grants(&portal, &stored(Some("no"))), (false, true));
+    }
+
+    // Any other stored answer, a store that is not running or would not answer,
+    // and no session bus answering the probe at all say nothing against capture.
+    #[test]
+    fn on_the_portal_any_other_stored_answer_leaves_both_as_served() {
+        let portal = unasked_portal();
+        let readings = [
+            stored(Some("unset")),
+            stored(Some("yes")),
+            stored(Some("not_running")),
+            stored(None),
+            Probed::default(),
+        ];
+
+        for probed in readings {
+            assert_eq!(grants(&portal, &probed), (true, true), "{probed:?}");
+        }
+    }
+
+    // On X11 input needs XTEST (the first input is refused without it) and the
+    // keymap (keys are found on it). Capture needs neither: it reads RandR's
+    // monitors and the core GetImage.
+    #[test]
+    fn on_x11_input_needs_xtest_and_the_keymap_and_capture_needs_neither() {
+        let pixels = x11_route();
+        let with = |xtest, keymap| Probed {
+            x11: Some(x11::Facts { xtest, keymap }),
+            portal: None,
+        };
+
+        assert_eq!(grants(&pixels, &with(true, true)), (true, true));
+        assert_eq!(grants(&pixels, &with(false, true)), (true, false));
+        assert_eq!(grants(&pixels, &with(true, false)), (true, false));
+        assert_eq!(grants(&pixels, &with(false, false)), (true, false));
+    }
+
+    // The probe's own X connection did not answer on the X11 route: neither
+    // capture nor input is reached through it. A stored portal answer plays no
+    // part there.
+    #[test]
+    fn on_x11_with_no_x_facts_neither_capture_nor_input_is_said() {
+        let pixels = x11_route();
+
+        assert_eq!(grants(&pixels, &Probed::default()), (false, false));
+        assert_eq!(grants(&pixels, &stored(Some("yes"))), (false, false));
+    }
+
+    #[test]
+    fn a_refused_route_says_neither_whatever_the_facts() {
+        let refused = Pixels::Refused(NoRoute::UnsupportedDesktop { kde: true });
+        let every = Probed {
+            x11: Some(x11::Facts {
+                xtest: true,
+                keymap: true,
+            }),
+            portal: Some((gnome(), Some("yes"))),
+        };
+
+        assert_eq!(grants(&refused, &every), (false, false));
+        assert_eq!(grants(&refused, &Probed::default()), (false, false));
+    }
+
+    // Each refused route names its own closed cause, with the desktop or the
+    // interface where the cause has one; the route itself says `none`.
+    #[test]
+    fn each_refused_route_names_its_closed_cause() {
+        let wayland = Server::Wayland { x11: true };
+        let with = |change: fn(&mut Wayland)| {
+            let mut facts = gnome();
+            change(&mut facts);
+            Some(facts)
+        };
+        let cases = [
+            (Server::None, None, json!({"cause": "no_display"})),
+            (wayland, None, json!({"cause": "no_session_bus"})),
+            (
+                wayland,
+                with(|w| (w.gnome, w.kde) = (false, true)),
+                json!({"cause": "unsupported_desktop", "desktop": "kde"}),
+            ),
+            (
+                wayland,
+                with(|w| w.gnome = false),
+                json!({"cause": "unsupported_desktop", "desktop": "other"}),
+            ),
+            (
+                wayland,
+                with(|w| w.running = Some(false)),
+                json!({"cause": "portal_not_running"}),
+            ),
+            (
+                wayland,
+                with(|w| w.running = None),
+                json!({"cause": "portal_unanswered"}),
+            ),
+            (
+                wayland,
+                with(|w| w.registry = false),
+                json!({"cause": "portal_no_registry"}),
+            ),
+            (
+                wayland,
+                with(|w| w.screenshot = false),
+                json!({"cause": "portal_missing", "interface": "Screenshot"}),
+            ),
+            (
+                wayland,
+                with(|w| w.remote_desktop = false),
+                json!({"cause": "portal_missing", "interface": "RemoteDesktop"}),
+            ),
+            (
+                wayland,
+                with(|w| w.screen_cast = false),
+                json!({"cause": "portal_missing", "interface": "ScreenCast"}),
+            ),
+        ];
+        for (server, facts, mut expected) in cases {
+            let pixels = match decide(server, facts.as_ref()) {
+                Decision::Refused(why) => Pixels::Refused(why),
+                other => panic!("not refused: {other:?}"),
+            };
+            expected["route"] = json!("none");
+
+            assert_eq!(pixels.pixel_route(), expected);
+        }
+    }
+
+    #[test]
+    fn a_session_with_a_route_names_it() {
+        assert_eq!(x11_route().pixel_route(), json!({"route": "x11"}));
+        assert_eq!(unasked_portal().pixel_route(), json!({"route": "portal"}));
     }
 }

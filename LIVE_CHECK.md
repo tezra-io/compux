@@ -2838,8 +2838,9 @@ file's token has changed (each is used once).
   `screenshot` asks again (the dialog shows); allow it.
 * `rm -f ~/.local/state/compux/portal.json`, reset the stored answer, then
   `{"action":"screenshot"}` and **Deny** the dialog: `consent_refused`, the detail
-  points at `fermix doctor`. The probe now says `"screenshot_permission": "no"`.
-  Reset it again; the probe says `"unset"`. The reset (compux itself never writes
+  points at `fermix doctor`. The probe now says `"screenshot_permission": "no"`,
+  `"screen_capture": false` and `"input_control": true`. Reset it again; the probe
+  says `"unset"` and `"screen_capture": true`. The reset (compux itself never writes
   the store):
 
   ```sh

@@ -342,7 +342,8 @@ defmodule CompuxTest do
                accessibility_packages: nil,
                toolkit_notes: nil,
                x11_pixels: nil,
-               portal: nil
+               portal: nil,
+               pixel_route: nil
              } = probe
     end
 
@@ -464,6 +465,37 @@ defmodule CompuxTest do
 
       cu = start!(responses: %{"probe" => {:ok, odd}})
       assert {:ok, %{portal: %{screenshot_permission: nil}}} = Compux.probe(cu)
+    end
+
+    # The route the session took, and where it took none the closed cause, with the
+    # desktop or the portal interface where the cause names one. A word outside
+    # those sets reads unknown: the route as "unknown", the rest as nil.
+    test "names the session's pixel route and, where there is none, why" do
+      linux = %{"ok" => true, "platform" => "linux", "display_server" => "wayland"}
+
+      routes = [
+        {%{"route" => "x11"}, %{route: "x11", cause: nil, desktop: nil, interface: nil}},
+        {%{"route" => "portal"}, %{route: "portal", cause: nil, desktop: nil, interface: nil}},
+        {%{"route" => "none", "cause" => "unsupported_desktop", "desktop" => "kde"},
+         %{route: "none", cause: "unsupported_desktop", desktop: "kde", interface: nil}},
+        {%{"route" => "none", "cause" => "portal_missing", "interface" => "ScreenCast"},
+         %{route: "none", cause: "portal_missing", desktop: nil, interface: "ScreenCast"}},
+        {%{"route" => "none", "cause" => "no_display"},
+         %{route: "none", cause: "no_display", desktop: nil, interface: nil}},
+        {%{"route" => "tunnel", "cause" => "eclipse", "desktop" => "beos", "interface" => "Fax"},
+         %{route: "unknown", cause: nil, desktop: nil, interface: nil}}
+      ]
+
+      for {sent, read} <- routes do
+        cu = start!(responses: %{"probe" => {:ok, Map.put(linux, "pixel_route", sent)}})
+        assert {:ok, %{pixel_route: ^read}} = Compux.probe(cu)
+      end
+
+      for cause <- ~w(no_session_bus portal_not_running portal_unanswered portal_no_registry) do
+        sent = %{"route" => "none", "cause" => cause}
+        cu = start!(responses: %{"probe" => {:ok, Map.put(linux, "pixel_route", sent)}})
+        assert {:ok, %{pixel_route: %{route: "none", cause: ^cause}}} = Compux.probe(cu)
+      end
     end
 
     test "names why the accessibility bus is unavailable" do
