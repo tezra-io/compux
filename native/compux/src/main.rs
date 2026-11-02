@@ -2967,8 +2967,9 @@ struct MarksInfo {
 ///
 /// The read is the application in view (`interactive_in_view`), or for a bound
 /// window what that window sees (`bound_in_view`); everything from the nodes
-/// onwards is the same code on every platform, which is what keeps a reference, a
-/// badge and an element-list entry spelling the same fact one way.
+/// onwards is the same code on every platform ([`badge_viewed`]), which is what
+/// keeps a reference, a badge and an element-list entry spelling the same fact one
+/// way.
 fn collect_marks(
     geom: &Geometry,
     region: &Region,
@@ -2983,19 +2984,22 @@ fn collect_marks(
             interactive_in_view(ax, geom, region, gate)
         }
     };
-    let viewed = match read {
-        Ok(viewed) => viewed,
-        Err(unsupported) => {
-            return MarksInfo {
-                entries: Vec::new(),
-                ax_activation: Some(unsupported.code),
-                truncated: 0,
-                truncated_walk: None,
-                elements: None,
-            }
-        }
-    };
+    match read {
+        Ok(viewed) => badge_viewed(viewed, marks, img),
+        Err(unsupported) => MarksInfo {
+            entries: Vec::new(),
+            ax_activation: Some(unsupported.code),
+            truncated: 0,
+            truncated_walk: None,
+            elements: None,
+        },
+    }
+}
 
+/// One read's marks: a badge on the image for each control it placed, up to the
+/// cap, and the table behind them, named by reference unless the marks are points
+/// only.
+fn badge_viewed(viewed: Viewed, marks: &MarksFrom, img: &mut image::RgbaImage) -> MarksInfo {
     // A badge needs a place: a control the platform places nowhere gets none.
     let placed: Vec<(tree::Node, (i64, i64))> = viewed
         .nodes
@@ -6605,22 +6609,19 @@ mod tests {
         assert!((ly - 60).abs() <= 2, "logical y: {ly}");
     }
 
-    // The DISPATCH is what this pins; whether a display is attached is the host's
-    // business (CI has none, and a locked Mac reports `no_active_display`). So a
-    // window list OR a typed display error both pass — "unknown action" never does.
+    // The DISPATCH is what this pins. A display the test host does not have is
+    // refused by the handler's first step, so the answer is the handler's own and
+    // no window list is read: on macOS that list is the window server's, which no
+    // test asks.
     #[test]
     fn handle_dispatches_windows() {
-        let response = dispatch(json!({ "action": "windows" })).unwrap_or_else(err_payload);
+        let response =
+            dispatch(json!({ "action": "windows", "display": 1 })).unwrap_or_else(err_payload);
 
-        let unknown = response["error"]
-            .as_str()
-            .map(|e| e.contains("unknown action"))
-            .unwrap_or(false);
-
-        assert!(!unknown, "windows must reach its handler: {response}");
-        assert!(
-            response["windows"].is_array() || response["ok"] == json!(false),
-            "expected a window list or a typed error: {response}"
+        assert_eq!(
+            response["error"],
+            json!("display 1 not found"),
+            "windows must reach its handler: {response}"
         );
     }
 
@@ -9283,7 +9284,9 @@ mod tests {
     // to read, so its screenshot's marks are the application's in view, as a
     // display's are, with points and no references: none could be used under the
     // binding, and listing the bound window to get one leads nowhere. A mark is
-    // clicked by its point. A display's marks keep their references.
+    // clicked by its point. A display's marks keep their references. On macOS the
+    // application in view is the window server's answer, which no test asks, so
+    // the read is handed the application, as a listing test's is.
     #[test]
     fn a_bound_window_with_no_accessibility_element_gets_marks_without_references() {
         let gate = boot_gate();
@@ -9312,8 +9315,15 @@ mod tests {
         let (geom, region) = one_to_one();
         let (w, h) = crop_rect(&geom, &region).sent_dims();
         let mut image = image::RgbaImage::new(w, h);
-        let mut marked =
-            |marks: &MarksFrom| collect_marks(&geom, &region, &mut image, &gate, &platform, marks);
+        let in_view = TargetApp {
+            pid: FIXTURE_PID,
+            app: "Fixture".to_string(),
+        };
+        let mut marked = |marks: &MarksFrom| {
+            let viewed = read_application(&platform, &in_view, &geom, &region, &gate, switched_on)
+                .expect("the application in view");
+            badge_viewed(viewed, marks, &mut image)
+        };
 
         let points = marked(&MarksFrom::PointsOnly);
         assert_eq!(points.entries.len(), 1, "the button is badged");
@@ -11078,7 +11088,10 @@ mod tests {
     // than claiming the action made it hold.
     #[test]
     fn a_semantic_until_is_read_before_the_input_and_waited_on_after() {
-        let gate = boot_gate();
+        // A clock the test moves, so a wait that is not met takes the looks the
+        // protocol promises, one at once and one every 100 ms to its timeout, and
+        // not the fewer a slow runner's oversleep leaves room for.
+        let gate = Gate::new("boot-1".to_string(), StepClock::new());
         let app = controls_app();
         let (mut worker, observation) = worker_listing(&gate, &app);
         let waiting = |value: Value| {
@@ -11132,7 +11145,9 @@ mod tests {
 
     #[test]
     fn wait_for_answers_met_and_not_met_and_never_sends_input() {
-        let gate = boot_gate();
+        // A clock the test moves, so the looks are the protocol's and not a slow
+        // runner's.
+        let gate = Gate::new("boot-1".to_string(), StepClock::new());
         let app = controls_app();
         let (mut worker, observation) = worker_listing(&gate, &app);
         let waiting = |value: Value| {
@@ -11432,10 +11447,11 @@ mod tests {
 
     // A wait never outlives the request: what is left of its deadline bounds the
     // wait however long the condition's own timeout, and the reply says the
-    // deadline is what ended it.
+    // deadline is what ended it. The clock is the test's, so how long the wait
+    // took is the wait's and not a slow runner's.
     #[test]
     fn a_wait_cut_short_by_the_request_deadline_says_so() {
-        let gate = boot_gate();
+        let gate = Gate::new("boot-1".to_string(), StepClock::new());
         let app = controls_app();
         let (mut worker, observation) = worker_listing(&gate, &app);
         let never = || {
