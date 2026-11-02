@@ -113,9 +113,22 @@ defmodule Compux.Protocol do
   # `target_id` behaves exactly as it did at protocol 10 — the display-level path is
   # unchanged, and it is also how the full desktop stays reachable: there is no
   # "desktop" target, there is the absence of one.
-  @protocol_version 11
+  #
+  # v12 (M86 P2, the model's surface; the whole contract is PROTOCOL.md): one
+  # surface for macOS and Linux. `elements` takes a `scope`, a `query` (a find), a
+  # `root` to drill into and a `skeleton` for a dense application, and names every
+  # control by a normalised `role` with its `native_role` beside it and the `verbs`
+  # it has a route for. Six verbs act on a reference — `focus`, `select`, `toggle`,
+  # `expand`, `collapse`, `scroll_to` — and `type` may name a control too, typing
+  # into it with no keyboard. `wait_for` waits on the tree instead of on pixels, and
+  # `check` gains an object form, `{"kind": "semantic", "until": …}`, whose baseline
+  # is taken before the input so an action and its wait are one request. Receipts
+  # gain `surfaces`, and every refusal either platform can answer is named now, so
+  # Linux adds a backend and no second break. A `role` that changed its vocabulary
+  # is not additive, so the version bumps and the handshake refuses the pairing.
+  @protocol_version 12
 
-  @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows press set_value select_target release_target)
+  @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows press set_value focus select toggle expand collapse scroll_to wait_for select_target release_target)
 
   # Read-only in both senses the wire needs: a consumer may auto-run one without a
   # confirmation step, and it dispatches no input, so it carries no `mutation_seq`
@@ -130,8 +143,10 @@ defmodule Compux.Protocol do
   # receipt on them would claim input where there was none. A pause therefore does
   # not refuse them either, which is right: the person took the keyboard back, not
   # the bookkeeping.
+  #
+  # v12: `wait_for` is here too. It waits on the tree and sends nothing.
   @read_only ~w(screenshot mouse_move wait inspect wait_for_change elements windows
-                select_target release_target
+                select_target release_target wait_for
                 probe idle_ms wait_for_idle hello)
 
   # v11: the actions that may name a bound window. Everything that looks at, or
@@ -139,17 +154,21 @@ defmodule Compux.Protocol do
   # windows, which is how a target is found in the first place; `wait`,
   # `wait_for_change` and the two target verbs themselves have no target to name.
   @targetable ~w(screenshot elements inspect left_click right_click double_click
-                 mouse_move left_click_drag scroll type key paste press set_value)
+                 mouse_move left_click_drag scroll type key paste press set_value
+                 focus select toggle expand collapse scroll_to wait_for)
   # v8: the actions addressed INTO an observation — their target is read out of a
   # reply the caller was handed. Each one names that observation with
   # `observation_id` and takes no `region`: the rectangle is the sidecar's to
   # remember, and a caller that echoes one back is the defect this replaces.
   @addressed ~w(left_click right_click double_click mouse_move left_click_drag scroll inspect
-                press set_value)
+                press set_value focus select toggle expand collapse scroll_to)
 
   # v9: addressed by a CONTROL, never by a point. Their whole promise is that they
   # cannot miss, so a coordinate on one of them is a contradiction, not a hint.
-  @element ~w(press set_value)
+  @element ~w(press set_value focus select toggle expand collapse scroll_to)
+
+  # v12: the verbs on a reference that take no argument of their own.
+  @plain_verbs ~w(focus select expand collapse scroll_to)
 
   # v9: addressed by a point OR by a control, and the sidecar re-reads the
   # control's bounds at the moment it acts. Both on one request is a conflict:
@@ -157,8 +176,9 @@ defmodule Compux.Protocol do
   @pointer_or_element ~w(left_click right_click double_click mouse_move scroll)
 
   # The actions that PRODUCE coordinates. `region` stays theirs; an `observation_id`
-  # beside it says which image the rectangle is read in.
-  @viewing ~w(screenshot elements wait_for_change)
+  # beside it says which image the rectangle is read in. v12: `wait_for` lists what
+  # it waited for, with references, as `elements` does.
+  @viewing ~w(screenshot elements wait_for_change wait_for)
 
   # v10: the evidence an action brings back. Only an action that DISPATCHES INPUT
   # has anything to bring back, so the field is offered exactly there — `mouse_move`
@@ -168,6 +188,8 @@ defmodule Compux.Protocol do
 
   @modifiers ~w(cmd ctrl alt shift)
   @scroll_directions ~w(up down left right)
+  # The sidecar turns at most this many notches in one scroll and refuses more.
+  @max_scroll_notches 50
   @max_type_bytes 10_000
   @max_wait_ms 10_000
   # `wait_for_change` must finish inside the caller's per-action deadline (30s in
@@ -176,12 +198,68 @@ defmodule Compux.Protocol do
   @min_poll_ms 50
   @max_poll_ms 5_000
 
+  # v12: where an `elements` walk, or a condition, starts (PROTOCOL.md §2.1).
+  @scopes ~w(window app focused menu dialog)
+
+  # v12: the normalised roles, the same on every platform (PROTOCOL.md §6.1). A
+  # query names one of these, never a platform's own spelling.
+  @roles ~w(button menubutton checkbox switch radio tab textfield textarea combobox menuitem
+            link slider stepper disclosure row cell column list table tree scrollarea
+            scrollbar splitter toolbar tablist group menu menubar window dialog alert popup
+            text image heading progress datefield document application unknown)
+
+  # v12: what a receipt's `surfaces` may name (PROTOCOL.md §6.2).
+  @surface_kinds ~w(dialog alert menu popup)
+
+  # v12: every `error` code the sidecar answers (PROTOCOL.md §7), the ones only the
+  # Linux build answers at first included, so a caller can hold a sentence for each.
+  @refusals ~w(malformed_frame untagged_frame unknown_frame_type request_too_large
+               unknown_field unknown_action observation_required element_required
+               addressing_conflict check_unsupported invalid_argument
+               stale_generation stale_mutation paused cancelled busy
+               unknown_observation expired_observation stale_observation
+               point_outside_observation no_active_display display_asleep
+               display_disconnected capture_stalled capture_geometry_mismatch
+               capture_unavailable capture_budget_exceeded screen_recording_not_granted
+               target_unavailable target_minimized target_obstructed
+               control_surface_unavailable ax_binding_unavailable target_binding_unavailable
+               stale_element element_disabled ax_action_unsupported state_unreadable
+               focus_refused ax_action_failed ax_timed_out scope_not_found
+               accessibility_unavailable ambiguous_element identity_unknown
+               toolkit_accessibility_off text_outside_layout consent_refused consent_timeout
+               pixels_unavailable no_active_window keyboard_not_neutral)
+
+  # v12: what each kind of `until` condition reads, beside `kind` and `timeout_ms`
+  # (PROTOCOL.md §5.1). A field a kind does not read is refused, never dropped.
+  @until_query ~w(role name scope)
+  @until_text ~w(contains scope)
+  @max_until_ms 25_000
+
   @doc "The wire-compatibility version this build speaks (see the moduledoc)."
   @spec protocol_version() :: pos_integer()
   def protocol_version, do: @protocol_version
 
   @spec actions() :: [String.t()]
   def actions, do: @actions
+
+  @doc "Where an `elements` walk or an `until` condition may start (v12)."
+  @spec scopes() :: [String.t()]
+  def scopes, do: @scopes
+
+  @doc "The normalised roles a control is named by, on every platform (v12)."
+  @spec roles() :: [String.t()]
+  def roles, do: @roles
+
+  @doc "The kinds a receipt's `surfaces` name (v12)."
+  @spec surface_kinds() :: [String.t()]
+  def surface_kinds, do: @surface_kinds
+
+  @doc """
+  Every `error` code protocol 12 answers, including the ones only the Linux build
+  answers at first, so a caller can hold a sentence for each before it meets one.
+  """
+  @spec refusals() :: [String.t()]
+  def refusals, do: @refusals
 
   @doc """
   Read-only actions never mutate the screen, so they carry no post-action
@@ -255,6 +333,28 @@ defmodule Compux.Protocol do
     end
   end
 
+  # v12: `type` types at the focus, or into the control a listing named. The
+  # listing is named only beside the control: typing at the focus reads no image.
+  defp check_addressing("type", params) do
+    cond do
+      Map.has_key?(params, "element_ref") and not observation?(params) ->
+        {:error,
+         "type with element_ref requires observation_id: the id of the elements reply " <>
+           "that listed the control"}
+
+      Map.has_key?(params, "observation_id") and not Map.has_key?(params, "element_ref") ->
+        {:error,
+         "type takes observation_id only beside element_ref — typing at the focus reads " <>
+           "no coordinates"}
+
+      Map.has_key?(params, "element_ref") and point?(params) ->
+        {:error, conflict("type")}
+
+      true ->
+        :ok
+    end
+  end
+
   defp check_addressing(action, params) do
     cond do
       Map.has_key?(params, "observation_id") ->
@@ -322,18 +422,43 @@ defmodule Compux.Protocol do
       read_only?(action) ->
         {:error, "#{action} takes no check — it dispatches no input, so it reports no evidence"}
 
-      Map.get(params, "check") not in @check_kinds ->
-        {:error, "check must be one of #{Enum.join(@check_kinds, ", ")}"}
-
-      Map.get(params, "check") == "semantic" and not element?(params) ->
-        {:error,
-         "a semantic check re-reads the control the action named, so it needs an element_ref: " <>
-           "address this action by reference, or ask for an image check"}
-
       true ->
-        :ok
+        check_kind(Map.get(params, "check"), params)
     end
   end
+
+  # v12: the object form is a semantic check that also waits on the tree. It is
+  # offered on any action that dispatches input, because what it reads is the
+  # condition and not only the control the action named.
+  defp check_kind(%{} = check, params) do
+    with :ok <- only_fields(check, ~w(kind until), "check"),
+         :ok <- semantic_kind(check) do
+      validate_until(Map.get(check, "until"), params)
+    end
+  end
+
+  defp check_kind(kind, _params) when kind not in @check_kinds,
+    do: {:error, "check must be one of #{Enum.join(@check_kinds, ", ")}, or a semantic object"}
+
+  defp check_kind("semantic", params) do
+    if element?(params),
+      do: :ok,
+      else:
+        {:error,
+         "a semantic check re-reads the control the action named, so it needs an element_ref: " <>
+           "address this action by reference, ask for an image check, or wait on the tree " <>
+           ~s(with {"kind": "semantic", "until": …})}
+  end
+
+  defp check_kind(_kind, _params), do: :ok
+
+  defp semantic_kind(%{"kind" => "semantic", "until" => _until}), do: :ok
+
+  defp semantic_kind(_check),
+    do:
+      {:error,
+       ~s(a check object is {"kind": "semantic", "until": {…}}: only a semantic check waits, ) <>
+         "and it needs the condition it waits for"}
 
   # v11: the window this action is bound to, when it names one. A target changes
   # where an action LOOKS and where its coordinates mean something, so an action
@@ -427,6 +552,43 @@ defmodule Compux.Protocol do
     end
   end
 
+  # v12: the verbs on a reference that take nothing but the control. Each is offered
+  # only where the control has a route for it, and refused rather than replaced by a
+  # click everywhere else.
+  defp validate_action(action, params) when action in @plain_verbs do
+    with {:ok, element} <- element_ref(params),
+         {:ok, display} <- opt_display(params) do
+      {:ok, put_display(%{"action" => action, "element_ref" => element}, display)}
+    end
+  end
+
+  # v12: `on` is the state the control should END in, so a toggle that finds it there
+  # already sends nothing and says so.
+  defp validate_action("toggle", params) do
+    with {:ok, element} <- element_ref(params),
+         {:ok, display} <- opt_display(params) do
+      case Map.get(params, "on") do
+        on when is_boolean(on) ->
+          request = %{"action" => "toggle", "element_ref" => element, "on" => on}
+          {:ok, put_display(request, display)}
+
+        _other ->
+          {:error, "toggle requires on: true or false, the state the control should end in"}
+      end
+    end
+  end
+
+  # v12: wait on the tree until a condition holds, or the condition's own timeout.
+  # Read-only: it sends nothing and it never sends anything again.
+  defp validate_action("wait_for", params) do
+    with {:ok, until} <- required_until(params),
+         {:ok, display} <- opt_display(params),
+         {:ok, region} <- opt_region(params) do
+      request = %{"action" => "wait_for", "until" => until}
+      {:ok, request |> put_display(display) |> put_region(region)}
+    end
+  end
+
   # v11: bind one window, by the `id` a `windows` listing gave it. The helper
   # answers a `target_id` and a first observation OF THAT WINDOW, so the caller's
   # next coordinates are pixels of the window rather than of the display behind it.
@@ -479,10 +641,14 @@ defmodule Compux.Protocol do
 
   # Enumerate the accessibility elements (role/label/bounds) under a window or
   # `region` so the caller can target by element, not raw pixels. Read-only.
+  # v12: where the walk starts (`scope`), a find (`query`), a drill (`root`) and a
+  # walk cut at depth 3 for a dense application (`skeleton`).
   defp validate_action("elements", params) do
     with {:ok, display} <- opt_display(params),
-         {:ok, region} <- opt_region(params) do
-      {:ok, put_region(put_display(%{"action" => "elements"}, display), region)}
+         {:ok, region} <- opt_region(params),
+         {:ok, listing} <- listing(params) do
+      request = put_region(put_display(%{"action" => "elements"}, display), region)
+      {:ok, Map.merge(request, listing)}
     end
   end
 
@@ -522,7 +688,7 @@ defmodule Compux.Protocol do
   defp validate_action("scroll", params) do
     with {:ok, target} <- pointer_target(params),
          {:ok, direction} <- scroll_direction(params),
-         {:ok, amount} <- positive(params, "amount"),
+         {:ok, amount} <- scroll_notches(params),
          {:ok, display} <- opt_display(params) do
       request =
         Map.merge(%{"action" => "scroll", "direction" => direction, "amount" => amount}, target)
@@ -531,16 +697,13 @@ defmodule Compux.Protocol do
     end
   end
 
+  # v12: with an element_ref the text replaces that control's selection, or goes in
+  # at its caret, through the accessibility API — `check_addressing` has already
+  # made the reference come with the listing that names it.
   defp validate_action("type", params) do
-    case Map.get(params, "text") do
-      text when is_binary(text) and byte_size(text) > 0 and byte_size(text) <= @max_type_bytes ->
-        {:ok, %{"action" => "type", "text" => text}}
-
-      text when is_binary(text) ->
-        {:error, "type.text must be 1..#{@max_type_bytes} bytes"}
-
-      _other ->
-        {:error, "type requires a non-empty string text"}
+    with {:ok, text} <- type_text(params),
+         {:ok, element} <- opt_element_ref(params) do
+      {:ok, maybe_put(%{"action" => "type", "text" => text}, "element_ref", element)}
     end
   end
 
@@ -585,6 +748,229 @@ defmodule Compux.Protocol do
     end
   end
 
+  defp opt_element_ref(params) do
+    if Map.has_key?(params, "element_ref"), do: element_ref(params), else: {:ok, nil}
+  end
+
+  defp type_text(params) do
+    case Map.get(params, "text") do
+      text when is_binary(text) and byte_size(text) > 0 and byte_size(text) <= @max_type_bytes ->
+        {:ok, text}
+
+      text when is_binary(text) ->
+        {:error, "type.text must be 1..#{@max_type_bytes} bytes"}
+
+      _other ->
+        {:error, "type requires a non-empty string text"}
+    end
+  end
+
+  # --- v12: what an `elements` walk reads -------------------------------------
+
+  defp listing(params) do
+    with {:ok, scope} <- opt_member(params, "scope", @scopes, "scope"),
+         {:ok, query} <- opt_query(params),
+         {:ok, skeleton} <- opt_bool(params, "skeleton"),
+         {:ok, root} <- opt_root(params),
+         :ok <- listing_combination(scope, query, skeleton, root, params) do
+      {:ok,
+       %{}
+       |> maybe_put("scope", scope)
+       |> maybe_put("query", query)
+       |> maybe_put("skeleton", skeleton)
+       |> maybe_put("root", root)}
+    end
+  end
+
+  # The combinations the walk cannot honour, refused by name: a skeleton is cut at
+  # depth 3 and a find has to see the whole tree; a root is its own scope; a root
+  # is a reference, and a reference means nothing without the listing that minted it.
+  defp listing_combination(scope, query, skeleton, root, params) do
+    cond do
+      skeleton && query ->
+        {:error,
+         "a skeleton cuts the walk at depth 3 and a query has to see the whole tree: send " <>
+           "skeleton or query, not both"}
+
+      root && scope ->
+        {:error, "root names its own subtree, so scope is not accepted beside it"}
+
+      root && not observation?(params) ->
+        {:error,
+         "root requires observation_id: the id of the elements reply that listed that control"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp opt_root(params) do
+    case Map.fetch(params, "root") do
+      :error ->
+        {:ok, nil}
+
+      {:ok, root} when is_binary(root) and root != "" ->
+        {:ok, root}
+
+      {:ok, _other} ->
+        {:error,
+         ~s|root must be a non-empty string naming a control of the listing observation_id | <>
+           ~s|names (e.g. "e12")|}
+    end
+  end
+
+  defp opt_query(params) do
+    case Map.fetch(params, "query") do
+      :error -> {:ok, nil}
+      {:ok, query} -> validate_query(query, "query")
+    end
+  end
+
+  # A find by normalised role, by name, or both. Everything about it is checked,
+  # because a query that silently lost a field matches more than it was asked to.
+  defp validate_query(%{} = query, field) do
+    with :ok <- only_fields(query, ~w(role name), field),
+         :ok <- query_named(query, field),
+         {:ok, _role} <- opt_member(query, "role", @roles, "#{field}.role"),
+         :ok <- opt_text(query, "name", "#{field}.name") do
+      {:ok, query}
+    end
+  end
+
+  defp validate_query(_other, field),
+    do: {:error, "#{field} must be an object with role and/or name"}
+
+  defp query_named(query, field) do
+    if Map.has_key?(query, "role") or Map.has_key?(query, "name"),
+      do: :ok,
+      else: {:error, "#{field} needs role, name, or both: an empty #{field} matches everything"}
+  end
+
+  # --- v12: the condition a wait reads ----------------------------------------
+
+  defp required_until(params) do
+    case Map.fetch(params, "until") do
+      :error ->
+        {:error, "wait_for requires until: the condition to wait for"}
+
+      {:ok, until} ->
+        with :ok <- validate_until(until, params), do: {:ok, until}
+    end
+  end
+
+  defp validate_until(%{"kind" => kind} = until, params) when is_binary(kind) do
+    with {:ok, fields} <- until_fields(kind, until),
+         :ok <- only_fields(until, ["kind", "timeout_ms" | fields], "until"),
+         :ok <- until_subject(kind, until, params),
+         {:ok, _scope} <- opt_member(until, "scope", @scopes, "until.scope"),
+         {:ok, _ms} <- opt_bounded(until, "timeout_ms", 1, @max_until_ms) do
+      :ok
+    end
+  end
+
+  defp validate_until(_other, _params),
+    do: {:error, "until must be an object with a kind, e.g. %{\"kind\" => \"appears\", ...}"}
+
+  # The fields each kind reads, beside `kind` and `timeout_ms`.
+  defp until_fields("appears", _until), do: {:ok, @until_query}
+
+  defp until_fields("disappears", until) do
+    if Map.has_key?(until, "element_ref"), do: {:ok, ~w(element_ref)}, else: {:ok, @until_query}
+  end
+
+  defp until_fields("enabled", _until), do: {:ok, ~w(element_ref)}
+  defp until_fields("value", _until), do: {:ok, ~w(element_ref value)}
+  defp until_fields("window_title", _until), do: {:ok, @until_text}
+  defp until_fields("text", _until), do: {:ok, @until_text}
+  defp until_fields(kind, _until) when kind in ~w(menu_open menu_closed), do: {:ok, []}
+
+  defp until_fields(kind, _until),
+    do:
+      {:error,
+       "until.kind must be one of appears, disappears, enabled, value, window_title, " <>
+         "menu_open, menu_closed, text; #{inspect(kind)} is not one"}
+
+  # What the condition is ABOUT: a control of the request's own listing, a find, or
+  # a piece of text.
+  defp until_subject("disappears", until, params) do
+    if Map.has_key?(until, "element_ref"),
+      do: until_reference("disappears", until, params),
+      else: until_query(until)
+  end
+
+  defp until_subject(kind, until, params) when kind in ~w(enabled value),
+    do: until_reference(kind, until, params)
+
+  defp until_subject("appears", until, _params), do: until_query(until)
+
+  defp until_subject(kind, until, _params) when kind in ~w(window_title text),
+    do: opt_text_required(until, "contains", "until.contains")
+
+  defp until_subject(_menu, _until, _params), do: :ok
+
+  defp until_reference(kind, until, params) do
+    cond do
+      not nonempty_string?(Map.get(until, "element_ref")) ->
+        {:error, "until.element_ref must be a non-empty string, as an elements reply spells it"}
+
+      not observation?(params) ->
+        {:error,
+         "until.element_ref names a control of the listing this request's observation_id " <>
+           "names, and this request names none"}
+
+      kind == "value" and not is_binary(Map.get(until, "value")) ->
+        {:error, "until of kind value needs value: the string the control should hold"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp until_query(until) do
+    with {:ok, _query} <- validate_query(Map.take(until, ~w(role name)), "until"), do: :ok
+  end
+
+  # --- shared shape checks -----------------------------------------------------
+
+  # A nested object the library canonicalises: every key it does not read is
+  # refused, never dropped.
+  defp only_fields(map, allowed, field) do
+    case Map.keys(map) -- allowed do
+      [] ->
+        :ok
+
+      unknown ->
+        {:error,
+         "#{field} takes only #{Enum.join(allowed, ", ")}; #{inspect(unknown)} is not one of them"}
+    end
+  end
+
+  defp opt_member(map, key, members, field) do
+    case Map.fetch(map, key) do
+      :error ->
+        {:ok, nil}
+
+      {:ok, value} ->
+        if value in members,
+          do: {:ok, value},
+          else: {:error, "#{field} must be one of #{Enum.join(members, ", ")}"}
+    end
+  end
+
+  defp opt_text(map, key, field) do
+    case Map.fetch(map, key) do
+      :error -> :ok
+      {:ok, _value} -> opt_text_required(map, key, field)
+    end
+  end
+
+  defp opt_text_required(map, key, field) do
+    case Map.get(map, key) do
+      text when is_binary(text) and text != "" -> :ok
+      _other -> {:error, "#{field} must be a non-empty string"}
+    end
+  end
+
   # The same bound `type` and `paste` carry: a value the sidecar sets in one AX
   # call, not a stream.
   defp value_text(params) do
@@ -617,10 +1003,13 @@ defmodule Compux.Protocol do
     end
   end
 
-  defp positive(params, key) do
-    case Map.get(params, key) do
-      value when is_integer(value) and value > 0 -> {:ok, value}
-      _other -> {:error, "#{key} must be a positive integer"}
+  defp scroll_notches(params) do
+    case Map.get(params, "amount") do
+      amount when is_integer(amount) and amount in 1..@max_scroll_notches ->
+        {:ok, amount}
+
+      _other ->
+        {:error, "amount must be a whole number of notches from 1 to #{@max_scroll_notches}"}
     end
   end
 

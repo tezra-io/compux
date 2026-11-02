@@ -32,6 +32,8 @@ defmodule Compux.ProtocolTest do
   defp check_params(action) do
     cond do
       action in ~w(press set_value) -> element_params(action, %{"value" => "v"})
+      action == "toggle" -> element_params(action, %{"on" => true})
+      action in ~w(focus select expand collapse scroll_to) -> element_params(action)
       action in ~w(type paste) -> %{"action" => action, "text" => "hi"}
       action == "key" -> %{"action" => "key", "chord" => "ctrl+s"}
       true -> addressed_params(action)
@@ -365,7 +367,8 @@ defmodule Compux.ProtocolTest do
       end
     end
 
-    for action <- ~w(screenshot elements wait_for_change windows type paste key wait) do
+    # `type` takes one since v12, beside the listing that named it (protocol_12_test).
+    for action <- ~w(screenshot elements wait_for_change windows paste key wait) do
       test "#{action} takes no element_ref either" do
         params = %{"action" => unquote(action), "element_ref" => "e3"}
         assert {:error, reason} = Protocol.validate(params)
@@ -561,6 +564,17 @@ defmodule Compux.ProtocolTest do
 
       assert {:ok, req} = Protocol.validate(ok)
       assert req["direction"] == "down" and req["amount"] == 3
+    end
+
+    # The sidecar turns at most 50 notches in one scroll and refuses more; the
+    # library refuses them first, naming the cap, rather than cutting them down.
+    test "scroll turns at most 50 notches" do
+      at_cap = addressed_params("scroll") |> Map.put("amount", 50)
+      assert {:ok, %{"amount" => 50}} = Protocol.validate(at_cap)
+
+      over = Map.put(at_cap, "amount", 51)
+      assert {:error, reason} = Protocol.validate(over)
+      assert reason =~ "50"
     end
 
     test "type needs a non-empty string" do

@@ -27,6 +27,7 @@
 //! to run. Display-level requests are untouched: they are today's foreground mode
 //! with today's `/pause`.
 
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child as OsChild, Command, Stdio};
@@ -41,7 +42,12 @@ use crate::window_server::{self, Bounds, Windows};
 use crate::wire;
 
 /// The executable that draws the badge, beside this one inside the bundle.
+#[cfg(not(target_os = "linux"))]
 pub const INDICATOR_BINARY: &str = "compux-indicator";
+
+/// On Linux, the X11 badge beside this one in the release archive.
+#[cfg(target_os = "linux")]
+pub const INDICATOR_BINARY: &str = "compux-indicator-x11";
 
 /// How often the window is re-read while a target is held. Four times a second is
 /// fast enough that a dragged window's badge keeps up and slow enough that it costs
@@ -54,34 +60,30 @@ pub const WATCH_INTERVAL_MS: u64 = 250;
 /// badge must never hold a release open.
 pub const STOP_WAIT_MS: u64 = 1_000;
 
-/// **The badge's possible area — the contract between this process and the panel.**
-///
-/// The child may draw the badge in one of two places relative to the window's
-/// top-left corner: OUTSIDE, floating just above the window's frame, or INSIDE,
-/// below the traffic lights where a title bar has room. Which one it picks is the
-/// child's business (`native/indicator/Placement.swift`); what is NOT the child's
-/// business is where this process looks for something covering it, so the numbers
-/// live here, once, and the child is written against them.
-///
-/// The rectangle below covers BOTH placements. It starts [`BADGE_ABOVE`] points
-/// above the window's top edge and runs to [`BADGE_INSIDE_DROP`] plus
-/// [`BADGE_HEIGHT`] below it, [`BADGE_WIDTH`] wide from the window's left edge. A
-/// window in front of the target that touches any of it is a window the badge
-/// cannot be drawn over, and the child hides rather than drawing on somebody else's
-/// window.
-///
-/// The width is the child's own ceiling, not a guess: `Placement.inset` (8) plus
-/// `Placement.maxBadgeWidth` (440), which the child enforces on its panel and
-/// proves in its headless self-test; a badge that cannot fit inside this rectangle
-/// hides. The height is `Placement.badgeHeight`. Change one side and the other
-/// must move with it.
-pub const BADGE_WIDTH: f64 = 448.0;
-pub const BADGE_HEIGHT: f64 = 28.0;
-/// How far above the window's top edge the outside placement floats.
-pub const BADGE_ABOVE: f64 = 34.0;
-/// How far below the window's top edge the inside placement sits — clear of the
-/// traffic lights.
-pub const BADGE_INSIDE_DROP: f64 = 52.0;
+// **The badge's possible area — the contract between this process and the panel.**
+//
+// The child may draw the badge in one of two places relative to the window's
+// top-left corner: OUTSIDE, floating just above the window's frame, or INSIDE,
+// below the traffic lights (on X11, below the title bar). Which one it picks is
+// the child's business (`native/indicator/Placement.swift`, and the X11 badge's
+// `place.rs`); what is NOT the child's business is where this process looks for
+// something covering it, so the numbers live on this side, once, and the child is
+// written against them.
+//
+// The rectangle below covers BOTH placements. It starts [`BADGE_ABOVE`] points
+// above the window's top edge and runs to [`BADGE_INSIDE_DROP`] plus
+// [`BADGE_HEIGHT`] below it, [`BADGE_WIDTH`] wide from the window's left edge. A
+// window in front of the target that touches any of it is a window the badge
+// cannot be drawn over, and the child hides rather than drawing on somebody else's
+// window.
+//
+// The width is the child's own ceiling, not a guess: `Placement.inset` (8) plus
+// `Placement.maxBadgeWidth` (440), which the child enforces on its panel and
+// proves in its headless self-test; a badge that cannot fit inside this rectangle
+// hides. The height is `Placement.badgeHeight`. Change one side and the other
+// must move with it. The numbers themselves are in `badge_area.rs`, which the
+// X11 badge compiles too, so on Linux both sides read one copy.
+use crate::badge_area::{BADGE_ABOVE, BADGE_HEIGHT, BADGE_INSIDE_DROP, BADGE_WIDTH};
 
 /// Every point the badge might be drawn on, for a window at these bounds.
 ///
@@ -279,6 +281,11 @@ pub trait Launcher: Send + Sync {
 /// The indicator beside this executable inside the bundle.
 pub struct Bundled {
     path: PathBuf,
+    /// The display the badge draws on, as the variables its own connection
+    /// reads: a value is set in its environment, `None` is taken out of it.
+    /// Empty on macOS. On Linux this process may have taken its display from the
+    /// user manager, and its own environment names none.
+    display: Vec<(&'static str, Option<OsString>)>,
 }
 
 impl Bundled {
@@ -291,7 +298,24 @@ impl Bundled {
             .and_then(|exe| exe.parent().map(|dir| dir.join(INDICATOR_BINARY)))
             .unwrap_or_else(|| PathBuf::from(INDICATOR_BINARY));
 
-        Bundled { path }
+        Bundled {
+            path,
+            display: Vec::new(),
+        }
+    }
+
+    /// The badge on this X display, with this authority: the ones this process
+    /// connects with, handed to the child as its own. This process's environment
+    /// is not changed.
+    #[cfg(target_os = "linux")]
+    pub fn on(env: &crate::linux::display::Env) -> Bundled {
+        Bundled {
+            display: vec![
+                ("DISPLAY", env.display.clone().map(OsString::from)),
+                ("XAUTHORITY", env.xauthority.clone().map(OsString::from)),
+            ],
+            ..Bundled::new()
+        }
     }
 }
 
@@ -315,7 +339,14 @@ impl Launcher for Bundled {
             ));
         }
 
-        let mut child = Command::new(&self.path)
+        let mut command = Command::new(&self.path);
+        for (name, value) in &self.display {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -876,6 +907,46 @@ mod tests {
     impl Buttons for Silent {
         fn pressed(&self, _pressed: Pressed) {}
         fn ended(&self) {}
+    }
+
+    // The badge draws on the display this process connects to, with its
+    // authority, even where that display was taken from the user manager and
+    // this process's own environment names none.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_the_badge_is_told_the_display_and_authority_this_process_uses() {
+        let dir = std::env::temp_dir().join(format!("compux-badge-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let seen = dir.join("seen");
+        let script = dir.join(INDICATOR_BINARY);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s' \"$DISPLAY\" \"${{XAUTHORITY-none}}\" > {}\ncat >/dev/null\n",
+                seen.display()
+            ),
+        )
+        .expect("a stand-in badge");
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("runnable");
+
+        let env = crate::linux::display::Env {
+            display: Some(":42".to_string()),
+            xauthority: Some(PathBuf::from("/run/user/1000/gdm/Xauthority")),
+            ..crate::linux::display::Env::default()
+        };
+        let launcher = Bundled {
+            path: script,
+            ..Bundled::on(&env)
+        };
+        let child = launcher.spawn(Arc::new(Silent)).expect("it starts");
+        child.stop();
+
+        assert_eq!(
+            std::fs::read_to_string(&seen).expect("the badge wrote what it was told"),
+            ":42|/run/user/1000/gdm/Xauthority"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleaned up");
     }
 
     #[test]

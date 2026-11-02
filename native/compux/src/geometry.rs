@@ -69,7 +69,15 @@ const PIXELS_PER_POINT_TOLERANCE: f32 = 0.01;
 pub enum Host {
     MacOs,
     Linux,
+    /// GNOME Wayland through the portal: the monitor is in the compositor's
+    /// logical points, as macOS's are, and no mode scale is known beforehand, so
+    /// any ratio the frame measures from 1 to [`MAX_PORTAL_SCALE`] is taken
+    /// (fractional scaling included) once both axes agree.
+    Portal,
 }
+
+/// The largest pixels-per-point a portal frame may measure.
+pub const MAX_PORTAL_SCALE: f32 = 4.0;
 
 impl Host {
     /// The arm this build runs under. Windows is not a supported target; the
@@ -173,8 +181,13 @@ pub fn measure(
         ));
     }
 
-    let explained = (across - facts.scale_factor).abs() < PIXELS_PER_POINT_TOLERANCE
-        || (across - 1.0).abs() < PIXELS_PER_POINT_TOLERANCE;
+    let explained = match host {
+        Host::Portal => (1.0 - PIXELS_PER_POINT_TOLERANCE..=MAX_PORTAL_SCALE).contains(&across),
+        _ => {
+            (across - facts.scale_factor).abs() < PIXELS_PER_POINT_TOLERANCE
+                || (across - 1.0).abs() < PIXELS_PER_POINT_TOLERANCE
+        }
+    };
 
     if explained {
         Ok(Measurement {
@@ -192,7 +205,8 @@ pub fn measure(
 impl Geometry {
     /// Build the transform from what the OS said and what a capture measured.
     ///
-    /// **macOS:** the bounds and the origin are points and are used as they are —
+    /// **macOS** (and GNOME Wayland through the portal, whose monitor is in
+    /// logical points too): the bounds and the origin are points and are used as they are —
     /// the defect this replaces divided them by the backing scale, which put every
     /// second display at half its true origin. The physical size is the MEASURED
     /// frame's own size, so what the crop indexes into and what the transform
@@ -204,7 +218,7 @@ impl Geometry {
         let ppp = measured.pixels_per_point;
 
         match host {
-            Host::MacOs => Geometry {
+            Host::MacOs | Host::Portal => Geometry {
                 phys_w: measured.frame_w.max(1),
                 phys_h: measured.frame_h.max(1),
                 logical_w: facts.width as f32,
@@ -648,6 +662,45 @@ mod tests {
 
         let g = Geometry::from_facts(&facts, short, Host::MacOs);
         assert_eq!((g.phys_w, g.phys_h), (1512, 981));
+    }
+
+    // GNOME Wayland's monitor is in logical points, as macOS's is, and its scale is
+    // not known beforehand: any ratio from 1 to the cap that both axes agree on is
+    // measured, fractional ones included, and the frame maps back to the points.
+    #[test]
+    fn a_portal_frame_is_measured_at_any_scale_both_axes_agree_on() {
+        let facts = MonitorFacts {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+            scale_factor: 1.0,
+        };
+
+        for (image, ratio) in [
+            ((1280, 800), 1.0),
+            ((1600, 1000), 1.25),
+            ((2560, 1600), 2.0),
+        ] {
+            let measured = measure(&facts, image.0, image.1, Host::Portal).expect("measured");
+            let g = Geometry::from_facts(&facts, measured, Host::Portal);
+
+            assert_eq!(measured.pixels_per_point, ratio);
+            assert_eq!((g.phys_w, g.phys_h), image);
+            assert_eq!((g.logical_w, g.logical_h), (1280.0, 800.0));
+        }
+        assert!(
+            measure(&facts, 640, 400, Host::Portal).is_err(),
+            "smaller than the monitor"
+        );
+        assert!(
+            measure(&facts, 6400, 4000, Host::Portal).is_err(),
+            "past the cap"
+        );
+        assert!(
+            measure(&facts, 2560, 1200, Host::Portal).is_err(),
+            "the axes disagree"
+        );
     }
 
     // A ratio is only true of the mode it was measured in. Keyed on the display's

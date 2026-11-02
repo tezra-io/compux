@@ -99,6 +99,13 @@ it carries the numbers rather than mapping a coordinate through them.
 There is no "desktop" target: a call with no `:target_id` is the display-level path
 this library has always had, unchanged.
 
+On Linux a window is bound on X11 only, where the window manager says which window
+is which and Composite reads one: `hello` lists `select_target` and
+`release_target` there and nowhere else, and a selection sent anyway is
+`target_binding_unavailable`. The X11 differences (which window counts as in
+front, GTK 4's `ax_binding`, what the badge draws) are in PROTOCOL.md, "Bound
+windows on X11".
+
 ## Coordinates name their image
 
 Every reply that hands you coordinates carries an `observation_id`, and every call
@@ -129,19 +136,125 @@ is always sent with its observation; alone it means nothing.
 
 ```json
 {
-  "element_ref": "e3", "role": "AXButton", "label": "Save",
-  "enabled": true, "actions": ["press"], "settable": false,
+  "element_ref": "e3", "role": "button", "native_role": "AXButton", "label": "Save",
+  "enabled": true, "verbs": ["press", "focus"],
   "bounds": {"x": 480, "y": 312, "w": 84, "h": 24},
   "path": ["Document", "Toolbar"], "x": 186, "y": 121
 }
 ```
 
-`path` is up to three ancestor labels, nearest last, which is what tells two
-buttons both labelled "Save" apart. `value` carries what a field holds, bounded and
-absent for a secure field. `actions` lists only what this build can really perform
-— `press`, and only where the control's own action list says so — and `settable`
-only where the accessibility API says the value may be written. Nothing is
-inferred from a role name.
+`role` is a normalised name every platform shares (`button`, `checkbox`,
+`textfield`, `row`, `dialog`, …) and `native_role` the platform's own. `path` is up
+to three ancestor labels, nearest last, which is what tells two buttons both
+labelled "Save" apart. `value` carries what a field holds, bounded; a secure field
+has none and says `"secure": true`. `verbs` lists exactly what this control has a
+route for, read from the control itself, and states ride beside it where they read
+(`checked`, `expanded`, `selected`, `focused`). Nothing is inferred from a role
+name.
+
+A node is listed when its role is one a person operates (a button, a field, a
+checkbox, a link, a cell, …) **or** when its own action list advertises a primary
+action — `AXPress`, `AXConfirm`, `AXPick`, `AXIncrement`, `AXDecrement` or `AXOpen`.
+The second rule picks up the SwiftUI and web groups and rows that act like buttons;
+`AXShowMenu`, `AXScrollToVisible`, `AXRaise` and focus alone list nothing, because
+every container answers them.
+
+The walk is bounded: 14 levels deep, 250 controls, 3000 nodes visited, 250 children
+read from any one parent (128 to a page) and 1.5 seconds of wall clock. A listing
+that stopped at one of those says which in `truncated` — `"depth"`, `"nodes"` or
+`"time"` — so a partial tree is never passed off as the whole one. `"time"` also
+covers a node that did not answer within its own timeout: the walk skips it, still
+reads what is inside it, and says the listing is incomplete. A node that is gone
+takes its subtree with it and is not a truncation; a parent that will not count its
+children (Xcode's windows), or will not hand over a page of them, has its child list
+copied once instead.
+
+`ax_messages` says how many accessibility messages the read of the returned list
+sent. On macOS each node is read with one batched message for its role, subrole,
+title, description, enabled state and frame and one for its action names; only a
+node that is listed is asked which of its attributes may be written (one message
+per attribute: macOS has no batched form), what its states read, and — unless it is
+secure — its value. A verb on a reference asks only the one attribute it writes. A value is asked for only
+after the role and subrole say the field is not secure, so a password field's
+contents never leave the application. Every node is given a 250 ms messaging
+timeout before it is read; an application's windows and the application in front
+keep the one-second timeout they had before.
+
+An application whose tree walks to no controls at all is asked to switch its
+accessibility on (`AXManualAccessibility`, then `AXEnhancedUserInterface`), and the
+switch counts when the attribute reads back on, whatever the setter answered —
+Chrome applies `AXEnhancedUserInterface` and still answers
+`kAXErrorNotImplemented`. A switch that is already on — a screen reader turned it
+on — is left alone and never recorded, so the helper never turns it off under the
+client that needs it. The walk is then retried every 300 ms for up to 2.4 seconds,
+which outlasts Chromium's two-second debounce, and every switch the helper turned on
+is turned off again when it exits. `ax_activation` says what happened, and
+`ax_messages` counts only the last of those walks: the one whose list is returned.
+
+On Linux, `elements` reads the same way through AT-SPI, the desktop's accessibility
+bus, and the same walk lists what it finds (M86 L1):
+
+* the application read is the one whose window reads ACTIVE on the accessibility
+  bus, and the view decides which of its controls are listed;
+* `native_role` is AT-SPI's own role, as the name of its `AtspiRole` constant
+  (`push button`, `check box`, `password text`, …), and `role` is the normalised
+  role `PROTOCOL.md` maps it to; a control is listed for its role or for one of its
+  own actions named `click`, `press`, `activate`, `jump`, `check`, `open`,
+  `toggle`, `increase` or `decrease`, in any case (a node whose only such action is
+  Chromium's `clickAncestor` is its ancestor's text, not a control);
+* every property is read with its own `Get`, the optional interfaces only when the
+  node lists them, and action names one index at a time (`NActions`, then
+  `GetName(i)`). The helper never sends `Action.GetActions` — ATK bridge 2.38
+  (Ubuntu 22.04) aborts the application it is sent to — and never
+  `Properties.GetAll`, which kills a Qt 6.4 application. A control some of whose
+  actions would not name says `"actions_partial": true`;
+* a node's reads go out together, and up to eight siblings are read at once;
+* bounds are the X11 screen extents of a node that says it is SHOWING, clipped to
+  the scroll pane it sits in; a password field (`password text`) is listed and its
+  text is never asked for;
+* GTK 4 has no screen positions, on X11 too (it answers every node's screen extents
+  at 0, 0), and a Wayland session gives no client a position at all: those
+  controls are listed with no `bounds` and no click point, and act by reference
+  only. A session that places nothing lists without a display;
+* a row with no name of its own takes its label's, a combo box its `LABELLED_BY`
+  label, a combo box that is not open is not walked into, and the embedded-object
+  character (U+FFFC) is dropped from text values;
+* `ax_messages` counts the D-Bus calls of the walk.
+
+The verbs act through AT-SPI too, each only where the control's own read gives
+it a route: `press` is `DoAction` at the index its press name was read at (never
+`doDefault`), `set_value` is `EditableText.SetTextContents` or
+`Value.CurrentValue`, `type` by reference deletes the selection and inserts at
+the caret, `select` asks the container's `Selection`, `toggle`, `expand` and
+`collapse` act only when the state differs, `focus` is `Component.GrabFocus` and
+only inside the active window (never on GTK 4, which refuses it), and
+`scroll_to` is `Component.ScrollTo` on Chromium and the scroll bar's value on
+GTK. A reference is found again before every action, by its place in the tree and
+by the object itself: two candidates are `ambiguous_element`, one that stays
+unreadable after two more reads is `identity_unknown`. On Qt an object is also
+found where it says it is, and only while its label is the one listed.
+`inspect` is macOS-only.
+
+Two Qt routes are Qt's own. A Qt menu title (a menu-bar item, or an item with a
+submenu) names only `ShowMenu`, and pressing it opens its menu. Qt's item views
+and tab list list no `Selection`: a list or tree item that reads `SELECTABLE` and
+not `CHECKABLE` is selected by its own `Toggle`, sent only while it reads not
+selected, since the action toggles the selection.
+
+What the toolkits do not offer, measured on the fixture apps (`fixtures/linux`,
+`spike.sh` stage `verbs`), and so not listed there: a GTK 4 check box names no
+action (no `toggle`) and refuses `GrabFocus` (no `focus`); a GTK 4 menu-bar item
+names no action, so its menu does not open by reference; a Qt tab is pressed (no
+`select`), a Qt tree cell's one action toggles its selection (no `expand`), and
+Qt has no `scroll_to`.
+
+Nothing on Linux switches accessibility on for the person. An application in
+front whose toolkit publishes no tree until it is asked, and whose tree stays
+empty, is refused `toolkit_accessibility_off` with the switch that would make it
+publish one (Qt: `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`; Chromium:
+`--force-renderer-accessibility` and `ACCESSIBILITY_ENABLED=1`). One that is not
+on the accessibility bus at all (those, and a GTK 4 one started before the bus)
+leaves no window reading active there, and the note says so.
 
 Two actions address a control rather than a point:
 
@@ -149,7 +262,10 @@ Two actions address a control rather than a point:
   cannot miss.
 * **`set_value/4`** writes the value and reads it back: the receipt says
   `effect: "verified"` when the read-back matches, `"not_observed"` when it does
-  not (a secure field always reads back masked, so it never verifies).
+  not (a secure field is never read back, so it never verifies). A field that
+  shows a write a moment late is read again every 50 ms for up to 400 ms; a pause
+  during that wait ends it, and the receipt reports the write `sent` and its
+  effect `not_observed`.
 
 Both are offered only where the control advertises support and are refused
 `ax_action_unsupported` everywhere else — never silently replaced by a click,
@@ -169,6 +285,39 @@ Every receipt says which method carried the action: `input_method` is `"ax"` for
 action also reports `foreground_changed`, read before and after, because an action
 that promises not to take the focus should have to say when it did.
 
+## Controls before pixels (protocol 12)
+
+`PROTOCOL.md` is the contract; in short:
+
+* **Where a listing looks.** `scope` is `window`, `app`, `focused`, `menu` or
+  `dialog`; with a target, `focused`, `menu` and `dialog` are the bound
+  window's alone, and a reference is used only under the binding it was listed
+  under; `query` lists only what matches a role and/or a name, wherever it is;
+  `skeleton` stops three levels down and names what each cut hides; `root` drills
+  into one control of a listing, keeping the listing's other references, and takes
+  a `query` or a `skeleton` inside it.
+* **Verbs on a reference.** `focus/3`, `select/3`, `toggle/4`, `expand/3`,
+  `collapse/3`, `scroll_to/3`, and `type/3` with an `:element_ref`, each through
+  the accessibility API alone. Each reads its state first and acts only when it
+  differs (the receipt says `already` when it held), reads it back
+  (`effect: "changed"` when it shows what was asked), and is refused
+  `ax_action_unsupported` where the control has no route — never clicked
+  instead. `focus` never activates a window: `focus_refused` where the control's
+  window is not the active one.
+* **Waiting on the tree.** `wait_for/3` waits for a condition (`appears`,
+  `disappears`, `enabled`, `value`, `window_title`, `menu_open`, `menu_closed`,
+  `text`) and never sends input. Any input action can wait in the same request
+  with `check: %{"kind" => "semantic", "until" => condition}`; the condition is
+  read before the input, so a receipt says `met`, `not_met` or `held_before`. A
+  wait never outlives the request's deadline, and says `deadline_cut` when that
+  is what ended it. A wait for something to be gone holds only on a look that
+  saw everything, and says `truncated` when its last look stopped short.
+* **What opened.** Every receipt of input that went out names the dialogs,
+  alerts, menus and popups open after it in `surfaces` (`[]` when none is), and
+  says `surfaces_truncated` when its scan stopped before it finished.
+
+The Linux build answers all of these through AT-SPI (M86 L1).
+
 ## Every action says what evidence it wants back
 
 An action that dispatches input carries `:check`, and the reply's `receipt` says
@@ -185,9 +334,10 @@ which evidence it really came back with.
   floor between looks rather than a delay added to each one. The check's own image
   is an observation like any other, with rulers drawn and the executed point marked.
 * **`:semantic`** — for an action addressed by `element_ref`: the control is read
-  again and returned as `element_after` — `{present, role, label, enabled, value}`,
-  with `value` absent for a secure field and `{"present": false}` alone for a
-  control that no longer answers. No capture, and never visual evidence.
+  again and returned as `element_after` — `{present, role, native_role, label,
+  enabled, value}` and its states, with `value` absent for a secure field (which
+  says `"secure": true`) and `{"present": false}` alone for a control that no
+  longer answers. No capture, and never visual evidence.
 * **`:none`** — the receipt alone.
 
 ```json
@@ -215,6 +365,13 @@ settle's own polls included.
 `{:error, {:protocol_mismatch, _}}`. Because the encoder is compiled in but the
 binary is installed separately, this is what keeps them from silently drifting.
 
+The handshake's `actions` and `capabilities.input_methods` list only what that
+build can do. The macOS build lists every verb and both input methods
+(`foreground_hid`, `ax`). The Linux build lists both input methods too, and every
+verb but `inspect`, `select_target` and `release_target`, which it does not
+answer, so a caller that offers what `hello` lists never offers a verb whose every
+use is a refusal.
+
 ## Installation
 
 ```elixir
@@ -225,7 +382,10 @@ end
 
 `Compux.Binary.path!/0` resolves the sidecar for the host: a checksum-verified
 per-target binary downloaded once from the GitHub release and cached, or — with
-`COMPUX_BUILD=1` — the local `cargo build --release` output (the dev loop). An
+`COMPUX_BUILD=1` — the local `cargo build --release` output (the dev loop). On
+Linux the release archive carries the X11 badge, `compux-indicator-x11`, beside
+the helper, and the licence of the font built into it; an archive without the
+badge is refused and nothing is cached. An
 embedder that manages its own signed install passes an explicit `:binary_path` to
 `Compux.start/1` instead.
 
@@ -233,23 +393,63 @@ embedder that manages its own signed install passes an explicit `:binary_path` t
 
 macOS-first. **Apple-Silicon macOS** is the primary, fully-featured target
 (capture, input, accessibility `inspect` + `elements`, non-prompting permission
-probe, idle detection). **Linux/X11** supports capture + input + `wait_for_change`
-+ `paste` (the accessibility actions — `inspect` and `elements` — are macOS-only and
-return a typed error on Linux; the paste chord is Ctrl+V). The permission
-`probe` works on both (on Linux it reports X11-vs-Wayland capability).
-**Wayland**, **Linux accessibility**, and **Windows** are not supported yet. The
-accessibility actions `press` and `set_value` are macOS-only for the same reason
-`elements` is, and answer a typed error elsewhere rather than an empty success.
+probe, idle detection). **Linux** answers `elements`, the verbs on a reference and
+`wait_for` through AT-SPI (see "Controls have names") on any session, and its
+pixels by one route per session, decided once at start (PROTOCOL.md, "Linux pixel
+routes"):
+
+- **X11:** capture, input, `wait_for_change`, `windows` and `paste` (the paste
+  chord is Ctrl+V), in pure Rust over x11rb: XTEST with the server's own keymap
+  (never remapped), the core `GetImage` in strips, RandR, EWMH, and the
+  `CLIPBOARD` selection compux owns for the helper's life. `type` is refused
+  before a key is sent for a character the layout cannot type
+  (`text_outside_layout`, use `paste`) or while a modifier, Caps Lock or a second
+  layout group is on (`keyboard_not_neutral`). A key or button held across an
+  action is journalled under `$XDG_RUNTIME_DIR`, and the next helper releases what
+  a killed one left held; without a journal it can write there, a drag, a click
+  or chord with modifiers, or a paste sends nothing and fails, naming the
+  directory. One window can be bound (see "One window, bound"): it is read
+  through Composite, so it is seen while another window covers it, and the
+  badge over it is `compux-indicator-x11`, a second binary that ships beside the
+  helper and draws its text from the Noto Sans font built into it
+  (PROTOCOL.md, "Bound windows on X11").
+- **GNOME Wayland:** capture and input through the XDG desktop portal
+  (xdg-desktop-portal 1.18 or later, which registers compux as
+  `io.tezra.fermix.ComputerUse`): the portal asks the person once, and a restore
+  token kept in `$XDG_STATE_HOME/compux/portal.json` lets later sessions start
+  without asking. One monitor per session; no `paste` and no `windows`.
+- **KDE Plasma, COSMIC, wlroots compositors, and GNOME with an older portal:**
+  controls only; every pixel request is refused `pixels_unavailable` with the
+  reason.
+
+On both, keys go only into a window that reads `ACTIVE` on the accessibility bus,
+and only where exactly one application's does (`no_active_window` otherwise).
+`inspect` is macOS-only; the Linux build's `hello` does not list it, and a request
+for it is `unknown_action` (see "The version handshake").
+The permission `probe` works on both: on Linux it reports which display server
+answered its socket (`x11`, `wayland`, `none`) and whether an X endpoint answers
+(`x11_endpoint`, XWayland beside Wayland), whether the accessibility bus answers
+and how many applications its registry lists (or why it is unavailable), the
+at-spi2-core and ATK bridge versions dpkg records, the toolkit notes known
+without reading any application, whether XTEST and the keymap answer
+(`x11_pixels`), and whether the portal runs, its version, its Registry and any
+stored Screenshot answer for compux (`portal`), all read-only, raising no dialog
+and starting neither the portal nor its store (PROTOCOL.md, "`probe`"). A helper
+started with no display of its own (a daemon a systemd user unit started before
+login) reads `DISPLAY`, `WAYLAND_DISPLAY` and `XAUTHORITY`, and nothing else,
+from the user manager over the session bus, and carries them as values: it never
+writes its own environment, and reaches that display as its own. **Windows** is
+not supported.
 
 `idle_ms` / `wait_for_idle` (operational, not model actions) report how long the
 human has been idle — a coexistence signal so a policy layer can yield the seat to
 a present human. macOS only (typed error elsewhere). They count synthetic input too,
 so a caller that also drives input disambiguates its own actions.
 
-Building the Linux target needs the X11/input system headers the crates link
-via pkg-config: `libxcb1-dev libxcb-render0-dev libxcb-shape0-dev
-libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libdbus-1-dev`
-(mirrored in `ci.yml`'s `rust-linux` job and the release workflow).
+Building the Linux target needs no C library but the C runtime: no X, XKB, xdo
+or D-Bus development package and no pkg-config
+(`fixtures/linux/spike/no_c_deps.sh` proves it in a plain Ubuntu 24.04
+container, and checks the helper links nothing else).
 
 macOS requires the user to grant **Screen Recording** (capture) and **Accessibility**
 (input) in System Settings → Privacy & Security. Without Accessibility, synthetic
@@ -279,13 +479,17 @@ never read.
 Alpha (`0.x`). The coordinate math is unit-tested (including the Retina
 physical-vs-logical regression, at both the backing scale and 1x); the wire
 protocol, handshake, and capture paths are verified on-device. The accessibility
-seam is a trait with a recording implementation, so the tree walk, the checks
-before an action and the retain/release balance of every element reference are
-tested with no OS call — but whether a `press` really presses, and whether it
+seam is a per-node trait with a recording implementation that scripts whole trees,
+and the tree walk sits above it (`tree.rs`), so the walk's budgets, which nodes it
+lists, its paging and its paths, the checks before an action and the
+retain/release balance of every element reference are tested with no OS call — but whether a `press` really presses, and whether it
 leaves the person's keyboard alone while it does, needs a real machine with the
 grants. `fixtures/macos/FixtureApp.swift` (built by `scripts/build_fixture_app.sh`,
 never shipped) is the application those runs are made against, and `LIVE_CHECK.md`
 ends with the support matrix they fill in.
+
+Where it's headed — set-of-marks + OCR grounding, action batching, and eventual
+continuous-video capture — is in [ROADMAP.md](ROADMAP.md).
 
 ## License
 

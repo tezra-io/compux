@@ -36,11 +36,18 @@ use crate::wire::{self, Failure};
 use crate::Frames;
 
 /// How closely one of the application's accessibility windows must match the window
-/// the caller named before it is bound to it. Two points, because a window's
-/// accessibility frame and its window-server bounds are the same rectangle read
-/// through two APIs that round differently — and because a second window two points
-/// from the first is not a thing a desktop has.
+/// the caller named before it is bound to it. Two points on macOS, because a
+/// window's accessibility frame and its window-server bounds are the same rectangle
+/// read through two APIs that round differently — and because a second window two
+/// points from the first is not a thing a desktop has.
+#[cfg(not(target_os = "linux"))]
 const AX_MATCH_TOLERANCE: f64 = 2.0;
+
+/// On X11 both are whole root pixels, read off the same server, so the match is
+/// exact: at the window's bounds with the window manager's frame, or at its own
+/// area without it, whichever the toolkit reports.
+#[cfg(target_os = "linux")]
+const AX_MATCH_TOLERANCE: f64 = 0.0;
 
 /// How far a window may move before the image a caller acted in is stale. Half a
 /// point: below that is the rounding two readings of one number disagree by, above
@@ -354,8 +361,11 @@ impl TargetFrames {
         let deadline = self.clock.now_ms() + FENCE_WAIT_MS;
 
         loop {
+            // A window being proved again has its frame a frame or two away.
             match self.stream.latest(fence) {
-                Err(FrameError::NotYet) if self.clock.now_ms() < deadline => {
+                Err(FrameError::NotYet | FrameError::Reproving(_))
+                    if self.clock.now_ms() < deadline =>
+                {
                     self.clock.sleep(SLOT_POLL_MS)
                 }
                 answer => return answer,
@@ -442,6 +452,8 @@ pub fn select(
         ));
     }
 
+    owned(&window)?;
+
     let started_at = selecting.ax.process_started_at(window.pid).ok_or_else(|| {
         Failure::new(
             "target_unavailable",
@@ -461,6 +473,7 @@ pub fn select(
             id: window_id,
             width: surface_pixels(window.bounds.w, selecting.facts.scale_factor),
             height: surface_pixels(window.bounds.h, selecting.facts.scale_factor),
+            pid: window.pid,
         })
         .map_err(as_failure)?;
 
@@ -509,6 +522,31 @@ pub fn select(
     })
 }
 
+/// On X11 a window names its process only through `_NET_WM_PID`, which some
+/// windows never set (a Qt popup). A window that names none cannot be bound: its
+/// process's start time is the half of the binding a reused id is caught by.
+#[cfg(target_os = "linux")]
+fn owned(window: &WindowFacts) -> Result<(), Failure> {
+    if window.pid > 0 {
+        return Ok(());
+    }
+    Err(Failure::new(
+        "target_binding_unavailable",
+        format!(
+            "{} — {} does not say which process owns it (it sets no _NET_WM_PID), so a binding \
+             to it could not be told apart from a later window that reuses its id; work at the \
+             display, or by control",
+            window.app, window.title
+        ),
+    ))
+}
+
+/// The window server names every window's process here.
+#[cfg(not(target_os = "linux"))]
+fn owned(_window: &WindowFacts) -> Result<(), Failure> {
+    Ok(())
+}
+
 /// A window's side in points, as a surface side in real pixels. Rounded up, so a
 /// window at a fractional size is never asked for at a pixel less than it covers.
 fn surface_pixels(points: f64, scale: f32) -> u32 {
@@ -531,9 +569,11 @@ fn first_frame(frames: &Rc<TargetFrames>, gate: &Gate) -> Result<WindowFrame, Fa
         let answer = frames.stream.latest(None);
         gate.record(Phase::Capture, gate.now_ms().saturating_sub(started));
 
+        // A window resized or shown again just as it was bound is proved again
+        // within a frame or two: that frame is waited for as one not yet sent.
         match answer {
             Ok(frame) => return Ok(frame),
-            Err(FrameError::NotYet) if gate.now_ms() < deadline => {
+            Err(FrameError::NotYet | FrameError::Reproving(_)) if gate.now_ms() < deadline => {
                 gate.sleep(SLOT_POLL_MS).map_err(crate::barred)?;
             }
             Err(FrameError::NotYet) => {
@@ -582,21 +622,44 @@ fn matches_window(
     handle: crate::ax::Handle,
     window: &WindowFacts,
 ) -> bool {
-    let titled = ax.label(handle).unwrap_or_default() == window.title;
-    let placed = ax
-        .bounds(handle)
-        .map(|frame| {
-            Bounds {
-                x: frame.x,
-                y: frame.y,
-                w: frame.w,
-                h: frame.h,
-            }
-            .matches(&window.bounds, AX_MATCH_TOLERANCE)
-        })
-        .unwrap_or(false);
+    // A window that answers nothing it could be matched by is not the one.
+    let Ok(facts) = ax.facts(handle) else {
+        return false;
+    };
+    let titled = facts.label.unwrap_or_default() == window.title;
+    let placed = facts.frame.is_some_and(|frame| placed(frame, window));
 
     titled && placed
+}
+
+/// Whether an accessibility frame is this window's rectangle: its bounds, or its
+/// own area without the window manager's frame where the window server tells the
+/// two apart, within [`AX_MATCH_TOLERANCE`].
+fn placed(frame: crate::ax::Frame, window: &WindowFacts) -> bool {
+    let frame = Bounds {
+        x: frame.x,
+        y: frame.y,
+        w: frame.w,
+        h: frame.h,
+    };
+    [Some(window.bounds), window.content]
+        .into_iter()
+        .flatten()
+        .any(|bounds| frame.matches(&bounds, AX_MATCH_TOLERANCE))
+}
+
+/// Whether a surface in a top-level accessibility window of its own, at `frame`,
+/// is the bound window's: exactly one of the application's windows (`family`) is
+/// placed there, as a bound window is matched, and it is one of the `owned`. The
+/// title is not compared: toolkits name a dialog's or a menu's window differently
+/// on the two sides. Two windows at one rectangle could be either, and neither is
+/// claimed.
+pub fn tied(frame: crate::ax::Frame, family: &[WindowFacts], owned: &[u32]) -> bool {
+    let mut there = family.iter().filter(|window| placed(frame, window));
+    match (there.next(), there.next()) {
+        (Some(window), None) => owned.contains(&window.id),
+        _ => false,
+    }
 }
 
 /// The methods this binding really offers. `ax` only where an accessibility window
@@ -806,15 +869,31 @@ pub fn unobstructed(
                 )
             })?;
 
-    match covering {
-        None => Ok(()),
-        Some(covering) => Err(Failure::new(
+    if let Some(covering) = covering {
+        return Err(Failure::new(
             "target_obstructed",
             format!(
                 "{} — {} is in front of the target window at that point, so a click there would \
                  reach it instead. Act on a control by name, aim somewhere the target is not \
                  covered, or ask the user to move it",
                 covering.app, covering.title
+            ),
+        ));
+    }
+    // A menu, a tooltip or a shell's own window is in no listing on X11, and
+    // takes a click all the same.
+    match windows
+        .unlisted_cover(live.window_id, lx, ly)
+        .map_err(unavailable)?
+    {
+        None => Ok(()),
+        Some(name) => Err(Failure::new(
+            "target_obstructed",
+            format!(
+                "{name} is in front of the target window at that point (a menu, a popup or \
+                 another window no window manager lists), so a click there would reach it \
+                 instead. Close it, aim somewhere the target is not covered, or act on a \
+                 control by name"
             ),
         )),
     }
@@ -962,11 +1041,51 @@ mod tests {
         }
     }
 
+    /// A stream whose window is being proved again for its first `looks`
+    /// looks, and that then has a frame.
+    struct ProvingFirst {
+        looks: std::cell::Cell<u32>,
+    }
+
+    impl WindowFrames for ProvingFirst {
+        fn start(&self, _window: StreamWindow) -> Result<(), FrameError> {
+            Ok(())
+        }
+
+        fn latest(&self, _after: Option<Fence>) -> Result<WindowFrame, FrameError> {
+            let left = self.looks.get();
+            if left == 0 {
+                return Ok(frame(800.0, 600.0, 1.0, 1));
+            }
+            self.looks.set(left - 1);
+            Err(FrameError::Reproving("being proved again".to_string()))
+        }
+
+        fn stop(&self) {}
+    }
+
+    // A window resized or shown again just as it is bound, or just after an
+    // action, is proved again within a frame or two: the look waits for that
+    // frame inside its own deadline, as for one that has not arrived yet.
+    #[test]
+    fn a_look_waits_out_a_window_being_proved_again() {
+        let clock = Arc::new(crate::gate::SystemClock::new());
+        let gate = Gate::new("boot-1".to_string(), clock.clone());
+        let stream = Rc::new(ProvingFirst {
+            looks: std::cell::Cell::new(2),
+        });
+        let frames = Rc::new(TargetFrames::new(stream.clone(), clock));
+        assert!(first_frame(&frames, &gate).is_ok());
+        stream.looks.set(2);
+        assert!(frames.newest().is_ok());
+    }
+
     fn stream_window() -> StreamWindow {
         StreamWindow {
             id: 20,
             width: 1600,
             height: 1200,
+            pid: 200,
         }
     }
 
@@ -1173,6 +1292,26 @@ mod tests {
         );
     }
 
+    // On X11 a menu, a tooltip or a shell's notification is in no window
+    // manager's list, and a click where it takes input reaches it all the same.
+    #[test]
+    fn a_window_the_listing_does_not_hold_refuses_the_click_too() {
+        let live = live_at(at(0.0, 0.0, 800.0, 600.0), 2.0);
+        let recorder = windows_at(at(0.0, 0.0, 800.0, 600.0));
+        recorder.unlisted(Ok(Some("Compux Popup".to_string())));
+        let windows: Arc<dyn Windows> = recorder.clone();
+        let refusal = unobstructed(&live, &windows, 400, 400).expect_err("a popup is over it");
+        assert_eq!(refusal.code, "target_obstructed");
+        assert!(
+            refusal.detail.unwrap().contains("Compux Popup"),
+            "the refusal must name the popup"
+        );
+
+        recorder.unlisted(Err("the X server went away".to_string()));
+        let refusal = unobstructed(&live, &windows, 400, 400).expect_err("nothing is known");
+        assert_eq!(refusal.code, "target_unavailable");
+    }
+
     // A window server that will not answer is the target being unusable, never an
     // empty desktop that looks like nothing is in the way.
     #[test]
@@ -1207,6 +1346,33 @@ mod tests {
                 .expect_err("the process is gone")
                 .code,
             "target_unavailable"
+        );
+    }
+
+    // A window destroyed under the watch that bound it is gone for good: the
+    // window listed under its id now is another one, whatever process it names.
+    #[test]
+    fn a_window_destroyed_under_its_watch_never_revives_the_target() {
+        let recorder = crate::ax::Recorder::new(200, Vec::new());
+        let ax: Rc<dyn crate::ax::Ax> = recorder.clone();
+        let windows: Arc<dyn Windows> = windows_at(at(0.0, 0.0, 800.0, 600.0));
+        let stream = FrameRecorder::new();
+        let target = bound_on(stream.clone(), recorder.started_at());
+        assert!(live(Some(&target), "t1", &windows, &ax).is_ok());
+
+        stream.faults(FrameError::Gone(
+            "the window was closed after it was bound".to_string(),
+        ));
+        stream.deliver_sized(2_000, Health::Live, 1600, 1200, 1600 * 4);
+
+        let refusal = live(Some(&target), "t1", &windows, &ax).expect_err("another window");
+        assert_eq!(refusal.code, "target_unavailable");
+        assert!(
+            refusal
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("closed")),
+            "{refusal:?}"
         );
     }
 
@@ -1256,7 +1422,11 @@ mod tests {
     /// A target bound to window 20 of pid 200, with a stream that has delivered one
     /// frame — enough for every liveness rule above.
     fn bound_target(started_at: u64) -> Target {
-        let stream = FrameRecorder::new();
+        bound_on(FrameRecorder::new(), started_at)
+    }
+
+    /// The same, on a stream the test keeps.
+    fn bound_on(stream: Rc<FrameRecorder>, started_at: u64) -> Target {
         stream.start(stream_window()).unwrap();
         stream.deliver_sized(1_000, Health::Live, 1600, 1200, 1600 * 4);
 
@@ -1419,14 +1589,127 @@ mod tests {
 
         assert_eq!(binding, AxBinding::Unavailable);
         assert!(bound.is_none());
+    }
 
-        // Two points of disagreement is two readings of one rectangle, and IS bound.
+    // Two points of disagreement is two readings of one rectangle, and IS bound.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_frame_two_points_off_is_one_rectangle_read_twice() {
+        let bounds = at(0.0, 0.0, 800.0, 600.0);
         let near = scripted_app(&[("Window 20", ax_frame(at(1.5, 0.0, 800.0, 600.0)))]);
         let near_ax: Rc<dyn crate::ax::Ax> = near.clone();
         assert_eq!(
             bind_accessibility(&near_ax, &window(20, 200, bounds)).0,
             AxBinding::Bound
         );
+    }
+
+    // On X11 a toolkit reports its window's frame at one of two rectangles: with
+    // the window manager's frame around it (GTK 3) or without it (Qt). Either one,
+    // exactly, binds; a pixel off is another window.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_x11_a_frame_binds_exactly_at_either_side_of_the_window_managers_frame() {
+        let outer = at(0.0, 229.0, 982.0, 795.0);
+        let inner = at(1.0, 249.0, 980.0, 770.0);
+        let listed = WindowFacts {
+            content: Some(inner),
+            ..window(20, 200, outer)
+        };
+        for frame in [outer, inner] {
+            let recorder = scripted_app(&[("Window 20", ax_frame(frame))]);
+            let ax: Rc<dyn crate::ax::Ax> = recorder.clone();
+            assert_eq!(
+                bind_accessibility(&ax, &listed).0,
+                AxBinding::Bound,
+                "{frame:?}"
+            );
+        }
+
+        let off = scripted_app(&[("Window 20", ax_frame(at(1.0, 250.0, 980.0, 770.0)))]);
+        let off_ax: Rc<dyn crate::ax::Ax> = off.clone();
+        assert_eq!(
+            bind_accessibility(&off_ax, &listed).0,
+            AxBinding::Unavailable
+        );
+    }
+
+    // A surface in a window of its own is the bound window's when exactly one of
+    // the application's windows sits at its frame, at either side of the window
+    // manager's frame, and the window server says that window belongs to the
+    // bound one. The title is not compared: a GTK 3 message dialog is named by its
+    // message type where its window has its title, and a menu's window is named
+    // nothing on one side and the program on the other.
+    #[test]
+    fn a_surface_is_tied_to_the_one_window_at_its_frame_and_owned_through_it() {
+        let dialog = at(115.0, 189.0, 214.0, 102.0);
+        let client = at(116.0, 209.0, 212.0, 81.0);
+        let family = vec![
+            window(10, 200, at(0.0, 0.0, 400.0, 300.0)),
+            WindowFacts {
+                content: Some(client),
+                transient_for: Some(10),
+                ..window(12, 200, dialog)
+            },
+        ];
+        let owned = [12];
+
+        assert!(tied(ax_frame(dialog), &family, &owned));
+        assert!(tied(ax_frame(client), &family, &owned));
+        assert!(
+            !tied(ax_frame(dialog), &family, &[]),
+            "at its frame, and nobody's"
+        );
+        assert!(
+            !tied(ax_frame(at(155.0, 189.0, 214.0, 102.0)), &family, &owned),
+            "somewhere else"
+        );
+
+        let twins = vec![family[1].clone(), window(13, 200, dialog)];
+        assert!(
+            !tied(ax_frame(dialog), &twins, &owned),
+            "two windows there: either could be it"
+        );
+    }
+
+    // A window that names no process is not claimed: nothing is captured and no
+    // badge is shown for it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_x11_a_window_that_names_no_process_is_not_claimed() {
+        let gate = Gate::new(
+            "boot-test".to_string(),
+            Arc::new(crate::gate::SystemClock::new()),
+        );
+        let unowned: Arc<dyn Windows> =
+            WindowRecorder::new(vec![window(20, 0, at(0.0, 0.0, 800.0, 600.0))]);
+        let ax: Rc<dyn crate::ax::Ax> = crate::ax::Recorder::new(200, Vec::new());
+        let launcher = crate::indicator::Scripted::new();
+        let launching: Arc<dyn crate::indicator::Launcher> = launcher.clone();
+        let stream = FrameRecorder::new();
+
+        let selected = select(
+            20,
+            1,
+            "t1".to_string(),
+            &gate,
+            Selecting {
+                windows: &unowned,
+                ax: &ax,
+                launcher: &launching,
+                emitter: &crate::capture::Emitter::capturing(),
+                stream: stream.clone(),
+                display_id: 7,
+                facts: facts(),
+            },
+        );
+
+        let Err(refused) = selected else {
+            panic!("a window that names no process was claimed");
+        };
+        assert_eq!(refused.code, "target_binding_unavailable");
+        assert!(stream.started().is_empty());
+        assert_eq!(launcher.spawns(), 0);
     }
 
     // No badge, no working in somebody's window — and exactly one restart, after

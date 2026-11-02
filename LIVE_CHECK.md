@@ -1902,3 +1902,1215 @@ here rather than working around it.
 * **Anything about a window on another display, or a display this machine does
   not have.** A window dragged between two panels of different backing scales is
   its own row.
+
+---
+
+# Live check — controls by action, batched reads, an honest handshake (M86 P1)
+
+**What this is for.** P1 moved the accessibility walk above the platform seam
+(`tree.rs`) and rebuilt the macOS reader under it. The walk's rules — its budgets,
+which nodes it lists, its pages and its paths — are proved without a screen
+against scripted trees (379 Rust tests). What no unit test can tell you is how
+many messages a REAL application costs now, whether the new listing rule finds
+controls the old one missed without losing any, and whether Chrome's accessibility
+switch is now recorded and given back. This section measures those on the fixture
+app and on Chrome, with the build before P1 and the build after it.
+
+Expected outcome in one line: the same handshake on the Mac, fewer messages per
+listed control, at least as many controls listed, and Chrome's switch reported as
+activated and turned off again when the helper exits.
+
+> **Step 5 POSTS REAL INPUT** (a `set_value`). **Step 4 changes Chrome's
+> accessibility mode** while the helper runs (it is turned off again when the
+> helper exits). Steps 1 to 3 read only. Nothing here may be run by an agent. Run
+> it yourself, at the machine, with nothing confidential on screen.
+
+## 0. Preconditions
+
+* **Two builds**, so every number below has a before and an after:
+
+  ```sh
+  cd /Users/sujshe/projects/compux
+  git switch main && (cd native/compux && cargo build --release) \
+    && cp native/compux/target/release/compux /tmp/compux-before
+  git switch feat/m86 && (cd native/compux && cargo build --release) \
+    && cp native/compux/target/release/compux /tmp/compux-after
+  ```
+
+  Both speak protocol 11: P1 adds a reply field and changes no shape.
+* **The fixture app** (`scripts/build_fixture_app.sh`) and **Chrome** with an
+  ordinary page open — a page with a form and a few links is best.
+* `cx.py` from the slice-2 section, and this timer, which takes eleven listings in
+  ONE helper and prints the median of the last ten beside what the last one said:
+
+  ```sh
+  cat > /tmp/cxlist.py <<'PYEOF'
+  import json, os, statistics, subprocess, sys, time
+
+  side = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          env=os.environ.copy(), text=True, bufsize=1)
+
+  def ask(frame):
+      side.stdin.write(json.dumps(frame) + "\n")
+      side.stdin.flush()
+      return json.loads(side.stdout.readline())
+
+  hello = ask({"type": "request", "request_id": "r0", "action": "hello",
+               "protocol_version": 11, "deadline_ms": 10000})
+  envelope = {"type": "request", "deadline_ms": 30000, "session_generation": 1,
+              "authorization_generation": 1,
+              "sidecar_generation": hello["sidecar_generation"]}
+
+  took = []
+  for n in range(1, 12):
+      started = time.monotonic()
+      reply = ask({**envelope, "request_id": "r%d" % n, "action": "elements"})
+      took.append((time.monotonic() - started) * 1000)
+
+  listed = len(reply.get("elements", []))
+  sent = reply.get("ax_messages")
+  print(json.dumps({
+      "listed": listed,
+      "ax_messages": sent,
+      "per_listed": round(sent / listed, 1) if sent and listed else None,
+      "p50_ms": round(statistics.median(took[1:])),
+      "truncated": reply.get("truncated"),
+      "ax_activation": reply.get("ax_activation"),
+  }))
+  side.stdin.close()
+  side.wait()
+  PYEOF
+  ```
+
+  The before build prints `"ax_messages": null`: it does not count.
+
+## 1. The handshake is unchanged on the Mac (10 seconds, fails fastest)
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py /tmp/compux-after </dev/null | head -1
+```
+
+`actions` lists the same nineteen verbs as before, in the same order, and
+`capabilities.input_methods` is `["foreground_hid", "ax"]`. On the Linux build the
+same handshake lists neither `ax` nor `inspect`, `elements`, `press`, `set_value`,
+`select_target` and `release_target`; that is proved by a test on each platform,
+and is worth one look on the Pop!_OS desktop only if you are already there
+(`hello` reads nothing from the screen).
+
+## 2. Messages per listed control (M1, M2, M3, M7)
+
+Bring the fixture window to the front, then:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cxlist.py /tmp/compux-before
+COMPUX_DISCLAIMED=1 python3 /tmp/cxlist.py /tmp/compux-after
+```
+
+* **`per_listed` on the after build should be about 5.5 or less on the fixture
+  window.** The reader before P1 spent ten or eleven messages on every control it
+  listed — role, title, description when there was no title, position, size,
+  subrole, value, enabled, action names, settable and the children array — before
+  counting a single node it passed over, so about 5.5 is M1's "at most half". The
+  after build spends one batched read, the action names, whether the value may be
+  written, the value (not for a secure field), the child count and a page of
+  children only when there are some: four to six. A higher figure is nodes passed
+  over (three or four messages each, before and after alike); paste the reply
+  rather than judging it.
+* **What `ax_messages` counts:** the messages of the ONE walk whose list the reply
+  returns. It leaves out the activation's own reads and writes, any `inspect`, and
+  the earlier walks of an empty-tree poll (step 4), so `per_listed` divides one
+  walk's cost by that walk's controls even on Chrome's first listing.
+* **`p50_ms` should be no worse after than before.** Write both down.
+* `truncated` should be absent on the fixture window on both builds.
+
+Then bring Chrome to the front and run both again. Chrome's figure is dominated by
+the web nodes the walk passes over, so record it rather than judging it against
+5.5; `truncated: "time"` or `"nodes"` there is worth writing down too.
+
+## 3. Controls listed, before and after (M4)
+
+From the same runs, compare `listed` for each application.
+
+* **The after build lists at least as many controls as the before build, and
+  usually more.** The new ones are nodes whose role is not one of the fixed fourteen
+  (an `AXGroup`, an `AXRow`, an `AXImage`) but whose own action list advertises
+  `AXPress`, `AXConfirm`, `AXPick`, `AXIncrement`, `AXDecrement` or `AXOpen`.
+  Expect `AXScrollBar` among them: a scroll bar advertises `AXIncrement` and
+  `AXDecrement`, so every scroll area adds up to two (vertical and horizontal).
+  To see which, run `{"action":"elements"}` through `cx.py` on each build and diff
+  the roles.
+* **Fewer on the after build is a regression.** With `truncated: "time"` it is a
+  slow application: a node that did not answer within 250 ms is skipped and the
+  listing says so. With no `truncated`, the likeliest cause is a node whose
+  batched read failed outright — it is not listed, though what is inside it still
+  is. Paste both listings, and note which controls are missing.
+
+## 4. Chrome's accessibility switch is recorded and given back (M5)
+
+Quit Chrome completely and start it again, so its accessibility mode starts off.
+Open the same page, bring it to the front, and run the after build once:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py /tmp/compux-after '{"action":"elements"}' </dev/null
+```
+
+* If the first walk found no controls, `ax_activation` names the switch that
+  worked — `AXManualAccessibility activated` or `AXEnhancedUserInterface
+  activated` — and how long the tree took to appear (up to 2400 ms now, to outlast
+  Chromium's two-second debounce). The before build said `activation refused:
+  AXError -25208` for the same Chrome, because Chrome applies
+  `AXEnhancedUserInterface` and answers "not implemented" anyway; the after build
+  reads the attribute back and believes that instead.
+* If the first walk already found controls, nothing was switched (the switch is
+  tried only on an empty tree) and this step proves nothing: quit Chrome and try
+  again with a fresh launch.
+* **It is turned off again when the helper exits.** With Xcode's Accessibility
+  Inspector pointed at Chrome's application element, `AXEnhancedUserInterface`
+  (or `AXManualAccessibility`) reads true while the helper runs — keep `cx.py`
+  open by leaving off `</dev/null` — and false a moment after you press ctrl-D.
+* **A switch that was already on is left on.** Turn VoiceOver on (cmd-F5), quit
+  and relaunch Chrome, and repeat the run. If the first walk is empty,
+  `ax_activation` now says `AXEnhancedUserInterface already on, left as it was`
+  (or the same for `AXManualAccessibility`), and after ctrl-D the Inspector still
+  reads it true: the helper never turns off a switch VoiceOver turned on. Turn
+  VoiceOver off again afterwards.
+
+## 5. A field that shows its value late now verifies (M6)
+
+**This step POSTS REAL INPUT.** In the fixture app, set its text field by
+reference through the after build:
+
+```sh
+COMPUX_DISCLAIMED=1 python3 /tmp/cx.py /tmp/compux-after
+{"action":"elements"}
+{"action":"set_value","observation_id":"<the id it printed>","element_ref":"<the text field>","value":"grace"}
+```
+
+`verified` is `true` and `receipt.effect` is `"verified"`, as before. On a field that
+formats or commits late — a number or date field, or a form field in Chrome — the
+before build often said `verified: false` with the right text arriving a moment
+later; the after build reads it back every 50 ms for up to 400 ms, and
+`receipt.timings_ms.settle` says how long it waited.
+
+## 6. The numbers
+
+| Application | Build | `listed` | `ax_messages` | `per_listed` | `p50_ms` | `truncated` |
+|---|---|---|---|---|---|---|
+| FixtureApp | before | | n/a | n/a | | |
+| FixtureApp | after | | | | | |
+| Chrome | before | | n/a | n/a | | |
+| Chrome | after | | | | | |
+
+## 7. What this check still cannot prove
+
+* **That every application answers a batched read.** The reader asks for seven
+  attributes in one `AXUIElementCopyMultipleAttributeValues`. A node whose
+  application fails that call outright is not listed (its children still are).
+  Step 3's comparison is what would show it.
+* **That the 250 ms read timeout is long enough everywhere.** A slow application
+  now costs a quarter of a second per message, not a second; a node that needs
+  longer is skipped rather than waited on, and the listing says `truncated:
+  "time"`. A slow application that lists fewer controls with that note is this.
+* **The Linux reader.** Nothing here touches Linux accessibility; P1 only makes the
+  Linux build stop offering it.
+
+# Live check — controls before pixels: scopes, verbs, waits, surfaces (M86 P2)
+
+**What this is for.** Protocol 12 adds scoped listings, finds, skeletons and
+drills, seven verbs on a reference that act through the accessibility API
+alone, waits on the tree, and the surfaces a receipt names. The unit tests
+script every rule against a recording platform on Linux, and the macOS reader
+behind them compiles and lints but has never run. This section runs each new
+thing once on a real Mac, against the fixture app, plus one web page for a slow
+control. It also measures what the new per-control reads cost.
+
+Expected outcome in one line: every scope lists what it names, every verb changes
+the control and reads it back (or says it already held), a wait answers `met`
+when the control arrives and `not_met` when it does not, and a sheet the action
+opened rides the receipt.
+
+> **Steps 3, 4 and 5 POST REAL INPUT**: accessibility writes and presses on the
+> fixture app, and one key press. Steps 1, 2 and 6 read only. Nothing here may be
+> run by an agent. Run it yourself, at the machine, with nothing confidential on
+> screen.
+
+## 0. Preconditions
+
+* **Two builds**, P1 (protocol 11) for the message counts in step 6 and P2:
+
+  ```sh
+  cd /Users/sujshe/projects/compux
+  git switch <the P1 commit> && (cd native/compux && cargo build --release) \
+    && cp native/compux/target/release/compux /tmp/compux-p1
+  git switch feat/m86 && (cd native/compux && cargo build --release) \
+    && cp native/compux/target/release/compux /tmp/compux-p2
+  ```
+
+* **The fixture app** (`scripts/build_fixture_app.sh`), in front, its window
+  showing the AppKit and SwiftUI controls.
+* `cx.py` from the slice-2 section, with `"protocol_version": 12` in its `hello`
+  for the P2 build. Every request below goes through it, one line at a time:
+
+  ```sh
+  COMPUX_DISCLAIMED=1 python3 /tmp/cx.py /tmp/compux-p2
+  ```
+
+## 1. The handshake (10 seconds, fails fastest)
+
+`protocol_version` is `12`. `actions` lists twenty-six verbs: the nineteen of
+protocol 11 with `focus`, `select`, `toggle`, `expand`, `collapse`, `scroll_to`
+and `wait_for` after `set_value`. The Linux build lists them all but `inspect`
+and the bound windows' two (the M86 L1 section). A test proves that on each
+platform.
+
+## 2. Every scope once, a find, a skeleton and a drill (read only)
+
+```json
+{"action":"elements","scope":"window"}
+{"action":"elements","scope":"app"}
+{"action":"elements","scope":"focused"}
+{"action":"elements","query":{"role":"checkbox"}}
+{"action":"elements","query":{"name":"save"}}
+{"action":"elements","scope":"window","skeleton":true}
+{"action":"elements","root":"<a cut node's element_ref>","observation_id":"<the skeleton's id>"}
+```
+
+* Every entry has a normalised `role` (`button`, `checkbox`, `textfield`, …)
+  beside its `native_role`, and `verbs` in place of `actions` and `settable`.
+  The AppKit checkbox reads `checked`, and a secure field has `"secure": true`
+  and no `value`.
+* `window` is the fixture window's controls only, and the reply says
+  `"scope":"window"`. `app` adds the menu bar's. `focused` lists the focused
+  control first: click into the text field before you send it.
+* The find by role lists both checkboxes (AppKit and the SwiftUI toggle), and
+  nothing else. The find by name lists both Save buttons (Document, Sidebar)
+  with their `path`s.
+* The skeleton says `"skeleton":{"depth":3,"hidden":N}`. Some entries carry
+  `hidden`: those are the cuts. Drilling into one lists its contents numbered
+  after the skeleton's last reference, and `root` echoes the reference. A
+  reference from the skeleton outside that cut still presses with the drill's
+  `observation_id`. The same drill with `"skeleton":true` cuts again three levels
+  below its root, and with `"query":{"role":"button"}` lists only the buttons
+  inside it.
+* A scoped listing never asks an application to expose its tree. Quit and
+  reopen a Chromium-based browser, send `{"action":"elements","scope":"window"}`
+  with it in view first: note whether it lists anything and whether the reply
+  has an `ax_activation` (it must not). Then send `{"action":"elements"}`, which
+  may name the switch it turned on, and the scoped request again: it now lists
+  the browser's controls.
+* Open the sheet by hand (**Clear All…**), then send
+  `{"action":"elements","scope":"dialog"}`: it lists OK and Cancel, and nothing
+  else. Press Cancel by hand. The same request now answers `scope_not_found`.
+* Right-click the fixture window's context-menu area, and send
+  `{"action":"elements","scope":"menu"}` while the menu is open (keep `cx.py`
+  in a second terminal and paste quickly). It lists the menu's items. Press
+  Escape.
+
+## 3. Each verb once (POSTS INPUT)
+
+With a fresh `{"action":"elements","scope":"window"}` listing, and its id as
+`O`:
+
+```json
+{"action":"toggle","observation_id":"O","element_ref":"<AppKit checkbox>","on":true,"check":"semantic"}
+{"action":"toggle","observation_id":"O","element_ref":"<AppKit checkbox>","on":true}
+{"action":"focus","observation_id":"O","element_ref":"<AppKit text field>"}
+{"action":"type","observation_id":"O","element_ref":"<AppKit text field>","text":"ada"}
+{"action":"type","observation_id":"O","element_ref":"<AppKit secure field>","text":"x"}
+{"action":"select","observation_id":"O","element_ref":"<a row of the AppKit list>"}
+{"action":"scroll_to","observation_id":"O","element_ref":"<the far list's bottom row>"}
+```
+
+* The first toggle: `receipt.effect` is `"changed"`, `state_before` is `"off"`,
+  `state_after` is `"on"`, and `element_after` says `"checked": true`. The box is
+  ticked on screen, and the pointer never moved.
+* The second toggle: `dispatch` is `"not_sent"`, `already` is `true`, and the box
+  is untouched.
+* `focus`: the caret is in the field and `state_after` is `"focused"`. Now bring
+  another app's window to the front and repeat it. The answer is `focus_refused`,
+  and the fixture window stays where it is: **focus never activates a window**.
+* `type` into the field: no key events (watch the keyboard viewer if you have
+  it). The field shows `ada` at the caret, the reply's `value` says what it
+  holds, and `effect` is `"changed"`. Into the secure field: the dots appear,
+  `effect` is `"unknown"`, and there is no `value`.
+* `select`: the row is highlighted, and `state_after` is `"selected"`.
+* `scroll_to`: the far list scrolls its bottom row into view, and `effect` is
+  `"changed"`. Again, now that it is in view: `"not_observed"`.
+* A verb with no route is refused: `{"action":"toggle", … the AppKit button …,
+  "on":true}` answers `ax_action_unsupported`, and nothing is pressed.
+* The fixture has no disclosure or outline row. Run `expand` and `collapse` once
+  on any outline in Finder's sidebar (a "Locations" or "Tags" header):
+  `state_before` and `state_after` name `expanded` and `collapsed`.
+
+## 4. A sheet rides the receipt (POSTS INPUT)
+
+```json
+{"action":"press","observation_id":"O","element_ref":"<Clear All…>"}
+```
+
+`receipt.surfaces` is
+`[{"kind":"dialog","native_kind":"AXSheet","label":"Clear all fields?"}]` (the
+label as the sheet gives it). Press Cancel by hand. A press with nothing opened
+answers `"surfaces":[]`, and a refused request (`element_ref` `e999`) carries no
+`surfaces` at all.
+
+Then the same in one request, waiting on the tree:
+
+```json
+{"action":"press","observation_id":"O","element_ref":"<Clear All…>","check":{"kind":"semantic","until":{"kind":"appears","role":"dialog"}}}
+```
+
+`receipt.check` is `{"kind":"semantic","until":"met","looks":N,"waited_ms":M}`
+with a small `N`. Leave the sheet open, and send the same request again: the
+condition held before the input, so it says `"held_before"` (and the press is
+answered by a modal window: note what `dispatch` says). Press Cancel by hand.
+
+## 4a. A bound window's scopes (POSTS INPUT)
+
+The unit tests prove what a binding does to `focused`, `menu` and `dialog` on a
+recording platform; the macOS reader's half (an element's `AXWindow` against the
+bound window, for the focus and for a menu of the application's) has never run. Bind the fixture window (`windows`, then
+`select_target` with its id, `T` below), and send each with `"target_id":"T"`:
+
+* With the caret in the fixture's text field,
+  `{"action":"elements","scope":"focused","target_id":"T"}` lists the field.
+* Open the sheet by hand (**Clear All…**): `{"action":"elements","scope":"dialog","target_id":"T"}`
+  lists OK and Cancel; a press with `"target_id":"T"` on Clear All… names the sheet
+  in `receipt.surfaces`, once (note it if it is listed twice). With the sheet still
+  open, send
+  `{"action":"elements","scope":"focused","target_id":"T"}`: a control in the sheet
+  is inside the bound window, so if the sheet holds the focus this lists it. Note
+  what it answers: a `scope_not_found` saying focus is in another window means the
+  sheet's controls name the sheet, not the window, as their `AXWindow`. Press
+  Cancel by hand. The scope then answers
+  `scope_not_found` saying no dialog **of the bound window** is open.
+* Press the fixture's **AppKit pop-up button** through the binding (its
+  `element_ref` from a listing taken with `"target_id":"T"`, pressed with
+  `"target_id":"T"`), and with its menu (First, Second, Third) open send
+  `{"action":"elements","scope":"menu","target_id":"T"}`,
+  `{"action":"elements","scope":"window","target_id":"T"}` and
+  `{"action":"wait_for","until":{"kind":"menu_open"},"timeout_ms":1000,"target_id":"T"}`.
+  If macOS names the bound window as the open menu's `AXWindow`, the menu scope
+  lists First, Second and Third, the wait is met (`"met":true`), and the press's
+  `receipt.surfaces` names the menu; pressing Second by the menu scope's
+  `element_ref` with `"target_id":"T"` picks it. If it does not, the menu scope is
+  `scope_not_found` saying to release the target, and the wait is not met
+  (`"met":false`). A third answer is neither: if reading the menu's `AXWindow`
+  does not answer within 250 ms, the scan stops, the menu scope is
+  `scope_not_found` saying the look stopped before it finished, and the wait is
+  not met with `"truncated":"time"`. Note which answer came (with `truncated` if
+  the not-met reply carries it, so a slow read is not recorded as macOS not naming
+  the window), and whether the window scope lists the items (AppKit listing the
+  open menu under the pop-up button): together they say whether "press a pop-up,
+  pick an item" works under a binding. Press Escape.
+* Right-click the context-menu area and send
+  `{"action":"elements","scope":"menu","target_id":"T"}` while it is open. Like the
+  pop-up's menu, it lists the menu's items if macOS names the bound window as the
+  menu's `AXWindow`, and otherwise answers `scope_not_found` saying to release the
+  target; note which. The same request without `target_id` lists the menu's items
+  either way. Press Escape.
+* TextEdit with two documents open: bind the first, click into the second, and
+  send `{"action":"elements","scope":"focused","target_id":"T"}`: `scope_not_found`
+  saying focus is in another window of the application. Nothing of the second
+  document is listed. Then, still bound to the first, right-click in the second
+  and, with its menu open, send
+  `{"action":"elements","scope":"menu","target_id":"T"}` and
+  `{"action":"wait_for","until":{"kind":"menu_open"},"timeout_ms":1000,"target_id":"T"}`:
+  `scope_not_found` saying to release the target, and `"met":false`. If the
+  menu's items are listed, macOS names the wrong window as a menu's `AXWindow`,
+  and the `AXWindow` mark must be dropped: report it. Press Escape.
+* `{"action":"screenshot","target_id":"T","marks":true}` badges the fixture
+  window's controls; press one by its mark's `element_ref` with `"target_id":"T"`
+  and it acts. With the context menu open over the window, the same screenshot
+  badges the menu's items exactly when the step above listed them under the
+  binding, and none of them otherwise. A window
+  bound without an accessibility element (`ax_binding` not `bound`) gets marks
+  with points and no `element_ref`.
+* With the fixture bound again, a reference from step 2's listing (taken without
+  `target_id`) pressed with `"target_id":"T"` is `stale_element`, saying it was
+  listed without a window binding, and **nothing is pressed** (watch the control);
+  the same control from a listing taken with `"target_id":"T"` presses.
+
+## 5. Waiting on a slow control (POSTS INPUT)
+
+Open this page in Chrome. Its button turns enabled two seconds after it loads.
+
+```
+data:text/html,<button id=b disabled onclick="document.title='done'">Go</button><script>setTimeout(()=>b.disabled=false,2000)</script>
+```
+
+Reload, list it at once, and wait:
+
+```json
+{"action":"elements"}
+{"action":"wait_for","observation_id":"<that id>","until":{"kind":"enabled","element_ref":"<Go>"}}
+```
+
+`met` is `true` and `waited_ms` is between about 1000 and 2000. Reload and wait
+again with `"timeout_ms":500`: `met` is `false`, `looks` is 6, and there is no
+`deadline_cut`. Reload once more and send the wait with `"deadline_ms":1000`
+and `"timeout_ms":5000` beside it: `met` is `false` and `"deadline_cut": true`,
+because the request's own deadline ended it.
+
+Then press it and wait on the title in the same request:
+
+```json
+{"action":"press","observation_id":"<id>","element_ref":"<Go>","check":{"kind":"semantic","until":{"kind":"window_title","contains":"done"}}}
+```
+
+`until` is `"met"`.
+
+## 6. What the new reads cost
+
+With the fixture window in front, run `/tmp/cxlist.py` from the P1 section
+against both builds (with `"protocol_version": 12` for the P2 one):
+
+* **`per_listed` rises by about six to eight on P2.** Each listed control now
+  also costs its write routes (one `AXUIElementIsAttributeSettable` per route,
+  which has no batched form: five, or six for a control with no `AXExpanded` to
+  write), its states (one batched read), and, under a container that selects its
+  children, one question to that container per parent. Reading a value asks for
+  the role and subrole first (two messages) on both builds, since the secure-field
+  fix. Write both figures down. More than ten above P1 is worth pasting.
+* `p50_ms` should stay below a second on the fixture window.
+
+| Build | `listed` | `ax_messages` | `per_listed` | `p50_ms` |
+|---|---|---|---|---|
+| P1 | | | | |
+| P2 | | | | |
+
+## 7. What this check still cannot prove
+
+* **Every application's routes.** `AXSelectedText`, `AXSelectedChildren`,
+  `AXDisclosing` and `AXFocused` are settable where the application says so. An
+  application that says so and ignores the write reads back unchanged:
+  `not_observed`, never `changed`.
+* **Menus inside web content and custom popovers.** The surface scan reads the
+  application's windows, their children and the menu bar, at most 64 nodes. A
+  dialog drawn inside a web page is not a surface.
+* **Linux.** Nothing here touches Linux accessibility: the M86 L1 section below
+  runs the same verbs through AT-SPI.
+
+# Live check — controls on Linux through AT-SPI (M86 L1)
+
+**What this is for.** The Linux build now lists controls with normalised roles
+and verbs, acts on them through AT-SPI (`press`, `set_value`, `type` by
+reference, `select`, `toggle`, `expand`, `collapse`, `focus`, `scroll_to`), waits
+on the tree, and names the menus and dialogs an action opened. Every rule is
+tested against fake AT-SPI servers, and every verb has run against the GTK 3,
+GTK 4 and Qt fixture apps in private containers (`fixtures/linux/spike/spike.sh`,
+stages `verbs` and `verbs-jammy`), judged by what each fixture recorded. None of
+it has run on a real GNOME desktop. This section runs it once on yours: Pop!_OS
+22.04, GNOME 42, an X11 session, at-spi2-core 2.44 and the ATK bridge 2.38 that
+aborts an application asked `Action.GetActions`.
+
+Expected outcome in one line: the fixture apps survive every listing and every
+verb, each verb changes its control and the fixture records it, and the probe
+names the X11 session by its socket.
+
+> **Steps 3, 4 and 5 POST REAL INPUT** through the accessibility bus to the
+> fixture apps: presses, text, selections, a menu and a dialog. Steps 1, 2, 2a
+> and 6 read only (in 2a you click the fixture yourself). Nothing here may be run by an agent. Run it yourself, at the machine,
+> with nothing confidential on screen. The fixture apps run on your desktop for
+> this check only; everywhere else they run in a private container.
+
+## 0. Preconditions
+
+* **The build**, from the branch with L1 on it:
+
+  ```sh
+  cd ~/src/compux && git switch feat/m86
+  (cd native/compux && cargo build --release)
+  CX=$PWD/native/compux/target/release/compux
+  ```
+
+* **The GTK fixture apps** (`python3-gi`, `gir1.2-gtk-3.0` and `gir1.2-gtk-4.0`;
+  22.04 ships GTK 4.6, and packages no PyQt6, so the Qt fixture runs in the
+  containers only). Each in its own terminal, each writing what happened to its
+  state file:
+
+  ```sh
+  python3 fixtures/linux/fixture_gtk3.py --state-file /tmp/gtk3.json
+  python3 fixtures/linux/fixture_gtk4.py --state-file /tmp/gtk4.json
+  ```
+
+  A GTK 4 application joins the accessibility bus only if the bus was up when it
+  started; on a GNOME login it always is.
+* `cx.py` from the slice-2 section, with `"protocol_version": 12` in its `hello`.
+  Every request below names its listing's `observation_id` (the `O` of the
+  `elements` line before it), so the script's own `ADDRESSED` list does not
+  matter. Keep one session for a whole step:
+
+  ```sh
+  python3 /tmp/cx.py "$CX"
+  ```
+
+* To read what a fixture recorded: `python3 -m json.tool /tmp/gtk3.json | tail -20`.
+
+## 1. The handshake and the probe (10 seconds, fails fastest)
+
+```json
+{"action":"probe"}
+```
+
+`hello` says `"protocol_version": 12`, `capabilities.input_methods` is
+`["foreground_hid","ax"]`, and `actions` lists twenty-three verbs: every one the
+Mac lists but `inspect`, `select_target` and `release_target`. The probe says
+`"display_server": "x11"`, `"x11_endpoint": true`, and capture and input `true`.
+It also says what a doctor shows of accessibility, read only (no event
+registered, no application read, nothing set):
+
+- `accessibility_bus.state` is `"answering"`, `applications` about as many as
+  the accessible applications you have open, and `status` is read (both `false`
+  unless a screen reader or another assistive technology runs);
+- `accessibility_packages` is `{"source": "dpkg", "at_spi2_core": "2.44.0-3",
+  "atk_bridge": "2.38.0-3"}`, the versions `dpkg -l at-spi2-core
+  libatk-bridge2.0-0` prints;
+- `toolkit_notes` has a `qt` note while `status` reads both `false`, and a
+  `chromium` note always.
+
+Then `{"action":"inspect","x":1,"y":1,"observation_id":"x"}` answers
+`unknown_action`.
+
+Now the helper with no display of its own, as a daemon started before login has
+it (read only: it reads two names from the user manager, sets nothing):
+
+```sh
+env -u DISPLAY -u WAYLAND_DISPLAY -u XAUTHORITY python3 /tmp/cx.py "$CX" '{"action":"probe"}' </dev/null
+```
+
+Its stderr says `took ["DISPLAY", "XAUTHORITY"] from the user manager` (the
+names only, never a value). The probe says `x11` again, `"display_adopted":
+true`, and since M86 L2 capture and input `true`: the helper reaches the adopted
+display with its authority as its own (the M86 L2 section checks its pixels).
+`systemctl --user show-environment | grep -c DISPLAY` should be at least 1 for
+this to hold; if it is 0, GNOME did not import the display into the user
+manager, and the probe answers `none`: write that down.
+
+## 2. The GTK 3 fixture survives a listing (read only)
+
+With **Compux Fixture GTK3** in front:
+
+```json
+{"action":"elements"}
+{"action":"elements","scope":"window"}
+{"action":"elements","query":{"name":"save"}}
+```
+
+* The fixture is still running after each (its terminal shows no `SIGABRT`, and
+  `pgrep -f fixture_gtk3` still answers): the ATK bridge 2.38 aborts an
+  application asked `GetActions`, and compux never asks it.
+* Roles are normalised (`button`, `checkbox`, `textfield`, `slider`, `row`,
+  `cell`, `tab`) beside the AT-SPI `native_role` (`push button`, `check box`, …),
+  and every control has `bounds` and a click point.
+* The Fruit and History rows are named by their labels (`Apple`, `Entry 1`), the
+  pop-up button is named `GTK3 pop-up button` and lists none of its items, and no
+  History row below the list's visible end is listed.
+* The find lists both Save buttons with their `path`s (Document, Sidebar).
+* `verbs`: the button `press`; the checkbox `press`, `toggle` and `focus`; the
+  text field `set_value`, `type` and `focus`; the Folders cells `expand` and
+  `collapse`; the Fruit rows and the tabs `select`.
+
+## 2a. A removed GTK 3 row, read within 16 s (read only; one click by you)
+
+compux finds a reference by an object's own account of its place (its `Parent`
+and `GetIndexInParent`) on Qt only. A destroyed GTK 3 object was measured
+elsewhere to keep answering its old parent and index for about 16 s, and taking
+its word would bind a row the list no longer has. This step reads what a row of
+the GTK 3 fixture says right after its list drops it. The script reads the
+fixture's objects only (it refuses any other process), never sends
+`GetActions` or `GetAll`, and acts on nothing: the collapse is your click.
+
+With **Compux Fixture GTK3** running and Projects expanded in its Folders list
+(it starts expanded):
+
+```sh
+python3 fixtures/linux/removed_row.py --pid "$(pgrep -f 'fixture_gtk3.py --state-file /tmp/gtk3.json')"
+```
+
+It prints the row `Alpha` with `listed_there=yes`, then asks you to collapse
+Projects: **click Projects' triangle in the fixture window**, then press Enter in
+the terminal at once. For 20 s it prints, once a second, what the removed row
+says: its `parent`, `index`, whether that parent still lists it there, and its
+`states`.
+
+* In the containers (bridge 2.38 and 2.52) the removed row answered
+  `UnknownObject` to every read from the first second.
+* Write down what yours says, and when it changes. A row that answers its old
+  `parent` and an `index` with `listed_there=no` is the case the Qt-only rule
+  is for: compux calls it `stale_element`, never the row it was.
+
+Then expand Projects again by its triangle: step 3 collapses it.
+
+## 3. Each verb once, on GTK 3 (POSTS INPUT)
+
+Take a fresh `{"action":"elements","scope":"window"}` and use its id as `O` and
+its references below. After each, read `/tmp/gtk3.json`.
+
+* **`{"action":"press","observation_id":"O","element_ref":"<GTK3 button>"}`**: the
+  fixture records `gtk3.button press`, and the pointer never moved.
+* **`{"action":"toggle","observation_id":"O","element_ref":"<GTK3 checkbox>","on":true}`**:
+  `effect` `changed`, `state_before` `off`, `state_after` `on`; the fixture records
+  `toggle on`. **Send it again**: `dispatch` `not_sent`, `already` `true`.
+* **`{"action":"set_value","observation_id":"O","element_ref":"<GTK3 text field>","value":"hello"}`**:
+  `effect` `verified`; the fixture records `set_value hello`.
+* **`{"action":"type","observation_id":"O","element_ref":"<Search>","text":"abc"}`**:
+  no key events; the field shows `abc`, the reply's `value` says so.
+* **`{"action":"focus","observation_id":"O","element_ref":"<Search>"}`**: the caret
+  is in the field, the fixture records `search focus`. **Bring another window to
+  the front and send it again**: `focus_refused`, and the fixture window stays
+  behind. Focus never activates a window.
+* **`{"action":"select","observation_id":"O","element_ref":"<Banana>"}`** and
+  **the same on the `Advanced` tab**: each recorded as `select`.
+* **`{"action":"expand","observation_id":"O","element_ref":"<Documents>"}`** and
+  **`collapse` on `Projects`**: recorded as `expand Documents`, `collapse Projects`.
+* **`{"action":"set_value","observation_id":"O","element_ref":"<Volume>","value":"75"}`**:
+  recorded as `set_value 75`.
+* **`{"action":"scroll_to","observation_id":"O","element_ref":"<the last History row listed>"}`**:
+  the list scrolls that row fully into view, `effect` `changed`; again,
+  `not_observed`.
+* **`press` on `GTK3 disabled button`**: `element_disabled`, nothing recorded.
+
+## 4. A menu and a dialog, on GTK 3 (POSTS INPUT)
+
+* **`press` on `Actions`** (the menu bar's menu), then at once
+  `{"action":"wait_for","until":{"kind":"menu_open"}}`: `met` `true`. Then
+  `{"action":"elements","scope":"menu"}` lists `Export Report` and `Print Preview`;
+  **press `Export Report`** in that listing: the fixture records
+  `menu activate Export Report`.
+* **`{"action":"press","observation_id":"O","element_ref":"<Clear All…>","check":{"kind":"semantic","until":{"kind":"appears","role":"button","name":"Cancel","scope":"dialog"}}}`**:
+  `receipt.check.until` is `met`, and `receipt.surfaces` names the dialog (GTK 3
+  makes it an `alert`, `native_kind` `alert`). `{"action":"elements","scope":"dialog"}`
+  lists OK and Cancel; **press Cancel**: recorded as `dialog cancel`.
+
+## 5. The GTK 4 fixture (POSTS INPUT)
+
+With **Compux Fixture GTK4** in front, `{"action":"elements","scope":"window"}`:
+
+* Every control is listed **without** `bounds`, `x` and `y` (GTK 4 answers every
+  screen position at 0, 0, on X11 too), and the reply says nothing is wrong.
+* The check box lists no `toggle` and the fields no `focus` (GTK 4 names no action
+  on a check box and refuses `GrabFocus`). A `toggle` on it answers
+  `ax_action_unsupported`, nothing sent.
+* **`press` the GTK4 button, `set_value` the text field, `select` Banana and the
+  Advanced tab, `expand` the `Documents` button in Folders** (the row named
+  Documents selects; the button inside it expands): each recorded in
+  `/tmp/gtk4.json`.
+* **`scroll_to` on `Entry 200`** (GTK 4 lists every row of its list): the list
+  scrolls to its end, and the fixture records `far_list scroll bottom`.
+* **`press` on `Clear All…`**, then `{"action":"elements","scope":"dialog"}`. In
+  the containers (Openbox) no GTK 4 window reads ACTIVE while its dialog is open,
+  so this answers `scope_not_found`. Write down what GNOME does: a listing of the
+  dialog means Mutter gives a dialog opened by an accessibility press the focus.
+  Close the dialog by hand.
+* A GTK 4 menu-bar item names no action: `press` on `Actions` answers
+  `ax_action_unsupported`.
+
+## 6. The numbers
+
+`{"action":"elements"}` five times on each fixture, and write down
+`ax_messages` and how long the reply took (the script prints each reply as it
+arrives; a stopwatch is enough):
+
+| Fixture | listed | `ax_messages` | time |
+|---|---|---|---|
+| GTK 3 | | | |
+| GTK 4 | | | |
+
+## 7. What this check still cannot prove
+
+* **Qt on this desktop.** 22.04 packages no PyQt6; the Qt fixture ran in the
+  containers only. There a menu-bar item opens by its `ShowMenu`, list and tree
+  items are selected by their own `Toggle` (Qt lists no `Selection`; a tab is
+  pressed), a tree cell has no `expand`, and there is no `scroll_to`.
+* **Wayland.** Controls on a Wayland session are listed without positions and act
+  by reference; nothing here runs one. Pixels on Wayland are checked in the M86 L2
+  section below, part B.
+* **Chromium and Electron.** `scroll_to` through `Component.ScrollTo` and the
+  `toolkit_accessibility_off` refusal are tested against fakes only here.
+* **An application that is not on the accessibility bus** (a Qt one without
+  `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`, a GTK 4 one started before the bus) leaves
+  no window reading ACTIVE there: `elements` says so and names the switches, but
+  cannot name the application until the window list arrives in a later stage.
+
+# Live check — Linux pixels on x11rb and the GNOME portal (M86 L2)
+
+**What this is for.** The Linux build no longer captures, clicks, types or pastes
+through xcap, enigo and arboard. On X11 it speaks to the X server itself (x11rb):
+XTEST with the server's own keymap, the core `GetImage` in strips, RandR, EWMH, and
+a `CLIPBOARD` it owns. On GNOME Wayland it goes through the XDG desktop portal under
+the app id `io.tezra.fermix.ComputerUse`. In private containers (Xvfb, openbox, the
+GTK 3 fixture; `fixtures/linux/spike/spike.sh`, stage `pixels`) a click, typing, a
+paste, a refused character and a frame against a known pattern all pass, and a
+button a killed helper held is released by the next one. The portal route is
+tested against a fake portal only: nothing here has met a real GNOME Shell.
+
+Expected outcome in one line: on your X11 desktop compux's frame is GNOME's picture,
+and its clicks, keys and paste land where they are aimed; on the Wayland VM one
+dialog grants the session, and a restarted helper is not asked again.
+
+> **Steps A3, A4, B1 (its `remote` runs), B3, B4, B5 and B6 POST REAL INPUT**: clicks,
+> typed text and a paste, into the GTK 3 fixture (A) or Text Editor (B). The other steps read only. Nothing
+> here may be run by an agent. Run it yourself, at the machine, with nothing
+> confidential on screen.
+
+## A. Your X11 desktop (Pop!_OS 22.04, GNOME 42)
+
+### A0. Preconditions
+
+* The build, from the branch with L2 on it, and `cx.py` from the slice-2 section
+  with `"protocol_version": 12` in its `hello`:
+
+  ```sh
+  cd ~/src/compux && git switch feat/m86
+  (cd native/compux && cargo build --release)
+  CX=$PWD/native/compux/target/release/compux
+  ```
+
+* The GTK 3 fixture in its own terminal: `python3 fixtures/linux/fixture_gtk3.py
+  --state-file /tmp/gtk3.json`. To read what it recorded: `python3 -m json.tool
+  /tmp/gtk3.json | tail -20`.
+
+### A1. Is the frame honest? (read only, fails fastest)
+
+Whether a grab of the root window shows what GNOME's GPU compositor draws, on the
+code that ships. Put something GPU-drawn in view (a playing video in Firefox, or
+`glxgears`), then:
+
+```sh
+python3 fixtures/linux/spike/owner/owner_capture.py --binary "$CX" --out ~/l2-frame
+gnome-screenshot -f ~/l2-frame/gnome.png       # straight after, same scene
+```
+
+* `~/l2-frame/compux.png` and `~/l2-frame/gnome.png` show the same scene: the video
+  or GL window and the top bar drawn in both, not black or stale in compux's. If
+  they are not, stop here: the X11 frame needs Composite capture, which is a later
+  stage's, and nothing below changes that.
+* `~/l2-frame/compux.json`'s `physical` size is your monitor's size in pixels, as
+  `xrandr | grep '*'` prints it: compux now works in root pixels at a scale of 1,
+  whatever GNOME's text scaling says.
+
+### A2. The handshake and the probe (read only)
+
+```sh
+python3 /tmp/cx.py "$CX" '{"action":"probe"}' </dev/null
+```
+
+* `hello` lists `screenshot`, the clicks, `mouse_move`, `left_click_drag`, `scroll`,
+  `key`, `wait_for_change`, `paste` and `windows`, and `input_methods` is
+  `["foreground_hid","ax"]`.
+* The probe says `"x11_pixels": {"xtest": true, "keymap": true}` and `"portal":
+  {"running": …, "version": "1.14.4-…", "registry": …, "screenshot_permission": …}`:
+  22.04's portal has no Registry. The probe starts neither the portal nor its store,
+  so either may read not running (`"running": false`, `"registry": null`,
+  `"screenshot_permission": "not_running"`). Write down what it shows.
+
+Then the helper with no display of its own (read only):
+
+```sh
+env -u DISPLAY -u WAYLAND_DISPLAY -u XAUTHORITY python3 /tmp/cx.py "$CX" \
+  '{"action":"probe"}' '{"action":"screenshot"}' </dev/null
+```
+
+Its stderr names what it took from the user manager (expect `DISPLAY` and
+`XAUTHORITY`); the probe says `"display_adopted": true` and capture and input
+`true`; the screenshot answers `ok` with the same size as A1's. If it is refused,
+write down the refusal and whether `systemctl --user show-environment | grep -c
+XAUTHORITY` is 0.
+
+### A3. Clicks, keys and a paste into the GTK 3 fixture (POSTS INPUT)
+
+Copy some text of your own first (select a word anywhere, Ctrl+C): the paste puts it
+back afterwards. With **Compux Fixture GTK3** in front, one `cx.py` session
+(`python3 /tmp/cx.py "$CX"`, then one line at a time):
+
+* **`{"action":"left_click","element_ref":"<GTK3 button>"}`** (take the reference
+  from a `{"action":"elements","scope":"window"}` line): the pointer moves to the
+  button and clicks it; the fixture records `gtk3.button press`, and the receipt's
+  `input_method` is `foreground_hid`.
+* **`left_click` on `GTK3 text field`, then `{"action":"type","text":"hello"}`**:
+  the field shows `hello`; the fixture records `set_value hello`.
+* `{"action":"type","text":"é"}` (with your layout's `é` not on a key; a US layout
+  has none): `text_outside_layout`, the detail names `é` and `paste`, and nothing is
+  typed.
+* Turn **Caps Lock on**, then `{"action":"type","text":"abc"}`:
+  `keyboard_not_neutral`, the detail says Caps Lock, nothing typed. Turn it off.
+* **`{"action":"paste","text":" and ✓ pasted"}`**: the field shows `hello and ✓
+  pasted`.
+* End the session (Ctrl-D). In any text field, press Ctrl+V: your own text from
+  before the step comes back. compux kept it on the clipboard until it exited; write
+  down if it came back empty (no clipboard manager took it over at exit).
+
+### A4. The pointer by point, and a drag (POSTS INPUT)
+
+* **`{"action":"left_click","x":X,"y":Y}`** at the GTK3 button's centre read off the
+  `image` line's picture (the script prints the screenshot it aimed through): the
+  fixture records the press. This is the root-pixel scale on your display.
+* **`{"action":"left_click_drag","from":{"x":A,"y":B},"to":{"x":C,"y":D}}`** on the
+  GTK3 slider's knob to its far end: the slider moves; then `ls
+  "$XDG_RUNTIME_DIR/compux-held"` lists nothing (the journal is gone once the button
+  is up). A helper killed mid-drag was released by the next start in the
+  containers; it is not repeated here.
+
+### A5. What A cannot prove
+
+* XTEST and `GetImage` under GNOME Shell's compositor at a scale other than 1, and
+  a keyboard with a second layout group: write down your scale and layouts.
+* `no_active_window` needs a desktop where no window reads ACTIVE; on GNOME one
+  always does.
+
+## B. The GNOME Wayland VM (Ubuntu 24.04, logged in for real)
+
+### B1. The portal itself (fails fastest)
+
+The portal alone first, with the probe script, in this order:
+
+1. `apt policy xdg-desktop-portal`: 1.18 or later (the `Registry` compux needs).
+2. The desktop file for the app id, which compux needs too:
+   `~/.local/share/applications/io.tezra.fermix.ComputerUse.desktop`:
+
+   ```
+   [Desktop Entry]
+   Type=Application
+   Name=Fermix Computer Use
+   Exec=/bin/false
+   NoDisplay=true
+   ```
+
+3. `python3 fixtures/linux/spike/owner/owner_portal_probe.py screenshot` twice: a
+   dialog naming **Fermix Computer Use** the first time (allow it), none the second.
+   Write down the directory its `image` line names: the portal saves each
+   screenshot there as a file and leaves it.
+4. **`python3 fixtures/linux/spike/owner/owner_portal_probe.py remote --type-after 5
+   --hold 15`**, with Text Editor focused when it says (it types `abc` and moves the
+   pointer): allow the dialog, write down whether the `a` arrived, and keep the
+   `restore_token` it prints.
+5. **`python3 fixtures/linux/spike/owner/owner_portal_probe.py remote --token
+   <that token>`** in a new process: no dialog means a restore token survives a
+   restart.
+
+If no dialog ever names the app, or the token does not survive, stop: compux's
+portal route rests on both.
+
+### B2. The handshake and the probe (read only)
+
+Build and copy `cx.py` into the VM as in A0, then
+`python3 /tmp/cx.py "$CX" '{"action":"probe"}' </dev/null`:
+
+* `hello` lists `screenshot`, the clicks, `scroll`, `key` and `type`, and **no**
+  `paste` and **no** `windows`; `input_methods` is `["foreground_hid","ax"]`.
+* The probe says `"display_server": "wayland"`, `"portal": {"running": true,
+  "version": "1.18.…", "registry": true, "screenshot_permission": "unset"}` (or
+  `"yes"` after B1), and no dialog appears. A portal or store nobody has started
+  yet reads `"running": false` or `"not_running"`: the probe does not start them. `rm -f ~/.local/state/compux/portal.json` before B3, so B3
+  starts with no restore token.
+
+### B3. The first session (POSTS INPUT)
+
+Open Text Editor, then in one `cx.py` session:
+
+* `{"action":"screenshot"}`: GNOME asks to share the screen and allow remote
+  control, naming **Fermix Computer Use**. Pick the monitor and allow. Then the
+  screenshot itself: no second dialog if B1 already allowed screenshots. Note the
+  image's `width` and `height` beside the monitor's size.
+* **`left_click` on Text Editor's page, then `{"action":"type","text":"abc"}`**:
+  `abc` arrives, all three (the session's first key is not dropped).
+* `{"action":"type","text":"é"}`: write down whether it arrives. The compositor
+  drops a character its layout cannot type without saying so, so compux does not
+  refuse it on Wayland.
+* `cat ~/.local/state/compux/portal.json` holds a `restore_token`, and `ls -l`
+  shows it `-rw-------`.
+* `ls` the directory B1 step 3 wrote down: none of compux's screenshots stays
+  there (compux removes each file once it has decoded).
+* `{"action":"wait_for_change","timeout_ms":3000}` with nothing changing on screen
+  (read only): it looks once per poll, and each look is a portal screenshot. Write
+  down whether GNOME flashes the screen, or plays the shutter sound, at each look.
+
+### B4. A restarted helper is not asked again (POSTS INPUT)
+
+End the session (Ctrl-D) and start a new one: **`{"action":"screenshot"}` then a
+`left_click` on Text Editor**. No dialog appears, and the click lands. The state
+file's token has changed (each is used once).
+
+### B5. The person ends it, and a refusal (POSTS INPUT)
+
+* In a session, stop the sharing from the shell's indicator (top bar). The next
+  `screenshot` asks again (the dialog shows); allow it.
+* `rm -f ~/.local/state/compux/portal.json`, reset the stored answer, then
+  `{"action":"screenshot"}` and **Deny** the dialog: `consent_refused`, the detail
+  points at `fermix doctor`. The probe now says `"screenshot_permission": "no"`.
+  Reset it again; the probe says `"unset"`. The reset (compux itself never writes
+  the store):
+
+  ```sh
+  gdbus call --session --dest org.freedesktop.impl.portal.PermissionStore \
+    --object-path /org/freedesktop/impl/portal/PermissionStore \
+    --method org.freedesktop.impl.portal.PermissionStore.DeletePermission \
+    screenshot screenshot io.tezra.fermix.ComputerUse
+  ```
+
+* Once more, and leave the dialog unanswered: at 25 s `consent_timeout`. Write down
+  whether the dialog closes then.
+
+### B6. At scale 200% (POSTS INPUT: one click)
+
+Settings → Displays → Scale 200%. Repeat B3's screenshot and **one `left_click` on
+Text Editor's page**: the image's size is the monitor's logical size times 2, and
+the click lands where it was aimed.
+
+### B7. What B cannot prove
+
+* KDE Plasma, COSMIC and wlroots compositors: pixels are refused there by design,
+  and the controls stage's verbs by reference still work; nothing here runs one.
+* A desktop of more than one monitor on Wayland: the portal's screenshot is the
+  whole desktop and says nothing of where the others lie, so compux refuses it
+  (`capture_unavailable`). Write down what a second monitor does.
+* Monitors that tile into the picked one's shape: the check is by size alone, so
+  four 1280×800 monitors in a 2×2 grid at 100% give the same 2560×1600 screenshot
+  as one 1280×800 monitor at 200%, and compux takes them as that one monitor (its
+  clicks would then land in the wrong place). If the VM can show four monitors,
+  write down what compux's screenshot and one click do there.
+
+---
+
+# Live check — one window bound on X11, and its badge (M86 L3)
+
+**What this is for.** On X11 the Linux build now binds a window. It reads the
+bound window through Composite, so the window is still seen while another covers
+it. It refuses a click on a covered point and refuses a window that was closed,
+even when a new window gets its X id. It puts a badge over the window
+(`compux-indicator-x11`, a second binary beside the helper) whose Pause and Stop
+reach the helper's gate. All of this passes in private containers: Xvfb, openbox
+and the GTK 3 fixture (`fixtures/linux/spike/spike.sh`, stage `bound`). There, the
+person's clicks on the badge are judged by the gate and by what the window under a
+missed click recorded. None of it has met GNOME Shell. Mutter redirects every
+window itself, so on your desktop compux reads Mutter's pixmap rather than
+redirecting the window. It still sends nothing until it has asked the window and
+GNOME's frame around it to repaint and seen them draw every pixel, which has only
+been seen under openbox. That path, a real GPU, your monitor and the badge's look
+are what this check is for.
+
+Expected outcome in one line: the bound fixture is seen under a covering window, a
+click there is refused, and twenty bindings leave no badge behind. The badge sits
+on the fixture's top edge, never takes your focus, and its buttons pause and stop
+the helper.
+
+> **Steps C3 to C6 POST REAL INPUT**: clicks into the GTK 3 fixture, and your own
+> clicks and typing. C1 and C2 send no input, but every step from C1 on reads
+> one window and puts the badge on your screen. Nothing here may be run by an
+> agent. Run it yourself, at the machine, with nothing confidential on screen.
+
+## C0. Preconditions
+
+* The build, from the branch with L3 on it. One `cargo build` builds the helper
+  and the badge into the same directory, which is where the helper looks for it:
+
+  ```sh
+  cd ~/src/compux && git switch feat/m86
+  (cd native/compux && cargo build --release)
+  CX=$PWD/native/compux/target/release/compux
+  ls native/compux/target/release/compux-indicator-x11      # must exist
+  ```
+
+* The GTK 3 fixture in its own terminal: `python3 fixtures/linux/fixture_gtk3.py
+  --state-file /tmp/gtk3.json`. To read what it recorded: `python3 -m json.tool
+  /tmp/gtk3.json | tail -20`. Text Editor open beside it, as the window you type
+  into and cover the fixture with.
+* `fixtures/linux/spike/owner/owner_bound.py` drives every step. `cx.py` cannot
+  drive them: a badge press writes an event line, which cx.py would read as the
+  next reply. The script binds the window titled exactly `--title` and reads one
+  JSON action per line. It sends each action in the bound window, takes a fresh
+  picture of the window before a click, prints every badge press the moment it
+  arrives (`event`), and with `--save` writes every picture to that directory.
+  The commands below shorten it to `B`:
+
+  ```sh
+  B="python3 fixtures/linux/spike/owner/owner_bound.py --binary $CX --title 'Compux Fixture GTK3'"
+  ```
+
+## C1. The handshake, one binding, and the badge (fails fastest; no input)
+
+This is the first L3 step, and the one most likely to fail on GNOME: compux sends
+no picture of a window until the window and GNOME's frame around it have redrawn
+every pixel of it after being asked to, and under Mutter that has never been
+seen.
+
+```sh
+eval "$B --save ~/l3-images"
+```
+
+* The `hello` line lists `select_target` and `release_target`, and its
+  `capabilities` say `"targets": true`, `"capture_methods": ["display",
+  "window"]` and **`"indicator": "present"`**. `"missing"` means the badge is not
+  beside the helper, and every step below fails. Stop and check C0's `ls`.
+* **What failure looks like.** The `bound` line is refused
+  `capture_unavailable`, its detail starting "the window's own picture could not
+  be proved" and counting the parts "not drawn within 1000 ms of asking it to
+  repaint". No picture is saved and no badge appears. Run it twice more, then
+  once with `--title` naming Text Editor's window. If every binding is refused
+  this way, the frame is never proved on this desktop: stop here, and send us
+  each detail line and how long each `bound` line took. Nothing from C2 on can
+  run.
+* The `bound` line says `"ok": true`, `"ax_binding": "bound"`, and a `width` and
+  `height` that are the fixture window's size with its title bar. Open the saved
+  picture (`saved` names it): it is the fixture window, title bar included, and
+  nothing around it. Write down how long the line took to come.
+* **The badge is on screen**, a dark strip 28 pixels high: a green dot,
+  `Fermix`, `Fixture_gtk3.py — Compux Fixture GTK3`, then **Pause** and
+  **Stop**. It sits at the fixture's left, just above its title bar. With the
+  fixture maximized there is no room above it (the top bar is there), so the badge
+  sits just inside the window's top edge instead. Write down where it sits, and
+  whether its text is sharp at your scale. The badge draws at a scale of 1 on any
+  screen, so on a HiDPI panel it is small.
+
+Ctrl-D ends the session: the badge goes with it.
+
+## C2. Twenty bindings, and nothing left behind (no input)
+
+```sh
+eval "$B --cycles 20"
+pgrep -fc compux-indicator-x11      # after it ends: 0
+```
+
+Twenty lines of `bound True … badge up True, released True, badge gone True`, and
+a last line `PASS` with no failed cycles, no badges left and resident memory
+growth under 4096 kB after the fifth cycle. The badge flickers on and off twenty
+times. It must not once take the focus from the window you were in.
+
+## C3. A covered window is seen, and a click on it is refused
+
+Start a session (`eval "$B --save ~/l3-images"`). Put Text Editor over the
+fixture so that none of the fixture shows, and keep Text Editor clear of the strip
+above the fixture where the badge sits. Then:
+
+* `{"action":"screenshot"}`: the saved picture is the fixture window, complete,
+  with none of Text Editor in it.
+* **`{"action":"left_click","x":200,"y":120}`**, a point inside the fixture and
+  under Text Editor: it must be refused **`target_obstructed`**, naming Text
+  Editor's window. The pointer does not move, nothing is raised, and
+  `/tmp/gtk3.json` records nothing new. A click that lands anywhere is a defect: write down
+  where.
+* Now move Text Editor over the badge's strip as well: the badge hides. Move
+  Text Editor away: the badge comes back within about a quarter of a second.
+* **A menu over the fixture.** Put Text Editor beside the fixture and right-click
+  in it near the edge, so its menu hangs over the fixture. Leave the menu open, take
+  `{"action":"screenshot"}`, and send **`left_click`** at a point of the fixture
+  the menu covers: it must be refused **`target_obstructed`**, naming the menu
+  ("a menu or popup", or Text Editor's class). The menu stays open and
+  `/tmp/gtk3.json` records nothing. Close the menu (Escape) and click the same
+  point again: it lands. The badge must not have jumped over the open menu.
+  Open the menu once more so it hangs over the badge too: the badge stays under
+  it while it is open, and is back over the fixture within about a second of
+  Escape.
+* **GNOME's own panels over the badge.** Move the fixture so its top edge is
+  just under the top bar and its left edge a little left of the clock, so the
+  badge sits where the calendar drops down. Open the calendar (click the clock)
+  so it hangs over the badge. The badge stays under the calendar while it is
+  open, and is back over the fixture within about a second of closing it
+  (Escape). Do the same with the quick settings menu, with the fixture's left
+  edge under it (top right). GNOME Shell draws these in its own full-screen
+  window, which takes input over the badge while they are open and is never
+  unmapped, so the badge comes back only by looking again: if it stays under the
+  fixture after the calendar closes, write down how long.
+* If a GNOME notification is on screen over the fixture, a click at a point
+  under it should be refused the same way, naming GNOME Shell. If it lands in
+  the fixture instead, write it down: the shell's own windows were not seen.
+
+## C4. The badge takes nothing from you (your own input)
+
+With the session still bound and the badge showing:
+
+* **Click into Text Editor and type a sentence.** Every character lands in Text
+  Editor. The badge does not appear in Alt-Tab and never takes the caret.
+* **Drag the fixture window** a few hundred pixels: the badge follows it within
+  about a quarter of a second.
+* **Click on the badge's text, away from its two buttons.** The click reaches the
+  window under it (the fixture's title bar, or whatever is there), as if the badge
+  were not there.
+
+## C5. Pause, Resume and Stop reach the helper (POSTS INPUT)
+
+In the same session, Text Editor focused:
+
+* **Press Pause on the badge.** The session prints `event` with `operator_pause`.
+  The badge's green dot becomes two orange bars, and **Pause** becomes
+  **Resume**. Text Editor still has the focus: type a word and it lands there.
+  **`{"action":"left_click","element_ref":"<GTK3 button>"}`** is refused
+  `paused`, and the fixture records nothing. Take the reference from an
+  `{"action":"elements"}` line.
+* **Press Resume.** `event` with `operator_resume`; the badge is green again.
+  **The same click** now lands: the fixture records the press.
+* **Press Stop.** `event` with `operator_stop`, and the next click is refused
+  `paused`. **Press Resume** to go on.
+
+## C5b. Stop on the badge with the driver suspended (POSTS INPUT)
+
+The macOS check's step 7, on X11: the badge's Stop reaches the helper's gate with
+nothing else in the path. In the same session, press Resume first if C5 left it
+stopped. Read two points inside the fixture's empty area from a screenshot, then
+send one drag whose check waits up to 25 seconds for a dialog the fixture never
+opens, so the request is still running when you press Stop:
+
+```
+{"action":"left_click_drag","from":{"x":<x1>,"y":<y1>},"to":{"x":<x2>,"y":<y2>},"check":{"kind":"semantic","until":{"kind":"appears","role":"dialog","timeout_ms":25000}}}
+```
+
+In another terminal, at once:
+
+```sh
+kill -STOP $(pgrep -f owner_bound.py)
+```
+
+* **Press Stop on the badge.**
+* The left button is up: drag in Text Editor's text yourself. It selects text as
+  usual, and nothing on screen is still being dragged.
+* `kill -CONT $(pgrep -f owner_bound.py)`: the session prints `event` with
+  `operator_stop`, and the drag's reply is `cancelled`, with a receipt that says
+  the drag was sent.
+* The drag itself takes about a third of a second, so by hand the Stop lands in
+  the check's wait after it, not in the middle of the drag. Press **Resume** to
+  go on.
+
+## C6. Minimize, close, relaunch
+
+Each with the window still bound, in the session:
+
+* **Minimize the fixture**, then `{"action":"screenshot"}`: `target_minimized`,
+  and the badge hides. Restore the fixture, then `{"action":"screenshot"}`: the
+  picture is the fixture again.
+* **Close the fixture window** (its close button), then
+  `{"action":"screenshot"}`: `target_unavailable`, and the detail says the
+  window was closed after it was bound. The badge hides.
+* **Start the fixture again**, then `{"action":"screenshot"}` once more: still
+  `target_unavailable`. The new window is another window even if it got the same
+  X id, and only a new `select_target` binds it. The containers prove the case of
+  the same id given to a new window of the same process. GNOME cannot be made to
+  reuse an id on demand.
+
+## C7. What C cannot prove
+
+* A GTK 4 window. Bind one (GNOME Settings, `--title Settings`): the binding
+  should say `"ax_binding": "unavailable"`, and `elements` in it should be
+  `ax_binding_unavailable`, because GTK 4 places no window on X11. Write down
+  what it says.
+* A title the badge's font cannot draw. Noto Sans has no CJK, so a title in
+  Chinese or Japanese shows the font's missing-glyph boxes, and right-to-left text
+  reads in the wrong order. If you have such a window, bind it and write down
+  how the badge reads.
+* A window that does not repaint when asked (a hung application) is refused
+  `capture_unavailable`; the containers prove it with a window that paints only
+  once. Nothing here hangs one on GNOME.
+* A program clicking the badge through `SendEvent` is dropped, and the containers
+  prove it; a program clicking it through XTEST cannot be told from you, on X11,
+  and nothing here tries.
+* A program holding a pointer grab with no window at the point takes a click
+  there, and compux cannot see it.
+* A new state sent to the badge while a menu is open over it (the window moved,
+  or a pause) leaves it under the menu. A menu closes when you move the window,
+  so the containers prove it, with a popup that stays open while the bound window
+  moves and is raised.
+* *Optional:* a window manager that keeps a client's own X border on its
+  top-level windows (dwm, for one). Bind a window there with `--save`: the
+  picture must start at the window's first pixel, with no strip of the border's
+  colour along its top or left edge and none of the window cut off at its bottom
+  or right. The containers prove it on a display with no window manager.

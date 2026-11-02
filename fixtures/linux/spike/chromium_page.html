@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Compux Fixture Chromium</title>
+<style>body { font: 14px sans-serif; margin: 16px; } fieldset { margin: 8px 0; }</style>
+</head>
+<body>
+<!-- M86 L0(a): the controls a page shows most often, each named, so the spike can
+     say which ones `elements` lists from Chromium's accessibility tree. -->
+<fieldset><legend>Buttons</legend>
+  <button type="button">Chromium button</button>
+  <button type="button" disabled>Chromium disabled button</button>
+  <a href="#help">Help</a>
+</fieldset>
+<fieldset><legend>Fields</legend>
+  <label>Chromium text field <input type="text" value="hello"></label>
+  <label>Chromium secure field <input type="password" value="hunter2"></label>
+  <label>Search <input type="search"></label>
+  <label>Volume <input type="range" min="0" max="100" value="40"></label>
+</fieldset>
+<fieldset><legend>Choices</legend>
+  <label><input type="checkbox"> Chromium checkbox</label>
+  <label><input type="radio" name="size" checked> Small</label>
+  <label><input type="radio" name="size"> Large</label>
+  <label>Chromium pop-up button
+    <select><option>Apple</option><option>Banana</option><option>Cherry</option></select>
+  </label>
+</fieldset>
+<p id="help">Plain text that is no control.</p>
+</body>
+</html>

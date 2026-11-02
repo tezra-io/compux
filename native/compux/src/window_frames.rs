@@ -60,19 +60,10 @@
 //! compiled on every macOS build and started only on a real machine.
 
 // The slot, the fence, the budget, the health codes and the frame type are the
-// portable half of this module: on macOS the ScreenCaptureKit adapter produces
-// every one of them and the unit tests exercise them on every target, but on a
-// build whose `WindowFrames` is the refusing stub nothing constructs a frame at
-// all, so the producer side is unreachable rather than unwanted. Scoped to
-// non-macOS so a genuinely unused helper still fails the macOS gate — the same
-// shape, and for the same reason, as `capture.rs`'s portable frame builders.
-//
-// It is one attribute rather than a gate per item because the unreachable set
-// includes struct FIELDS and enum VARIANTS (`WindowFrame`'s timing and status,
-// `Health`'s four, `FrameError`'s four), and a type whose shape changes with the
-// target is a worse thing to own than a scoped allow. M42.1's Linux capture makes
-// the whole of it reachable again and this line goes with it.
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// portable half of this module: the ScreenCaptureKit adapter produces them on
+// macOS and the Composite stream on Linux. The three items only ScreenCaptureKit
+// has (its queue depth, a stream the server stopped, a refused grant) are allowed
+// unused off macOS, each where it is declared.
 
 use std::sync::{Arc, Mutex};
 
@@ -92,6 +83,7 @@ pub const MAX_FRAMES_PER_SECOND: i32 = 10;
 /// The stream's own queue depth: three native buffers SCK may hold. Three is the
 /// lowest depth Apple's own guidance names; the latest-frame semantics this module
 /// answers from are OURS and are unaffected by it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const QUEUE_DEPTH: isize = 3;
 
 /// How many frames' worth of memory one bound window may cost: the three native
@@ -139,6 +131,7 @@ pub enum Health {
     Minimized,
     /// The stream ended — the window closed, the application quit, the server
     /// stopped it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Disconnected,
 }
 
@@ -302,12 +295,32 @@ pub enum FrameError {
     /// Screen Recording was refused (`SCStreamErrorUserDeclined`). Its own code,
     /// because it is an operator action in System Settings and nothing the caller
     /// can retry its way out of.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Denied(String),
     /// A frame of this shape is more memory than a bound window may have.
     BudgetExceeded(String),
     /// No frame has passed the fence YET. Not a failure: the caller polls, and only
     /// its own deadline turns this into an answer.
     NotYet,
+    /// The window the stream was bound to is gone for good: destroyed under the
+    /// watch that bound it, or that watch's connection ended. Its own code,
+    /// because a window id may be reused and the window that has it now is
+    /// another one. Only the X11 stream watches a window this way; on macOS the
+    /// window server's listing says a window is gone before any frame is asked.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    Gone(String),
+    /// The window under the bound id is not the one the listing named: its
+    /// process changed between the listing and the stream's own look, as when
+    /// the id was given to another window. Only the X11 stream looks again this
+    /// way; macOS binds the window server's own window.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    Replaced(String),
+    /// The bound window is being proved again (it was resized, shown again or
+    /// given a new border, or its last proof fell short): no frame of it is
+    /// served until a proof holds, which is a frame or two away. Only the X11
+    /// stream proves a window this way.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    Reproving(String),
 }
 
 impl FrameError {
@@ -319,6 +332,9 @@ impl FrameError {
             FrameError::Denied(_) => "screen_recording_not_granted",
             FrameError::BudgetExceeded(_) => "capture_budget_exceeded",
             FrameError::NotYet => "capture_unavailable",
+            FrameError::Gone(_) => "target_unavailable",
+            FrameError::Replaced(_) => "target_binding_unavailable",
+            FrameError::Reproving(_) => "capture_unavailable",
         }
     }
 
@@ -327,7 +343,10 @@ impl FrameError {
             FrameError::Unavailable(detail)
             | FrameError::Minimized(detail)
             | FrameError::Denied(detail)
-            | FrameError::BudgetExceeded(detail) => detail.clone(),
+            | FrameError::BudgetExceeded(detail)
+            | FrameError::Gone(detail)
+            | FrameError::Replaced(detail)
+            | FrameError::Reproving(detail) => detail.clone(),
             FrameError::NotYet => {
                 "no frame of that window arrived after the action was dispatched".to_string()
             }
@@ -365,6 +384,11 @@ pub struct StreamWindow {
     pub id: u32,
     pub width: u32,
     pub height: u32,
+    /// The process the listing gave the window. Where the window server binds
+    /// nothing by itself (X11), the stream reads it again once it watches the
+    /// window, so an id given to another window in between binds nothing.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub pid: i32,
 }
 
 /// One window's frames.
@@ -1095,9 +1119,9 @@ pub mod sck {
     }
 }
 
-/// Linux has no window capture this build speaks. A typed refusal rather than an
-/// empty stream: a caller that cannot tell "nothing arrived" from "not supported
-/// here" writes the wrong sentence about both. [M42.1] owns the Linux half.
+/// A session with no window capture this build speaks: Linux off X11. A typed
+/// refusal rather than an empty stream: a caller that cannot tell "nothing
+/// arrived" from "not supported here" writes the wrong sentence about both.
 #[cfg(not(target_os = "macos"))]
 pub struct Unsupported;
 
@@ -1105,13 +1129,13 @@ pub struct Unsupported;
 impl WindowFrames for Unsupported {
     fn start(&self, _window: StreamWindow) -> Result<(), FrameError> {
         Err(FrameError::Unavailable(
-            "window capture is only supported on macOS".to_string(),
+            "a window is captured on macOS, and on Linux on X11 only".to_string(),
         ))
     }
 
     fn latest(&self, _after: Option<Fence>) -> Result<WindowFrame, FrameError> {
         Err(FrameError::Unavailable(
-            "window capture is only supported on macOS".to_string(),
+            "a window is captured on macOS, and on Linux on X11 only".to_string(),
         ))
     }
 
@@ -1294,6 +1318,7 @@ mod tests {
             id,
             width: 8,
             height: 4,
+            pid: 200,
         }
     }
 

@@ -426,7 +426,7 @@ mod tests {
     /// that counts what it hands out and what comes back.
     fn listed(recorder: &Rc<crate::ax::Recorder>) -> Rc<Elements> {
         let ax: Rc<dyn crate::ax::Ax> = recorder.clone();
-        let found = crate::ax::walk(&ax, 4711, &crate::gate::SystemClock::new(), u64::MAX);
+        let found = crate::tree::walk(&ax, 4711, &crate::gate::SystemClock::new(), u64::MAX);
 
         let entries = found
             .nodes
@@ -436,11 +436,12 @@ mod tests {
                 reference: crate::ax::reference_for(index),
                 role: node.role,
                 secure: node.secure,
+                under: None,
                 element: node.element,
             })
             .collect();
 
-        Rc::new(Elements::new(4711, recorder.started_at(), entries))
+        Rc::new(Elements::new(4711, recorder.started_at(), None, entries))
     }
 
     fn recorder() -> Rc<crate::ax::Recorder> {
@@ -603,13 +604,13 @@ mod tests {
         let ax = recorder();
 
         drop(mint_with(&mut table, Kind::Semantic, Some(listed(&ax))));
-        assert_eq!(ax.counts(), (2, 0, 2), "two controls retained");
+        assert_eq!(ax.counts(), (3, 1, 2), "two controls retained");
 
         // Three more replies push it out: the table holds three.
         for _ in 0..3 {
             mint(&mut table, Kind::Image);
         }
-        assert_eq!(ax.counts(), (2, 2, 0), "the evicted reply let go of both");
+        assert_eq!(ax.counts(), (3, 3, 0), "the evicted reply let go of both");
     }
 
     #[test]
@@ -624,7 +625,7 @@ mod tests {
         // The next mint sweeps everything already expired, which is when the
         // references it was holding go back.
         mint(&mut table, Kind::Image);
-        assert_eq!(ax.counts(), (2, 2, 0));
+        assert_eq!(ax.counts(), (3, 3, 0));
     }
 
     #[test]
@@ -641,7 +642,7 @@ mod tests {
         table.clear();
 
         assert_eq!(table.resolve(&id), Err(Refusal::Unknown));
-        assert_eq!(ax.counts(), (2, 2, 0));
+        assert_eq!(ax.counts(), (3, 3, 0));
     }
 
     // The worker going away — the helper's own exit path — is the table being
@@ -657,7 +658,7 @@ mod tests {
             assert_eq!(ax.counts().2, 2);
         }
 
-        assert_eq!(ax.counts(), (2, 2, 0));
+        assert_eq!(ax.counts(), (3, 3, 0));
     }
 
     // An action COPIES the observation it named and then mints its own check image
@@ -678,12 +679,12 @@ mod tests {
         }
         assert_eq!(
             ax.counts(),
-            (2, 0, 2),
+            (3, 1, 2),
             "the action is still holding what it is acting on"
         );
 
         drop(in_flight);
         drop(listed_in);
-        assert_eq!(ax.counts(), (2, 2, 0));
+        assert_eq!(ax.counts(), (3, 3, 0));
     }
 }

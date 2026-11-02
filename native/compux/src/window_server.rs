@@ -79,12 +79,19 @@ pub struct WindowFacts {
     pub app: String,
     pub title: String,
     pub bounds: Bounds,
+    /// The window's own area without the frame its window manager draws around
+    /// it, where the window server tells the two apart (X11). An accessibility
+    /// frame may be placed at either, depending on the toolkit.
+    pub content: Option<Bounds>,
     /// The window server's own layer. Zero is "a window a person works in"; the
     /// Dock, the menu bar and floating panels live above it.
     pub layer: i64,
     /// Whether the window is on screen at all. A minimized window, and one on
     /// another desktop, are both listed and both off screen.
     pub on_screen: bool,
+    /// The window it says it belongs to, where the window server keeps the mark:
+    /// X11's `WM_TRANSIENT_FOR`. macOS keeps none.
+    pub transient_for: Option<u32>,
 }
 
 /// The window server, as this build reads it.
@@ -97,6 +104,59 @@ pub trait Windows: Send + Sync {
     /// refuses the listing, which is a different fact from an empty desktop and
     /// must never be flattened into one.
     fn list(&self) -> Result<Vec<WindowFacts>, String>;
+
+    /// What takes a click at (`x`, `y`) in front of window `target_id` among the
+    /// windows [`Windows::list`] does not hold, named; `None` where nothing does.
+    /// An X11 window manager lists only the windows it manages, so menus,
+    /// tooltips and a desktop shell's own windows are read here. The macOS
+    /// listing holds every window, so nothing is left to read there.
+    fn unlisted_cover(&self, _target_id: u32, _x: i32, _y: i32) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    /// Every window of process `pid` that is on screen, managed or not, with the
+    /// window each says it belongs to: what tells which of an application's
+    /// windows (a dialog, a menu in a window of its own) are a bound window's. A
+    /// window manager lists no menu, so X11 reads the root's children too. Empty
+    /// where no window says it belongs to another (macOS).
+    fn family(&self, _pid: i32) -> Result<Vec<WindowFacts>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// How many `WM_TRANSIENT_FOR` links are followed from a window to the one it
+/// belongs to: a dialog over a dialog over the window, a menu of that dialog, with
+/// room to spare. A chain that has not reached the window by then belongs to
+/// nobody, and so does one that loops.
+pub const MAX_TRANSIENT_HOPS: usize = 8;
+
+/// The ids of the windows of `family` that belong to window `owner`: transient for
+/// it, or for a window that is, within [`MAX_TRANSIENT_HOPS`] links. A link to a
+/// window outside the family ends the chain there, and a window outside it owns
+/// nothing.
+pub fn owned_by(family: &[WindowFacts], owner: u32) -> Vec<u32> {
+    if find(family, owner).is_none() {
+        return Vec::new();
+    }
+    family
+        .iter()
+        .filter(|window| belongs(family, window, owner))
+        .map(|window| window.id)
+        .collect()
+}
+
+/// Whether `window`'s chain of `WM_TRANSIENT_FOR` links reaches `owner` within
+/// [`MAX_TRANSIENT_HOPS`].
+fn belongs(family: &[WindowFacts], window: &WindowFacts, owner: u32) -> bool {
+    let mut at = window.transient_for;
+    for _ in 0..MAX_TRANSIENT_HOPS {
+        match at {
+            Some(id) if id == owner => return true,
+            Some(id) => at = find(family, id).and_then(|parent| parent.transient_for),
+            None => return false,
+        }
+    }
+    false
 }
 
 /// The window a given id names, out of one listing.
@@ -331,8 +391,10 @@ pub mod mac {
             app: read_text(dict, &keys.owner),
             title: read_text(dict, &keys.name),
             bounds,
+            content: None,
             layer: read_i64(dict, &keys.layer).unwrap_or(0),
             on_screen: read_bool(dict, &keys.on_screen),
+            transient_for: None,
         })
     }
 
@@ -412,31 +474,29 @@ pub use mac::Real;
 
 // --- everywhere else ----------------------------------------------------------
 
-/// Linux has no window server this build reads, and saying so is not the same as
-/// answering an empty desktop: a caller that cannot tell them apart writes the
-/// wrong sentence about both.
+/// A session whose window server this build does not read, and why. Saying so is
+/// not the same as answering an empty desktop: a caller that cannot tell them
+/// apart writes the wrong sentence about both.
 #[cfg(not(target_os = "macos"))]
-mod stub {
-    use super::{WindowFacts, Windows};
+pub struct Unlisted {
+    why: String,
+}
 
-    #[derive(Default)]
-    pub struct Real;
-
-    impl Real {
-        pub fn new() -> Real {
-            Real
-        }
-    }
-
-    impl Windows for Real {
-        fn list(&self) -> Result<Vec<WindowFacts>, String> {
-            Err("window targeting is only supported on macOS".to_string())
+#[cfg(not(target_os = "macos"))]
+impl Unlisted {
+    pub fn new(why: &str) -> Unlisted {
+        Unlisted {
+            why: why.to_string(),
         }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-pub use stub::Real;
+impl Windows for Unlisted {
+    fn list(&self) -> Result<Vec<WindowFacts>, String> {
+        Err(self.why.clone())
+    }
+}
 
 // --- the recording window server (tests only) ---------------------------------
 
@@ -445,6 +505,7 @@ pub use stub::Real;
 #[cfg(test)]
 pub struct Recorder {
     listed: std::sync::Mutex<Result<Vec<WindowFacts>, String>>,
+    unlisted: std::sync::Mutex<Result<Option<String>, String>>,
     calls: std::sync::atomic::AtomicUsize,
 }
 
@@ -454,8 +515,15 @@ impl Recorder {
     pub fn new(listed: Vec<WindowFacts>) -> std::sync::Arc<Recorder> {
         std::sync::Arc::new(Recorder {
             listed: std::sync::Mutex::new(Ok(listed)),
+            unlisted: std::sync::Mutex::new(Ok(None)),
             calls: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// What a window the listing does not hold (a menu, a popup) answers from
+    /// now on: its name over every point, nothing, or a refusal.
+    pub fn unlisted(&self, answer: Result<Option<String>, String>) {
+        *self.unlisted.lock().unwrap_or_else(|e| e.into_inner()) = answer;
     }
 
     /// The OS refuses the listing from now on.
@@ -495,6 +563,21 @@ impl Windows for Recorder {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.state().clone()
     }
+
+    fn family(&self, pid: i32) -> Result<Vec<WindowFacts>, String> {
+        let listed = self.list()?;
+        Ok(listed
+            .into_iter()
+            .filter(|window| window.pid == pid && window.on_screen)
+            .collect())
+    }
+
+    fn unlisted_cover(&self, _target_id: u32, _x: i32, _y: i32) -> Result<Option<String>, String> {
+        self.unlisted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
 /// One ordinary window, for a test that cares about two of its facts and not the
@@ -507,8 +590,10 @@ pub fn window(id: u32, pid: i32, bounds: Bounds) -> WindowFacts {
         app: format!("App{pid}"),
         title: format!("Window {id}"),
         bounds,
+        content: None,
         layer: 0,
         on_screen: true,
+        transient_for: None,
     }
 }
 
@@ -727,5 +812,69 @@ mod tests {
         let listed = desktop();
         assert_eq!(find(&listed, 20).map(|window| window.pid), Some(200));
         assert_eq!(find(&listed, 21), None);
+    }
+
+    fn transient(id: u32, of: u32) -> WindowFacts {
+        WindowFacts {
+            transient_for: Some(of),
+            ..window(id, 100, at(0.0, 0.0, 10.0, 10.0))
+        }
+    }
+
+    // A window belongs to the one it is transient for, and so does one transient
+    // for a window that belongs to it, as far as the cap reaches. A chain that
+    // goes further, loops, or leaves the application's windows belongs to nobody.
+    #[test]
+    fn a_window_belongs_to_the_one_its_transient_chain_reaches() {
+        let mut family = vec![
+            window(1, 100, at(0.0, 0.0, 400.0, 300.0)),
+            window(2, 100, at(500.0, 0.0, 400.0, 300.0)),
+            transient(3, 1),
+            transient(4, 3),
+            transient(5, 2),
+            transient(6, 7),
+            transient(7, 6),
+            transient(8, 99),
+        ];
+        assert_eq!(owned_by(&family, 1), vec![3, 4]);
+        assert_eq!(owned_by(&family, 2), vec![5]);
+
+        let mut parent = 4;
+        for id in 10..10 + MAX_TRANSIENT_HOPS as u32 {
+            family.push(transient(id, parent));
+            parent = id;
+        }
+        let owned = owned_by(&family, 1);
+        assert!(
+            owned.contains(&(9 + MAX_TRANSIENT_HOPS as u32 - 2)),
+            "{owned:?}"
+        );
+        assert!(
+            !owned.contains(&(9 + MAX_TRANSIENT_HOPS as u32)),
+            "past the cap: {owned:?}"
+        );
+        assert!(owned_by(&family, 99).is_empty(), "not one of its windows");
+    }
+
+    // The recording window server answers a process's windows on screen, and
+    // nothing of another's.
+    #[test]
+    fn a_family_is_one_processs_windows_on_screen() {
+        let recorder = Recorder::new(vec![
+            window(1, 100, at(0.0, 0.0, 400.0, 300.0)),
+            transient(2, 1),
+            window(3, 200, at(0.0, 0.0, 400.0, 300.0)),
+            WindowFacts {
+                on_screen: false,
+                ..transient(4, 1)
+            },
+        ]);
+        let ids: Vec<u32> = recorder
+            .family(100)
+            .expect("listed")
+            .iter()
+            .map(|window| window.id)
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
     }
 }
