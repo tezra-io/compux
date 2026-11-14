@@ -77,6 +77,9 @@ writes=$((acts + value_sets))
 rules=$(grep -A1 'member=AddMatch$' "$log" | grep '^ *string' || true)
 content_rules=$(printf '%s\n' "$rules" | grep -cE "TextChanged|arg0='focused'|PropertyChange" || true)
 unscoped=$(printf '%s\n' "$rules" | grep -E "TextChanged|arg0='focused'|PropertyChange" | grep -vc "sender=':" || true)
+# A name change is asked of one window: a browser renames whatever takes the focus.
+names=$(printf '%s\n' "$rules" | grep -c "PropertyChange" || true)
+unwindowed=$(printf '%s\n' "$rules" | grep "PropertyChange" | grep -vc "path='" || true)
 {
   echo "fixture pid before: $before"
   echo "fixture pid after:  $after"
@@ -87,6 +90,7 @@ unscoped=$(printf '%s\n' "$rules" | grep -E "TextChanged|arg0='focused'|Property
   echo "Get(NActions): $nactions"
   echo "writes: $writes"
   echo "content subscriptions: $content_rules, naming no connection: $unscoped"
+  echo "name subscriptions: $names, naming no window: $unwindowed"
 } | tee "$verdict"
 if [ "$after" != "$before" ]; then
   echo "VERDICT: the fixture did not survive"; exit 1
@@ -103,6 +107,9 @@ if [ "$mode" = observe ]; then
   fi
   if [ "$unscoped" -ne 0 ]; then
     echo "VERDICT: a subscription to content named no application's connection"; exit 1
+  fi
+  if [ "$names" -eq 0 ] || [ "$unwindowed" -ne 0 ]; then
+    echo "VERDICT: $names name subscriptions, $unwindowed naming no window"; exit 1
   fi
   if [ "$verbs_rc" -ne 0 ]; then
     echo "VERDICT: the bus was clean, but the recorder failed (observe.py exit $verbs_rc)"; exit 1

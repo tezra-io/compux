@@ -7,10 +7,10 @@
 //! became or stopped being active, a state change that carries no text, and that an
 //! application left the bus. Everything else (focus, titles and typed text) is
 //! asked of the one active allowlisted application alone, by match rules that name
-//! its connection, added when it comes in front and removed when it leaves. A
-//! browser's rules leave out its text changes, whose signals carry the text itself.
-//! So nothing an application the owner did not list types or shows reaches this
-//! process.
+//! its connection, added when it comes in front and removed when it leaves; its
+//! name changes are asked of its active window alone. A browser's rules leave out
+//! its text changes, whose signals carry the text itself. So nothing an application
+//! the owner did not list types or shows reaches this process.
 //!
 //! Two threads, so that a read the recorder waits on never stops the bus being read:
 //! the pump takes every signal off the connection into a bounded queue (one that
@@ -20,10 +20,17 @@
 //! STOP_TICK: it ends what is pending, closes the connection, which ends the pump,
 //! and both threads are joined.
 //!
+//! `observe_start` is answered once the bus is set up; the look for the window
+//! active now, which asks every application for its windows and each window for
+//! its state, comes after, held to SWEEP_BUDGET. Events dropped by a full queue
+//! are one gap, and the active window is looked for again in place of whatever
+//! they said.
+//!
 //! A bus that goes away (a logout, at-spi2-core restarting) is said as
 //! `gap{accessibility_bus_lost}`. The observer then asks for the bus again every
-//! RECONNECT_EVERY, at most RECONNECT_TRIES times, and stops observing once they
-//! are spent.
+//! RECONNECT_EVERY, at most RECONNECT_TRIES times; once they are spent the helper
+//! exits with EXIT_BUS_GONE, so the engine that owns it starts it again and says
+//! so if the bus is still away.
 //!
 //! The rules M86 carries hold here too: no `Action.GetActions`, no
 //! `Properties.GetAll` (every property is one `Get`, an optional interface's only
@@ -37,7 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -45,16 +52,22 @@ use zbus::message::Type;
 use zbus::zvariant::{DynamicDeserialize, DynamicType, OwnedObjectPath, OwnedValue};
 use zbus::{Connection, Message, MessageStream};
 
-use super::vocabulary::{self, ACTIVE, EDITABLE, PASSWORD_TEXT, TERMINAL};
+use super::vocabulary::{self, ACTIVE, EDITABLE, ENTRY, MULTI_LINE, PASSWORD_TEXT, TERMINAL, TEXT};
 
 /// `ATSPI_ROLE_DOCUMENT_WEB`: a web page, in a browser or in any application's web
 /// view.
 const DOCUMENT_WEB: u32 = 95;
+/// The roles of a window: `ATSPI_ROLE_ALERT`, `_DIALOG`, `_FILE_CHOOSER`, `_FRAME`
+/// and `_WINDOW`. GTK 3 makes a tree view's cells read ACTIVE too, so an object
+/// that becomes active is a window only where its role is one of these.
+const WINDOW_ROLES: [u32; 5] = [2, 16, 19, 23, 69];
 /// How far up a focused field's ancestry is read for a web document; past it, the
 /// field is taken as inside one.
 const MAX_ANCESTRY: usize = 64;
 use crate::capture::{now_ms, Emitter};
-use crate::recorder::{Application, Bus, Event, Field, Focus, Recorder, Text, MAX_TEXT_CHARS};
+use crate::recorder::{
+    Answer, Application, Bus, Event, Field, Focus, Recorder, Text, MAX_TEXT_CHARS,
+};
 
 const EVENT_OBJECT: &str = "org.a11y.atspi.Event.Object";
 const ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
@@ -100,9 +113,14 @@ const OBSERVER_READ_TIMEOUT: Duration = Duration::from_secs(1);
 /// (an hour), then the observer stops.
 const RECONNECT_EVERY: Duration = Duration::from_secs(5);
 const RECONNECT_TRIES: u32 = 720;
-/// Bounds of the look for the active window at start.
+/// The helper's exit status once the bus has not come back within RECONNECT_TRIES
+/// (`EX_UNAVAILABLE`).
+const EXIT_BUS_GONE: i32 = 69;
+/// Bounds of the look for the active window: how many applications and windows it
+/// asks, and how long it takes in all.
 const MAX_APPLICATIONS: usize = 256;
 const MAX_WINDOWS: usize = 64;
+const SWEEP_BUDGET: Duration = Duration::from_secs(3);
 
 // --- the session ------------------------------------------------------------
 
@@ -162,18 +180,18 @@ fn observe(
     stop: &AtomicBool,
     ready: mpsc::Sender<Result<(), String>>,
 ) {
-    let (link, active) = match Link::open() {
-        Ok(opened) => opened,
+    let mut link = match Link::open() {
+        Ok(link) => link,
         Err(why) => {
             let _ = ready.send(Err(why));
             return;
         }
     };
     let _ = ready.send(Ok(()));
+    let exit = emitter.clone();
     let bus = LiveBus::over(link.connection.clone());
     let mut recorder = Recorder::new(bus, emitter, apps, boot_id());
-    let mut link = link;
-    begin(&mut recorder, active);
+    recorder.begin(now_ms());
     loop {
         match run(&mut recorder, &link, stop) {
             Ended::Stopped => {
@@ -186,40 +204,60 @@ fn observe(
                 link.close();
             }
         }
-        let Some((reopened, active)) = reconnect(stop) else {
-            return;
-        };
-        recorder.bus().replace(reopened.connection.clone());
-        link = reopened;
-        begin(&mut recorder, active);
-    }
-}
-
-/// Start from the window that is active now, as if it had just become so.
-fn begin(recorder: &mut Recorder<LiveBus>, active: Option<(String, String)>) {
-    if let Some((sender, path)) = active {
-        let event = Event::Active {
-            sender,
-            path,
-            on: true,
-        };
-        recorder.handle(event, now_ms());
-    }
-}
-
-/// Ask for the bus again until it answers, the tries are spent, or observation stops.
-fn reconnect(stop: &AtomicBool) -> Option<(Link, Option<(String, String)>)> {
-    for _ in 0..RECONNECT_TRIES {
-        if !sleep_unless_stopped(RECONNECT_EVERY, stop) {
-            return None;
+        match reconnect(stop, RECONNECT_TRIES, RECONNECT_EVERY, Link::open) {
+            Reconnected::Open(reopened) => {
+                recorder.bus().replace(reopened.connection.clone());
+                link = reopened;
+                recorder.begin(now_ms());
+            }
+            Reconnected::Stopped => return,
+            Reconnected::Spent => {
+                eprintln!(
+                    "compux: capture: the accessibility bus did not come back; the helper \
+                     exits for its owner to start it again"
+                );
+                exit_helper(&exit);
+            }
         }
-        match Link::open() {
-            Ok(opened) => return Some(opened),
+    }
+}
+
+#[cfg(not(test))]
+fn exit_helper(emitter: &Emitter) -> ! {
+    emitter.exit(EXIT_BUS_GONE)
+}
+
+/// Under test nothing may end the test process.
+#[cfg(test)]
+fn exit_helper(_emitter: &Emitter) -> ! {
+    panic!("the helper would exit with {EXIT_BUS_GONE}")
+}
+
+/// How asking for the bus again ended.
+enum Reconnected<L> {
+    Open(L),
+    Stopped,
+    Spent,
+}
+
+/// Ask for the bus again every `every`, at most `tries` times, until it answers or
+/// observation stops.
+fn reconnect<L>(
+    stop: &AtomicBool,
+    tries: u32,
+    every: Duration,
+    mut open: impl FnMut() -> Result<L, String>,
+) -> Reconnected<L> {
+    for _ in 0..tries {
+        if !sleep_unless_stopped(every, stop) {
+            return Reconnected::Stopped;
+        }
+        match open() {
+            Ok(opened) => return Reconnected::Open(opened),
             Err(why) => eprintln!("compux: capture: the accessibility bus is still away: {why}"),
         }
     }
-    eprintln!("compux: capture: the accessibility bus did not come back; observation stopped");
-    None
+    Reconnected::Spent
 }
 
 /// Sleep `total`, looking at the flag every STOP_TICK. False when it was raised.
@@ -242,7 +280,9 @@ enum Ended {
     Lost,
 }
 
-/// Feed the recorder until observation stops or the bus goes away.
+/// Feed the recorder until observation stops or the bus goes away. A queue that
+/// stays empty for a wait is a drained one: a gap of dropped events, if one is open,
+/// is said then.
 fn run(recorder: &mut Recorder<LiveBus>, link: &Link, stop: &AtomicBool) -> Ended {
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -250,13 +290,12 @@ fn run(recorder: &mut Recorder<LiveBus>, link: &Link, stop: &AtomicBool) -> Ende
         }
         match link.events.recv_timeout(wait_for(recorder.due())) {
             Ok(event) => recorder.handle(event, now_ms()),
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => recorder.drained(now_ms()),
             Err(RecvTimeoutError::Disconnected) => return Ended::Lost,
         }
         let dropped = link.dropped.swap(0, Ordering::SeqCst);
         if dropped > 0 {
-            eprintln!("compux: capture: {dropped} accessibility events dropped");
-            recorder.overflowed(now_ms(), now_ms());
+            recorder.dropped(dropped, now_ms());
         }
         recorder.tick(now_ms());
     }
@@ -291,9 +330,9 @@ struct Link {
 }
 
 impl Link {
-    /// The session's accessibility bus, set up, with the window active on it now.
+    /// The session's accessibility bus, set up.
     #[cfg(not(test))]
-    fn open() -> Result<(Link, Option<(String, String)>), String> {
+    fn open() -> Result<Link, String> {
         let connection = async_io::block_on(async {
             let session = super::bus::session().await?;
             let address = super::bus::address(&session)
@@ -307,14 +346,15 @@ impl Link {
 
     /// Under test there is no session this process may read.
     #[cfg(test)]
-    fn open() -> Result<(Link, Option<(String, String)>), String> {
+    fn open() -> Result<Link, String> {
         Err("a unit test builds its link over a fake's connection".to_string())
     }
 
     /// Set up an open connection: the pump first, so no signal sent after a
     /// subscription is missed, then the registrations and the subscriptions, then
-    /// the registry read that proves the bus answers.
-    fn over(connection: Connection) -> Result<(Link, Option<(String, String)>), String> {
+    /// the registry read that proves the bus answers. The look for the active window
+    /// is not part of it: it comes once `observe_start` is answered.
+    fn over(connection: Connection) -> Result<Link, String> {
         let stream = MessageStream::from(&connection);
         let (queue, events) = mpsc::sync_channel::<Event>(QUEUE);
         let dropped = Arc::new(AtomicU64::new(0));
@@ -332,10 +372,7 @@ impl Link {
             pump: Some(pump),
         };
         match async_io::block_on(subscribe(&link.connection)) {
-            Ok(()) => {
-                let active = async_io::block_on(active_window(&link.connection));
-                Ok((link, active))
-            }
+            Ok(()) => Ok(link),
             Err(why) => {
                 link.close();
                 Err(why)
@@ -483,12 +520,22 @@ fn gone_of(message: &Message) -> Option<Event> {
     (name.starts_with(':') && new.is_empty()).then_some(Event::Gone { sender: name })
 }
 
-/// The window that reads ACTIVE on the bus now, when exactly one does.
-async fn active_window(connection: &Connection) -> Option<(String, String)> {
+/// The window that reads ACTIVE on the bus now, when exactly one does: every
+/// application's windows (`GetChildren`) and each window's state (`GetState`),
+/// asked until `deadline`. A look the deadline cuts short finds none.
+async fn active_window(connection: &Connection, deadline: Instant) -> Option<(String, String)> {
     let applications = children(connection, REGISTRY, ROOT, MAX_APPLICATIONS).await;
     let mut active = Vec::new();
     for (sender, root) in applications {
+        if Instant::now() >= deadline {
+            eprintln!("compux: capture: the look for the active window ran out of time");
+            return None;
+        }
         for (bus, window) in children(connection, &sender, &root, MAX_WINDOWS).await {
+            if Instant::now() >= deadline {
+                eprintln!("compux: capture: the look for the active window ran out of time");
+                return None;
+            }
             let states: Vec<u32> = call(connection, &bus, &window, ACCESSIBLE, "GetState", &())
                 .await
                 .unwrap_or_default();
@@ -578,8 +625,9 @@ impl LiveBus {
         self.connection.borrow().clone()
     }
 
-    fn lists(&self, sender: &str, path: &str, interface: &str) -> bool {
-        let listed: Vec<String> = async_io::block_on(call(
+    /// The interfaces an object lists, or `None` when it did not answer.
+    fn interfaces(&self, sender: &str, path: &str) -> Option<Vec<String>> {
+        async_io::block_on(call(
             &self.connection(),
             sender,
             path,
@@ -587,24 +635,38 @@ impl LiveBus {
             "GetInterfaces",
             &(),
         ))
-        .unwrap_or_default();
-        listed.iter().any(|name| name == interface)
     }
 
-    /// The toolkit an application's root names, read only where the root lists the
-    /// Application interface. `None` when it does not say.
-    fn toolkit(&self, sender: &str) -> Option<String> {
-        if !self.lists(sender, ROOT, APPLICATION_INTERFACE) {
-            return None;
+    fn lists(&self, sender: &str, path: &str, interface: &str) -> bool {
+        self.interfaces(sender, path)
+            .is_some_and(|listed| listed.iter().any(|name| name == interface))
+    }
+
+    /// One property of an application's root Application interface (`ToolkitName`,
+    /// `Version`): what it says; that it says none, where the root lists no such
+    /// interface or the property is empty; or that it did not answer.
+    fn root_says(&self, sender: &str, listed: Option<&[String]>, name: &str) -> Answer<String> {
+        let Some(listed) = listed else {
+            return Answer::Unanswered;
+        };
+        if !listed
+            .iter()
+            .any(|interface| interface == APPLICATION_INTERFACE)
+        {
+            return Answer::SaysNothing;
         }
-        let name: Option<String> = async_io::block_on(property(
+        let value: Option<String> = async_io::block_on(property(
             &self.connection(),
             sender,
             ROOT,
             APPLICATION_INTERFACE,
-            "ToolkitName",
+            name,
         ));
-        name.filter(|name| !name.trim().is_empty())
+        match value {
+            None => Answer::Unanswered,
+            Some(value) if value.trim().is_empty() => Answer::SaysNothing,
+            Some(value) => Answer::Says(value),
+        }
     }
 
     /// Whether a control sits inside a web document: its own role and each
@@ -659,9 +721,8 @@ impl LiveBus {
     }
 }
 
-/// The match rules that watch one application: its focus and its window titles,
-/// and its text changes where `text` is true. A connection's unique name is all
-/// they hold of it.
+/// The match rules that watch one application: its focus, and its text changes
+/// where `text` is true. A connection's unique name is all they hold of it.
 pub fn scoped_rules(sender: &str, text: bool) -> Vec<String> {
     let rule = |member: &str, arg0: Option<&str>| {
         let arg0 = arg0.map(|a| format!(",arg0='{a}'")).unwrap_or_default();
@@ -669,14 +730,26 @@ pub fn scoped_rules(sender: &str, text: bool) -> Vec<String> {
             "type='signal',sender='{sender}',interface='{EVENT_OBJECT}',member='{member}'{arg0}"
         )
     };
-    let mut rules = vec![
-        rule("StateChanged", Some("focused")),
-        rule("PropertyChange", Some("accessible-name")),
-    ];
+    let mut rules = vec![rule("StateChanged", Some("focused"))];
     if text {
         rules.push(rule("TextChanged", None));
     }
     rules
+}
+
+/// The match rule that watches one window's name: a browser renames whatever takes
+/// the focus, by what the page or the address bar says, so names are asked of the
+/// active window alone.
+pub fn title_rule(sender: &str, frame: &str) -> String {
+    format!(
+        "type='signal',sender='{sender}',path='{frame}',interface='{EVENT_OBJECT}',\
+         member='PropertyChange',arg0='accessible-name'"
+    )
+}
+
+/// An object path: nothing else may be put into a rule.
+fn object_path(path: &str) -> bool {
+    zbus::zvariant::ObjectPath::try_from(path).is_ok()
 }
 
 /// A unique connection name (`:1.42`): nothing else may be put into a rule.
@@ -688,9 +761,9 @@ fn unique_name(sender: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
-/// What kind of field a control is, from its role and its states. A terminal is its
-/// own kind, whose text is never read: what a prompt asks for there (a password to
-/// `sudo` or `ssh`) is marked by no role.
+/// What kind of field a control is, from its role and its states: the fact the
+/// content rules (`recorder::content`) decide on. GTK 4 from 4.20 gives a field
+/// whose input purpose is a password or a PIN the password role too.
 pub fn field_of(role: u32, states: &[u32]) -> Field {
     if role == PASSWORD_TEXT {
         return Field::Secure;
@@ -702,6 +775,12 @@ pub fn field_of(role: u32, states: &[u32]) -> Field {
         return Field::Editable;
     }
     Field::Other
+}
+
+/// Whether a field is one line: an `entry`, or a `text` that does not read
+/// MULTI_LINE, where a toolkit that does not mark every password puts one.
+pub fn single_line(role: u32, states: &[u32]) -> bool {
+    role == ENTRY || (role == TEXT && !vocabulary::has(states, MULTI_LINE))
 }
 
 /// The file name of a process's executable, without the mark of one replaced on
@@ -717,7 +796,13 @@ fn program(pid: i32) -> Option<String> {
 
 impl Bus for LiveBus {
     fn application(&self, sender: &str) -> Option<Application> {
-        let name = self.words(sender, ROOT, "Name")?;
+        let name: String = async_io::block_on(property(
+            &self.connection(),
+            sender,
+            ROOT,
+            ACCESSIBLE,
+            "Name",
+        ))?;
         let pid: Option<u32> = async_io::block_on(call(
             &self.connection(),
             BUS_DAEMON,
@@ -727,19 +812,33 @@ impl Bus for LiveBus {
             &(sender,),
         ));
         let pid = pid.and_then(|pid| i32::try_from(pid).ok()).unwrap_or(0);
+        let listed = self.interfaces(sender, ROOT);
         Some(Application {
-            name,
+            name: name.trim().to_string(),
             pid,
             program: program(pid),
-            toolkit: self.toolkit(sender),
+            toolkit: self.root_says(sender, listed.as_deref(), "ToolkitName"),
+            version: self.root_says(sender, listed.as_deref(), "Version"),
         })
+    }
+
+    fn is_window(&self, sender: &str, path: &str) -> bool {
+        let role: Option<u32> = async_io::block_on(call(
+            &self.connection(),
+            sender,
+            path,
+            ACCESSIBLE,
+            "GetRole",
+            &(),
+        ));
+        role.is_some_and(|role| WINDOW_ROLES.contains(&role))
     }
 
     fn title(&self, sender: &str, path: &str) -> Option<String> {
         self.words(sender, path, "Name")
     }
 
-    fn focus(&self, sender: &str, path: &str) -> Option<Focus> {
+    fn focus(&self, sender: &str, path: &str, web: bool) -> Option<Focus> {
         let connection = self.connection();
         let role: u32 =
             async_io::block_on(call(&connection, sender, path, ACCESSIBLE, "GetRole", &()))?;
@@ -749,14 +848,12 @@ impl Bus for LiveBus {
         let label = self
             .words(sender, path, "Name")
             .or_else(|| self.words(sender, path, "Description"));
-        let field = field_of(role, &states);
-        // Only a field's ancestry matters: nothing else's text is ever read.
-        let web = field != Field::Other && self.in_web_document(sender, path, role);
         Some(Focus {
             role: vocabulary::role(role),
-            field,
+            field: field_of(role, &states),
             label,
-            web,
+            web: web && self.in_web_document(sender, path, role),
+            single_line: single_line(role, &states),
         })
     }
 
@@ -827,6 +924,28 @@ impl Bus for LiveBus {
                 eprintln!("compux: capture: {why}");
             }
         }
+    }
+
+    fn watch_title(&self, sender: &str, frame: &str) -> Result<(), String> {
+        if !unique_name(sender) || !object_path(frame) {
+            return Err(format!("{sender:?} {frame:?} is not a window's name"));
+        }
+        async_io::block_on(add_match(&self.connection(), &title_rule(sender, frame)))
+    }
+
+    fn unwatch_title(&self, sender: &str, frame: &str) {
+        if !unique_name(sender) || !object_path(frame) {
+            return;
+        }
+        let rule = title_rule(sender, frame);
+        if let Err(why) = async_io::block_on(remove_match(&self.connection(), &rule)) {
+            eprintln!("compux: capture: {why}");
+        }
+    }
+
+    fn active_window(&self) -> Option<(String, String)> {
+        let deadline = Instant::now() + SWEEP_BUDGET;
+        async_io::block_on(active_window(&self.connection(), deadline))
     }
 }
 
@@ -1038,11 +1157,12 @@ mod tests {
     }
 
     // Every rule that watches content names the one application's connection; a
-    // browser's leave out its text changes; nothing else can be put into a rule.
+    // browser's leave out its text changes; names are asked of one window alone;
+    // nothing else can be put into a rule.
     #[test]
     fn content_rules_name_the_one_application_and_a_browser_has_no_text_rule() {
         let rules = scoped_rules(APP, true);
-        assert_eq!(rules.len(), 3);
+        assert_eq!(rules.len(), 2);
         assert!(
             rules.iter().all(|r| r.contains("sender=':1.10'")),
             "{rules:?}"
@@ -1054,9 +1174,17 @@ mod tests {
         assert!(EVERY_APPLICATION
             .iter()
             .all(|r| !r.contains("TextChanged") && !r.contains("PropertyChange")));
+        assert!(rules.iter().all(|r| !r.contains("PropertyChange")));
+        let title = title_rule(APP, "/w");
+        assert!(title.contains("sender=':1.10'"), "{title}");
+        assert!(title.contains("path='/w'"), "{title}");
+        assert!(title.contains("arg0='accessible-name'"), "{title}");
         assert!(unique_name(":1.10"));
         assert!(!unique_name(":1.10',type='signal"));
         assert!(!unique_name("org.example.App"));
+        assert!(object_path("/org/a11y/atspi/accessible/12"));
+        assert!(!object_path("/w',type='signal"));
+        assert!(!object_path("w"));
     }
 
     #[test]
@@ -1069,6 +1197,29 @@ mod tests {
         let editable = [1u32 << EDITABLE, 0];
         assert_eq!(field_of(vocabulary::TEXT, &editable), Field::Editable);
         assert_eq!(field_of(vocabulary::TEXT, &[0, 0]), Field::Other);
+        // One line: an entry, or a text that is not MULTI_LINE.
+        let multi_line = [(1u32 << EDITABLE) | (1 << MULTI_LINE), 0];
+        assert!(single_line(ENTRY_ROLE, &[]));
+        assert!(single_line(vocabulary::TEXT, &editable));
+        assert!(!single_line(vocabulary::TEXT, &multi_line));
+        assert!(!single_line(TERMINAL, &editable));
+    }
+
+    // An object is a window where its role is one: a frame, a window, a dialog, an
+    // alert or a file chooser. A field, or an object that does not answer, is not.
+    #[test]
+    fn only_a_windows_role_makes_a_window() {
+        let mut desktop = desktop();
+        desktop.put(APP, "/dialog", Node::of(16));
+        desktop.put(APP, "/cell", Node::of(vocabulary::TABLE_CELL));
+        let (_fake, connection) = Fake::start(desktop, TIMEOUT);
+        let bus = LiveBus::over(connection);
+
+        assert!(bus.is_window(APP, "/w"));
+        assert!(bus.is_window(APP, "/dialog"));
+        assert!(!bus.is_window(APP, "/cell"));
+        assert!(!bus.is_window(APP, "/w/f"));
+        assert!(!bus.is_window(APP, "/nowhere"));
     }
 
     // The reads the recorder makes: who an application is (its root's name and its
@@ -1081,17 +1232,20 @@ mod tests {
 
         let app = bus.application(APP).expect("the application");
         assert_eq!(app.name, "Fixture Editor");
-        assert_eq!(app.toolkit.as_deref(), Some("GTK"));
+        assert_eq!(app.toolkit, Answer::Says("GTK".to_string()));
+        assert_eq!(app.version, Answer::Says("3.24.41".to_string()));
         let other = bus.application(OTHER).expect("the other application");
         assert_eq!(
-            other.toolkit, None,
+            (other.toolkit, other.version),
+            (Answer::SaysNothing, Answer::SaysNothing),
             "a root that lists no Application says no toolkit"
         );
         assert_eq!(app.pid, PID);
-        let focus = bus.focus(APP, "/w/f").expect("the field");
+        let focus = bus.focus(APP, "/w/f", true).expect("the field");
         assert_eq!(focus.role, "entry");
         assert_eq!(focus.field, Field::Editable);
         assert_eq!(focus.label.as_deref(), Some("Search"));
+        assert!(focus.single_line);
         assert!(!focus.web, "read up to the application, no web document");
         assert_eq!(
             bus.text(APP, "/w/f"),
@@ -1104,6 +1258,74 @@ mod tests {
         assert_eq!(fake.sent("GetText").len(), 1);
     }
 
+    // A root whose toolkit or version does not answer is told from one that says
+    // none: it is unanswered, and read again next time; one whose name does not
+    // answer is no application yet.
+    #[test]
+    fn a_root_that_does_not_answer_is_unanswered() {
+        let mut desktop = desktop();
+        let root = desktop
+            .nodes
+            .get_mut(&(APP.to_string(), ROOT.to_string()))
+            .expect("the root");
+        root.stalls = vec!["ToolkitName", "Version"];
+        let (_fake, connection) = Fake::start(desktop, TIMEOUT);
+        let bus = LiveBus::over(connection);
+
+        let app = bus.application(APP).expect("its name answered");
+        assert_eq!(
+            (app.toolkit, app.version),
+            (Answer::Unanswered, Answer::Unanswered)
+        );
+        assert_eq!(bus.application(":1.99"), None, "no such application");
+    }
+
+    // A control that is not a field has its web ancestry read too, where it is
+    // asked, so its label can be left out; in a browser it is not asked.
+    #[test]
+    fn a_controls_web_ancestry_is_read_only_where_asked() {
+        let mut desktop = desktop();
+        desktop.put(
+            APP,
+            "/w/doc/link",
+            Node::of(BUTTON_ROLE).named("my search — example.com"),
+        );
+        let doc = desktop
+            .nodes
+            .get_mut(&(APP.to_string(), "/w/doc".to_string()))
+            .expect("the document");
+        doc.children
+            .push((APP.to_string(), "/w/doc/link".to_string()));
+        let window = desktop
+            .nodes
+            .get_mut(&(APP.to_string(), "/w".to_string()))
+            .expect("the window");
+        window.children.push((APP.to_string(), "/w/b".to_string()));
+        let (_fake, connection) = Fake::start(desktop, TIMEOUT);
+        let bus = LiveBus::over(connection);
+
+        assert!(bus.focus(APP, "/w/doc/link", true).expect("the link").web);
+        assert!(!bus.focus(APP, "/w/doc/link", false).expect("the link").web);
+        assert!(!bus.focus(APP, "/w/b", true).expect("the button").web);
+    }
+
+    // The look for the active window finds the one window that reads ACTIVE, and a
+    // look whose deadline has passed asks nothing and finds none.
+    #[test]
+    fn the_sweep_finds_the_active_window_within_its_deadline() {
+        let (fake, connection) = Fake::start(desktop(), TIMEOUT);
+        let bus = LiveBus::over(connection.clone());
+
+        assert_eq!(
+            bus.active_window(),
+            Some((APP.to_string(), "/w".to_string()))
+        );
+        let asked = fake.sent("GetState").len();
+        let late = async_io::block_on(active_window(&connection, Instant::now()));
+        assert_eq!(late, None);
+        assert_eq!(fake.sent("GetState").len(), asked, "nothing asked past it");
+    }
+
     // A field inside a web document is a web page's, and one whose ancestry does not
     // read as far as its application is taken as one: its text is never read.
     #[test]
@@ -1111,8 +1333,8 @@ mod tests {
         let (_fake, connection) = Fake::start(desktop(), TIMEOUT);
         let bus = LiveBus::over(connection);
 
-        let inside = bus.focus(APP, "/w/doc/f").expect("the field");
-        let orphan = bus.focus(APP, "/orphan").expect("the field");
+        let inside = bus.focus(APP, "/w/doc/f", true).expect("the field");
+        let orphan = bus.focus(APP, "/orphan", true).expect("the field");
 
         assert!(inside.web);
         assert!(orphan.web);
@@ -1152,8 +1374,8 @@ mod tests {
         let (_fake, connection) = Fake::start(deep(3), TIMEOUT);
         let bus = LiveBus::over(connection);
 
-        assert!(!bus.focus(APP, "/w/f").expect("the field").web);
-        assert!(!bus.focus(APP, "/deep/3").expect("the field").web);
+        assert!(!bus.focus(APP, "/w/f", true).expect("the field").web);
+        assert!(!bus.focus(APP, "/deep/3", true).expect("the field").web);
     }
 
     // A parent on another connection (a web view embedded from another process, a
@@ -1167,7 +1389,7 @@ mod tests {
         let (_fake, connection) = Fake::start(desktop, TIMEOUT);
         let bus = LiveBus::over(connection);
 
-        assert!(bus.focus(APP, "/embedded").expect("the field").web);
+        assert!(bus.focus(APP, "/embedded", true).expect("the field").web);
     }
 
     // An ancestry deeper than MAX_ANCESTRY is not read to its end, so it is not
@@ -1178,7 +1400,7 @@ mod tests {
         let (_fake, connection) = Fake::start(deep(past), TIMEOUT);
         let bus = LiveBus::over(connection);
         assert!(
-            bus.focus(APP, &format!("/deep/{past}"))
+            bus.focus(APP, &format!("/deep/{past}"), true)
                 .expect("the field")
                 .web
         );
@@ -1187,21 +1409,25 @@ mod tests {
         let (_fake, connection) = Fake::start(deep(within), TIMEOUT);
         let bus = LiveBus::over(connection);
         assert!(
-            !bus.focus(APP, &format!("/deep/{within}"))
+            !bus.focus(APP, &format!("/deep/{within}"), true)
                 .expect("the field")
                 .web
         );
     }
 
-    // Watching an application subscribes rules naming it, and unwatching removes
-    // exactly those.
+    // Watching an application subscribes rules naming it, and its window's name,
+    // and unwatching removes exactly those; a window that is no object path is not
+    // put into a rule.
     #[test]
     fn watching_adds_and_unwatching_removes_the_same_rules() {
         let (fake, connection) = Fake::start(desktop(), TIMEOUT);
         let bus = LiveBus::over(connection);
 
         bus.watch(APP, true).expect("watched");
+        bus.watch_title(APP, "/w").expect("its title watched");
+        assert!(bus.watch_title(APP, "/w',member='x").is_err());
         bus.unwatch(APP, true);
+        bus.unwatch_title(APP, "/w");
 
         let added: Vec<String> = fake
             .calls()
@@ -1215,8 +1441,34 @@ mod tests {
             .filter(|c| c.member == "RemoveMatch")
             .map(|c| c.argument)
             .collect();
-        assert_eq!(added, scoped_rules(APP, true));
+        let mut expected = scoped_rules(APP, true);
+        expected.push(title_rule(APP, "/w"));
+        assert_eq!(added, expected);
         assert_eq!(removed, added);
+    }
+
+    // Asking for the bus again ends when it answers, when observation stops, or when
+    // the tries are spent, and then only.
+    #[test]
+    fn asking_for_the_bus_again_is_bounded() {
+        let stop = AtomicBool::new(false);
+        let mut asked = 0;
+        let spent = reconnect(&stop, 3, Duration::ZERO, || {
+            asked += 1;
+            Err::<(), String>("away".to_string())
+        });
+        assert!(matches!(spent, Reconnected::Spent));
+        assert_eq!(asked, 3);
+
+        let mut answers = vec![Ok(()), Err("away".to_string())];
+        let open = reconnect(&stop, 3, Duration::ZERO, || {
+            answers.pop().expect("an answer")
+        });
+        assert!(matches!(open, Reconnected::Open(())));
+
+        stop.store(true, Ordering::SeqCst);
+        let stopped = reconnect(&stop, 3, Duration::ZERO, || Ok::<(), String>(()));
+        assert!(matches!(stopped, Reconnected::Stopped));
     }
 
     /// An observation over the fake bus: the fake, the link and the recorder.
@@ -1225,12 +1477,11 @@ mod tests {
         link: Link,
         recorder: Recorder<LiveBus>,
         emitter: Emitter,
-        active: Option<(String, String)>,
     }
 
     fn observing(apps: &[&str]) -> Observing {
         let (fake, connection) = Fake::start(desktop(), TIMEOUT);
-        let (link, active) = Link::over(connection.clone()).expect("a link");
+        let link = Link::over(connection.clone()).expect("a link");
         let emitter = Emitter::capturing();
         let apps = apps.iter().map(|a| a.to_string()).collect();
         let recorder = Recorder::new(
@@ -1244,7 +1495,6 @@ mod tests {
             link,
             recorder,
             emitter,
-            active,
         }
     }
 
@@ -1273,11 +1523,11 @@ mod tests {
             .collect()
     }
 
-    // Setting up registers the events in the form every registry takes, subscribes
-    // to the content-free activation of every application, and finds the window
-    // active now.
+    // Setting up registers the events in the form every registry takes and
+    // subscribes to the content-free activation of every application; the look for
+    // the active window is not part of it, so `observe_start` is answered first.
     #[test]
-    fn a_link_registers_subscribes_and_finds_the_active_window() {
+    fn a_link_registers_and_subscribes_and_looks_for_no_window() {
         let observing = observing(&["Fixture Editor"]);
         let fake = &observing.fake;
 
@@ -1295,18 +1545,18 @@ mod tests {
             .map(|c| c.argument)
             .collect();
         assert_eq!(added, EVERY_APPLICATION.to_vec());
-        assert_eq!(observing.active, Some((APP.to_string(), "/w".to_string())));
+        assert!(fake.sent("GetState").is_empty(), "no window was looked at");
         observing.link.close();
     }
 
     // End to end over the fake bus: the active allowlisted application is announced
     // and watched, its typed value read once it settles, a password field never
-    // read, and an application not on the list says nothing whatever it sends.
+    // read, and an application not on the list says nothing whatever it sends, even
+    // on the path the watched one has focused.
     #[test]
     fn an_observation_records_the_allowlisted_application_alone() {
         let mut observing = observing(&["Fixture Editor"]);
-        let active = observing.active.take();
-        begin(&mut observing.recorder, active);
+        observing.recorder.begin(now_ms());
         assert_eq!(
             kinds(&observing.emitter),
             vec!["app.activated", "window.focused"]
@@ -1329,15 +1579,7 @@ mod tests {
             0,
             ZValue::from("x"),
         ));
-        fake.emit(signal(
-            "TextChanged",
-            OTHER,
-            "/w/f",
-            "insert",
-            0,
-            ZValue::from("y"),
-        ));
-        observing.take(3);
+        observing.take(2);
 
         let frames = observing.emitter.captured();
         let value = frames
@@ -1346,9 +1588,39 @@ mod tests {
             .expect("a value");
         assert_eq!(value["text"], json!("groceries"));
         assert_eq!(value["app"]["bundle_id"], json!("Fixture Editor"));
-        assert!(frames
+
+        // The other application's text change on the very path focused here.
+        observing.fake.emit(signal(
+            "TextChanged",
+            OTHER,
+            "/w/f",
+            "insert",
+            0,
+            ZValue::from("y"),
+        ));
+        observing.take(1);
+        let values = |o: &Observing| {
+            o.emitter
+                .captured()
+                .iter()
+                .filter(|f| f["kind"] == json!("field.value"))
+                .count()
+        };
+        assert_eq!(values(&observing), 1, "the other application said nothing");
+        assert_eq!(observing.fake.sent("GetText").len(), 1);
+        assert!(observing
+            .emitter
+            .captured()
             .iter()
             .all(|f| f["app"]["bundle_id"] != json!("Mail")));
+        let added: Vec<String> = observing
+            .fake
+            .calls()
+            .into_iter()
+            .filter(|c| c.member == "AddMatch")
+            .map(|c| c.argument)
+            .collect();
+        assert!(added.contains(&title_rule(APP, "/w")));
 
         let fake = &observing.fake;
         fake.emit(signal(

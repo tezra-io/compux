@@ -35,7 +35,7 @@ ARG FIXTURES="gtk3 gtk4 qt"
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       xvfb openbox dbus at-spi2-core \
-      python3 python3-gi gir1.2-gtk-3.0 gir1.2-gtk-4.0 \
+      python3 python3-gi gir1.2-gtk-3.0 gir1.2-gtk-4.0 gir1.2-adw-1 \
       xdotool systemd fonts-dejavu-core \
       ${QT_PACKAGES} \
  && rm -rf /var/lib/apt/lists/*

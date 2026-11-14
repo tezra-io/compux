@@ -11,6 +11,11 @@ widgets in GTK4 would qualify something nobody ships:
   * the outline is a ListView over a TreeListModel with TreeExpander rows, not the
     deprecated TreeView, which GTK4 exposes as one opaque node;
   * the pop-up button is a DropDown and the secure field a PasswordEntry;
+  * beside it, two fields that hide a password the way GTK 4 before 4.20 does not
+    mark as one: an Entry with its text hidden, and libadwaita's PasswordEntryRow
+    where the image's libadwaita has it (1.2 and later). Both read on the bus as a
+    plain editable `text` whose text is the password, which is what computer
+    history's recorder must never read (spike/observe.py);
   * the menu bar is the application's, built from a menu model and actions;
   * the dialog is a modal, transient window whose accessible role is DIALOG, since
     MessageDialog is deprecated from GTK 4.10 and AlertDialog is missing before it.
@@ -32,6 +37,14 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gio, GLib, Gtk  # noqa: E402
+
+# libadwaita is in the image; its PasswordEntryRow only from 1.2, which jammy's 1.1
+# is not. Where it is missing the window has no password row; observe.py asks the
+# same libadwaita whether it has one.
+gi.require_version("Adw", "1")
+from gi.repository import Adw  # noqa: E402
+
+PASSWORD_ROW = hasattr(Adw, "PasswordEntryRow")
 
 TOOLKIT = "gtk4"
 LABEL = "GTK4"
@@ -150,6 +163,22 @@ class FixtureWindow(Gtk.ApplicationWindow):
         self.button = Gtk.Button(label=f"{LABEL} button")
         self.button.connect("clicked", lambda _b: rec.record(control("button"), "press"))
 
+        # Next after the button in the focus order, so a Tab from it reaches them.
+        # Like the secure field, they record only how much text arrived.
+        self.hidden_field = named(Gtk.Entry(placeholder_text=f"{LABEL} hidden field",
+                                            visibility=False), f"{LABEL} hidden field")
+        self.hidden_field.connect("changed", lambda e: rec.record(
+            control("hidden_field"), "set_value", length=len(e.get_text())))
+        hidden = [self.hidden_field]
+        if PASSWORD_ROW:
+            self.password_row = named(Adw.PasswordEntryRow(title=f"{LABEL} password row"),
+                                      f"{LABEL} password row")
+            self.password_row.connect("changed", lambda e: rec.record(
+                control("password_row"), "set_value", length=len(e.get_text())))
+            rows = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+            rows.append(self.password_row)
+            hidden.append(rows)
+
         self.checkbox = Gtk.CheckButton(label=f"{LABEL} checkbox")
         self.checkbox.connect("toggled", lambda b: rec.record(
             control("checkbox"), "toggle", value="on" if b.get_active() else "off"))
@@ -194,7 +223,7 @@ class FixtureWindow(Gtk.ApplicationWindow):
 
         self.clear_all = Gtk.Button(label="Clear All…")
         self.clear_all.connect("clicked", self._open_dialog)
-        return [self.button, self.checkbox, self.text_field, self.secure_field,
+        return [self.button, *hidden, self.checkbox, self.text_field, self.secure_field,
                 self.disabled_button, self.popup, self.search, self.slider, self.clear_all]
 
     def _build_list(self):
@@ -398,8 +427,9 @@ def check_events(events):
     for index, event in enumerate(events, start=1):
         if event["seq"] != index:
             failures.append(f"event {index} is numbered {event['seq']}")
-        if event["control"] == control("secure_field") and "value" in event:
-            failures.append("the secure field wrote its text into the state file")
+        secret = (control("secure_field"), control("hidden_field"), control("password_row"))
+        if event["control"] in secret and "value" in event:
+            failures.append(f"{event['control']} wrote its text into the state file")
     return failures
 
 
@@ -450,6 +480,7 @@ def parse_args(argv):
 
 def main(argv):
     args = parse_args(argv)
+    Adw.init()
     recorder = Recorder(args.state_file)
     # NON_UNIQUE: every launch is its own instance, never a message to an older one.
     application = Gtk.Application(application_id=APPLICATION_ID,

@@ -3144,7 +3144,7 @@ text), and names an application by the name the accessibility bus gives it.
 * **The build**, from the branch with stage 4 on it:
 
   ```sh
-  cd ~/src/compux && git switch feat/linux-history-events
+  cd ~/src/compux && git switch fix/linux-recorder-review
   (cd native/compux && cargo build --release)
   CX=$PWD/native/compux/target/release/compux
   ```
@@ -3211,8 +3211,9 @@ while you are away. On your return, `app.activated` appears again, with no
 
 ## 3. Your own editor and terminal
 
-Run `observe` with the two names step 0 gave (for example
-`'["Text Editor","Terminal"]'`). Type a line in the editor and save the file: the
+Run `observe` with the two names step 0 gave (a GTK application's is its program name,
+`gnome-text-editor` rather than "Text Editor", but use what step 0 printed). Type a line
+in the editor and save the file: the
 save's new window title arrives as `window.title_changed`. Run `ls` in the terminal,
 then click back into the editor: a `field.value` with `"role": "terminal"`,
 `"content_withheld": true` and a `char_len` arrives, with **no `text`**. A terminal's
@@ -3229,6 +3230,11 @@ search box, then click elsewhere on the page.
 * A `field.value` arrives with `"content_withheld": true`, `"private_state": "unknown"`,
   `"browser_id": "Firefox"` and a `char_len`, and with **no `text`**.
 * One `observer.gap` with `"gap_reason": "private_unknown"` arrives, once.
+
+Click the address bar, type a few letters and arrow down through the suggestions. Each
+`focus.changed` on a suggestion carries its `role` and **no `field_label`**: a
+suggestion is named by what you typed and the address it offers. The address bar
+itself carries its label.
 
 Open a private window (ctrl+shift+P) and do the same. The same withheld frame
 arrives. Its window titles are recorded, as for any browser whose private state
@@ -3265,3 +3271,7 @@ sitting reaches the server or this computer's own summarizer.
   `accessibility_bus_lost`, and after you log back in a new observation records again.
   Nothing here logs you out.
 * The recorder's CPU cost over a working hour.
+* GTK 4.20 or later: Pop!_OS 22.04 has GTK 4.6, so every one-line field of a GTK 4
+  application there is counted, never read (step 3's editor, if it is a GTK 4 one,
+  says its fields' counts only). A GTK 4.20 desktop reads them.
+

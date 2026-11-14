@@ -474,7 +474,11 @@ arrives as volume-only metadata, so a caller can always tell withheld content fr
 content that never existed. A private window needs no explanation — it is working as
 designed — so only a browser whose private-browsing state the sidecar cannot read at all
 also reports a named gap, once per session, naming that browser. Secure text fields are
-never read.
+never read. A terminal emulator's text (what a prompt asked for, what a command printed)
+is never read either, only how many characters it holds: an application is one by its
+bundle id or by holding a pseudo-terminal's controlling side, whatever it is called. In a
+browser only a field's label is sent, never the name of whatever else takes the focus.
+These content rules are decided once for both systems, each observer reporting only facts.
 
 On Linux the same rail records through the accessibility bus (PROTOCOL.md, "Computer
 history on Linux"). An application is named by its name on the bus, and only the one
@@ -485,8 +489,10 @@ browser's typed text never reaches the helper at all: a field it changed arrives
 character count alone, withheld. An application is a browser by its name, its program,
 or the web engine its toolkit names (and one that names none is taken as one), and a
 field inside a web document is a browser's field anywhere. A terminal's text is never
-read either, only its count. `Compux.Protocol.history_systems/0` names the systems whose
-helper records.
+read either, only its count, and nor is a one-line field of a GTK 4 application before
+GTK 4.20, which marks only one kind of password field as one. An application's name on
+the bus is its own to give (a GTK application's is its program name), never its window
+title. `Compux.Protocol.history_systems/0` names the systems whose helper records.
 
 ## Status
 
