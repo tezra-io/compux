@@ -141,7 +141,7 @@ spike_images() {
   if staged wayland; then
     build -q -t "$IMAGE:wayland" -f "$HERE/wayland.Dockerfile" "$context" >/dev/null
   fi
-  if staged chromium; then
+  if staged chromium || staged observe-chromium; then
     build -q -t "$IMAGE:chromium" --build-arg "BASE=$CHROMIUM_BASE" \
       -f "$HERE/chromium.Dockerfile" "$context" >/dev/null
   fi

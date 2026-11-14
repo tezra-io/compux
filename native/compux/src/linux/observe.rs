@@ -765,6 +765,18 @@ impl Bus for LiveBus {
         Some(Text { text, chars })
     }
 
+    fn is_focused(&self, sender: &str, path: &str) -> bool {
+        let states: Option<Vec<u32>> = async_io::block_on(call(
+            &self.connection(),
+            sender,
+            path,
+            ACCESSIBLE,
+            "GetState",
+            &(),
+        ));
+        states.is_some_and(|states| vocabulary::has(&states, vocabulary::FOCUSED))
+    }
+
     fn count(&self, sender: &str, path: &str) -> Option<i64> {
         if !self.lists(sender, path, TEXT_INTERFACE) {
             return None;
@@ -1095,6 +1107,81 @@ mod tests {
 
         assert!(inside.web);
         assert!(orphan.web);
+    }
+
+    /// The desktop with a chain of `depth` panels under the window and an entry at
+    /// its bottom, `/deep/<depth>`.
+    fn deep(depth: usize) -> Desktop {
+        let mut desktop = desktop();
+        let window = desktop
+            .nodes
+            .get_mut(&(APP.to_string(), "/w".to_string()))
+            .expect("the window");
+        window
+            .children
+            .push((APP.to_string(), "/deep/0".to_string()));
+        for level in 0..depth {
+            let below = format!("/deep/{}", level + 1);
+            desktop.put(
+                APP,
+                &format!("/deep/{level}"),
+                Node::of(39).holding(APP, &[below.as_str()]),
+            );
+        }
+        desktop.put(
+            APP,
+            &format!("/deep/{depth}"),
+            Node::of(ENTRY_ROLE).named("Deep").listing(&["Text"]),
+        );
+        desktop
+    }
+
+    // A field whose ancestry reaches its own application's root, through nothing
+    // that is a web document, is read: the one case that is.
+    #[test]
+    fn an_ancestry_that_reaches_its_own_root_reads_as_not_web() {
+        let (_fake, connection) = Fake::start(deep(3), TIMEOUT);
+        let bus = LiveBus::over(connection);
+
+        assert!(!bus.focus(APP, "/w/f").expect("the field").web);
+        assert!(!bus.focus(APP, "/deep/3").expect("the field").web);
+    }
+
+    // A parent on another connection (a web view embedded from another process, a
+    // plug in a socket) is not known to be no web page's: withheld.
+    #[test]
+    fn a_parent_on_another_connection_reads_as_web() {
+        let mut desktop = desktop();
+        let mut embedded = Node::of(ENTRY_ROLE).named("Embedded").listing(&["Text"]);
+        embedded.claims = Some(((OTHER.to_string(), "/plug".to_string()), 0));
+        desktop.put(APP, "/embedded", embedded);
+        let (_fake, connection) = Fake::start(desktop, TIMEOUT);
+        let bus = LiveBus::over(connection);
+
+        assert!(bus.focus(APP, "/embedded").expect("the field").web);
+    }
+
+    // An ancestry deeper than MAX_ANCESTRY is not read to its end, so it is not
+    // known to be no web page's: withheld. One level shorter is read to its root.
+    #[test]
+    fn an_ancestry_past_the_bound_reads_as_web() {
+        let past = MAX_ANCESTRY + 1;
+        let (_fake, connection) = Fake::start(deep(past), TIMEOUT);
+        let bus = LiveBus::over(connection);
+        assert!(
+            bus.focus(APP, &format!("/deep/{past}"))
+                .expect("the field")
+                .web
+        );
+
+        let within = MAX_ANCESTRY - 2;
+        let (_fake, connection) = Fake::start(deep(within), TIMEOUT);
+        let bus = LiveBus::over(connection);
+        assert!(
+            !bus.focus(APP, &format!("/deep/{within}"))
+                .expect("the field")
+                .web
+        );
     }
 
     // Watching an application subscribes rules naming it, and unwatching removes

@@ -240,6 +240,8 @@ pub trait Bus {
     fn text(&self, sender: &str, path: &str) -> Option<Text>;
     /// How many characters a field holds, and nothing of what they are.
     fn count(&self, sender: &str, path: &str) -> Option<i64>;
+    /// Whether a control reads FOCUSED now.
+    fn is_focused(&self, sender: &str, path: &str) -> bool;
     /// Start receiving this application's focus and title changes, and its text
     /// changes where `text` is true.
     fn watch(&self, sender: &str, text: bool) -> Result<(), String>;
@@ -318,6 +320,8 @@ pub struct Recorder<B: Bus> {
     deactivation: Option<(String, i64)>,
     gaps: Ledger<(String, &'static str)>,
     logged: Ledger<(String, &'static str)>,
+    /// The last control a text change came from that did not read FOCUSED.
+    unfocused: Option<String>,
 }
 
 impl<B: Bus> Recorder<B> {
@@ -334,6 +338,7 @@ impl<B: Bus> Recorder<B> {
             deactivation: None,
             gaps: Ledger::default(),
             logged: Ledger::default(),
+            unfocused: None,
         }
     }
 
@@ -546,6 +551,7 @@ impl<B: Bus> Recorder<B> {
         }
         // Blur is a boundary: the edit just left is said before the focus moves.
         self.blur(now_ms);
+        self.unfocused = None;
         let focus = self.bus.focus(sender, &path);
         self.emit_focus_changed(focus.as_ref());
         let Some(focus) = focus.filter(|f| f.field != Field::Other) else {
@@ -575,6 +581,7 @@ impl<B: Bus> Recorder<B> {
     }
 
     fn text_changed(&mut self, sender: &str, path: String, now_ms: i64) {
+        self.adopt_focus(sender, &path, now_ms);
         // A browser's text is never taken, whatever arrives.
         let Some(focus) = self.focused_field(sender, &path) else {
             return;
@@ -604,6 +611,25 @@ impl<B: Bus> Recorder<B> {
                     });
                 }
             }
+        }
+    }
+
+    /// A field that had the focus before observation began sent no focus event:
+    /// a text change from a control the recorder has not seen take the focus asks
+    /// whether it reads FOCUSED, and one that does is taken as just focused. A
+    /// control found not focused is not asked again until the focus moves.
+    fn adopt_focus(&mut self, sender: &str, path: &str, now_ms: i64) {
+        let Some(attached) = self.attached.as_ref() else {
+            return;
+        };
+        let known = attached.focused.as_ref().is_some_and(|f| f.path == path);
+        if attached.sender != sender || known || self.unfocused.as_deref() == Some(path) {
+            return;
+        }
+        if self.bus.is_focused(sender, path) {
+            self.focused(sender, path.to_string(), now_ms);
+        } else {
+            self.unfocused = Some(path.to_string());
         }
     }
 
@@ -891,6 +917,7 @@ mod tests {
         focus: HashMap<(String, String), Focus>,
         text: RefCell<HashMap<(String, String), Text>>,
         counts: RefCell<HashMap<(String, String), i64>>,
+        focused_now: RefCell<Vec<(String, String)>>,
         watched: RefCell<Vec<String>>,
         reads: RefCell<Vec<String>>,
     }
@@ -928,6 +955,14 @@ mod tests {
                 .borrow()
                 .get(&Script::key(sender, path))
                 .copied()
+        }
+        fn is_focused(&self, sender: &str, path: &str) -> bool {
+            self.reads
+                .borrow_mut()
+                .push(format!("focused {sender} {path}"));
+            self.focused_now
+                .borrow()
+                .contains(&Script::key(sender, path))
         }
         fn watch(&self, sender: &str, text: bool) -> Result<(), String> {
             self.watched
@@ -1143,6 +1178,29 @@ mod tests {
         assert_eq!(frame["field_label"], json!("Search"));
         let reads: Vec<String> = script.reads.borrow().clone();
         assert_eq!(reads.iter().filter(|r| r.starts_with("text")).count(), 1);
+    }
+
+    // A field that already had the focus when observation began sends no focus
+    // event: its first text change finds it focused, and it is recorded as if it
+    // had just taken the focus.
+    #[test]
+    fn a_field_focused_before_observation_is_recorded_from_its_first_change() {
+        let script = script();
+        scripted_text(&script, EDITOR, "/f", "groceries");
+        script
+            .focused_now
+            .borrow_mut()
+            .push(Script::key(EDITOR, "/f"));
+        let (mut recorder, emitter) = recorder(&script);
+        recorder.handle(active(EDITOR, "/w1", true), 0);
+        recorder.handle(typed(EDITOR, "/f"), 10);
+        recorder.tick(10_000);
+
+        assert_eq!(
+            last(&emitter, "focus.changed")["field_label"],
+            json!("Search")
+        );
+        assert_eq!(last(&emitter, "field.value")["text"], json!("groceries"));
     }
 
     // A value that never goes quiet still reports at the ceiling.
