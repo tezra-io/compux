@@ -608,9 +608,12 @@ impl LiveBus {
     }
 
     /// Whether a control sits inside a web document: its own role and each
-    /// ancestor's, read up to its application's root. An ancestry that will not
-    /// read that far, or is deeper than MAX_ANCESTRY, is taken as inside one, so a
-    /// field is read only where it is known not to be a web page's.
+    /// ancestor's, read up to its application's root. The answer is "no" only when
+    /// the walk ends at this connection's own root, or at the null reference. An
+    /// ancestry that will not read, that passes onto another connection (a web view
+    /// embedded from another process, a plug in a socket), or that is deeper than
+    /// MAX_ANCESTRY is taken as inside one, so a field is read only where it is
+    /// known not to be a web page's.
     fn in_web_document(&self, sender: &str, path: &str, role: u32) -> bool {
         if role == DOCUMENT_WEB {
             return true;
@@ -624,7 +627,13 @@ impl LiveBus {
                 return true;
             };
             let parent = parent.to_string();
-            if parent == ROOT || parent == NULL_PATH || bus != sender {
+            if parent == NULL_PATH {
+                return false;
+            }
+            if bus != sender {
+                return true;
+            }
+            if parent == ROOT {
                 return false;
             }
             let role: Option<u32> = async_io::block_on(call(
