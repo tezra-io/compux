@@ -66,6 +66,9 @@ NAME_STEP_S = 0.2
 LABELS = {"gtk3": "GTK3", "gtk4": "GTK4", "qt": "Qt", "chromium": "Chromium"}
 SECRET = "s3cret-value"
 TYPED = "groceries list"
+# What the not-listed phase types: never TYPED, since a toolkit sends no text
+# change for a field set to the text it already holds (GTK 3 does not).
+UNLISTED_TYPED = "nothing to record"
 NOT_LISTED = "Nothing Running By This Name"
 REGISTRY = ("org.a11y.atspi.Registry", "/org/a11y/atspi/accessible/root")
 ACCESSIBLE = "org.a11y.atspi.Accessible"
@@ -214,16 +217,17 @@ def nowhere(recorder, *secrets):
 
 
 def focus_and_set(driver, name, value, takes_focus):
-    """Focus the control named `name` (by reference, where the toolkit takes it) and
-    set its value. The replies, for the record."""
-    element, observation, listing = find(driver, None, name)
+    """Focus the text field named `name` (by reference, where the toolkit takes it)
+    and set its value. The replies, for the record. Looked up as a text field, so a
+    label of the same name (Chromium's) is never taken for it."""
+    element, observation, listing = find(driver, "textfield", name)
     if element is None:
         return {"listed": False, "listing": json.dumps(listing)[:1500] if listing else None}
     replies = {}
     if takes_focus:
         _, replies["focus"] = driver.ask("focus", mutation=True, observation_id=observation,
                                          element_ref=element["element_ref"])
-    element, observation, _ = find(driver, None, name)
+    element, observation, _ = find(driver, "textfield", name)
     _, replies["set_value"] = driver.ask("set_value", mutation=True, observation_id=observation,
                                          element_ref=element["element_ref"], value=value)
     return {"listed": True, "replies": replies}
@@ -245,7 +249,8 @@ def not_listed_step(args, driver, label):
     recorder = Recorder(args.binary, args.out + ".not-listed.stderr")
     try:
         ack = recorder.control("observe_start", {"apps": [NOT_LISTED]})
-        acted = focus_and_set(driver, f"{label} text field", TYPED, args.toolkit != "gtk4")
+        acted = focus_and_set(driver, f"{label} text field", UNLISTED_TYPED,
+                              args.toolkit != "gtk4")
         time.sleep(SETTLE_S)
         events = recorder.events()
         stop = recorder.control("observe_stop")
