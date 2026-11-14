@@ -45,6 +45,14 @@
 #    raised onto it. The badge (compux-indicator-x11) is built beside the helper
 #    and installed beside it, as the release archive carries it.
 #
+# 11. observe (M97 stage 4): computer history's recorder on each fixture in noble
+#    (observe.py): nothing at all for an application not on its list; for the
+#    fixture listed by its name on the bus, its window announced, a typed value
+#    recorded, a password field never read; observe-jammy: the same on GTK3 in
+#    jammy under the bus monitor, where every subscription to an application's
+#    content must name its connection; observe-chromium: Chromium's typed text
+#    withheld, its count only, with one private_unknown gap.
+#
 # The helper is built with no C library but the C runtime (build.Dockerfile has no
 # X, XKB, xdo or D-Bus development package); no_c_deps.sh proves that on its own.
 #
@@ -75,7 +83,7 @@ CACHE=${SPIKE_CACHE:-$HOME/.cache/compux-l0-spike}
 BUILD_LIMIT_S=${BUILD_LIMIT_S:-3600}
 RUN_LIMIT_S=${RUN_LIMIT_S:-600}
 CHROMIUM_BASE=${CHROMIUM_BASE:-debian:bookworm}
-STAGES=${SPIKE_STAGES:-a b wayland chromium verbs verbs-jammy pixels bound}
+STAGES=${SPIKE_STAGES:-a b wayland chromium verbs verbs-jammy pixels bound observe observe-jammy observe-chromium}
 IMAGE=${SPIKE_IMAGE:-compux-spike}
 VOLUMES=${SPIKE_VOLUMES:-compux-spike}
 mkdir -p "$OUT" "$CACHE"
@@ -125,7 +133,7 @@ spike_images() {
   cp "$CACHE/compux" "$CACHE/compux-indicator-x11" \
     "$HERE"/{elements_timing.py,a11y_tree.py,measure.sh,atk_bridge_check.sh,verbs.py} \
     "$HERE"/{pixels.py,x11_oracle.py,bound.py,panes.py,xcb_victim.py} \
-    "$HERE"/{wayland_session.sh,chromium_session.sh,chromium_page.html} "$context/"
+    "$HERE"/{wayland_session.sh,chromium_session.sh,chromium_page.html,observe.py} "$context/"
   for base in noble jammy; do
     build -q -t "$IMAGE:$base" --build-arg "BASE=compux-fixtures:$base" \
       -f "$HERE/spike.Dockerfile" "$context" >/dev/null
@@ -133,7 +141,7 @@ spike_images() {
   if staged wayland; then
     build -q -t "$IMAGE:wayland" -f "$HERE/wayland.Dockerfile" "$context" >/dev/null
   fi
-  if staged chromium; then
+  if staged chromium || staged observe-chromium; then
     build -q -t "$IMAGE:chromium" --build-arg "BASE=$CHROMIUM_BASE" \
       -f "$HERE/chromium.Dockerfile" "$context" >/dev/null
   fi
@@ -241,6 +249,27 @@ if staged bound; then
     --binary /opt/compux/compux --state /tmp/compux-fixture-state/gtk3.json \
     --out /tmp/spike-out/gtk3-bound.json \
     || failed+=("bound:gtk3")
+fi
+
+if staged observe; then
+  for toolkit in gtk3 gtk4 qt; do
+    echo "== M97 stage 4 recorder $toolkit (noble)"
+    in_session "$IMAGE:noble" "$toolkit" python3 /opt/compux-spike/observe.py \
+      --binary /opt/compux/compux --toolkit "$toolkit" --out "/tmp/spike-out/$toolkit-observe.json" \
+      || failed+=("observe:$toolkit")
+  done
+fi
+
+if staged observe-jammy; then
+  echo "== M97 stage 4 recorder gtk3 under ATK bridge 2.38 (jammy)"
+  in_session "$IMAGE:jammy" gtk3 bash /opt/compux-spike/atk_bridge_check.sh observe \
+    || failed+=("observe:gtk3-jammy")
+fi
+
+if staged observe-chromium; then
+  echo "== M97 stage 4 recorder on Chromium (Debian bookworm)"
+  in_own_session "$IMAGE:chromium" chromium /opt/compux-spike/chromium_session.sh observe \
+    || failed+=("observe:chromium")
 fi
 
 [ "${#failed[@]}" -eq 0 ] || die "failed: ${failed[*]} (see $OUT)"

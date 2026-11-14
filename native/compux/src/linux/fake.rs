@@ -383,6 +383,14 @@ impl Fake {
     pub fn quits(&self, bus: &str) {
         self.desktop().quit.push(bus.to_string());
     }
+
+    /// Send a signal, as an application on the bus would: the message names its
+    /// sender, and reaches the client whatever it subscribed to.
+    pub fn emit(&self, signal: Message) {
+        if let Err(error) = async_io::block_on(self.server.send(&signal)) {
+            panic!("fake desktop: a signal was not sent: {error}");
+        }
+    }
 }
 
 impl Drop for Fake {
@@ -775,7 +783,7 @@ fn answer(desktop: &Desktop, call: &Call, message: &Message) -> Reply {
     }
     match call.interface.as_str() {
         "org.a11y.atspi.Registry" => registration(call),
-        "org.freedesktop.DBus" => process_id(desktop, &call.argument),
+        "org.freedesktop.DBus" => bus_daemon(desktop, call),
         _ => from_node(desktop, call, message),
     }
 }
@@ -798,6 +806,18 @@ fn registration(call: &Call) -> Reply {
     match call.signature.as_str() {
         "s" | "sas" => Reply::Nothing,
         _ => Reply::Silence,
+    }
+}
+
+/// The bus daemon: who is behind a connection, and the match rules a client
+/// subscribes with, which a peer-to-peer connection has no daemon to keep: every
+/// signal the fake emits reaches the client whatever it subscribed to, so a test
+/// asserts on the rules it was sent.
+fn bus_daemon(desktop: &Desktop, call: &Call) -> Reply {
+    match call.member.as_str() {
+        "GetConnectionUnixProcessID" => process_id(desktop, &call.argument),
+        "AddMatch" | "RemoveMatch" => Reply::Nothing,
+        _ => Reply::Error(UNKNOWN_METHOD),
     }
 }
 
@@ -872,6 +892,7 @@ fn property(node: &Node, message: &Message) -> Reply {
         "MinimumValue" => Value::from(node.range.0),
         "MaximumValue" => Value::from(node.range.1),
         "CaretOffset" => Value::from(node.caret),
+        "CharacterCount" => Value::from(node.text.chars().count() as i32),
         "ToolkitName" => Value::from(node.toolkit.0),
         "Version" => Value::from(node.toolkit.1),
         _ => return Reply::Error(UNKNOWN_OBJECT),

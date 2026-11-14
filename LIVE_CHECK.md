@@ -3115,3 +3115,153 @@ Each with the window still bound, in the session:
   picture must start at the window's first pixel, with no strip of the border's
   colour along its top or left edge and none of the window cut off at its bottom
   or right. The containers prove it on a display with no window manager.
+
+# Live check — computer history on Linux (M97 stage 4)
+
+**What this is for.** The Linux build now answers `observe_start`. It records the
+active application on its list through the accessibility bus: its windows, the
+focused control, and the settled text of the field you type in. A password field is
+never read, and a browser's typed text never reaches the helper at all. Every rule is
+tested against fake AT-SPI servers, and the recorder has run against the GTK 3, GTK 4
+and Qt fixture apps and Debian's Chromium in private containers
+(`fixtures/linux/spike/spike.sh`, stages `observe`, `observe-jammy` and
+`observe-chromium`), driven there by a second helper's verbs. None of it has run on a
+real GNOME desktop. This section runs it once on yours: Pop!_OS 22.04, GNOME 42, an
+X11 session, at-spi2-core 2.44, ATK bridge 2.38.
+
+Expected outcome in one line: the helper says nothing of an application not on its
+list, records what you type in one that is (never a password and never a browser's
+text), and names an application by the name the accessibility bus gives it.
+
+> **Nothing here posts input.** The helper only listens. You type and click
+> yourself, in the fixture apps and in your own applications. What you type in an
+> application on the list is printed to your terminal and written to
+> `/tmp/observe.ndjson`, so type nothing you would not want there, and delete the file
+> at the end (step 7). Nothing here may be run by an agent.
+
+## 0. Preconditions
+
+* **The build**, from the branch with stage 4 on it:
+
+  ```sh
+  cd ~/src/compux && git switch feat/linux-history-events
+  (cd native/compux && cargo build --release)
+  CX=$PWD/native/compux/target/release/compux
+  ```
+
+* **The GTK 3 fixture** in its own terminal (as in M86 L1):
+  `python3 fixtures/linux/fixture_gtk3.py --state-file /tmp/gtk3.json`.
+* **The names on the bus**, read only (`GetChildren`, then one `Get` of each root's
+  `Name`):
+
+  ```sh
+  A=$(busctl --user call org.a11y.Bus /org/a11y/bus org.a11y.Bus GetAddress | sed -e 's/^s "//' -e 's/"$//')
+  for app in $(busctl --address="$A" call org.a11y.atspi.Registry /org/a11y/atspi/accessible/root \
+      org.a11y.atspi.Accessible GetChildren | grep -o '":[0-9.]*"' | tr -d '"'); do
+    printf '%s  ' "$app"
+    busctl --address="$A" get-property "$app" /org/a11y/atspi/accessible/root org.a11y.atspi.Accessible Name
+  done
+  ```
+
+  Write down each name: the fixture's (probably `fixture_gtk3.py`), your text
+  editor's, your terminal's, and Firefox's if it is listed at all.
+* **The observer**, one per step, keeping its input open until you press ctrl-D,
+  which ends it:
+
+  ```sh
+  observe() {
+    { printf '%s\n' "{\"type\":\"request\",\"request_id\":\"o\",\"action\":\"observe_start\",\"params\":{\"apps\":$1}}"; cat; } \
+      | "$CX" | tee /tmp/observe.ndjson
+  }
+  ```
+
+## 1. Nothing from an application not on the list (fails fastest)
+
+```sh
+observe '["Nothing By This Name"]'
+```
+
+The first line is `{"type":"ack","action":"observe_start","ok":true,"protocol_version":12}`.
+Click into the fixture's text field, type a word, and switch to your editor and type
+there too. **No further line appears.** Press ctrl-D.
+
+## 2. The fixture on the list
+
+```sh
+observe '["fixture_gtk3.py"]'
+```
+
+Use the fixture's name as step 0 printed it. Click the fixture's window, then its
+text field, and type `hello`.
+
+* `app.activated` and `window.focused` with `"window_title": "Compux Fixture GTK3"`
+  appear when its window becomes active.
+* `focus.changed` with `"role": "entry"` and the field's label appears when you click
+  the field.
+* About a second after you stop typing, `field.value` appears with `"text": "hello"`
+  and `"char_len": 5`.
+
+Click the secure field and type a few characters. An `observer.gap` with
+`"gap_reason": "secure_input"` and a `field.value` with `"content_withheld": true`
+and no `text` appear. **What you typed is on no line.**
+
+Switch to an application not on the list, then back to the fixture. Nothing appears
+while you are away. On your return, `app.activated` appears again, with no
+`prev_bundle_id`. Press ctrl-D.
+
+## 3. Your own editor and terminal
+
+Run `observe` with the two names step 0 gave (for example
+`'["Text Editor","Terminal"]'`). Type a line in the editor and save the file: the
+save's new window title arrives as `window.title_changed`. Run `ls` in the terminal,
+then click back into the editor: a `field.value` with `"role": "terminal"`,
+`"content_withheld": true` and a `char_len` arrives, with **no `text`**. A terminal's
+text is never read, since a prompt's password is marked by no role. Write down whether
+each one records, and what its `role` is. Press ctrl-D.
+
+## 4. Firefox: titles yes, typed text never
+
+Firefox publishes its tree only while accessibility is on in your session, and
+compux never turns that on. If step 0 did not list Firefox, write that down and go
+to step 5. Otherwise run `observe` with its name (`'["Firefox"]'`). Type in a page's
+search box, then click elsewhere on the page.
+
+* A `field.value` arrives with `"content_withheld": true`, `"private_state": "unknown"`,
+  `"browser_id": "Firefox"` and a `char_len`, and with **no `text`**.
+* One `observer.gap` with `"gap_reason": "private_unknown"` arrives, once.
+
+Open a private window (ctrl+shift+P) and do the same. The same withheld frame
+arrives. Its window titles are recorded, as for any browser whose private state
+compux cannot read. Write down the private window's `window_title`: it is the evidence
+a later release would pin a marker from. Press ctrl-D.
+
+## 5. An Electron or Chromium application
+
+Run `observe` with VS Code's or Chrome's name, if step 0 listed it. Write down whether
+anything arrives. Without `--force-renderer-accessibility` and `ACCESSIBILITY_ENABLED=1`
+it publishes no tree, and nothing should. If it does publish one, its toolkit is
+Chromium, so it is taken as a browser: a field it changed arrives withheld, its count
+alone, never its text.
+
+## 6. Through Fermix, once
+
+Pin this build into a dev engine on this computer (the paired engine change), switch
+computer history on for this computer with your editor on its list, and type for a
+minute. Check that `/history status` names this computer's recorder as on, and that a
+sitting reaches the server or this computer's own summarizer.
+
+## 7. Restore
+
+`rm /tmp/observe.ndjson /tmp/gtk3.json`, and close the fixture.
+
+## 8. What this check cannot prove
+
+* GNOME on Wayland: the recorder asks nothing of the display, so it should behave the
+  same. No Wayland session is part of this check.
+* Flatpak and Snap applications: their name on the bus is whatever the application
+  says. Write down any that step 0 lists.
+* A login after the helper started: the recorder asks for the bus again every 5 s for
+  an hour after it is lost. A logout during step 2 should print
+  `accessibility_bus_lost`, and after you log back in a new observation records again.
+  Nothing here logs you out.
+* The recorder's CPU cost over a working hour.

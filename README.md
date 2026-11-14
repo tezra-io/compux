@@ -476,6 +476,18 @@ designed — so only a browser whose private-browsing state the sidecar cannot r
 also reports a named gap, once per session, naming that browser. Secure text fields are
 never read.
 
+On Linux the same rail records through the accessibility bus (PROTOCOL.md, "Computer
+history on Linux"). An application is named by its name on the bus, and only the one
+active application on the list has its focus, titles and text subscribed, by match rules
+naming its connection; every other application tells the helper only that one of its
+windows became active. No Linux browser's private-browsing state can be read, so a
+browser's typed text never reaches the helper at all: a field it changed arrives as its
+character count alone, withheld. An application is a browser by its name, its program,
+or the web engine its toolkit names (and one that names none is taken as one), and a
+field inside a web document is a browser's field anywhere. A terminal's text is never
+read either, only its count. `Compux.Protocol.history_systems/0` names the systems whose
+helper records.
+
 ## Status
 
 Alpha (`0.x`). The coordinate math is unit-tested (including the Retina

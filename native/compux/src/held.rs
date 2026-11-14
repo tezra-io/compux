@@ -716,15 +716,14 @@ pub fn sweep_injected_failures(
         .position(Call::is_release)
         .unwrap_or(clean.calls.len());
 
-    for at in 0..body {
-        if clean.calls[at].is_sleep() {
+    for (at, call) in clean.calls.iter().enumerate().take(body) {
+        if call.is_sleep() {
             continue; // a sleep cannot fail, so there is nothing to inject
         }
         let mut run = Recorder::new(clipboard);
         run.fail_at = vec![at];
         let outcome = sequence(&mut run);
 
-        let call = &clean.calls[at];
         assert!(
             outcome.is_err(),
             "call {at} ({call:?}) failed but returned Ok"

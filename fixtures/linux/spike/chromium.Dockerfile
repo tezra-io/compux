@@ -14,6 +14,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --shell /bin/bash tester
 COPY compux /opt/compux/compux
-COPY elements_timing.py a11y_tree.py chromium_session.sh chromium_page.html /opt/compux-spike/
+COPY elements_timing.py a11y_tree.py chromium_session.sh chromium_page.html verbs.py observe.py \
+     /opt/compux-spike/
 USER tester
 WORKDIR /home/tester
