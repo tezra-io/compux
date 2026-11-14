@@ -942,7 +942,10 @@ any other system's answers `observe_start` with `ok: false`.
   trusts, so every browser is `unknown`: a field that changed is said, once it is left, as a `field.value` with
   `content_withheld: true`, `private_state: "unknown"`, `browser_id` (the browser's name), `window_ref` (its window's
   object path) and `char_len` (its `CharacterCount`), and `observer.gap{private_unknown}` (with the browser's `app`)
-  once per browser per observation. Its window titles and focus are recorded as any application's.
+  once per browser per observation. Its window titles and focus are recorded as any application's. A browser field that
+  already held the focus when its window became active is counted from the next time it takes the focus: no text
+  change of a browser reaches the helper to say it is focused, and AT-SPI has no question for the focused control. A
+  field of any other application, a terminal's included, is taken as focused at its first text change.
 - **What is a browser fails closed.** An application is one when its name is one a browser is known by (Firefox,
   Chromium, Google Chrome, Brave, Microsoft Edge, Vivaldi, Opera, Epiphany, …, compared without case), when its
   program is (`firefox`, `chrome`, `chromium`, `msedge`, …), when its root's `ToolkitName` names a web engine
