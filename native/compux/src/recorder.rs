@@ -14,12 +14,17 @@
 //!   never read (`gap{secure_input}`). In a browser no text is ever received or
 //!   read: the field's character count alone, withheld, with `private_state`
 //!   `unknown` and `gap{private_unknown}` once per browser per session, since no
-//!   Linux browser has a private-window marker this recorder trusts.
+//!   Linux browser has a private-window marker this recorder trusts. A field
+//!   inside a web document in any application is a browser's field. A terminal's
+//!   text is never read either (a prompt's password is marked by no role, and a
+//!   command prints what it likes): its count alone, withheld.
 //!
 //! An application's identity, the allowlist key the frames carry as
 //! `app.bundle_id`, is its name on the accessibility bus (the Name of its root),
-//! matched exactly. A browser is known by that name or by its program, so a browser
-//! under an unexpected name still has its text withheld.
+//! matched exactly. Whether it is a browser fails closed: it is one by its name, by
+//! its program, or by the web engine its toolkit names (Gecko, Chromium, WebKit),
+//! and an application whose toolkit cannot be read is taken as one, so withholding
+//! never rests on a list being complete.
 //!
 //! Default-deny is structural: only the one active allowlisted application is
 //! watched (`Bus::watch`), so nothing another application does reaches the helper
@@ -122,12 +127,30 @@ const BROWSER_PROGRAMS: &[&str] = &[
     "qutebrowser",
 ];
 
-/// Whether an application is a browser, by its name or its program.
-pub fn is_browser(name: &str, program: Option<&str>) -> bool {
+/// The web engines a root's `ToolkitName` names, lower case, as a part of it.
+const WEB_ENGINES: &[&str] = &["gecko", "chromium", "webkit"];
+
+/// Whether an application's typed text is withheld as a browser's: by its name, by
+/// its program, or by its toolkit, which fails closed (`web_engine`), so withholding
+/// never rests on a hand list being complete.
+pub fn is_browser(name: &str, program: Option<&str>, toolkit: Option<&str>) -> bool {
     BROWSER_NAMES
         .iter()
         .any(|browser| browser.eq_ignore_ascii_case(name))
         || program.is_some_and(|program| BROWSER_PROGRAMS.contains(&program))
+        || web_engine(toolkit)
+}
+
+/// Whether a toolkit is a web engine, or could not be read to say it is not: an
+/// application that does not say what it was made with is not known to be one that
+/// keeps no web content, so it is taken as one. Gecko is Firefox's and Thunderbird's,
+/// Chromium every Chromium browser's and every Electron application's.
+fn web_engine(toolkit: Option<&str>) -> bool {
+    let Some(toolkit) = toolkit.filter(|t| !t.trim().is_empty()) else {
+        return true;
+    };
+    let toolkit = toolkit.to_ascii_lowercase();
+    WEB_ENGINES.iter().any(|engine| toolkit.contains(engine))
 }
 
 /// One event of the accessibility bus, as the recorder reads it. `sender` is the
@@ -161,10 +184,12 @@ pub enum Event {
 /// What kind of field a focused control is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Field {
-    /// Its text is what a person typed there: a text field, a text area, a terminal.
+    /// Its text is what a person typed there: a text field, a text area.
     Editable,
     /// A password field: never read.
     Secure,
+    /// A terminal.
+    Terminal,
     /// Anything else: its text is not recorded.
     Other,
 }
@@ -177,6 +202,9 @@ pub struct Focus {
     pub field: Field,
     /// Its name, else its description.
     pub label: Option<String>,
+    /// It sits inside a web document, or its ancestry could not be read as far as
+    /// its application to say it does not.
+    pub web: bool,
 }
 
 /// An application on the bus.
@@ -187,6 +215,8 @@ pub struct Application {
     pub pid: i32,
     /// The executable's file name, where it reads.
     pub program: Option<String>,
+    /// The toolkit its root says it was made with (`ToolkitName`), where it says.
+    pub toolkit: Option<String>,
 }
 
 /// A field's text, read bounded, and how many characters it holds in all.
@@ -497,7 +527,7 @@ impl<B: Bus> Recorder<B> {
             self.known.clear();
         }
         let known = self.bus.application(sender).map(|app| Known {
-            browser: is_browser(&app.name, app.program.as_deref()),
+            browser: is_browser(&app.name, app.program.as_deref(), app.toolkit.as_deref()),
             identity: AppIdentity {
                 bundle_id: Some(app.name.clone()).filter(|name| !name.is_empty()),
                 name: Some(app.name),
@@ -521,8 +551,7 @@ impl<B: Bus> Recorder<B> {
         let Some(focus) = focus.filter(|f| f.field != Field::Other) else {
             return;
         };
-        let browser = self.attached.as_ref().is_some_and(|a| a.known.browser);
-        let baseline = if browser {
+        let baseline = if self.counted_only(&focus) {
             self.bus.count(sender, &path)
         } else {
             None
@@ -581,15 +610,24 @@ impl<B: Bus> Recorder<B> {
     /// The focused field `path` is, in a watched application that is not a browser.
     fn focused_field(&self, sender: &str, path: &str) -> Option<Focus> {
         let attached = self.attached.as_ref()?;
-        if attached.sender != sender || attached.known.browser {
+        if attached.sender != sender {
             return None;
         }
         let focused = attached.focused.as_ref()?;
-        (focused.path == path).then(|| focused.focus.clone())
+        (focused.path == path && !self.counted_only(&focused.focus)).then(|| focused.focus.clone())
     }
 
-    /// The focused field is left: its pending value is said, and a browser field
-    /// that changed says how many characters it holds.
+    /// Whether a field's text is never read, only its count kept: a browser's field
+    /// (`is_browser`), a field inside a web document in any application, and a
+    /// terminal, whose contents hold what no role marks as a password (a prompt's)
+    /// and whatever a command printed.
+    fn counted_only(&self, focus: &Focus) -> bool {
+        let browser = self.attached.as_ref().is_some_and(|a| a.known.browser);
+        browser || focus.web || focus.field == Field::Terminal
+    }
+
+    /// The focused field is left: its pending value is said, and a field whose
+    /// text is never read says, if it changed, how many characters it holds.
     fn blur(&mut self, now_ms: i64) {
         self.flush_value(now_ms);
         let Some(attached) = self.attached.as_mut() else {
@@ -598,13 +636,13 @@ impl<B: Bus> Recorder<B> {
         let Some(focused) = attached.focused.take() else {
             return;
         };
-        if attached.known.browser {
-            let sender = attached.sender.clone();
-            self.browser_field_left(&sender, focused, now_ms);
+        let sender = attached.sender.clone();
+        if self.counted_only(&focused.focus) {
+            self.counted_field_left(&sender, focused, now_ms);
         }
     }
 
-    fn browser_field_left(&mut self, sender: &str, focused: Focused, now_ms: i64) {
+    fn counted_field_left(&mut self, sender: &str, focused: Focused, now_ms: i64) {
         let Some(count) = self
             .bus
             .count(sender, &focused.path)
@@ -616,16 +654,21 @@ impl<B: Bus> Recorder<B> {
             return;
         };
         let app = attached.known.identity.clone();
+        let web = attached.known.browser || focused.focus.web;
         let mut extra = field_extras(&focused.focus);
         if focused.focus.field == Field::Secure {
             self.emit_secure(&app, extra, now_ms, now_ms);
             return;
         }
         extra.insert("char_len".into(), json!(count));
+        extra.insert("content_withheld".into(), json!(true));
+        if !web {
+            self.emit("field.value", Some(&app), extra);
+            return;
+        }
         extra.insert("private_state".into(), json!("unknown"));
         insert_str(&mut extra, "browser_id", app.bundle_id.clone());
         extra.insert("window_ref".into(), json!(attached.frame));
-        extra.insert("content_withheld".into(), json!(true));
         self.emit("field.value", Some(&app), extra);
         self.announce_private_unknown(&app, now_ms);
     }
@@ -904,6 +947,14 @@ mod tests {
             name: name.to_string(),
             pid,
             program: Some(program.to_string()),
+            toolkit: Some("GTK".to_string()),
+        }
+    }
+
+    fn made_with(app: Application, toolkit: Option<&str>) -> Application {
+        Application {
+            toolkit: toolkit.map(str::to_string),
+            ..app
         }
     }
 
@@ -912,6 +963,7 @@ mod tests {
             role: role.to_string(),
             field,
             label: Some(label.to_string()),
+            web: false,
         }
     }
 
@@ -921,9 +973,10 @@ mod tests {
             .apps
             .insert(EDITOR.into(), app("Text Editor", 41, "gnome-text-editor"));
         script.apps.insert(OTHER.into(), app("Mail", 42, "mail"));
-        script
-            .apps
-            .insert(BROWSER.into(), app("Firefox", 43, "firefox"));
+        script.apps.insert(
+            BROWSER.into(),
+            made_with(app("Firefox", 43, "firefox"), Some("Gecko")),
+        );
         for (sender, title) in [(EDITOR, "notes.txt"), (OTHER, "Inbox"), (BROWSER, "Docs")] {
             script
                 .titles
@@ -950,8 +1003,12 @@ mod tests {
     }
 
     fn recorder(script: &Script) -> (Recorder<&Script>, Emitter) {
+        recorder_of(script, &["Text Editor", "Firefox"])
+    }
+
+    fn recorder_of<'s>(script: &'s Script, apps: &[&str]) -> (Recorder<&'s Script>, Emitter) {
         let emitter = Emitter::capturing();
-        let apps = vec!["Text Editor".to_string(), "Firefox".to_string()];
+        let apps = apps.iter().map(|app| app.to_string()).collect();
         let recorder = Recorder::new(script, emitter.clone(), apps, "boot-test".to_string());
         (recorder, emitter)
     }
@@ -1227,14 +1284,161 @@ mod tests {
     }
 
     // A browser under a name the table does not know is still a browser by its
-    // program.
+    // program, and by its web engine whatever it is called; an application whose
+    // engine cannot be read is taken as one, so withholding never rests on a list.
     #[test]
-    fn a_browser_is_known_by_its_program_too() {
-        assert!(is_browser("Firefox", None));
-        assert!(is_browser("firefox", None));
-        assert!(is_browser("Some Fork", Some("firefox-bin")));
-        assert!(!is_browser("Code", Some("code")));
-        assert!(!is_browser("Terminal", Some("gnome-terminal-server")));
+    fn a_browser_is_known_by_its_name_its_program_or_its_engine() {
+        let gtk = Some("GTK");
+        assert!(is_browser("Firefox", None, gtk));
+        assert!(is_browser("firefox", None, gtk));
+        assert!(is_browser("Some Fork", Some("firefox-bin"), gtk));
+        assert!(is_browser("Fennec Fork", Some("fennec"), Some("Gecko")));
+        assert!(is_browser(
+            "Brave Nightly Plus",
+            Some("brave-plus"),
+            Some("Chromium")
+        ));
+        assert!(is_browser("Code", Some("code"), Some("Chromium")));
+        assert!(is_browser("Mystery", Some("mystery"), None));
+        assert!(!is_browser("Terminal", Some("gnome-terminal-server"), gtk));
+        assert!(!is_browser("Dolphin", Some("dolphin"), Some("Qt")));
+    }
+
+    /// The text a field held, for a test that must never see it read.
+    fn scripted_text(script: &Script, sender: &str, path: &str, text: &str) {
+        script.text.borrow_mut().insert(
+            Script::key(sender, path),
+            Text {
+                text: text.into(),
+                chars: char_len(text),
+            },
+        );
+    }
+
+    /// Focus `path`, type into it, change its count, and leave it.
+    fn typed_and_left(recorder: &mut Recorder<&Script>, script: &Script, sender: &str, path: &str) {
+        script
+            .counts
+            .borrow_mut()
+            .insert(Script::key(sender, path), 0);
+        recorder.handle(focused(sender, path), 0);
+        recorder.handle(typed(sender, path), 10);
+        recorder.tick(10_000);
+        script
+            .counts
+            .borrow_mut()
+            .insert(Script::key(sender, path), 7);
+        recorder.handle(focused(sender, "/b"), 20_000);
+        recorder.tick(40_000);
+    }
+
+    fn texts_read(script: &Script) -> usize {
+        script
+            .reads
+            .borrow()
+            .iter()
+            .filter(|r| r.starts_with("text"))
+            .count()
+    }
+
+    // A browser on no list, named anything, is a browser by its web engine: an
+    // allowlisted Gecko or Chromium application (a renamed fork, an Electron
+    // browser) never has its text read, and says only its count.
+    #[test]
+    fn an_application_on_a_web_engine_never_has_its_text_read() {
+        for (name, engine) in [("Fennec Fork", "Gecko"), ("Chat", "Chromium")] {
+            let mut script = script();
+            script.apps.insert(
+                ":1.30".into(),
+                made_with(app(name, 50, "fork"), Some(engine)),
+            );
+            script
+                .titles
+                .insert(Script::key(":1.30", "/w1"), "Page".to_string());
+            script.focus.insert(
+                Script::key(":1.30", "/f"),
+                field("entry", Field::Editable, "Search"),
+            );
+            scripted_text(&script, ":1.30", "/f", "my secret search");
+            let (mut recorder, emitter) = recorder_of(&script, &[name]);
+            recorder.handle(active(":1.30", "/w1", true), 0);
+            typed_and_left(&mut recorder, &script, ":1.30", "/f");
+
+            assert_eq!(texts_read(&script), 0, "{name}: text was read");
+            let value = last(&emitter, "field.value");
+            assert_eq!(value["content_withheld"], json!(true), "{name}");
+            assert_eq!(value["browser_id"], json!(name));
+            assert!(value.get("text").is_none());
+            assert!(*script.watched.borrow() == vec![format!("watch :1.30 text=false")]);
+        }
+    }
+
+    // An application whose toolkit could not be read is not known not to be a web
+    // engine, so its text is withheld too.
+    #[test]
+    fn an_application_whose_engine_cannot_be_read_never_has_its_text_read() {
+        let mut script = script();
+        script.apps.insert(
+            EDITOR.into(),
+            made_with(app("Text Editor", 41, "gnome-text-editor"), None),
+        );
+        scripted_text(&script, EDITOR, "/f", "draft");
+        let (mut recorder, emitter) = recorder(&script);
+        recorder.handle(active(EDITOR, "/w1", true), 0);
+        typed_and_left(&mut recorder, &script, EDITOR, "/f");
+
+        assert_eq!(texts_read(&script), 0);
+        assert_eq!(
+            last(&emitter, "field.value")["content_withheld"],
+            json!(true)
+        );
+    }
+
+    // A field inside a web document in any application (a web view in a native
+    // one) is a browser's field: never read, its count only.
+    #[test]
+    fn a_field_inside_a_web_document_never_has_its_text_read() {
+        let mut script = script();
+        let mut web = field("entry", Field::Editable, "Comment");
+        web.web = true;
+        script.focus.insert(Script::key(EDITOR, "/web"), web);
+        scripted_text(&script, EDITOR, "/web", "a web comment");
+        let (mut recorder, emitter) = recorder(&script);
+        recorder.handle(active(EDITOR, "/w1", true), 0);
+        typed_and_left(&mut recorder, &script, EDITOR, "/web");
+
+        assert_eq!(texts_read(&script), 0);
+        let value = last(&emitter, "field.value");
+        assert_eq!(value["content_withheld"], json!(true));
+        assert_eq!(value["char_len"], json!(7));
+        assert!(value.get("text").is_none());
+    }
+
+    // A terminal's contents are what a prompt's password (which no role marks) and a
+    // command's output are made of, so they are never read: a terminal left after
+    // it changed says only how many characters it holds, and nothing about a
+    // browser, since it is not one.
+    #[test]
+    fn a_terminal_never_has_its_text_read() {
+        let mut script = script();
+        script.focus.insert(
+            Script::key(EDITOR, "/t"),
+            field("terminal", Field::Terminal, "Terminal"),
+        );
+        scripted_text(&script, EDITOR, "/t", "$ sudo -k\n[sudo] password: hunter2");
+        let (mut recorder, emitter) = recorder(&script);
+        recorder.handle(active(EDITOR, "/w1", true), 0);
+        typed_and_left(&mut recorder, &script, EDITOR, "/t");
+
+        assert_eq!(texts_read(&script), 0);
+        let value = last(&emitter, "field.value");
+        assert_eq!(value["role"], json!("terminal"));
+        assert_eq!(value["content_withheld"], json!(true));
+        assert_eq!(value["char_len"], json!(7));
+        assert!(value.get("text").is_none());
+        assert!(value.get("browser_id").is_none());
+        assert!(value.get("private_state").is_none());
+        assert!(!kinds(&emitter).contains(&"gap:private_unknown".to_string()));
     }
 
     // A window title settles before it is said, and the title a window was focused

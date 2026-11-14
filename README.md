@@ -482,8 +482,11 @@ active application on the list has its focus, titles and text subscribed, by mat
 naming its connection; every other application tells the helper only that one of its
 windows became active. No Linux browser's private-browsing state can be read, so a
 browser's typed text never reaches the helper at all: a field it changed arrives as its
-character count alone, withheld. `Compux.Protocol.history_systems/0` names the systems
-whose helper records.
+character count alone, withheld. An application is a browser by its name, its program,
+or the web engine its toolkit names (and one that names none is taken as one), and a
+field inside a web document is a browser's field anywhere. A terminal's text is never
+read either, only its count. `Compux.Protocol.history_systems/0` names the systems whose
+helper records.
 
 ## Status
 

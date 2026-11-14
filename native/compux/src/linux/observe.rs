@@ -46,12 +46,21 @@ use zbus::zvariant::{DynamicDeserialize, DynamicType, OwnedObjectPath, OwnedValu
 use zbus::{Connection, Message, MessageStream};
 
 use super::vocabulary::{self, ACTIVE, EDITABLE, PASSWORD_TEXT, TERMINAL};
+
+/// `ATSPI_ROLE_DOCUMENT_WEB`: a web page, in a browser or in any application's web
+/// view.
+const DOCUMENT_WEB: u32 = 95;
+/// How far up a focused field's ancestry is read for a web document; past it, the
+/// field is taken as inside one.
+const MAX_ANCESTRY: usize = 64;
 use crate::capture::{now_ms, Emitter};
 use crate::recorder::{Application, Bus, Event, Field, Focus, Recorder, Text, MAX_TEXT_CHARS};
 
 const EVENT_OBJECT: &str = "org.a11y.atspi.Event.Object";
 const ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
 const TEXT_INTERFACE: &str = "org.a11y.atspi.Text";
+const APPLICATION_INTERFACE: &str = "org.a11y.atspi.Application";
+const NULL_PATH: &str = "/org/a11y/atspi/null";
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 const BUS_DAEMON: &str = "org.freedesktop.DBus";
 const BUS_DAEMON_PATH: &str = "/org/freedesktop/DBus";
@@ -569,7 +578,7 @@ impl LiveBus {
         self.connection.borrow().clone()
     }
 
-    fn lists_text(&self, sender: &str, path: &str) -> bool {
+    fn lists(&self, sender: &str, path: &str, interface: &str) -> bool {
         let listed: Vec<String> = async_io::block_on(call(
             &self.connection(),
             sender,
@@ -579,7 +588,59 @@ impl LiveBus {
             &(),
         ))
         .unwrap_or_default();
-        listed.iter().any(|name| name == TEXT_INTERFACE)
+        listed.iter().any(|name| name == interface)
+    }
+
+    /// The toolkit an application's root names, read only where the root lists the
+    /// Application interface. `None` when it does not say.
+    fn toolkit(&self, sender: &str) -> Option<String> {
+        if !self.lists(sender, ROOT, APPLICATION_INTERFACE) {
+            return None;
+        }
+        let name: Option<String> = async_io::block_on(property(
+            &self.connection(),
+            sender,
+            ROOT,
+            APPLICATION_INTERFACE,
+            "ToolkitName",
+        ));
+        name.filter(|name| !name.trim().is_empty())
+    }
+
+    /// Whether a control sits inside a web document: its own role and each
+    /// ancestor's, read up to its application's root. An ancestry that will not
+    /// read that far, or is deeper than MAX_ANCESTRY, is taken as inside one, so a
+    /// field is read only where it is known not to be a web page's.
+    fn in_web_document(&self, sender: &str, path: &str, role: u32) -> bool {
+        if role == DOCUMENT_WEB {
+            return true;
+        }
+        let connection = self.connection();
+        let mut at = path.to_string();
+        for _ in 0..MAX_ANCESTRY {
+            let parent: Option<(String, OwnedObjectPath)> =
+                async_io::block_on(property(&connection, sender, &at, ACCESSIBLE, "Parent"));
+            let Some((bus, parent)) = parent else {
+                return true;
+            };
+            let parent = parent.to_string();
+            if parent == ROOT || parent == NULL_PATH || bus != sender {
+                return false;
+            }
+            let role: Option<u32> = async_io::block_on(call(
+                &connection,
+                sender,
+                &parent,
+                ACCESSIBLE,
+                "GetRole",
+                &(),
+            ));
+            match role {
+                Some(DOCUMENT_WEB) | None => return true,
+                Some(_) => at = parent,
+            }
+        }
+        true
     }
 
     fn words(&self, sender: &str, path: &str, name: &str) -> Option<String> {
@@ -618,12 +679,17 @@ fn unique_name(sender: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
-/// What kind of field a control is, from its role and its states.
+/// What kind of field a control is, from its role and its states. A terminal is its
+/// own kind, whose text is never read: what a prompt asks for there (a password to
+/// `sudo` or `ssh`) is marked by no role.
 pub fn field_of(role: u32, states: &[u32]) -> Field {
     if role == PASSWORD_TEXT {
         return Field::Secure;
     }
-    if role == TERMINAL || vocabulary::textual(role, vocabulary::has(states, EDITABLE)) {
+    if role == TERMINAL {
+        return Field::Terminal;
+    }
+    if vocabulary::textual(role, vocabulary::has(states, EDITABLE)) {
         return Field::Editable;
     }
     Field::Other
@@ -656,6 +722,7 @@ impl Bus for LiveBus {
             name,
             pid,
             program: program(pid),
+            toolkit: self.toolkit(sender),
         })
     }
 
@@ -673,10 +740,14 @@ impl Bus for LiveBus {
         let label = self
             .words(sender, path, "Name")
             .or_else(|| self.words(sender, path, "Description"));
+        let field = field_of(role, &states);
+        // Only a field's ancestry matters: nothing else's text is ever read.
+        let web = field != Field::Other && self.in_web_document(sender, path, role);
         Some(Focus {
             role: vocabulary::role(role),
-            field: field_of(role, &states),
+            field,
             label,
+            web,
         })
     }
 
@@ -695,7 +766,7 @@ impl Bus for LiveBus {
     }
 
     fn count(&self, sender: &str, path: &str) -> Option<i64> {
-        if !self.lists_text(sender, path) {
+        if !self.lists(sender, path, TEXT_INTERFACE) {
             return None;
         }
         let count: Option<i32> = async_io::block_on(property(
@@ -758,7 +829,10 @@ mod tests {
             (
                 APP,
                 PID as u32,
-                Node::of(75).named("Fixture Editor").holding(APP, &["/w"]),
+                Node::of(75)
+                    .named("Fixture Editor")
+                    .made_with("GTK", "3.24.41")
+                    .holding(APP, &["/w"]),
             ),
             (
                 OTHER,
@@ -770,7 +844,7 @@ mod tests {
             states: vec![fake::ACTIVE, fake::ENABLED, fake::SHOWING],
             ..Node::of(23)
                 .named("notes.txt")
-                .holding(APP, &["/w/f", "/w/p"])
+                .holding(APP, &["/w/f", "/w/p", "/w/doc"])
         };
         desktop.put(APP, "/w", window);
         desktop.put(OTHER, "/w", Node::of(23).named("Inbox"));
@@ -784,6 +858,25 @@ mod tests {
         secure.text = "hunter2".to_string();
         desktop.put(APP, "/w/p", secure);
         desktop.put(APP, "/w/b", Node::of(BUTTON_ROLE).named("Save"));
+        desktop.put(
+            APP,
+            "/w/doc",
+            Node::of(DOCUMENT_WEB).holding(APP, &["/w/doc/f"]),
+        );
+        desktop.put(
+            APP,
+            "/w/doc/f",
+            Node::of(ENTRY_ROLE)
+                .named("Comment")
+                .listing(&["Text"])
+                .reading(&[fake::EDITABLE]),
+        );
+        // An entry no node lists: its ancestry does not read.
+        desktop.put(
+            APP,
+            "/orphan",
+            Node::of(ENTRY_ROLE).named("Loose").listing(&["Text"]),
+        );
         desktop
     }
 
@@ -949,7 +1042,7 @@ mod tests {
     fn fields_are_classified_by_role_and_state() {
         assert_eq!(field_of(PASSWORD_ROLE, &[]), Field::Secure);
         assert_eq!(field_of(ENTRY_ROLE, &[]), Field::Editable);
-        assert_eq!(field_of(TERMINAL, &[]), Field::Editable);
+        assert_eq!(field_of(TERMINAL, &[]), Field::Terminal);
         assert_eq!(field_of(BUTTON_ROLE, &[]), Field::Other);
         // A text node counts only while it is editable.
         let editable = [1u32 << EDITABLE, 0];
@@ -967,11 +1060,18 @@ mod tests {
 
         let app = bus.application(APP).expect("the application");
         assert_eq!(app.name, "Fixture Editor");
+        assert_eq!(app.toolkit.as_deref(), Some("GTK"));
+        let other = bus.application(OTHER).expect("the other application");
+        assert_eq!(
+            other.toolkit, None,
+            "a root that lists no Application says no toolkit"
+        );
         assert_eq!(app.pid, PID);
         let focus = bus.focus(APP, "/w/f").expect("the field");
         assert_eq!(focus.role, "entry");
         assert_eq!(focus.field, Field::Editable);
         assert_eq!(focus.label.as_deref(), Some("Search"));
+        assert!(!focus.web, "read up to the application, no web document");
         assert_eq!(
             bus.text(APP, "/w/f"),
             Some(Text {
@@ -981,6 +1081,20 @@ mod tests {
         );
         assert_eq!(bus.count(APP, "/w/b"), None, "a button lists no Text");
         assert_eq!(fake.sent("GetText").len(), 1);
+    }
+
+    // A field inside a web document is a web page's, and one whose ancestry does not
+    // read as far as its application is taken as one: its text is never read.
+    #[test]
+    fn a_field_in_a_web_document_or_an_unreadable_ancestry_reads_as_web() {
+        let (_fake, connection) = Fake::start(desktop(), TIMEOUT);
+        let bus = LiveBus::over(connection);
+
+        let inside = bus.focus(APP, "/w/doc/f").expect("the field");
+        let orphan = bus.focus(APP, "/orphan").expect("the field");
+
+        assert!(inside.web);
+        assert!(orphan.web);
     }
 
     // Watching an application subscribes rules naming it, and unwatching removes

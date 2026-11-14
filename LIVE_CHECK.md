@@ -3213,10 +3213,11 @@ while you are away. On your return, `app.activated` appears again, with no
 
 Run `observe` with the two names step 0 gave (for example
 `'["Text Editor","Terminal"]'`). Type a line in the editor and save the file: the
-save's new window title arrives as `window.title_changed`. Run `ls` in the terminal:
-its text arrives as `field.value` (`"role": "terminal"`) about a second after the
-output stops. Write down whether each one records, and what its `role` is. Press
-ctrl-D.
+save's new window title arrives as `window.title_changed`. Run `ls` in the terminal,
+then click back into the editor: a `field.value` with `"role": "terminal"`,
+`"content_withheld": true` and a `char_len` arrives, with **no `text`**. A terminal's
+text is never read, since a prompt's password is marked by no role. Write down whether
+each one records, and what its `role` is. Press ctrl-D.
 
 ## 4. Firefox: titles yes, typed text never
 
@@ -3238,7 +3239,9 @@ a later release would pin a marker from. Press ctrl-D.
 
 Run `observe` with VS Code's or Chrome's name, if step 0 listed it. Write down whether
 anything arrives. Without `--force-renderer-accessibility` and `ACCESSIBILITY_ENABLED=1`
-it publishes no tree, and nothing should.
+it publishes no tree, and nothing should. If it does publish one, its toolkit is
+Chromium, so it is taken as a browser: a field it changed arrives withheld, its count
+alone, never its text.
 
 ## 6. Through Fermix, once
 

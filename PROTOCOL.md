@@ -930,25 +930,32 @@ any other system's answers `observe_start` with `ok: false`.
   `field_label`, `window_title`) when one of its controls takes the focus. `field.value` (`role`, `field_label`,
   `text`, `char_len`, `content_withheld`) is the focused field's settled text (0.6 s debounce, 5 s ceiling; leaving
   the field settles it at once), read with `Text.GetText` only after `GetInterfaces` lists `Text`. `role` is
-  AT-SPI's role word (§6.1's `native_role`). A field is a `password text`, an `entry` or `combo box`, a `terminal`,
-  or a `text` that reads EDITABLE; nothing else's text is a value. No `browser.navigated`, `app.deactivated`,
-  `system.*` or `session.*` is emitted on Linux.
+  AT-SPI's role word (§6.1's `native_role`). A field is a `password text`, an `entry` or `combo box`, or a `text`
+  that reads EDITABLE; nothing else's text is a value. No `browser.navigated`, `app.deactivated`, `system.*` or
+  `session.*` is emitted on Linux.
+- **A terminal's text is never read.** A prompt's password (`sudo`, `ssh`) is marked by no role, and a command
+  prints what it likes, so a `terminal` that changed is said, once it is left, as a `field.value` with
+  `content_withheld: true` and its `char_len` alone.
 - **A password field** (`password text`) is never read: its change is `observer.gap{secure_input}` (no `app`) and
   a `field.value` with `content_withheld: true` and no text.
 - **A browser's typed text never reaches the helper.** No Linux browser has a private-window marker the helper
   trusts, so every browser is `unknown`: a field that changed is said, once it is left, as a `field.value` with
   `content_withheld: true`, `private_state: "unknown"`, `browser_id` (the browser's name), `window_ref` (its window's
   object path) and `char_len` (its `CharacterCount`), and `observer.gap{private_unknown}` (with the browser's `app`)
-  once per browser per observation. A browser is an application whose name is one a browser is known by (Firefox,
-  Chromium, Google Chrome, Brave, Microsoft Edge, Vivaldi, Opera, Epiphany, …, compared without case) or whose
-  program is (`firefox`, `chrome`, `chromium`, `msedge`, …). Its window titles and focus are recorded as any
-  application's.
+  once per browser per observation. Its window titles and focus are recorded as any application's.
+- **What is a browser fails closed.** An application is one when its name is one a browser is known by (Firefox,
+  Chromium, Google Chrome, Brave, Microsoft Edge, Vivaldi, Opera, Epiphany, …, compared without case), when its
+  program is (`firefox`, `chrome`, `chromium`, `msedge`, …), when its root's `ToolkitName` names a web engine
+  (Gecko, Chromium or WebKit: every Firefox and Chromium fork, Thunderbird and every Electron application), or when
+  its root says no toolkit at all. A field inside a web document (`document web` among its ancestors) is a browser's
+  field in any application, and so is one whose ancestry does not read as far as its application. So withholding
+  never rests on a list being complete.
 - **Gaps only this build authors.** `accessibility_bus_lost` (no `app`): the bus went away, after what was pending
   was said; the helper asks for the bus again every 5 s, at most for an hour, and then stops observing.
   `overflow` (no `app`): signals arrived faster than the helper took them (it holds 1024) and some were dropped.
   `truncated` (no `app`): a value was cut at 64 KiB; its `char_len` is still the whole.
 - **What it never does.** No `Action.GetActions`, no `Properties.GetAll`, no read of an application not on the
-  list beyond its root's `Name` and its process (`GetConnectionUnixProcessID`, `/proc/<pid>/exe`) when one of its
-  windows becomes active, and no change to the session: an application whose toolkit publishes no tree (Qt without
+  list beyond its root's `Name` and `ToolkitName` and its process (`GetConnectionUnixProcessID`, `/proc/<pid>/exe`)
+  when one of its windows becomes active, and no change to the session: an application whose toolkit publishes no tree (Qt without
   `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`, a Chromium or Electron one without its switches, a GTK 4 one started before
   the bus) is not switched on, and records nothing.
