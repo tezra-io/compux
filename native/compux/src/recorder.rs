@@ -1427,7 +1427,10 @@ mod tests {
             assert_eq!(value["content_withheld"], json!(true), "{name}");
             assert_eq!(value["browser_id"], json!(name));
             assert!(value.get("text").is_none());
-            assert!(*script.watched.borrow() == vec![format!("watch :1.30 text=false")]);
+            assert_eq!(
+                *script.watched.borrow(),
+                vec!["watch :1.30 text=false".to_string()]
+            );
         }
     }
 
