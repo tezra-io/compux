@@ -128,6 +128,14 @@ defmodule Compux.Protocol do
   # is not additive, so the version bumps and the handshake refuses the pairing.
   @protocol_version 12
 
+  # The systems whose helper of this release answers `observe_start` with a
+  # recorder (computer history's capture mode): macOS through its Accessibility
+  # observer since v6, and Linux through the accessibility bus since 0.12.0. Every
+  # other system's helper refuses it. A consumer reads this, not its own host, to
+  # know whether the helper it is paired with can record there: the release pairs
+  # them, as it pairs the actions.
+  @history_systems [:macos, :linux]
+
   @actions ~w(screenshot left_click right_click double_click mouse_move left_click_drag scroll type key wait inspect wait_for_change paste elements windows press set_value focus select toggle expand collapse scroll_to wait_for select_target release_target)
 
   # Read-only in both senses the wire needs: a consumer may auto-run one without a
@@ -241,6 +249,14 @@ defmodule Compux.Protocol do
 
   @spec actions() :: [String.t()]
   def actions, do: @actions
+
+  @doc """
+  The systems whose helper of this release records computer history: it answers
+  `observe_start` and pushes the capture-mode `event` frames (PROTOCOL.md,
+  "Computer history").
+  """
+  @spec history_systems() :: [:macos | :linux, ...]
+  def history_systems, do: @history_systems
 
   @doc "Where an `elements` walk or an `until` condition may start (v12)."
   @spec scopes() :: [String.t()]

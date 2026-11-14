@@ -77,6 +77,10 @@ mod listing;
 #[cfg(target_os = "linux")]
 mod linux;
 
+/// Computer history on Linux: what the recorder emits for each accessibility-bus
+/// event, decided apart from the bus so it is tested on every system.
+mod recorder;
+
 /// Held synthetic input: the press registry and the `Platform` seam every input
 /// sequence posts through, so nothing this process presses can outlive the action.
 mod held;

@@ -6,6 +6,8 @@
 //!   and the display a helper started before login takes from the user manager;
 //! - `bus`: where the accessibility bus is, and a connection to it that answers;
 //! - `probe`: what `probe` reports of the bus, its packages and the toolkits;
+//! - `observe`: computer history's recorder on the bus (its decisions are
+//!   `recorder`'s);
 //! - `vocabulary`: AT-SPI's role and state numbers as words;
 //! - `routes`: which verbs a node has a route for, from one read of it;
 //! - `atspi`: the reader itself;
@@ -21,6 +23,7 @@ pub mod atspi;
 pub mod bus;
 pub mod display;
 mod identity;
+pub mod observe;
 pub mod pixels;
 pub mod portal;
 mod private_file;

@@ -47,6 +47,15 @@ defmodule Compux.ProtocolTest do
     end
   end
 
+  describe "history_systems/0" do
+    # The systems whose helper of this release answers `observe_start` with a
+    # recorder: what a consumer reads to know whether this machine can record,
+    # since the helper it runs is the one this release pairs with it.
+    test "names macOS and Linux, and nothing else" do
+      assert Protocol.history_systems() == [:macos, :linux]
+    end
+  end
+
   describe "actions/0 and read_only?/1" do
     test "covers the v1 + V2 verbs" do
       for a <-

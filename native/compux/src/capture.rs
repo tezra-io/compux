@@ -3337,14 +3337,32 @@ mod imp {
     }
 }
 
-// --- non-macOS stub ----------------------------------------------------------
+// --- Linux engine ------------------------------------------------------------
 
-#[cfg(not(target_os = "macos"))]
+// The accessibility bus (M97 stage 4): `linux::observe` owns the connection and
+// `recorder` decides every frame, the same kinds and fields this module's macOS
+// engine emits.
+#[cfg(target_os = "linux")]
+mod imp {
+    use super::*;
+
+    pub fn start(config: ObserveConfig, emitter: Emitter) -> Result<(), String> {
+        crate::linux::observe::start(config.apps, emitter)
+    }
+
+    pub fn stop() {
+        crate::linux::observe::stop();
+    }
+}
+
+// --- every other system ---------------------------------------------------------
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod imp {
     use super::*;
 
     pub fn start(_config: ObserveConfig, _emitter: Emitter) -> Result<(), String> {
-        Err("computer-history capture is only supported on macOS".to_string())
+        Err("computer-history capture is only supported on macOS and Linux".to_string())
     }
 
     pub fn stop() {}
