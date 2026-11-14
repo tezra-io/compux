@@ -26,6 +26,13 @@ name: linux-desktop
 #          repaints refused, twenty select and release cycles, and on a second X
 #          server with no window manager a window with an X border read from
 #          inside it and the badge kept over its window but under a popup.
+#   observe  computer history's recorder (M97 stage 4, observe.py): on each fixture
+#          in Ubuntu 24.04 nothing at all for an application not on its list, and
+#          for the fixture listed by its name on the bus its window announced, a
+#          typed value recorded and a password field never read; the same on GTK 3
+#          in 22.04 under the bus monitor, where every subscription to an
+#          application's content must name its connection; and on Chromium its
+#          typed text withheld, its count only, with one private_unknown gap.
 #   no-c-deps  the helper and its X11 badge built and tested in plain Ubuntu 24.04
 #          with no C library but the C runtime (no_c_deps.sh), their links
 #          checked, and clippy for aarch64-unknown-linux-gnu.
@@ -126,6 +133,25 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-desktop-x11-bound
+          path: ${{ runner.temp }}/spike-out
+          if-no-files-found: warn
+
+  observe:
+    name: computer history's recorder (Ubuntu 24.04, 22.04, Chromium)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: The recorder on GTK 3, GTK 4 and Qt, on GTK 3 under ATK bridge 2.38, and on Chromium
+        env:
+          SPIKE_STAGES: observe observe-jammy observe-chromium
+          SPIKE_CACHE: ${{ runner.temp }}/spike-cache
+        run: fixtures/linux/spike/spike.sh "$RUNNER_TEMP/spike-out" 1
+      - name: Keep what the sessions wrote
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-desktop-observe
           path: ${{ runner.temp }}/spike-out
           if-no-files-found: warn
 

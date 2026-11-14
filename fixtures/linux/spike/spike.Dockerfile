@@ -10,5 +10,5 @@ FROM ${BASE}
 USER root
 COPY compux compux-indicator-x11 /opt/compux/
 COPY elements_timing.py a11y_tree.py measure.sh atk_bridge_check.sh verbs.py pixels.py \
-     x11_oracle.py bound.py panes.py xcb_victim.py /opt/compux-spike/
+     x11_oracle.py bound.py panes.py xcb_victim.py observe.py /opt/compux-spike/
 USER tester

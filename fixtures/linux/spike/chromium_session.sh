@@ -4,6 +4,7 @@
 # chromium_page.html; dumps the page's tree, then times compux's `elements` on it.
 # M86 L0(a), Chromium.
 #   chromium_session.sh RUNS
+#   chromium_session.sh observe   computer history's recorder on the page (observe.py)
 #
 # Chromium runs with --no-sandbox: its sandbox needs user namespaces, which the
 # container's seccomp profile refuses, and this container has no network and shows
@@ -54,5 +55,10 @@ started+=("$!")
 
 python3 /opt/compux-spike/a11y_tree.py --app-window "Compux Fixture Chromium" \
   --out "$out/chromium-tree.json"
+if [ "$runs" = observe ]; then
+  python3 /opt/compux-spike/observe.py --binary /opt/compux/compux --toolkit chromium \
+    --out "$out/chromium-observe.json"
+  exit $?
+fi
 python3 /opt/compux-spike/elements_timing.py --binary /opt/compux/compux --runs "$runs" \
   --expect "Compux Fixture Chromium" --out "$out/chromium-elements.json"

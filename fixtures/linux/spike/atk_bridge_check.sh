@@ -6,14 +6,19 @@
 #   atk_bridge_check.sh walk RUNS   `elements` RUNS times (elements_timing.py)
 #   atk_bridge_check.sh verbs       every verb on the fixture (verbs.py), whose
 #                                   writes are counted too
+#   atk_bridge_check.sh observe     computer history's recorder on the fixture
+#                                   (observe.py), and every subscription it made to
+#                                   an application's focus, titles or text names
+#                                   that application's connection
 set -euo pipefail
-mode=${1:?usage: atk_bridge_check.sh walk RUNS | verbs}
+mode=${1:?usage: atk_bridge_check.sh walk RUNS | verbs | observe}
 runs=${2:-20}
 out=/tmp/spike-out
 mkdir -p "$out"
 case "$mode" in
   walk) log=$out/gtk3-a11y-bus.log; verdict=$out/gtk3-jammy-verdict.txt ;;
   verbs) log=$out/gtk3-verbs-a11y-bus.log; verdict=$out/gtk3-jammy-verbs-verdict.txt ;;
+  observe) log=$out/gtk3-observe-a11y-bus.log; verdict=$out/gtk3-jammy-observe-verdict.txt ;;
   *) echo "atk_bridge_check.sh: no such mode $mode" >&2; exit 2 ;;
 esac
 
@@ -43,9 +48,12 @@ verbs_rc=0
 if [ "$mode" = walk ]; then
   python3 /opt/compux-spike/elements_timing.py --binary /opt/compux/compux --runs "$runs" \
     --expect "Compux Fixture GTK3" --out "$out/gtk3-jammy-elements.json"
-else
+elif [ "$mode" = verbs ]; then
   python3 /opt/compux-spike/verbs.py --binary /opt/compux/compux --toolkit gtk3 \
     --state /tmp/compux-fixture-state/gtk3.json --out "$out/gtk3-jammy-verbs.json" || verbs_rc=$?
+else
+  python3 /opt/compux-spike/observe.py --binary /opt/compux/compux --toolkit gtk3 \
+    --out "$out/gtk3-jammy-observe.json" || verbs_rc=$?
 fi
 sleep 1
 kill "$monitor"; wait "$monitor" 2>/dev/null || true
@@ -64,6 +72,11 @@ calls=$(grep -c '^method call' "$log" || true)
 acts=$(grep -cE 'member=(DoAction|SetTextContents|InsertText|DeleteText|SelectChild|GrabFocus)$' "$log" || true)
 value_sets=$(grep -A1 'member=Set$' "$log" | grep -c '"org.a11y.atspi.Value"' || true)
 writes=$((acts + value_sets))
+# The recorder's subscriptions: every match rule that asks for an application's
+# focus, its titles or its text must name that application's connection.
+rules=$(grep -A1 'member=AddMatch$' "$log" | grep '^ *string' || true)
+content_rules=$(printf '%s\n' "$rules" | grep -cE "TextChanged|arg0='focused'|PropertyChange" || true)
+unscoped=$(printf '%s\n' "$rules" | grep -E "TextChanged|arg0='focused'|PropertyChange" | grep -vc "sender=':" || true)
 {
   echo "fixture pid before: $before"
   echo "fixture pid after:  $after"
@@ -73,6 +86,7 @@ writes=$((acts + value_sets))
   echo "Action.GetName: $getname"
   echo "Get(NActions): $nactions"
   echo "writes: $writes"
+  echo "content subscriptions: $content_rules, naming no connection: $unscoped"
 } | tee "$verdict"
 if [ "$after" != "$before" ]; then
   echo "VERDICT: the fixture did not survive"; exit 1
@@ -82,6 +96,19 @@ if [ "$getactions" -ne 0 ]; then
 fi
 if [ "$getall" -ne 0 ]; then
   echo "VERDICT: Properties.GetAll was sent"; exit 1
+fi
+if [ "$mode" = observe ]; then
+  if [ "$content_rules" -eq 0 ]; then
+    echo "VERDICT: the recorder subscribed to no application, so the check proves nothing"; exit 1
+  fi
+  if [ "$unscoped" -ne 0 ]; then
+    echo "VERDICT: a subscription to content named no application's connection"; exit 1
+  fi
+  if [ "$verbs_rc" -ne 0 ]; then
+    echo "VERDICT: the bus was clean, but the recorder failed (observe.py exit $verbs_rc)"; exit 1
+  fi
+  echo "VERDICT: survived, no GetActions, no GetAll, $content_rules content subscriptions, each naming its application"
+  exit 0
 fi
 # The positive control: a walk that never named an action would pass the two
 # checks above without ever reaching the code that could have sent GetActions.
