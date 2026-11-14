@@ -903,23 +903,41 @@ an acked start, is the wire it has been since protocol 6: the same two `ack`s, t
 accessibility bus. `Compux.Protocol.history_systems/0` names the systems whose helper records (`[:macos, :linux]`);
 any other system's answers `observe_start` with `ok: false`.
 
+What of a focused control may leave is decided by one set of rules on both systems, each system's observer reporting
+only facts (the control's kind from its role, whether its application is a browser or a terminal emulator, whether it
+sits in web content): a password field is never read; a terminal's text is never read, its count alone; nor is a field
+that may hold a password no role marks (below); a browser's field, and a web page's in any application, leaves its
+text only from a window known not to be private, which on Linux is none; any other field is read. In a browser or web
+content only a field's `field_label` is sent, never the name of whatever else takes the focus (an address bar's
+suggestion row is named by what was typed and the address it offers). On macOS a password field is known by its
+subrole (`AXSecureTextField`), and an application is a terminal emulator by its bundle id or by holding the
+controlling side of a pseudo-terminal (`/dev/ptmx`), which every terminal emulator holds for each shell it runs (one
+whose open files cannot be listed is taken as one); its fields are counted (`AXNumberOfCharacters`), never read.
+
 ```json
-{"type":"request","request_id":"o-start","action":"observe_start","params":{"apps":["Text Editor","Firefox"]}}
+{"type":"request","request_id":"o-start","action":"observe_start","params":{"apps":["fixture_gtk3.py","Chromium"]}}
 {"type":"ack","action":"observe_start","ok":true,"protocol_version":12}
 {"type":"event","v":1,"ts":1763130000000,"seq":1,"boot_id":"compux-4711-…","kind":"app.activated",
- "app":{"bundle_id":"Text Editor","name":"Text Editor","pid":4711}}
+ "app":{"bundle_id":"fixture_gtk3.py","name":"fixture_gtk3.py","pid":4711}}
 {"type":"event","v":1,"ts":1763130000004,"seq":2,"boot_id":"compux-4711-…","kind":"window.focused",
- "app":{"bundle_id":"Text Editor","name":"Text Editor","pid":4711},"window_title":"notes.txt"}
+ "app":{"bundle_id":"fixture_gtk3.py","name":"fixture_gtk3.py","pid":4711},"window_title":"Compux Fixture GTK3"}
 ```
 
 - **What names an application.** `apps` and `app.bundle_id` hold its name on the accessibility bus, the `Name` of
   its root (`/org/a11y/atspi/accessible/root`), matched exactly; `app.pid` is its connection's process. On macOS
-  the same fields hold a bundle id. An application whose root has no name is never recorded.
+  the same fields hold a bundle id. An application whose root has no name is never recorded. The name is the
+  application's to give, and is not its window title: a GTK application's is its program name (`g_get_prgname()`,
+  its executable's name unless it sets another), a Qt one's its application name (its executable's unless it sets
+  one). The example's are the GTK 3 fixture's and Debian's Chromium's, as the recorder's CI reads them. Read the
+  names on a computer's bus as LIVE_CHECK.md's Linux history check does in its step 0.
 - **What is asked of every application.** Two match rules only: a window's `StateChanged` with `arg0='active'`,
-  which carries no text, and the bus daemon's `NameOwnerChanged`. Focus (`StateChanged` with `arg0='focused'`),
-  titles (`PropertyChange` with `arg0='accessible-name'`) and text (`TextChanged`) are asked only of the one active
-  application on the list, by rules that name its connection (`sender=':1.42'`), added when it comes in front and
-  removed when it leaves. A browser's rules leave out `TextChanged`, whose body is the text itself. The helper
+  which carries no text, and the bus daemon's `NameOwnerChanged`. An object that becomes active is taken as a window
+  only where one `GetRole` of it answers a frame, a window, a dialog, an alert or a file chooser: GTK 3 makes a tree
+  view's cells read ACTIVE too. Focus (`StateChanged` with `arg0='focused'`) and text (`TextChanged`) are asked only
+  of the one active application on the list, by rules that name its connection (`sender=':1.42'`), added when it
+  comes in front and removed when it leaves; titles (`PropertyChange` with `arg0='accessible-name'`) only of its
+  active window, by a rule that names its connection and the window's path. A browser's rules leave out
+  `TextChanged`, whose body is the text itself. The helper
   registers (`RegisterEvent`, sent as `(sas)`) `object:state-changed:active`, `object:state-changed:focused`,
   `object:text-changed`, `object:property-change:accessible-name` and `window:activate`.
 - **The kinds.** `app.activated` (with `prev_bundle_id`, the application on the list it left) when a window of a
@@ -927,7 +945,9 @@ any other system's answers `observe_start` with `ok: false`.
   window that stops being active is given 300 ms for another of the same application's to take over, which is a
   window switch, not an application switch. `window.title_changed` (`window_title`) is the active window's settled
   title (1 s debounce, 5 s ceiling, never the title it was focused with again). `focus.changed` (`role`,
-  `field_label`, `window_title`) when one of its controls takes the focus. `field.value` (`role`, `field_label`,
+  `field_label`, `window_title`) when one of its controls takes the focus; in a browser or inside a web document,
+  `field_label` only for a field. A control known to have the focus is not asked again while it keeps it, a field or
+  not. `field.value` (`role`, `field_label`,
   `text`, `char_len`, `content_withheld`) is the focused field's settled text (0.6 s debounce, 5 s ceiling; leaving
   the field settles it at once), read with `Text.GetText` only after `GetInterfaces` lists `Text`. `role` is
   AT-SPI's role word (§6.1's `native_role`). A field is a `password text`, an `entry` or `combo box`, or a `text`
@@ -937,7 +957,13 @@ any other system's answers `observe_start` with `ok: false`.
   prints what it likes, so a `terminal` that changed is said, once it is left, as a `field.value` with
   `content_withheld: true` and its `char_len` alone.
 - **A password field** (`password text`) is never read: its change is `observer.gap{secure_input}` (no `app`) and
-  a `field.value` with `content_withheld: true` and no text.
+  a `field.value` with `content_withheld: true` and no text. GTK 3 marks a field that hides its text so, and GTK 4
+  from 4.20 marks any field whose input purpose is a password or a PIN.
+- **A password no role marks.** GTK 4 before 4.20 marks only a `GtkPasswordEntry`: an entry that hides its text
+  and libadwaita's `AdwPasswordEntryRow` read as an editable `text` whose `GetText` is the password. So in a GTK
+  application whose root's `Version` (read beside `ToolkitName`) is a GTK 4 below 4.20, or does not read as one, a
+  single-line field (an `entry`, or a `text` that does not read MULTI_LINE) is counted, never read: once it is left,
+  a `field.value` with `content_withheld: true` and its `char_len` alone. Its multi-line fields are read.
 - **A browser's typed text never reaches the helper.** No Linux browser has a private-window marker the helper
   trusts, so every browser is `unknown`: a field that changed is said, once it is left, as a `field.value` with
   `content_withheld: true`, `private_state: "unknown"`, `browser_id` (the browser's name), `window_ref` (its window's
@@ -952,13 +978,23 @@ any other system's answers `observe_start` with `ok: false`.
   (Gecko, Chromium or WebKit: every Firefox and Chromium fork, Thunderbird and every Electron application), or when
   its root says no toolkit at all. A field inside a web document (`document web` among its ancestors) is a browser's
   field in any application, and so is one whose ancestry does not read as far as its application. So withholding
-  never rests on a list being complete.
+  never rests on a list being complete. Only a complete read of who an application is is remembered: a root whose
+  `ToolkitName` or `Version` does not answer is taken as a browser's for now, said once on stderr, and read again the
+  next time the application is in front; one that says it has no toolkit is a standing fact.
+- **Starting.** `observe_start` is answered once the helper has its connection, its registrations and its two
+  rules, and the registry has answered. Then it looks for the window active now: `GetChildren` of the registry and
+  of every application, and `GetState` of every window, at most 256 applications of 64 windows each and 3 s in
+  all; the application whose one window reads ACTIVE is taken as just activated, and a look cut short finds none.
 - **Gaps only this build authors.** `accessibility_bus_lost` (no `app`): the bus went away, after what was pending
-  was said; the helper asks for the bus again every 5 s, at most for an hour, and then stops observing.
-  `overflow` (no `app`): signals arrived faster than the helper took them (it holds 1024) and some were dropped.
-  `truncated` (no `app`): a value was cut at 64 KiB; its `char_len` is still the whole.
+  was said; the helper asks for the bus again every 5 s, at most for an hour, and then exits with status 69, so the
+  engine that owns it starts it again and degrades, visibly, if the bus is still away. `overflow` (no `app`):
+  signals arrived faster than the helper took them (it holds 1024) and some were dropped: one gap from the first
+  drop to the moment the queue went quiet (at most 5 s), after which the active window is looked for again as at
+  the start, in place of whatever the dropped events said. `truncated` (no `app`): a value was cut at 64 KiB; its
+  `char_len` is still the whole.
 - **What it never does.** No `Action.GetActions`, no `Properties.GetAll`, no read of an application not on the
-  list beyond its root's `Name` and `ToolkitName` and its process (`GetConnectionUnixProcessID`, `/proc/<pid>/exe`)
-  when one of its windows becomes active, and no change to the session: an application whose toolkit publishes no tree (Qt without
+  list beyond the start's look for the active window, the `GetRole` of an object of it that becomes active, and,
+  when one of its windows does, its root's `Name`, `GetInterfaces`, `ToolkitName` and `Version` and its process
+  (`GetConnectionUnixProcessID`, `/proc/<pid>/exe`), and no change to the session: an application whose toolkit publishes no tree (Qt without
   `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`, a Chromium or Electron one without its switches, a GTK 4 one started before
   the bus) is not switched on, and records nothing.

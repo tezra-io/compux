@@ -33,6 +33,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
+#[cfg(any(target_os = "macos", test))]
+use crate::recorder::{Control, Field};
+
 // --- Emitter: the one serialized writer both halves share --------------------
 
 /// A cloneable handle to the process stdout, guarded so the request loop and the
@@ -106,6 +109,14 @@ impl Emitter {
         if let Ok(line) = serde_json::to_string(frame) {
             let _ = self.emit_line(&line);
         }
+    }
+
+    /// End the process with `code` once no line is being written, so the last line
+    /// on stdout is a whole one.
+    #[cfg(all(target_os = "linux", not(test)))]
+    pub fn exit(&self, code: i32) -> ! {
+        let _writing = self.out.lock().unwrap_or_else(|e| e.into_inner());
+        std::process::exit(code)
     }
 }
 
@@ -663,6 +674,63 @@ pub fn is_editable_role(role: Option<&str>) -> bool {
     )
 }
 
+/// Terminal emulators by bundle id. A name list is never the whole answer: an
+/// application holding a pseudo-terminal's controlling side is one whatever it is
+/// called (`is_terminal_app`).
+pub const TERMINAL_BUNDLES: &[&str] = &[
+    "com.apple.Terminal",
+    "com.googlecode.iterm2",
+    "dev.warp.Warp-Stable",
+    "dev.warp.Warp-Beta",
+    "dev.warp.Warp-Preview",
+    "net.kovidgoyal.kitty",
+    "org.alacritty",
+    "com.mitchellh.ghostty",
+    "com.github.wez.wezterm",
+    "co.zeit.hyper",
+];
+
+/// Whether an application is a terminal emulator, so that every field of it is a
+/// terminal's: by its bundle id, or by holding the controlling side of a
+/// pseudo-terminal (`/dev/ptmx`), which every terminal emulator holds for each shell
+/// it runs. Fails closed: an application whose open files could not be listed
+/// (`None`) is taken as one.
+pub fn is_terminal_app(
+    bundle_id: &str,
+    holds_pseudo_terminal: impl FnOnce() -> Option<bool>,
+) -> bool {
+    TERMINAL_BUNDLES.contains(&bundle_id) || holds_pseudo_terminal() != Some(false)
+}
+
+/// The facts macOS's observer reports of a focused element, for the content rules
+/// (`recorder::content`): a password field by its subrole (or a role of that
+/// spelling), a field by its role, a terminal's field by its application, a
+/// browser's by its bundle id. Whether a field sits inside web content in an
+/// application that is not a browser is not read on macOS.
+#[cfg(any(target_os = "macos", test))]
+pub fn mac_control(
+    role: Option<&str>,
+    subrole: Option<&str>,
+    bundle_id: &str,
+    terminal_app: bool,
+) -> Control {
+    let field = if crate::ax::secure(role, subrole) {
+        Field::Secure
+    } else if !is_editable_role(role) {
+        Field::Other
+    } else if terminal_app {
+        Field::Terminal
+    } else {
+        Field::Editable
+    };
+    Control {
+        field,
+        browser: is_browser(bundle_id),
+        web: false,
+        unmarked_secret: false,
+    }
+}
+
 /// Membership test for the app allowlist (§8.5 / inv. 11). An empty bundle id is
 /// never allowlisted (a system/agent process is not the owner's activity).
 pub fn app_allowed(bundle_id: &Option<String>, allow: &[String]) -> bool {
@@ -940,6 +1008,7 @@ pub fn stop() {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
+    use crate::recorder::{content, label_sent, Content};
     use core_foundation::base::{CFType, CFTypeRef, TCFType};
     use core_foundation::boolean::CFBoolean;
     use core_foundation::string::{CFString, CFStringRef};
@@ -1813,7 +1882,7 @@ mod imp {
             None => return,
         };
 
-        let role = read_attr(element, "AXRole");
+        let (role, control) = control_of(ctx, &app, element);
         // The app-level AXValueChanged is not guaranteed to be delivered for
         // descendants, so an editable focused element is observed directly too.
         track_value_source(ctx, element, role.as_deref());
@@ -1825,9 +1894,144 @@ mod imp {
             "role_desc",
             read_attr(element, "AXRoleDescription"),
         );
-        insert_str(&mut extra, "field_label", field_label(element));
+        if label_sent(&control) {
+            insert_str(&mut extra, "field_label", field_label(element));
+        }
         insert_str(&mut extra, "window_title", focused_window_title(ctx));
         ctx.emit("focus.changed", Some(&app), extra);
+    }
+
+    // The facts the content rules take of a focused element (`mac_control`), and its
+    // role. Whether its application is a terminal emulator is read only for an
+    // element that could be a field, and read again each time: a terminal opened
+    // after its application came in front is one from that moment.
+    unsafe fn control_of(
+        ctx: &mut Ctx,
+        app: &AppIdentity,
+        element: CFTypeRef,
+    ) -> (Option<String>, Control) {
+        let role = read_attr(element, "AXRole");
+        let subrole = read_attr(element, "AXSubrole");
+        let bundle = app.bundle_id.clone().unwrap_or_default();
+        let terminal = is_editable_role(role.as_deref()) && terminal_app(ctx, app, &bundle);
+        let control = mac_control(role.as_deref(), subrole.as_deref(), &bundle, terminal);
+        (role, control)
+    }
+
+    fn terminal_app(ctx: &mut Ctx, app: &AppIdentity, bundle: &str) -> bool {
+        let mut unreadable = false;
+        let terminal = is_terminal_app(bundle, || {
+            let holds = holds_pseudo_terminal(app.pid);
+            unreadable = holds.is_none();
+            holds
+        });
+        if unreadable {
+            log_once(
+                ctx,
+                app,
+                "open_files",
+                &format!(
+                    "{}: its open files could not be listed; its fields are taken as a \
+                     terminal's, counted and never read",
+                    app_label(app)
+                ),
+            );
+        }
+        terminal
+    }
+
+    // The most open files a process's are looked through for a pseudo-terminal.
+    const MAX_OPEN_FILES: usize = 65_536;
+    // `PROC_PIDFDVNODEPATHINFO` (`sys/proc_info.h`): an open file's vnode and path.
+    const PROC_PIDFDVNODEPATHINFO: i32 = 2;
+
+    // `struct proc_fileinfo` (`sys/proc_info.h`), whose fields are not read.
+    #[repr(C)]
+    struct ProcFileInfo {
+        _openflags: u32,
+        _status: u32,
+        _offset: i64,
+        _type: i32,
+        _guardflags: u32,
+    }
+
+    // `struct vnode_fdinfowithpath` (`sys/proc_info.h`): 1200 bytes, the path at 176.
+    #[repr(C)]
+    struct VnodeFdInfoWithPath {
+        _pfi: ProcFileInfo,
+        pvip: libc::vnode_info_path,
+    }
+
+    // Whether a process holds the controlling side of a pseudo-terminal, an open
+    // `/dev/ptmx`: what a terminal emulator holds for every shell it runs. `None`
+    // when its open files could not be listed. A file that closes between the
+    // listing and its read is passed over.
+    pub(super) fn holds_pseudo_terminal(pid: i32) -> Option<bool> {
+        if pid <= 0 {
+            return None;
+        }
+        let entry = std::mem::size_of::<libc::proc_fdinfo>();
+        // SAFETY: a null buffer of size 0 asks only for the size the list needs.
+        let needed =
+            unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+        let needed = usize::try_from(needed).ok().filter(|n| *n > 0)?;
+        // Room for files opened between the two calls.
+        let room = (needed / entry + 32).min(MAX_OPEN_FILES);
+        let mut files = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0
+            };
+            room
+        ];
+        let size = i32::try_from(room * entry).ok()?;
+        // SAFETY: the buffer holds `room` entries, `size` bytes.
+        let listed = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                files.as_mut_ptr() as *mut c_void,
+                size,
+            )
+        };
+        let listed = usize::try_from(listed).ok().filter(|n| *n > 0)? / entry;
+        let vnode = libc::PROX_FDTYPE_VNODE as u32;
+        let ptmx = files
+            .iter()
+            .take(listed)
+            .filter(|file| file.proc_fdtype == vnode)
+            .any(|file| vnode_path(pid, file.proc_fd).as_deref() == Some("/dev/ptmx"));
+        Some(ptmx)
+    }
+
+    // The path of one open file of a process, where it reads.
+    fn vnode_path(pid: i32, fd: i32) -> Option<String> {
+        let size = std::mem::size_of::<VnodeFdInfoWithPath>();
+        // SAFETY: an all-zero `vnode_fdinfowithpath` is a valid value of it.
+        let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+        // SAFETY: the buffer is one `vnode_fdinfowithpath`, `size` bytes.
+        let read = unsafe {
+            libc::proc_pidfdinfo(
+                pid,
+                fd,
+                PROC_PIDFDVNODEPATHINFO,
+                &mut info as *mut VnodeFdInfoWithPath as *mut c_void,
+                i32::try_from(size).ok()?,
+            )
+        };
+        if usize::try_from(read).ok() != Some(size) {
+            return None;
+        }
+        let bytes: Vec<u8> = info
+            .pvip
+            .vip_path
+            .iter()
+            .flatten()
+            .map(|c| *c as u8)
+            .take_while(|b| *b != 0)
+            .collect();
+        String::from_utf8(bytes).ok()
     }
 
     // Register `AXValueChanged` on the focused element itself, keeping at most one
@@ -2288,54 +2492,64 @@ mod imp {
         element: CFTypeRef,
         started_ms: i64,
     ) {
-        let role = read_attr(element, "AXRole");
+        let (role, control) = control_of(ctx, app, element);
+        let content = content(&control);
 
-        // Only editable fields carry typed content; a value change on a label/title
+        // Only a field carries typed content; a value change on a label/title
         // (AXStaticText, …) is not user input and emits nothing here (§22.5).
-        if !is_editable_role(role.as_deref()) {
+        if content == Content::NotAField {
             return;
         }
 
         let mut extra = Map::new();
-        insert_str(&mut extra, "role", role.clone());
+        insert_str(&mut extra, "role", role);
         insert_str(&mut extra, "field_label", field_label(element));
 
-        // Secure fields (password entry) are NEVER read for content — mark a
-        // gap{secure_input} and emit no text (§7.1).
-        if role.as_deref() == Some("AXSecureTextField") {
-            ctx.emit_gap(GapReason::SecureInput, started_ms, now_ms(), None);
-            extra.insert("content_withheld".into(), json!(true));
-            ctx.emit("field.value", Some(app), extra);
-            return;
-        }
-
-        let is_browser_app = app.bundle_id.as_deref().map(is_browser).unwrap_or(false);
-        let value = read_attr(element, "AXValue");
-
-        match value {
-            Some(text) if is_browser_app => {
-                emit_browser_field_value(ctx, app, element, &text, extra, started_ms);
-            }
-            Some(text) => {
-                let full_len = char_len(&text);
-                let (sent, truncated) = truncate_text(&text);
-                extra.insert("text".into(), json!(sent));
-                extra.insert("char_len".into(), json!(full_len));
-                extra.insert("content_withheld".into(), json!(false));
-                ctx.emit("field.value", Some(app), extra);
-                if truncated {
-                    // A truncated field still reported its full char_len; a gap marks
-                    // that the bytes were clipped (Fermix authors "truncated" too, but
-                    // ours is boot-scoped to this event's timeline).
-                    ctx.emit_gap_reason_truncated(started_ms);
-                }
-            }
-            None => {
-                // No readable value (AX refused) — record volume-less metadata.
+        match content {
+            // Secure fields (password entry) are NEVER read for content — mark a
+            // gap{secure_input} and emit no text (§7.1).
+            Content::Secure => {
+                ctx.emit_gap(GapReason::SecureInput, started_ms, now_ms(), None);
                 extra.insert("content_withheld".into(), json!(true));
                 ctx.emit("field.value", Some(app), extra);
             }
+            // A terminal's text is never read: how many characters it holds alone.
+            Content::CountOnly => {
+                if let Some(count) = read_i64_attr(element, "AXNumberOfCharacters") {
+                    extra.insert("char_len".into(), json!(count));
+                }
+                extra.insert("content_withheld".into(), json!(true));
+                ctx.emit("field.value", Some(app), extra);
+            }
+            Content::PrivateGated => match read_attr(element, "AXValue") {
+                Some(text) => emit_browser_field_value(ctx, app, element, &text, extra, started_ms),
+                None => emit_unreadable_value(ctx, app, extra),
+            },
+            Content::Text => match read_attr(element, "AXValue") {
+                Some(text) => {
+                    let full_len = char_len(&text);
+                    let (sent, truncated) = truncate_text(&text);
+                    extra.insert("text".into(), json!(sent));
+                    extra.insert("char_len".into(), json!(full_len));
+                    extra.insert("content_withheld".into(), json!(false));
+                    ctx.emit("field.value", Some(app), extra);
+                    if truncated {
+                        // A truncated field still reported its full char_len; a gap
+                        // marks that the bytes were clipped (Fermix authors "truncated"
+                        // too, but ours is boot-scoped to this event's timeline).
+                        ctx.emit_gap_reason_truncated(started_ms);
+                    }
+                }
+                None => emit_unreadable_value(ctx, app, extra),
+            },
+            Content::NotAField => {}
         }
+    }
+
+    // No readable value (AX refused): volume-less metadata.
+    fn emit_unreadable_value(ctx: &mut Ctx, app: &AppIdentity, mut extra: Map<String, Value>) {
+        extra.insert("content_withheld".into(), json!(true));
+        ctx.emit("field.value", Some(app), extra);
     }
 
     // A browser field's content is gated on the window's private-browsing posture
@@ -2460,6 +2674,17 @@ mod imp {
         let text = cfstring_to_string(out as CFStringRef);
         CFRelease(out);
         text
+    }
+
+    // Read a number attribute of an element; None if absent or not a number.
+    unsafe fn read_i64_attr(element: CFTypeRef, attr: &str) -> Option<i64> {
+        let out = copy_element_attr(element, attr)?;
+        let mut value: i64 = 0;
+        // kCFNumberSInt64Type = 4.
+        let read = CFGetTypeID(out) == CFNumberGetTypeID()
+            && CFNumberGetValue(out, 4, &mut value as *mut i64 as *mut c_void);
+        CFRelease(out);
+        read.then_some(value)
     }
 
     // The human label of a field: AXTitle, else AXDescription.
@@ -2840,6 +3065,7 @@ mod imp {
         fn CFGetTypeID(cf: CFTypeRef) -> usize;
         fn CFArrayGetTypeID() -> usize;
         fn CFURLGetTypeID() -> usize;
+        fn CFNumberGetTypeID() -> usize;
         fn CFURLGetString(url: CFURLRef) -> CFStringRef;
         fn CFDictionaryGetValue(dict: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
         fn CFNumberGetValue(number: CFTypeRef, the_type: isize, out: *mut c_void) -> bool;
@@ -2887,6 +3113,40 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        // A process that holds a pseudo-terminal's controlling side reads as holding
+        // one, and a process that holds none reads as holding none: the fact that
+        // makes an unknown terminal emulator one.
+        #[test]
+        fn a_process_holding_a_pseudo_terminal_reads_as_holding_one() {
+            assert_eq!(
+                std::mem::size_of::<VnodeFdInfoWithPath>(),
+                1200,
+                "the layout sys/proc_info.h gives"
+            );
+            let mut child = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("a child to look at");
+            let child_pid = i32::try_from(child.id()).expect("a pid");
+            let child_holds = holds_pseudo_terminal(child_pid);
+
+            // SAFETY: opening, marking and closing one descriptor this test owns.
+            let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+            assert!(master >= 0, "a pseudo-terminal");
+            unsafe { libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC) };
+            let own_holds = holds_pseudo_terminal(std::process::id() as i32);
+            unsafe { libc::close(master) };
+            let _ = child.kill();
+            let _ = child.wait();
+
+            assert_eq!(child_holds, Some(false));
+            assert_eq!(own_holds, Some(true));
+            assert_eq!(holds_pseudo_terminal(0), None);
+        }
 
         #[test]
         fn a_gone_element_is_not_worth_logging_on_removal() {
@@ -3768,6 +4028,55 @@ mod tests {
         assert!(!is_editable_role(Some("AXStaticText")));
         assert!(!is_editable_role(Some("AXButton")));
         assert!(!is_editable_role(None));
+    }
+
+    // A terminal emulator is one by its bundle id, or, whatever it is called, by
+    // holding a pseudo-terminal's controlling side; an application whose open files
+    // could not be listed is taken as one, and only one known to hold none is not.
+    #[test]
+    fn a_terminal_emulator_is_known_by_its_identity_or_its_pseudo_terminal() {
+        for bundle in [
+            "com.apple.Terminal",
+            "com.googlecode.iterm2",
+            "dev.warp.Warp-Stable",
+            "net.kovidgoyal.kitty",
+            "org.alacritty",
+            "com.mitchellh.ghostty",
+            "com.github.wez.wezterm",
+        ] {
+            assert!(is_terminal_app(bundle, || Some(false)), "{bundle}");
+        }
+        assert!(is_terminal_app("com.example.NewTerm", || Some(true)));
+        assert!(is_terminal_app("com.example.NewTerm", || None));
+        assert!(!is_terminal_app("com.apple.TextEdit", || Some(false)));
+        let mut asked = false;
+        assert!(is_terminal_app("com.apple.Terminal", || {
+            asked = true;
+            Some(false)
+        }));
+        assert!(!asked, "a known terminal's open files are not listed");
+    }
+
+    // The facts macOS reports of a terminal's text view and of a browser's controls,
+    // as the content rules take them.
+    #[test]
+    fn the_mac_facts_of_a_terminal_and_a_browser() {
+        let terminal = mac_control(Some("AXTextArea"), None, "com.apple.Terminal", true);
+        assert_eq!(terminal.field, Field::Terminal);
+        assert!(!terminal.browser);
+        let password = mac_control(
+            Some("AXTextField"),
+            Some("AXSecureTextField"),
+            "com.apple.Terminal",
+            true,
+        );
+        assert_eq!(password.field, Field::Secure);
+
+        let address = mac_control(Some("AXTextField"), None, "com.google.Chrome", false);
+        let suggestion = mac_control(Some("AXRow"), None, "com.google.Chrome", false);
+        assert_eq!((address.field, address.browser), (Field::Editable, true));
+        assert_eq!((suggestion.field, suggestion.browser), (Field::Other, true));
+        assert!(!address.web && !address.unmarked_secret);
     }
 
     #[test]

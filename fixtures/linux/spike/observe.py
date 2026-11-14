@@ -24,8 +24,11 @@ The DRIVER acts on the fixture through compux's own verbs (`focus`, `set_value`,
       `window.focused` with its title);
    b. where the toolkit takes a focus by reference (GTK 3, Qt), the text field is
       focused and set: `focus.changed` names it and `field.value` carries the text;
-      GTK 4 refuses `GrabFocus`, so there a Tab moves the focus and
-      `focus.changed` is what is judged;
+      GTK 4 refuses `GrabFocus`, so there Tabs move the focus, from the button to a
+      field whose text is hidden and then to libadwaita's password row (where the
+      image's libadwaita has one), and a secret is typed into each: GTK 4 before
+      4.20 marks neither as a password, so each must say its count alone, withheld,
+      and neither secret may be in any frame;
    c. the secure field is focused and set: `gap{secure_input}` and a withheld
       `field.value`, and the secret is in no frame;
    d. in Chromium the text field is set and left: its `field.value` is withheld
@@ -65,6 +68,9 @@ NAME_STEP_S = 0.2
 
 LABELS = {"gtk3": "GTK3", "gtk4": "GTK4", "qt": "Qt", "chromium": "Chromium"}
 SECRET = "s3cret-value"
+# What is typed into GTK 4's hidden field and its password row.
+HIDDEN_SECRET = "hidden-s3cret"
+ROW_SECRET = "row-s3cret"
 TYPED = "groceries list"
 # What the not-listed phase types: never TYPED, since a toolkit sends no text
 # change for a field set to the text it already holds (GTK 3 does not).
@@ -278,7 +284,7 @@ def listed_steps(args, driver, label, name):
         if args.toolkit == "chromium":
             results.append(browser_step(recorder, driver, label, name))
         elif args.toolkit == "gtk4":
-            results.append(gtk4_focus_step(recorder, driver))
+            results.append(gtk4_hidden_step(recorder, driver, label))
         else:
             results.append(typed_step(recorder, driver, label))
         if args.toolkit != "gtk4":
@@ -314,13 +320,45 @@ def typed_step(recorder, driver, label):
             "why": f"focus.changed {focused}, field.value {value}"}
 
 
-def gtk4_focus_step(recorder, driver):
-    """GTK 4 refuses GrabFocus: a Tab sent through the driver moves the focus, and the
-    recorder is judged on saying so."""
-    _, reply = driver.ask("key", mutation=True, chord="tab")
-    focused = recorder.wait_for(kind("focus.changed"))
-    return {"step": "a focus change is recorded (GTK 4: Tab)", "key": reply,
-            "passed": focused is not None, "why": f"focus.changed {focused}"}
+def has_password_row():
+    """Whether the image's libadwaita, the fixture's, has a PasswordEntryRow."""
+    import gi
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw
+    return hasattr(Adw, "PasswordEntryRow")
+
+
+def labelled(name, label):
+    return lambda frame: kind(name)(frame) and frame.get("field_label") == label
+
+
+def gtk4_hidden_step(recorder, driver, label):
+    """GTK 4 refuses GrabFocus: Tabs sent through the driver move the focus from the
+    button to the hidden field, then to the password row, and a secret is typed at
+    each through the session's X11 route. Before 4.20 GTK 4 marks neither as a
+    password, so the recorder must count them and read neither."""
+    field = f"{label} hidden field"
+    replies = {}
+    _, replies["tab"] = driver.ask("key", mutation=True, chord="tab")
+    focused = recorder.wait_for(labelled("focus.changed", field))
+    _, replies["type"] = driver.ask("type", mutation=True, text=HIDDEN_SECRET)
+    _, replies["tab_to_row"] = driver.ask("key", mutation=True, chord="tab")
+    value = recorder.wait_for(labelled("field.value", field))
+    rowed = has_password_row()
+    row_value = None
+    if rowed:
+        _, replies["type_row"] = driver.ask("type", mutation=True, text=ROW_SECRET)
+        _, replies["tab_from_row"] = driver.ask("key", mutation=True, chord="tab")
+        row_value = recorder.wait_for(
+            lambda f: kind("field.value")(f) and f.get("field_label") != field)
+    time.sleep(SETTLE_S)
+    counted = (value is not None and value.get("content_withheld") is True
+               and "text" not in value and value.get("char_len") == len(HIDDEN_SECRET))
+    passed = focused is not None and counted and nowhere(recorder, HIDDEN_SECRET, ROW_SECRET)
+    return {"step": "GTK 4's unmarked password fields are never read", "keys": replies,
+            "passed": passed, "password_row": rowed,
+            "why": f"focus.changed {focused}, field.value {value}, row's {row_value}, "
+                   f"secrets absent {nowhere(recorder, HIDDEN_SECRET, ROW_SECRET)}"}
 
 
 def secure_step(recorder, driver, label, toolkit):
