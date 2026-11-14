@@ -340,7 +340,11 @@ def secure_step(recorder, driver, label, toolkit):
 
 
 def browser_step(recorder, driver, label, name):
+    """A browser sends no text change the recorder subscribes to, so a field is
+    counted from the focus event it gets on entry: the focus is moved off the page's
+    first field first, which has it when the page opens."""
     field = f"{label} text field"
+    focus_away(driver, f"{label} button")
     acted = focus_and_set(driver, field, TYPED, True, by_keys=True)
     left = focus_away(driver, f"{label} button")
     value = recorder.wait_for(kind("field.value", browser_id=name))
