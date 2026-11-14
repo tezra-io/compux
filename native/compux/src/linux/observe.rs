@@ -85,6 +85,7 @@ const STOP_TICK: Duration = Duration::from_millis(250);
 /// How long `observe_start` waits for the observer to say it is running.
 const READY_WAIT: Duration = Duration::from_secs(5);
 /// What each of the recorder's reads, and each subscription, is held to.
+#[cfg(not(test))]
 const OBSERVER_READ_TIMEOUT: Duration = Duration::from_secs(1);
 /// After the bus is lost: one try every RECONNECT_EVERY, at most RECONNECT_TRIES
 /// (an hour), then the observer stops.
@@ -560,7 +561,8 @@ impl LiveBus {
     }
 
     fn replace(&self, connection: Connection) {
-        self.connection.replace(connection);
+        // The connection it replaces is the one already closed when the bus was lost.
+        drop(self.connection.replace(connection));
     }
 
     fn connection(&self) -> Connection {
