@@ -894,3 +894,61 @@ nor the store is started to answer: one that is not running reads as such. It ne
 never writes the store. Outside `probe`, the helper's start on GNOME Wayland decides its pixel route (§1.1) by the
 same `Introspect` without that flag, and so may start xdg-desktop-portal, as any portal client's first call does;
 on X11 the route is decided without asking the portal anything.
+
+## 9. Computer history on Linux
+
+Capture mode, the `observe_start` and `observe_stop` control actions and the unsolicited `event` frames that follow
+an acked start, is the wire it has been since protocol 6: the same two `ack`s, the same frame envelope (`type`,
+`v`, `ts`, `seq`, `boot_id`, `app`, `kind`) and the same kinds. The Linux build answers it through the
+accessibility bus. `Compux.Protocol.history_systems/0` names the systems whose helper records (`[:macos, :linux]`);
+any other system's answers `observe_start` with `ok: false`.
+
+```json
+{"type":"request","request_id":"o-start","action":"observe_start","params":{"apps":["Text Editor","Firefox"]}}
+{"type":"ack","action":"observe_start","ok":true,"protocol_version":12}
+{"type":"event","v":1,"ts":1763130000000,"seq":1,"boot_id":"compux-4711-…","kind":"app.activated",
+ "app":{"bundle_id":"Text Editor","name":"Text Editor","pid":4711}}
+{"type":"event","v":1,"ts":1763130000004,"seq":2,"boot_id":"compux-4711-…","kind":"window.focused",
+ "app":{"bundle_id":"Text Editor","name":"Text Editor","pid":4711},"window_title":"notes.txt"}
+```
+
+- **What names an application.** `apps` and `app.bundle_id` hold its name on the accessibility bus, the `Name` of
+  its root (`/org/a11y/atspi/accessible/root`), matched exactly; `app.pid` is its connection's process. On macOS
+  the same fields hold a bundle id. An application whose root has no name is never recorded.
+- **What is asked of every application.** Two match rules only: a window's `StateChanged` with `arg0='active'`,
+  which carries no text, and the bus daemon's `NameOwnerChanged`. Focus (`StateChanged` with `arg0='focused'`),
+  titles (`PropertyChange` with `arg0='accessible-name'`) and text (`TextChanged`) are asked only of the one active
+  application on the list, by rules that name its connection (`sender=':1.42'`), added when it comes in front and
+  removed when it leaves. A browser's rules leave out `TextChanged`, whose body is the text itself. The helper
+  registers (`RegisterEvent`, sent as `(sas)`) `object:state-changed:active`, `object:state-changed:focused`,
+  `object:text-changed`, `object:property-change:accessible-name` and `window:activate`.
+- **The kinds.** `app.activated` (with `prev_bundle_id`, the application on the list it left) when a window of a
+  listed application becomes the active one; `window.focused` (`window_title`) when one of its windows does; a
+  window that stops being active is given 300 ms for another of the same application's to take over, which is a
+  window switch, not an application switch. `window.title_changed` (`window_title`) is the active window's settled
+  title (1 s debounce, 5 s ceiling, never the title it was focused with again). `focus.changed` (`role`,
+  `field_label`, `window_title`) when one of its controls takes the focus. `field.value` (`role`, `field_label`,
+  `text`, `char_len`, `content_withheld`) is the focused field's settled text (0.6 s debounce, 5 s ceiling; leaving
+  the field settles it at once), read with `Text.GetText` only after `GetInterfaces` lists `Text`. `role` is
+  AT-SPI's role word (§6.1's `native_role`). A field is a `password text`, an `entry` or `combo box`, a `terminal`,
+  or a `text` that reads EDITABLE; nothing else's text is a value. No `browser.navigated`, `app.deactivated`,
+  `system.*` or `session.*` is emitted on Linux.
+- **A password field** (`password text`) is never read: its change is `observer.gap{secure_input}` (no `app`) and
+  a `field.value` with `content_withheld: true` and no text.
+- **A browser's typed text never reaches the helper.** No Linux browser has a private-window marker the helper
+  trusts, so every browser is `unknown`: a field that changed is said, once it is left, as a `field.value` with
+  `content_withheld: true`, `private_state: "unknown"`, `browser_id` (the browser's name), `window_ref` (its window's
+  object path) and `char_len` (its `CharacterCount`), and `observer.gap{private_unknown}` (with the browser's `app`)
+  once per browser per observation. A browser is an application whose name is one a browser is known by (Firefox,
+  Chromium, Google Chrome, Brave, Microsoft Edge, Vivaldi, Opera, Epiphany, …, compared without case) or whose
+  program is (`firefox`, `chrome`, `chromium`, `msedge`, …). Its window titles and focus are recorded as any
+  application's.
+- **Gaps only this build authors.** `accessibility_bus_lost` (no `app`): the bus went away, after what was pending
+  was said; the helper asks for the bus again every 5 s, at most for an hour, and then stops observing.
+  `overflow` (no `app`): signals arrived faster than the helper took them (it holds 1024) and some were dropped.
+  `truncated` (no `app`): a value was cut at 64 KiB; its `char_len` is still the whole.
+- **What it never does.** No `Action.GetActions`, no `Properties.GetAll`, no read of an application not on the
+  list beyond its root's `Name` and its process (`GetConnectionUnixProcessID`, `/proc/<pid>/exe`) when one of its
+  windows becomes active, and no change to the session: an application whose toolkit publishes no tree (Qt without
+  `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`, a Chromium or Electron one without its switches, a GTK 4 one started before
+  the bus) is not switched on, and records nothing.
