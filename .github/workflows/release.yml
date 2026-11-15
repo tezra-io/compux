@@ -52,9 +52,12 @@ permissions:
 jobs:
   # A dispatch runs this workflow on whatever ref it is given, and only a
   # release tag, the same v*.*.* the push trigger matches, may be built, signed
-  # and notarized.
+  # and notarized. The tag must also name the version the tagged code says it
+  # is: a tag pushed on the wrong commit would otherwise publish that commit's
+  # code under the tag's version, signed, and the downloader (which names an
+  # artifact by mix.exs's version) would never find it.
   preflight:
-    name: refuse a non-tag ref
+    name: refuse a ref that is not this version's tag
     runs-on: ubuntu-24.04
     steps:
       - name: Require a release tag
@@ -69,6 +72,24 @@ jobs:
               exit 1
               ;;
           esac
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Require the tag to name the tagged code's version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="${REF_NAME#v}"
+          mix_version="$(sed -nE 's/^  @version "([^"]+)"$/\1/p' mix.exs)"
+          cargo_version="$(sed -nE '/^\[package\]$/,/^\[/ s/^version = "([^"]+)"$/\1/p' native/compux/Cargo.toml)"
+          echo "tag $tag, mix.exs $mix_version, Cargo.toml $cargo_version"
+          if [ "$tag" != "$mix_version" ] || [ "$tag" != "$cargo_version" ]; then
+            echo "::error title=Tag on the wrong commit::$REF_NAME is on $GITHUB_SHA, whose mix.exs says '$mix_version' and Cargo.toml '$cargo_version'; delete the tag and push it again on the release commit"
+            exit 1
+          fi
 
   build:
     name: build ${{ matrix.target }}
